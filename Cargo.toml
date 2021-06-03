@@ -1,0 +1,12 @@
+[workspace]
+
+members = ["core"]
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+#opt-level = 3
+opt-level = "z"
+debug = false
+incremental = false
