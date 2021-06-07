@@ -3,6 +3,7 @@ use crate::metadata::declarations::declaration::{Declaration, DeclarationKind};
 use crate::metadata::declarations::type_declaration::TypeDeclaration;
 use crate::bindings::imeta_data_import2;
 use crate::metadata::declarations::struct_field_declaration::StructFieldDeclaration;
+use std::borrow::Cow;
 
 pub struct StructDeclaration<'a> {
 	base: TypeDeclaration<'a>,
@@ -10,11 +11,11 @@ pub struct StructDeclaration<'a> {
 }
 
 impl Declaration for StructDeclaration {
-	fn name<'a>(&self) -> &'a str {
+	fn name<'a>(&self) -> Cow<'a, str> {
 		self.base.name()
 	}
 
-	fn full_name<'a>(&self) -> &'a str {
+	fn full_name<'a>(&self) -> Cow<'a, str> {
 		self.base.full_name()
 	}
 
@@ -38,17 +39,22 @@ impl StructDeclaration {
 		self.fields.len()
 	}
 
+	pub fn fields(&self) -> &[StructFieldDeclaration] {
+		self.fields.as_slice()
+	}
+
 	fn make_field_declarations(metadata: *mut c_void, token: mdTypeDef) -> Vec<StructFieldDeclaration> {
-		let enumerator = std::ptr::null_mut();
+		let mut enumerator = std::ptr::null_mut();
 		let mut count = 0;
-		let mut tokens: Vec<mdFieldDef> = vec![0; 1024];
+		let mut tokens = [0; 1024];
+		let mut enumerator_ptr = &mut enumerator;
 		debug_assert!(
 			imeta_data_import2::enum_fields(
-				metadata, enumerator, token, tokens.as_mut_ptr(), tokens.len(), &mut count,
+				metadata, enumerator_ptr, token, tokens.as_mut_ptr(), tokens.len() as u32, &mut count,
 			).is_ok()
 		);
 
-		debug_assert!(count < tokens.len() - 1);
+		debug_assert!(count < (tokens.len() - 1) as u32);
 
 		imeta_data_import2::close_enum(metadata, enumerator);
 

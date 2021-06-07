@@ -9,22 +9,22 @@ pub mod rometadataresolution {
 	) -> HRESULT {
 		unsafe {
 			windows::HRESULT(core_bindings::Rometadataresolution_RoGetMetaDataFile(
-				name, meta_data_dispenser.unwrap_or(0 as _), meta_data_file_path.unwrap_or(0 as _), meta_data_import.unwrap_or(0 as _), type_def_token.unwrap_or(0 as _),
+				std::mem::transmute(name), meta_data_dispenser.unwrap_or(0 as _), meta_data_file_path.unwrap_or(0 as _), meta_data_import.unwrap_or(0 as _), type_def_token.unwrap_or(0 as _),
 			) as u32)
 		}
 	}
 
 	pub(crate) fn ro_parse_type_name(
-		type_name: HSTRING,
+		mut type_name: HSTRING,
 		parts_count: *mut DWORD,
 		type_name_parts: *mut *mut HSTRING,
 	) -> HRESULT {
 		unsafe {
 			HRESULT(
 				core_bindings::Rometadataresolution_RoParseTypeName(
-					type_name,
+					std::mem::transmute(&mut type_name),
 					parts_count,
-					type_name_parts,
+					std::mem::transmute(type_name_parts),
 				) as u32
 			)
 		}
@@ -34,7 +34,9 @@ pub mod rometadataresolution {
 	pub(crate) fn ro_get_parameterized_type_instance_iid(
 		name_element_count: UINT32,
 		name_elements: *mut PCWSTR,
-		meta_data_locator: *const IRoMetaDataLocator,
+		fn_: ::core::option::Option<
+			unsafe extern "C" fn(name: PCWSTR, builder: *mut IRoSimpleMetaDataBuilder) -> HRESULT,
+		>,
 		iid: *mut GUID,
 		p_extra: Option<*mut ROPARAMIIDHANDLE>,
 	) -> HRESULT {
@@ -43,7 +45,7 @@ pub mod rometadataresolution {
 				core_bindings::Rometadataresolution_RoGetParameterizedTypeInstanceIID(
 					name_element_count,
 					name_elements,
-					meta_data_locator,
+					fn_ as _,
 					iid,
 					p_extra.unwrap_or(0 as _),
 				) as u32
@@ -51,15 +53,14 @@ pub mod rometadataresolution {
 		}
 	}
 
-	pub(crate) fn ro_locator(fn_: ::core::option::Option<
-		unsafe extern "C" fn(name: PCWSTR, builder: *mut IRoSimpleMetaDataBuilder) -> HRESULT,
-	>) -> Ro_detail__Locator<
-		::core::option::Option<
-			unsafe extern "C" fn(arg1: PCWSTR, arg2: *mut IRoSimpleMetaDataBuilder) -> HRESULT,
+	pub(crate) fn ro_locator(
+		fn_: ::core::option::Option<
+			unsafe extern "C" fn(name: PCWSTR, builder: *mut IRoSimpleMetaDataBuilder) -> i32,
 		>,
-	> {
+		locator: *mut Locator,
+	) {
 		unsafe {
-			core_bindings::Rometadataresolution_Ro_Locator(fn_)
+			core_bindings::Rometadataresolution_Ro_Locator(fn_, locator)
 		}
 	}
 }
@@ -488,6 +489,152 @@ pub mod imeta_data_import2 {
 			)
 		}
 	}
+
+
+	pub(crate) fn find_field(
+		meta: *mut c_void,
+		td: mdTypeDef,
+		sz_name: Option<LPCWSTR>,
+		pv_sig_blob: Option<PCCOR_SIGNATURE>,
+		cb_sig_blob: Option<ULONG>,
+		pmb: Option<*mut mdFieldDef>,
+	) -> HRESULT {
+		unsafe {
+			HRESULT(
+				core_bindings::IMetaDataImport2_FindField(
+					meta,
+					td,
+					sz_name.unwrap_or(0 as _),
+					pv_sig_blob.unwrap_or(0 as _),
+					cb_sig_blob.unwrap_or_default(),
+					pmb.unwrap_or(0 as _),
+				) as u32
+			)
+		}
+	}
+}
+
+pub mod iro_simple_meta_data_builder {
+	use crate::prelude::*;
+	use windows::{HRESULT, HSTRING};
+
+	pub(crate) fn set_runtime_class_simple_default(
+		builder: *mut IRoSimpleMetaDataBuilder,
+		name: PCWSTR,
+		default_interface_name: PCWSTR,
+		default_interface_iid: *const GUID,
+	) -> HRESULT {
+		unsafe {
+			HRESULT(
+				core_bindings::IRoSimpleMetaDataBuilder_SetRuntimeClassSimpleDefault(
+					builder,
+					name,
+					default_interface_name,
+					default_interface_iid,
+				) as u32
+			)
+		}
+	}
+
+
+	pub(crate) fn set_win_rt_interface(
+		builder: *mut IRoSimpleMetaDataBuilder,
+		iid: GUID,
+	) -> HRESULT {
+		unsafe {
+			HRESULT(
+				core_bindings::IRoSimpleMetaDataBuilder_SetWinRtInterface(
+					builder,
+					iid,
+				) as u32
+			)
+		}
+	}
+
+
+	pub fn set_parameterized_interface(
+		builder: *mut IRoSimpleMetaDataBuilder,
+		piid: GUID,
+		num_args: UINT32,
+	) -> HRESULT {
+		unsafe {
+			HRESULT(
+				core_bindings::IRoSimpleMetaDataBuilder_SetParameterizedInterface(
+					builder,
+					piid,
+					num_args,
+				) as u32
+			)
+		}
+	}
+
+
+	pub fn set_enum(
+		builder: *mut IRoSimpleMetaDataBuilder,
+		name: PCWSTR,
+		base_type: PCWSTR,
+	) -> HRESULT {
+		unsafe {
+			HRESULT(
+				core_bindings::IRoSimpleMetaDataBuilder_SetEnum(
+					builder,
+					name,
+					base_type,
+				) as u32
+			)
+		}
+	}
+
+
+	pub fn set_struct(
+		builder: *mut IRoSimpleMetaDataBuilder,
+		name: PCWSTR,
+		num_fields: UINT32,
+		field_type_names: *const PCWSTR,
+	) -> HRESULT {
+		unsafe {
+			HRESULT(
+				core_bindings::IRoSimpleMetaDataBuilder_SetStruct(
+					builder,
+					name,
+					num_fields,
+					field_type_names,
+				) as u32
+			)
+		}
+	}
+
+
+	pub fn set_delegate(
+		builder: *mut IRoSimpleMetaDataBuilder,
+		iid: GUID,
+	) -> HRESULT {
+		unsafe {
+			HRESULT(
+				core_bindings::IRoSimpleMetaDataBuilder_SetDelegate(
+					builder,
+					iid,
+				) as u32
+			)
+		}
+	}
+
+
+	pub fn set_parameterized_delegate(
+		builder: *mut IRoSimpleMetaDataBuilder,
+		piid: GUID,
+		num_args: UINT32,
+	) -> HRESULT {
+		unsafe {
+			HRESULT(
+				core_bindings::IRoSimpleMetaDataBuilder_SetParameterizedDelegate(
+					builder,
+					piid,
+					num_args,
+				) as u32
+			)
+		}
+	}
 }
 
 pub mod enums {
@@ -588,9 +735,9 @@ pub mod helpers {
 		}
 	}
 
-	pub(crate) fn windows_get_string_raw_buffer(string: HSTRING, length: Option<*mut UINT32>) -> PCWSTR {
+	pub(crate) fn windows_get_string_raw_buffer(mut string: HSTRING, length: Option<*mut UINT32>) -> PCWSTR {
 		unsafe {
-			core_bindings::Helpers_WindowsGetStringRawBuffer(string: HSTRING, length.unwrap_or(0 as _))
+			core_bindings::Helpers_WindowsGetStringRawBuffer(std::mem::transmute(&mut string), length.unwrap_or(0 as _))
 		}
 	}
 
@@ -611,6 +758,28 @@ pub mod helpers {
 			core_bindings::Helpers_IsEvSpecialName(value) == 1
 		}
 	}
+
+	pub(crate) fn generate_id_name(
+		name_parts_w: *mut PCWSTR,
+		declaration_full_name: *mut u16,
+		name_parts_count: *mut DWORD,
+	) {
+		unsafe {
+			core_bindings::Helpers_generate_id_name(
+				name_parts_w,
+				declaration_full_name,
+				name_parts_count,
+			)
+		}
+	}
+
+	pub(crate) fn to_string_length(value: PCWSTR, count: *mut usize) {
+		unsafe {
+			core_bindings::Helpers_toString_length(value: PCWSTR, count: *mut usize);
+		}
+	}
+
+
 }
 
 

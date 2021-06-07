@@ -2,6 +2,7 @@ use crate::prelude::*;
 use crate::metadata::declarations::declaration::{Declaration, DeclarationKind};
 use crate::metadata::declarations::field_declaration::FieldDeclaration;
 use crate::bindings::{imeta_data_import2, helpers};
+use std::borrow::Cow;
 
 pub struct StructFieldDeclaration<'a> {
 	base: FieldDeclaration<'a>,
@@ -32,23 +33,24 @@ impl StructFieldDeclaration {
 		}
 	}
 
-	pub fn type_(&self) -> PCCOR_SIGNATURE {
-		let mut signature = vec![0_u8; MAX_IDENTIFIER_LENGTH];
+	pub fn type_<'a>(&self) -> Cow<'a, [u8]> {
+		let mut signature = [0_u8; MAX_IDENTIFIER_LENGTH];
 		let mut signature_size = 0;
 
 		debug_assert!(
 			imeta_data_import2::get_field_props(
 				self.base.metadata, self.base.token, None, None, None,
-				None, None, Some(signature.as_mut_ptr()), Some(&mut signature_size),
+				None, None, Some(signature.as_mut_ptr() as *mut *const u8), Some(&mut signature_size),
 				None, None, None,
 			).is_ok()
 		);
-		signature.resize(signature_size, 0);
+
 		let header = helpers::cor_sig_uncompress_data(signature.as_mut_ptr());
 		debug_assert!(
-			header == CorCallingConvention::ImageCeeCsCallconvField
+			header == CorCallingConvention::ImageCeeCsCallconvField as u32
 		);
 
-		return signature;
+		let result: [u8] = signature[..signature_size];
+		result.into()
 	}
 }

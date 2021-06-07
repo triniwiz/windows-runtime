@@ -41,9 +41,10 @@ fn main() {
         .whitelist_function("IMetaDataImport2_.*")
         .whitelist_function("Enums_.*")
         .whitelist_function("Helpers_.*")
+        .whitelist_function("IRoSimpleMetaDataBuilder_.*")
         .whitelist_var("Helpers_.*")
-        .blacklist_type("HSTRING")
-        .raw_line("pub type HSTRING = *mut windows::HSTRING;")
+        //.blacklist_type("HSTRING")
+        //.raw_line("pub type HSTRING = windows::HSTRING;")
         .clang_args(&["-I", "C:\\Program Files (x86)\\Windows Kits\\NETFXSDK\\4.8\\Include\\um"])
         .header("src/bindings.cpp")
         // Tell cargo to invalidate the built crate whenever any of the

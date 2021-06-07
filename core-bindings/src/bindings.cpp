@@ -42,24 +42,30 @@ Rometadataresolution_RoParseTypeName(const HSTRING typeName, DWORD *partsCount, 
     return RoParseTypeName(typeName, partsCount, typeNameParts);
 }
 
+
+
 extern "C" HRESULT Rometadataresolution_RoGetParameterizedTypeInstanceIID(UINT32 nameElementCount,
                                                                           PCWSTR *nameElements,
-                                                                          const IRoMetaDataLocator &metaDataLocator,
+                                                                          HRESULT(*fn)(PCWSTR name, IRoSimpleMetaDataBuilder & builder),
                                                                           GUID *iid,
                                                                           ROPARAMIIDHANDLE *pExtra) {
-    /*auto proc = (ProcRoGetParameterizedTypeInstanceIID)GetProcAddress(
-        LoadLibraryA("api-ms-win-ro-typeresolution-l1-1-0.dll"),
-        "ro_get_parameterized_type_instance_iid");
 
-    return proc(nameElementCount, nameElements, metaDataLocator, iid, pExtra); */
 
-    return RoGetParameterizedTypeInstanceIID(nameElementCount, nameElements, metaDataLocator, iid, pExtra);
+
+    auto locatorImpl{ [&](PCWSTR name, IRoSimpleMetaDataBuilder& builder) {
+        return fn(name, builder);
+    } };
+
+
+    //auto const locator = locatorImpl;
+
+    return RoGetParameterizedTypeInstanceIID(nameElementCount, nameElements, Ro::Locator(locatorImpl), iid, pExtra);
 }
 
-//typedef HRESULT(void* RoLocator)(PCWSTR name, IRoSimpleMetaDataBuilder& builder);
+//typedef HRESULT(void* RoLocator)(PCWSTR name, iro_simple_meta_data_builder& builder);
 
 
-//typedef HRESULT(*RoLocator)(PCWSTR name, IRoSimpleMetaDataBuilder& builder);
+//typedef HRESULT(*RoLocator)(PCWSTR name, iro_simple_meta_data_builder& builder);
 
 struct _locator {
     Ro::detail::_Locator<HRESULT(__cdecl *)(PCWSTR, IRoSimpleMetaDataBuilder &)> locator;
@@ -315,6 +321,56 @@ extern "C" HRESULT IMetaDataImport2_GetEventProps(void *meta, mdEvent ev,
 }
 
 
+extern "C" HRESULT IMetaDataImport2_FindField(void* meta, mdTypeDef   td,
+    LPCWSTR     szName,                 
+    PCCOR_SIGNATURE pvSigBlob,        
+    ULONG       cbSigBlob,
+    mdFieldDef * pmb) {
+    auto metadata = reinterpret_cast<IMetaDataImport2*>(meta);
+    return metadata->FindField(td, szName, pvSigBlob, cbSigBlob, pmb);
+}
+
+
+
+extern "C" HRESULT IRoSimpleMetaDataBuilder_SetRuntimeClassSimpleDefault(IRoSimpleMetaDataBuilder* builder, PCWSTR     name,
+    PCWSTR     defaultInterfaceName,
+    const GUID * defaultInterfaceIID) {
+    return builder->SetRuntimeClassSimpleDefault(name, defaultInterfaceName, defaultInterfaceIID);
+}
+
+extern "C" HRESULT IRoSimpleMetaDataBuilder_SetWinRtInterface(IRoSimpleMetaDataBuilder * builder, GUID iid) {
+    return builder->SetWinRtInterface(iid);
+}
+
+extern "C" HRESULT IRoSimpleMetaDataBuilder_SetParameterizedInterface(IRoSimpleMetaDataBuilder* builder, GUID  piid,
+    UINT32 numArgs) {
+    return builder->SetParameterizedInterface(piid,numArgs);
+}
+
+extern "C" HRESULT IRoSimpleMetaDataBuilder_SetEnum(IRoSimpleMetaDataBuilder * builder, PCWSTR name,
+    PCWSTR baseType) {
+    return builder->SetEnum(name, baseType);
+}
+
+
+extern "C" HRESULT IRoSimpleMetaDataBuilder_SetStruct(IRoSimpleMetaDataBuilder * builder, PCWSTR       name,
+    UINT32       numFields,
+    const PCWSTR * fieldTypeNames) {
+    return builder->SetStruct(name, numFields, fieldTypeNames);
+}
+
+
+extern "C" HRESULT IRoSimpleMetaDataBuilder_SetDelegate(IRoSimpleMetaDataBuilder * builder, GUID iid) {
+    return builder->SetDelegate(iid);
+}
+
+
+extern "C" HRESULT IRoSimpleMetaDataBuilder_SetParameterizedDelegate(IRoSimpleMetaDataBuilder * builder, GUID   piid,
+    UINT32 numArgs) {
+    return builder->SetParameterizedDelegate(piid, numArgs);
+}
+
+
 
 extern "C" ULONG32 Enums_TypeFromToken(mdToken token) {
     return TypeFromToken(token);
@@ -431,11 +487,28 @@ extern "C" BOOL Helpers_IsEvSpecialName(DWORD value) {
     return IsEvSpecialName(value);
 }
 
+extern "C" void Helpers_generate_id_name(PCWSTR* namePartsW, wchar_t* declarationFullName, DWORD * namePartsCount) {
+    using namespace Microsoft::WRL::Wrappers;
+    HSTRING* nameParts{ nullptr };
+    RoParseTypeName(HStringReference(declarationFullName).Get(), namePartsCount, &nameParts);
+    
+    size_t count = (size_t)(namePartsCount);
+    for (size_t i = 0; i < count; ++i) {
+        namePartsW[i] = WindowsGetStringRawBuffer(nameParts[i], nullptr);
+    }
+
+
+}
+
+extern "C" void Helpers_toString_length(PCWSTR value, size_t * count) {
+    using namespace Microsoft::WRL::Wrappers;
+    *count = wcslen(value);
+}
 
 
 
 /*
-extern "C" HRESULT GenericInstanceIdBuilder_locatorImpl(PCWSTR name, IRoSimpleMetaDataBuilder & builder) {
+extern "C" HRESULT GenericInstanceIdBuilder_locatorImpl(PCWSTR name, iro_simple_meta_data_builder & builder) {
     shared_ptr<Declaration> declaration{ metadataReader.findByName(name) };
     ASSERT(declaration);
 
@@ -445,25 +518,25 @@ extern "C" HRESULT GenericInstanceIdBuilder_locatorImpl(PCWSTR name, IRoSimpleMe
         ClassDeclaration* classDeclaration{ static_cast<ClassDeclaration*>(declaration.get()) };
         const InterfaceDeclaration& defaultInterface{ classDeclaration->defaultInterface() };
         IID defaultInterfaceId = defaultInterface.id();
-        ASSERT_SUCCESS(builder.SetRuntimeClassSimpleDefault(name, defaultInterface.fullName().data(), &defaultInterfaceId));
+        ASSERT_SUCCESS(builder.set_runtime_class_simple_default(name, defaultInterface.fullName().data(), &defaultInterfaceId));
         return S_OK;
     }
 
     case DeclarationKind::Interface: {
         InterfaceDeclaration* interfaceDeclaration{ static_cast<InterfaceDeclaration*>(declaration.get()) };
-        ASSERT_SUCCESS(builder.SetWinRtInterface(interfaceDeclaration->id()));
+        ASSERT_SUCCESS(builder.set_win_rt_interface(interfaceDeclaration->id()));
         return S_OK;
     }
 
     case DeclarationKind::GenericInterface: {
         GenericInterfaceDeclaration* genericInterfaceDeclaration{ static_cast<GenericInterfaceDeclaration*>(declaration.get()) };
-        ASSERT_SUCCESS(builder.SetParameterizedInterface(genericInterfaceDeclaration->id(), genericInterfaceDeclaration->number_of_generic_parameters()));
+        ASSERT_SUCCESS(builder.set_parameterized_interface(genericInterfaceDeclaration->id(), genericInterfaceDeclaration->number_of_generic_parameters()));
         return S_OK;
     }
 
     case DeclarationKind::Enum: {
         EnumDeclaration* enumDeclaration{ static_cast<EnumDeclaration*>(declaration.get()) };
-        ASSERT_SUCCESS(builder.SetEnum(enumDeclaration->fullName().data(), Signature::toString(nullptr, enumDeclaration->type()).data()));
+        ASSERT_SUCCESS(builder.set_enum(enumDeclaration->fullName().data(), Signature::toString(nullptr, enumDeclaration->type()).data()));
         return S_OK;
     }
 
@@ -480,19 +553,19 @@ extern "C" HRESULT GenericInstanceIdBuilder_locatorImpl(PCWSTR name, IRoSimpleMe
             fieldNamesW.push_back(const_cast<wchar_t*>(fieldName.data()));
         }
 
-        ASSERT_SUCCESS(builder.SetStruct(structDeclaration->fullName().data(), structDeclaration->size(), fieldNamesW.data()));
+        ASSERT_SUCCESS(builder.set_struct(structDeclaration->fullName().data(), structDeclaration->size(), fieldNamesW.data()));
         return S_OK;
     }
 
     case DeclarationKind::Delegate: {
         DelegateDeclaration* delegateDeclaration{ static_cast<DelegateDeclaration*>(declaration.get()) };
-        ASSERT_SUCCESS(builder.SetDelegate(delegateDeclaration->id()));
+        ASSERT_SUCCESS(builder.set_delegate(delegateDeclaration->id()));
         return S_OK;
     }
 
     case DeclarationKind::GenericDelegate: {
         GenericDelegateDeclaration* genericDelegateDeclaration{ static_cast<GenericDelegateDeclaration*>(declaration.get()) };
-        ASSERT_SUCCESS(builder.SetParameterizedDelegate(genericDelegateDeclaration->id(), genericDelegateDeclaration->number_of_generic_parameters()));
+        ASSERT_SUCCESS(builder.set_parameterized_delegate(genericDelegateDeclaration->id(), genericDelegateDeclaration->number_of_generic_parameters()));
         return S_OK;
     }
 
