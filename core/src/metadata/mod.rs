@@ -1,10 +1,6 @@
 pub mod com_helpers;
-pub mod token_type;
-
-pub struct MetadataReader {}
-
-impl MetadataReader {
-    pub fn find_by_name(&self){
-
-    }
-}
+pub mod declarations;
+pub mod signature;
+pub mod declaration_factory;
+pub mod generic_instance_id_builder;
+pub mod meta_data_reader;

@@ -11,30 +11,12 @@ use std::ffi::{OsString};
 
 pub struct  FieldDeclaration <'a>{
     pub kind: DeclarationKind,
-    pub metadata: *const c_void,
-    pub token: mdTypeDef,
+    pub metadata: *mut c_void,
+    pub token: mdFieldDef,
     _marker: marker::PhantomData<&'a *const c_void>
 }
 
 impl Declaration for FieldDeclaration {
-    fn kind(&self) -> DeclarationKind{
-        self.kind
-    }
-
-    fn is_exported(&self) -> bool {
-        let mut flags: DWORD = 0;
-        assert(
-            imeta_data_import2::get_type_def_props(
-                self.token, 0, 0,0, &mut flags, 0
-            ).is_ok()
-        );
-
-        if !helpers::is_td_public(flags) || helpers::is_td_special_name(flags) {
-            return false;
-        }
-
-        return true;
-    }
 
     fn name<'b>(&self) -> &'b str {
         return self.full_name();
@@ -42,15 +24,28 @@ impl Declaration for FieldDeclaration {
 
     fn full_name<'b>(&self) -> &'b str {
         let mut full_name_data = vec![0_u16; MAX_IDENTIFIER_LENGTH];
+        let mut length = 0;
+        debug_assert!(imeta_data_import2::get_field_props(
+            self.metadata, self.token, None,
+            Some(full_name_data.as_mut_ptr()),
+            Some(full_name_data.len() as u32),
+            Some(&mut length),
+            None,None,
+            None, None,
+            None,None
+        ).is_ok());
 
-        let length = helpers::(self.metadata, self.token, full_name_data.as_mut_ptr(), full_name_data.len());
         full_name_data.resize(length as usize, 0);
-        OsString::from_wide(name.as_slice())
+        OsString::from_wide(name.as_slice()).to_string_lossy().as_ref()
+    }
+
+    fn kind(&self) -> DeclarationKind{
+        self.kind
     }
 }
 
 impl FieldDeclaration {
-    pub fn new(kind: DeclarationKind, metadata: *const c_void, token: mdTypeDef) -> Self {
+    pub fn new(kind: DeclarationKind, metadata: *mut c_void, token: mdFieldDef) -> Self {
         let value = Self {
             kind,
             metadata,
@@ -59,8 +54,8 @@ impl FieldDeclaration {
         };
 
         assert!(value.metadata.is_not_null());
-        assert!(enums::type_from_token(value.token) == mdtFieldDef);
-        assert!(value.token != mdTypeDefNil);
+        assert!(enums::type_from_token(value.token) == CorTokenType::mdtFieldDef as u32);
+        assert!(value.token != mdFieldDefNil);
         value
     }
 }

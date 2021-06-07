@@ -1,0 +1,13 @@
+[package]
+name = "core_bindings"
+version = "0.1.0"
+edition = "2018"
+build = "build.rs"
+
+[dependencies]
+windows = "0.10.0"
+
+[build-dependencies]
+windows = "0.10.0"
+cc = "1.0"
+bindgen = "0.53.1"

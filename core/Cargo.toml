@@ -2,7 +2,6 @@
 name = "core"
 version = "0.1.0"
 edition = "2018"
-build = "build.rs"
 
 [lib]
 name = "nativescript"
@@ -12,11 +11,7 @@ crate-type = ["dylib"]
 [dependencies]
 windows = "0.10.0"
 rusty_v8 = "0.21.0"
-bindings = { package = "core_bindings", path = "bindings" }
+core_bindings = { package = "core_bindings", path = "../core-bindings" }
 chrono = "0.4.19"
 libc = "0.2.95"
-
-[build-dependencies]
-windows = "0.10.0"
-cc = "1.0"
-bindgen = "0.53.1"
+lazy_static = "1.4.0"

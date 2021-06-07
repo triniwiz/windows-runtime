@@ -1,6 +1,6 @@
 [workspace]
 
-members = ["core"]
+members = ["core", "core-bindings"]
 
 [profile.release]
 panic = "abort"

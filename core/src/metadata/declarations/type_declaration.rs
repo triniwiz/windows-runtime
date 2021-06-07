@@ -1,79 +1,91 @@
-use crate::prelude::*;
-use super::declaration::{Declaration, DeclarationKind};
-use crate::bindings::{
-    imeta_data_import2,
-    helpers,
-    enums
+use crate::{
+	prelude::*,
+	bindings::{
+		imeta_data_import2,
+		helpers,
+		enums,
+	},
 };
+use super::declaration::{Declaration, DeclarationKind};
 use std::marker;
 use std::ffi::{OsString};
+use std::borrow::Cow;
 
 
-pub struct TypeDeclaration <'a>{
-    pub kind: DeclarationKind,
-    pub metadata: *const c_void,
-    pub token: mdTypeDef,
-    _marker: marker::PhantomData<&'a *const c_void>
+
+
+pub struct TypeDeclaration<'a> {
+	pub kind: DeclarationKind,
+	pub metadata: *mut c_void,
+	pub token: mdTypeDef,
+	_marker: marker::PhantomData<&'a *const c_void>,
 }
 
 
 impl Declaration for TypeDeclaration {
-    fn kind(&self) -> DeclarationKind{
-        self.kind
-    }
+	fn is_exported(&self) -> bool {
+		let mut flags: DWORD = 0;
+		debug_assert!(
+			imeta_data_import2::get_type_def_props(
+				self.metadata, self.token, None, None, None, Some(&mut flags), None,
+			).is_ok()
+		);
 
-    fn is_exported(&self) -> bool {
-        let mut flags: DWORD = 0;
-        assert(
-            imeta_data_import2::get_type_def_props(
-                self.token, 0, 0,0, &mut flags, 0
-            ).is_ok()
-        );
+		if !helpers::is_td_public(flags) || helpers::is_td_special_name(flags) {
+			return false;
+		}
 
-        if !helpers::is_td_public(flags) || helpers::is_td_special_name(flags) {
-            return false;
-        }
+		return true;
+	}
 
-        return true;
-    }
-    
-    fn name<'b>(&self) -> &'b str {
-        let mut name = self.full_name();
+	fn name<'a>(&self) -> Cow<'a, str> {
+		let mut name = self.full_name().to_string();
+		let back_tick_index = name.find('`');
+		if let Some(index) = back_tick_index {
+			name = name
+				.chars()
+				.take(0)
+				.chain(
+					name.chars().skip(index)
+				).collect()
+		}
 
-        // size_t backtickIndex{ fullyQualifiedName.rfind(L"`") };
-        // if (backtickIndex != wstring::npos) {
-        //     fullyQualifiedName.erase(backtickIndex);
-        // }
-        //
-        // size_t dotIndex{ fullyQualifiedName.rfind(L".") };
-        // if (dotIndex != wstring::npos) {
-        //     fullyQualifiedName.erase(0, dotIndex + 1);
-        // }
+		let dot_index = name.find('.');
+		if let Some(index) = dot_index {
+			name = name
+				.chars()
+				.take(0)
+				.chain(
+					name.chars().skip(index + 1)
+				).collect()
+		}
 
-        return name;
-    }
+		name.into()
+	}
 
-    fn full_name<'b>(&self) -> &'b str {
-        let mut full_name_data = vec![0_u16; MAX_IDENTIFIER_LENGTH];
+	fn full_name<'a>(&self) -> Cow<'a, str> {
+		let mut full_name_data = [0_u16; MAX_IDENTIFIER_LENGTH];
+		let length = helpers::get_type_name(self.metadata, self.token, full_name_data.as_mut_ptr(), full_name_data.len() as u32);
+		OsString::from_wide(&full_name_data[..length]).into()
+	}
 
-        let length = Helpers_Get_Type_Name(self.metadata, self.token, full_name_data.as_mut_ptr(), full_name_data.len());
-        full_name_data.resize(length as usize, 0);
-        OsString::from_wide(name.as_slice())
-    }
+	fn kind(&self) -> DeclarationKind {
+		self.kind
+	}
 }
 
 impl TypeDeclaration {
-    pub fn new(kind: DeclarationKind, metadata: *const c_void, token: mdTypeDef) -> Self {
-        let value = Self {
-            kind,
-            metadata,
-            token,
-            _marker: marker::PhantomData
-        };
+	pub fn new(kind: DeclarationKind, metadata: *mut c_void, token: mdTypeDef) -> Self {
+		let value = Self {
+			kind,
+			metadata,
+			token,
+			_marker: marker::PhantomData,
+		};
 
-        assert!(value.metadata.is_not_null());
-        assert!(enums::type_from_token(value.token) == mdtTypeDef);
-        assert!(value.token != mdTypeDefNil);
-        value
-    }
+		assert!(!value.metadata.is_null());
+		assert!(enums::type_from_token(value.token) == CorTokenType::mdtTypeDef as u32);
+		assert!(value.token != mdTypeDefNil);
+		value
+	}
 }
