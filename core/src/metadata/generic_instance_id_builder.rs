@@ -141,7 +141,7 @@ impl GenericInstanceIdBuilder {
 		std::unreachable!()
 	}
 
-	pub fn generate_id(declaration: &dyn Declaration){
+	pub fn generate_id(declaration: &dyn Declaration) -> GUID {
 		let mut declaration_full_name = declaration.full_name().into_owned().to_wide();
 		let mut name_parts = [0_u16;MAX_IDENTIFIER_LENGTH];
 		let mut name_parts_count = 0;
@@ -156,16 +156,7 @@ impl GenericInstanceIdBuilder {
 			)
 		);
 
-		/*
-		for (size_t i = 0; i < name_parts_count; ++i) {
-			ASSERT_SUCCESS(WindowsDeleteString(name_parts[i]));
-		}
-		*/
-
-		//CoTaskMemFree(name_parts);
-
 		return guid;
 	}
 
-	// HRESULT locatorImpl(PCWSTR name, iro_simple_meta_data_builder& builder);
 }

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use crate::metadata::declarations::declaration::Declaration;
 use crate::metadata::declarations::namespace_declaration::NamespaceDeclaration;
 use crate::metadata::declarations::enum_declaration::EnumDeclaration;
-use crate::metadata::declarations::d
 use crate::metadata::declarations::delegate_declaration::{GenericDelegateDeclaration, InterfaceDeclaration, DelegateDeclaration};
 use crate::bindings::{rometadataresolution, imeta_data_import2, helpers, enums};
 use windows::HSTRING;
@@ -11,6 +10,7 @@ use crate::metadata::declarations::declaration::DeclarationKind::GenericInterfac
 use crate::metadata::declarations::struct_declaration::StructDeclaration;
 use crate::metadata::declarations::class_declaration::ClassDeclaration;
 use std::ffi::OsStr;
+use crate::metadata::declarations::interface_declaration::{GenericInterfaceDeclaration, InterfaceDeclaration};
 
 const WINDOWS: &'static src = "Windows";
 const SYSTEM_ENUM: &'static src = "System.Enum";
@@ -62,8 +62,9 @@ impl MetadataReader {
 		if helpers::is_td_class(flags) {
 			let mut parent_name = vec![0_u16; MAX_IDENTIFIER_LENGTH];
 
-			match enums::type_from_token(parent_token) {
-				mdtTypeDef => {
+
+			match CorTokenType::from(enums::type_from_token(parent_token)) {
+				CorTokenType::mdtTypeDef => {
 					debug_assert!(
 						imeta_data_import2::get_type_def_props(
 							metadata, parent_token, Some(parent_name.as_mut_ptr()), Some(parent_name.len() as u32),
@@ -71,10 +72,10 @@ impl MetadataReader {
 						).is_ok()
 					);
 				}
-				mdtTypeRef => {
+				CorTokenType::mdtTypeRef => {
 					debug_assert!(
 						imeta_data_import2::get_type_ref_props(
-							metadata, parent_name, None, Some(parent_name.as_mut_ptr()), Some(parent_name.len()), None,
+							metadata, parent_token, None, Some(parent_name.as_mut_ptr()), Some(parent_name.len() as u32), None,
 						).is_ok()
 					)
 				}
@@ -102,18 +103,18 @@ impl MetadataReader {
 			}
 
 			if parent_name_string == SYSTEM_MULTICASTDELEGATE {
-				if full_name.contains("`") {
-					return Some(
+				return if full_name.contains("`") {
+					Some(
 						Arc::new(
 							GenericDelegateDeclaration::new(metadata, token)
 						)
-					);
+					)
 				} else {
-					return Some(
+					Some(
 						Arc::new(
 							DelegateDeclaration::new(metadata, token)
 						)
-					);
+					)
 				}
 			}
 

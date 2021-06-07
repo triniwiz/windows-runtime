@@ -8,8 +8,9 @@ use crate::bindings::{helpers, imeta_data_import2};
 use std::str::FromStr;
 use crate::metadata::declaration_factory::DeclarationFactory;
 use std::sync::Arc;
-use crate::metadata::declarations::base_class_declaration::BaseClassDeclaration;
+use crate::metadata::declarations::base_class_declaration::{BaseClassDeclaration, BaseClassDeclarationImpl};
 use crate::metadata::declarations::declaration::DeclarationKind;
+use crate::bindings::helpers::get_type_name;
 
 
 const DEFAULT_ATTRIBUTE:&'static str = "Windows.Foundation.Metadata.DefaultAttribute";
@@ -23,7 +24,8 @@ pub struct ClassDeclaration<'a> {
 impl ClassDeclaration {
 
     fn make_initializer_declarations(metadata: *mut c_void, token: mdTypeDef) -> Vec<MethodDeclaration>{
-        let enumerator = std::ptr::null_mut();
+        let mut enumerator = std::ptr::null_mut();
+        let enumerator_ptr = &mut enumerator;
         let mut count = 0;
         let mut tokens:Vec<mdProperty> = vec![0;1024];
 
@@ -31,12 +33,12 @@ impl ClassDeclaration {
         let name = name.to_wide();
         debug_assert!(
             imeta_data_import2::enum_methods_with_name(
-                metadata, enumerator, token, name.as_ptr(), tokens.as_mut_ptr(),
-                tokens.len(), &mut count
+                metadata, enumerator_ptr, token, name.as_ptr(), tokens.as_mut_ptr(),
+                tokens.len() as u32, &mut count
             ).is_ok()
         );
 
-         debug_assert!(count < tokens.len() - 1);
+         debug_assert!(count < (tokens.len() - 1) as u32);
 
         imeta_data_import2::close_enum(metadata, enumerator);
 
@@ -69,18 +71,19 @@ impl ClassDeclaration {
     fn make_default_interface(metadata: *mut c_void, token: mdTypeDef) -> Option<Arc<>> {
         let mut interface_impl_tokens = vec![0_1024];
         let mut interface_impl_count = 0;
-        let interface_enumerator = std::ptr::null_mut();
+        let mut interface_enumerator = std::ptr::null_mut();
+        let interface_enumerator_ptr = &mut interface_enumerator;
         debug_assert!(
             imeta_data_import2::enum_interface_impls(
-                metadata, interface_enumerator, token,
-                Some(interface_impl_tokens.as_mut_ptr()), Some(interface_impl_tokens.len()),
+                metadata, interface_enumerator_ptr, Some(token),
+                Some(interface_impl_tokens.as_mut_ptr()), Some(interface_impl_tokens.len() as u32),
                 Some(&mut interface_impl_count)
             ).is_ok()
         );
 
         debug_assert!(interface_impl_count < interface_impl_tokens.size());
         imeta_data_import2::close_enum(metadata, interface_enumerator);
-        let attr = OsString::from_str(DEFAULT_ATTRIBUTE).unwrap().to_wide();
+        let attr = DEFAULT_ATTRIBUTE.to_wide();
         for i in 0..interface_impl_count {
            let interface_impl_token = interface_impl_tokens[i];
             let get_custom_attribute_result = imeta_data_import2::get_custom_attribute_by_name(
@@ -116,15 +119,19 @@ impl ClassDeclaration {
     }
 
     pub fn base_full_name(&self) -> &str {
-        let mut parentToken = mdTokenNil;
+        let mut parent_token = mdTokenNil;
+        let base = self.base.base();
         debug_assert!(
          imeta_data_import2::get_type_def_props(
-             self.base
+             base.metadata,
+             base.token,
+             None, None,None,None,
+             Some(&mut parent_token)
          )
         );
-        ASSERT_SUCCESS(_metadata->GetTypeDefProps(_token, nullptr, 0, nullptr, nullptr, &parentToken));
-
-        return getTypeName(_metadata.Get(), parentToken);
+        let mut name = [0_u16; MAX_IDENTIFIER_LENGTH];
+        get_type_name(base.metadata, parent_token, name.as_mut_ptr(), count);
+        return getTypeName(_metadata.Get(), parent_token);
     }
 
     pub fn default_interface(&self) -> &InterfaceDeclaration{

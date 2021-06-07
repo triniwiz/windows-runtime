@@ -1,5 +1,6 @@
 use crate::prelude::*;
 use crate::bindings::{helpers, imeta_data_import2, enums, rometadataresolution};
+use std::borrow::Cow;
 
 
 const GUID_ATTRIBUTE: &'static str = "Windows.Foundation.Metadata.GuidAttribute";
@@ -81,4 +82,28 @@ pub fn get_guid_attribute_value(metadata: *mut c_void, token: mdToken) -> GUID {
 		os_data, &mut guid,
 	);
 	guid
+}
+
+pub fn getTypeName(metadata: *mut c_void, token: mdToken) -> &str {
+debug_assert!(!metadata.is_null());
+ASSERT(token != mdTokenNil);
+
+identifier nameData;
+ULONG nameLength{ 0 };
+
+switch (TypeFromToken(token)) {
+case mdtTypeDef:
+ASSERT_SUCCESS(metadata->GetTypeDefProps(token, nameData.data(), nameData.size(), &nameLength, nullptr, nullptr));
+break;
+
+case mdtTypeRef:
+ASSERT_SUCCESS(metadata->GetTypeRefProps(token, nullptr, nameData.data(), nameData.size(), &nameLength));
+break;
+
+default:
+ASSERT_NOT_REACHED();
+}
+
+wstring result{ nameData.data(), nameLength - 1 };
+return result;
 }
