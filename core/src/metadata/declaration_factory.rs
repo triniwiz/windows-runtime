@@ -1,93 +1,163 @@
-use crate::prelude::*;
-use crate::bindings::enums;
-use crate::metadata::declarations::delegate_declaration::DelegateDeclaration;
-use crate::bindings::rometadataresolution;
+use std::sync::{Arc, Mutex};
+
+use crate::bindings::{enums, helpers, imeta_data_import2};
 use crate::metadata::com_helpers::resolve_type_ref;
-use std::sync::Arc;
+use crate::metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
+
+use crate::metadata::declarations::delegate_declaration::{DelegateDeclaration, DelegateDeclarationImpl};
+use crate::metadata::declarations::delegate_declaration::generic_delegate_instance_declaration::GenericDelegateInstanceDeclaration;
+use crate::metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
+use crate::prelude::*;
 use crate::metadata::declarations::interface_declaration::InterfaceDeclaration;
 
+#[derive(Clone, Debug)]
 pub struct DeclarationFactory {}
 
 impl DeclarationFactory {
-	pub fn make_delegate_declaration(metadata: *mut c_void, token: mdToken) -> DelegateDeclaration{
-		match enums::type_from_token(token) as CorTokenType
+	pub fn make_delegate_declaration<'b>(metadata: *mut c_void, token: mdToken) -> Box<dyn DelegateDeclarationImpl> {
+		match CorTokenType::from(enums::type_from_token(token))
 		{
-			CorTokenType::mdtTypeDef => DelegateDeclaration::new(metadata, token),
+			CorTokenType::mdtTypeDef => Box::new(DelegateDeclaration::new(metadata, token)),
 			CorTokenType::mdtTypeRef => {
 				let mut external_metadata = std::ptr::null_mut();
 				let mut external_delegate_token = mdTokenNil;
-				let is_resolved = resolve_type_ref(metadata, token, &mut external_metadata,&mut external_delegate_token);
+				let is_resolved = resolve_type_ref(metadata, token, &mut external_metadata, &mut external_delegate_token);
 				debug_assert!(is_resolved);
-				DelegateDeclaration::new(external_metadata, external_delegate_token)
+				Box::new(DelegateDeclaration::new(external_metadata, external_delegate_token))
 			}
-			CorTokenType::mdtTypeSpec => {}
+			CorTokenType::mdtTypeSpec => {
+				let mut signature = [0_u8; MAX_IDENTIFIER_LENGTH];
+				let mut signature_ptr = signature.as_ptr();
+				let mut signature_size = 0;
+				debug_assert!(
+					imeta_data_import2::get_type_spec_from_token(
+						metadata, token, &mut signature_ptr, &mut signature_size,
+					).is_ok()
+				);
+
+				let type1 = helpers::cor_sig_uncompress_element_type(signature.as_ptr());
+				debug_assert!(
+					type1 == crate::enums::CorElementType::ElementTypeGenericinst
+				);
+
+				let type2 = helpers::cor_sig_uncompress_element_type(signature.as_ptr());
+				debug_assert!(
+					type2 == crate::enums::CorElementType::ElementTypeClass
+				);
+
+				let open_generic_delegate_token = helpers::cor_sig_uncompress_token(signature.as_ptr());
+				match CorTokenType::from(enums::type_from_token(open_generic_delegate_token)) {
+					CorTokenType::mdtTypeDef => {
+						Box::new(GenericDelegateInstanceDeclaration::new(metadata, open_generic_delegate_token, metadata, token))
+					}
+					CorTokenType::mdtTypeRef => {
+						let mut external_metadata = std::ptr::null_mut();
+						let external_metadata_ptr = &mut external_metadata;
+						let mut external_delegate_token = mdTokenNil;
+
+						let is_resolved = resolve_type_ref(
+							metadata, open_generic_delegate_token, external_metadata_ptr, &mut external_delegate_token,
+						);
+
+						debug_assert!(is_resolved);
+						Box::new(GenericDelegateInstanceDeclaration::new(external_metadata, external_delegate_token, metadata, token))
+					}
+					_ => {
+						std::unreachable!()
+					}
+				}
+			}
 			_ => {
 				std::unreachable!()
 			}
 		}
 	}
-	pub fn make_interface_declaration(metadata: *mut c_void, token: mdToken):  {
-
-		match enums::type_from_token(token){
-			mdtTypeDef => {
-				return Some(
-					Arc::new(
-						InterfaceDeclaration::new(metadata, token)
-					)
+	pub fn make_interface_declaration(metadata: *mut c_void, token: mdToken) -> Arc<Mutex<dyn BaseClassDeclarationImpl>> {
+		match CorTokenType::from(enums::type_from_token(token)) {
+			CorTokenType::mdtTypeDef => {
+				Arc::new(
+					Mutex::new(InterfaceDeclaration::new(metadata, token))
 				)
 			}
-		}
-		switch (TypeFromToken(token)) {
-			case mdtTypeDef: {
-				return make_unique<InterfaceDeclaration>(metadata, token);
+			CorTokenType::mdtTypeRef => {
+				let mut external_metadata = std::ptr::null_mut();
+				let external_metadata_ptr = &mut external_metadata;
+				let mut external_interface_token = mdTokenNil;
+
+				let is_resolved = resolve_type_ref(metadata, token, external_metadata_ptr, &mut external_interface_token);
+
+				debug_assert!(is_resolved);
+
+				Arc::new(
+					Mutex::new(InterfaceDeclaration::new(
+						external_metadata, external_interface_token,
+					))
+				)
 			}
+			CorTokenType::mdtTypeSpec => {
+				let mut signature = [0_u8; MAX_IDENTIFIER_LENGTH];
+				let mut signature_ptr = &mut signature.as_mut_ptr();
+				let mut signature_size = 0;
+				debug_assert!(
+					imeta_data_import2::get_type_spec_from_token(
+						metadata, token, signature_ptr as *mut _ as *mut *const u8, &mut signature_size,
+					).is_ok()
+				);
 
-			case mdtTypeRef: {
-				ComPtr<IMetaDataImport2> externalMetadata;
-				mdTypeDef externalInterfaceToken{ mdTokenNil };
+				let type1 = helpers::cor_sig_uncompress_element_type(signature.as_ptr());
+				debug_assert!(
+					type1 == crate::enums::CorElementType::ElementTypeGenericinst
+				);
 
-				bool isResolved{ resolveTypeRef(metadata, token, externalMetadata.GetAddressOf(), &externalInterfaceToken) };
-				ASSERT(isResolved);
+				let type2 = helpers::cor_sig_uncompress_element_type(signature.as_ptr());
 
-				return make_unique<InterfaceDeclaration>(externalMetadata.Get(), externalInterfaceToken);
-			}
+				debug_assert!(
+					type2 == crate::enums::CorElementType::ElementTypeClass
+				);
+				let open_generic_delegate_token = helpers::cor_sig_uncompress_token(signature.as_ptr());
 
-			case mdtTypeSpec: {
-				PCCOR_SIGNATURE signature{ nullptr };
-				ULONG signatureSize{ 0 };
-				ASSERT_SUCCESS(metadata->GetTypeSpecFromToken(token, &signature, &signatureSize));
+				match CorTokenType::from(enums::type_from_token(token)) {
+					CorTokenType::mdtTypeSpec => match CorTokenType::from(enums::type_from_token(open_generic_delegate_token)) {
+						CorTokenType::mdtTypeDef => {
+							Arc::new(
+								Mutex::new(GenericInterfaceInstanceDeclaration::new(
+									metadata, open_generic_delegate_token, metadata, token,
+								))
+							)
+						}
+						CorTokenType::mdtTypeRef => {
+							let mut external_metadata = std::ptr::null_mut();
+							let external_metadata_ptr = &mut external_metadata;
+							let mut external_delegate_token = mdTokenNil;
 
-				CorElementType type1{ CorSigUncompressElementType(signature) };
-				ASSERT(type1 == ELEMENT_TYPE_GENERICINST);
+							let is_resolved = resolve_type_ref(
+								metadata, open_generic_delegate_token, external_metadata_ptr, &mut external_delegate_token,
+							);
 
-				CorElementType type2{ CorSigUncompressElementType(signature) };
-				ASSERT(type2 == ELEMENT_TYPE_CLASS);
+							debug_assert!(
+								is_resolved
+							);
 
-				mdToken openGenericDelegateToken{ CorSigUncompressToken(signature) };
-				switch (TypeFromToken(openGenericDelegateToken)) {
-					case mdtTypeDef: {
-						return make_unique<GenericInterfaceInstanceDeclaration>(metadata, openGenericDelegateToken, metadata, token);
+							Arc::new(
+								Mutex::new(
+									GenericInterfaceInstanceDeclaration::new(
+										external_metadata, external_delegate_token, metadata, token,
+									)
+								)
+							)
+						}
+						_ => {
+							std::unreachable!()
+						}
 					}
-
-					case mdtTypeRef: {
-						ComPtr<IMetaDataImport2> externalMetadata;
-						mdTypeDef externalDelegateToken{ mdTokenNil };
-
-						bool isResolved{ resolveTypeRef(metadata, openGenericDelegateToken, externalMetadata.GetAddressOf(), &externalDelegateToken) };
-						ASSERT(isResolved);
-
-						return make_unique<GenericInterfaceInstanceDeclaration>(externalMetadata.Get(), externalDelegateToken, metadata, token);
+					_ => {
+						std::unreachable!()
 					}
-
-					default:
-						ASSERT_NOT_REACHED();
 				}
-
-				break;
 			}
-
-			default:
-				ASSERT_NOT_REACHED();
+			_ => {
+				std::unreachable!()
+			}
 		}
 	}
 }

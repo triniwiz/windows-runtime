@@ -5,23 +5,23 @@ use std::borrow::Cow;
 
 const GUID_ATTRIBUTE: &'static str = "Windows.Foundation.Metadata.GuidAttribute";
 
-pub fn get_string_value_from_blob(metadata: *mut c_void, signature: PCCOR_SIGNATURE) -> &str {
+pub fn get_string_value_from_blob<'a>(metadata: *mut c_void, signature: PCCOR_SIGNATURE) -> Cow<'a, str> {
 	debug_assert!(!metadata.is_null());
 	debug_assert!(!signature.is_null());
 
 	if signature as u8 == u8::MAX {
-		return "";
+		return "".into();
 	}
 
 	let size = helpers::cor_sig_uncompress_data(signature);
 
 	let slice = unsafe { std::slice::from_raw_parts(signature as *mut u16, size as usize) };
 
-	OsString::from_wide(slice).to_string_lossy().as_ref()
+	windows::HSTRING::from_wide(slice).to_string_lossy().into()
 }
 
 
-pub fn get_unary_custom_attribute_string_value(metadata: *mut c_void, token: mdToken, attribute_name: &str) -> &str {
+pub fn get_unary_custom_attribute_string_value<'a>(metadata: *mut c_void, token: mdToken, attribute_name: &str) -> Cow<'a, str> {
 	debug_assert!(!metadata.is_null());
 	debug_assert!(token != mdTokenNil);
 	debug_assert!(!attribute_name.is_null());
@@ -37,7 +37,7 @@ pub fn get_unary_custom_attribute_string_value(metadata: *mut c_void, token: mdT
 		result.is_ok()
 	);
 	if result.is_err() {
-		return "";
+		return "".into();
 	}
 
 	get_string_value_from_blob(metadata, data + 2)
@@ -84,26 +84,29 @@ pub fn get_guid_attribute_value(metadata: *mut c_void, token: mdToken) -> GUID {
 	guid
 }
 
-pub fn getTypeName(metadata: *mut c_void, token: mdToken) -> &str {
-debug_assert!(!metadata.is_null());
-ASSERT(token != mdTokenNil);
+pub fn get_type_name<'a>(metadata: *mut c_void, token: mdToken) -> Cow<'a, str> {
+	debug_assert!(!metadata.is_null());
+	debug_assert!(token != mdTokenNil);
 
-identifier nameData;
-ULONG nameLength{ 0 };
+	let mut name_data = [0_u16; MAX_IDENTIFIER_LENGTH];
+	let mut name_length = 0;
+	match CorTokenType::from(enums::type_from_token(token)) {
+		CorTokenType::mdtTypeDef => {
+			debug_assert!(imeta_data_import2::get_type_def_props(
+				metadata, token, Some(name_data.as_mut_ptr()), Some(name_data.len() as u32), Some(&mut name_length), None, None,
+			).is_ok());
+		}
+		CorTokenType::mdtTypeRef => {
+			debug_assert!(
+				imeta_data_import2::get_type_ref_props(
+					metadata, token, None, Some(name_data.as_mut_ptr()), Some(name_data.len() as u32), Some(&mut name_length),
+				).is_ok()
+			);
+		}
+		_ => {
+			std::unreachable!()
+		}
+	}
 
-switch (TypeFromToken(token)) {
-case mdtTypeDef:
-ASSERT_SUCCESS(metadata->GetTypeDefProps(token, nameData.data(), nameData.size(), &nameLength, nullptr, nullptr));
-break;
-
-case mdtTypeRef:
-ASSERT_SUCCESS(metadata->GetTypeRefProps(token, nullptr, nameData.data(), nameData.size(), &nameLength));
-break;
-
-default:
-ASSERT_NOT_REACHED();
-}
-
-wstring result{ nameData.data(), nameLength - 1 };
-return result;
+	OsString::from_wide(name_data[..name_length]).into()
 }

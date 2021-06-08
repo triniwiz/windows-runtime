@@ -5,17 +5,18 @@ use crate::bindings::imeta_data_import2;
 use crate::metadata::declarations::struct_field_declaration::StructFieldDeclaration;
 use std::borrow::Cow;
 
+#[derive(Clone, Debug)]
 pub struct StructDeclaration<'a> {
 	base: TypeDeclaration<'a>,
 	fields: Vec<StructFieldDeclaration<'a>>,
 }
 
-impl Declaration for StructDeclaration {
-	fn name<'a>(&self) -> Cow<'a, str> {
+impl<'a> Declaration for StructDeclaration<'a> {
+	fn name<'b>(&self) -> Cow<'b, str> {
 		self.base.name()
 	}
 
-	fn full_name<'a>(&self) -> Cow<'a, str> {
+	fn full_name<'b>(&self) -> Cow<'b, str> {
 		self.base.full_name()
 	}
 
@@ -24,7 +25,7 @@ impl Declaration for StructDeclaration {
 	}
 }
 
-impl StructDeclaration {
+impl<'a> StructDeclaration<'a> {
 	pub fn new(metadata: *mut c_void, token: mdTypeDef,
 	) -> Self {
 		Self {
@@ -43,7 +44,7 @@ impl StructDeclaration {
 		self.fields.as_slice()
 	}
 
-	fn make_field_declarations(metadata: *mut c_void, token: mdTypeDef) -> Vec<StructFieldDeclaration> {
+	fn make_field_declarations<'b>(metadata: *mut c_void, token: mdTypeDef) -> Vec<StructFieldDeclaration<'b>> {
 		let mut enumerator = std::ptr::null_mut();
 		let mut count = 0;
 		let mut tokens = [0; 1024];

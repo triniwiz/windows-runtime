@@ -1,37 +1,41 @@
-use crate::{
-	prelude::*,
-	metadata::declarations::type_declaration::TypeDeclaration,
-	metadata::declarations::interface_declaration::InterfaceDeclaration,
-	metadata::declarations::method_declaration::MethodDeclaration,
-	metadata::declarations::property_declaration::PropertyDeclaration,
-	metadata::declarations::event_declaration::EventDeclaration,
-	bindings::imeta_data_import2,
-};
-use crate::metadata::declarations::declaration::{DeclarationKind, Declaration};
-
-use crate::metadata::declaration_factory::DeclarationFactory;
-
-use std::str::FromStr;
+use std::any::Any;
 use std::borrow::Cow;
 
+
+use std::sync::{Arc, Mutex};
+
+use crate::{
+	bindings::imeta_data_import2,
+	metadata::declaration_factory::DeclarationFactory,
+	metadata::declarations::declaration::{Declaration, DeclarationKind},
+	metadata::declarations::event_declaration::EventDeclaration,
+	metadata::declarations::method_declaration::MethodDeclaration,
+	metadata::declarations::property_declaration::PropertyDeclaration,
+	metadata::declarations::type_declaration::TypeDeclaration,
+	prelude::*,
+};
+use crate::metadata::declarations::interface_declaration::InterfaceDeclaration;
+
+
+#[derive(Clone)]
 pub struct BaseClassDeclaration<'a> {
 	base: TypeDeclaration<'a>,
-	implemented_interfaces: Vec<InterfaceDeclaration<'a>>,
+	implemented_interfaces: Vec<Arc<Mutex<dyn BaseClassDeclarationImpl>>>,
 	methods: Vec<MethodDeclaration<'a>>,
 	properties: Vec<PropertyDeclaration<'a>>,
 	events: Vec<EventDeclaration<'a>>,
 }
 
-impl BaseClassDeclaration {
-	fn make_implemented_interfaces_declarations(metadata: *mut c_void, token: mdTypeDef) {
+impl<'a> BaseClassDeclaration<'a> {
+	fn make_implemented_interfaces_declarations(metadata: *mut c_void, token: mdTypeDef) -> Vec<Arc<Mutex<dyn BaseClassDeclarationImpl>>> {
 		let mut enumerator = std::ptr::null_mut();
-		let enumer = &mut enumerator;
+		let enumerator_ptr = &mut enumerator;
 		let mut count = 0;
 		let mut tokens = [0; 1024];
 
 		debug_assert!(
 			imeta_data_import2::enum_interface_impls(
-				metadata, enumer, Some(token), Some(tokens.as_mut_ptr()), Some(tokens.len() as u32), Some(&mut count),
+				metadata, enumerator_ptr, Some(token), Some(tokens.as_mut_ptr()), Some(tokens.len() as u32), Some(&mut count),
 			).is_ok()
 		);
 
@@ -39,11 +43,12 @@ impl BaseClassDeclaration {
 		imeta_data_import2::close_enum(metadata, enumerator);
 
 		let mut result = Vec::new();
-		for i in 0..count {
+
+		for token in tokens.into_iter() {
 			let mut interface_token = mdTokenNil;
 			debug_assert!(
 				imeta_data_import2::get_interface_impl_props(
-					metadata, tokens[i], None, Some(&mut interface_token),
+					metadata, *token, None, Some(&mut interface_token),
 				).is_ok()
 			);
 			result.push(
@@ -56,22 +61,23 @@ impl BaseClassDeclaration {
 		result
 	}
 
-	fn make_method_declarations(metadata: *mut c_void, token: mdTypeDef) -> Vec<MethodDeclaration> {
-		let enumerator = std::ptr::null_mut();
+	fn make_method_declarations<'b>(metadata: *mut c_void, token: mdTypeDef) -> Vec<MethodDeclaration<'b>> {
+		let mut enumerator = std::ptr::null_mut();
+		let enumerator_ptr = &mut enumerator;
 		let mut count = 0;
 		let mut tokens = [0; 1024];
 		debug_assert!(
 			imeta_data_import2::enum_methods(
-				metadata, enumerator, token, tokens.as_mut_ptr(), tokens.len(), &mut count,
+				metadata, enumerator_ptr, token, tokens.as_mut_ptr(), tokens.len() as u32, &mut count,
 			).is_ok()
 		);
 
-		debug_assert!(count < tokens.len() - 1);
+		debug_assert!(count < (tokens.len() - 1) as u32);
 		imeta_data_import2::close_enum(metadata, enumerator);
 
 		let mut result = Vec::new();
-		for i in 0..count {
-			let method = MethodDeclaration::new(metadata, tokens[i]);
+		for token in tokens.iter() {
+			let method = MethodDeclaration::new(metadata, *token);
 			if !method.is_exported() {
 				continue;
 			}
@@ -81,25 +87,23 @@ impl BaseClassDeclaration {
 		return result;
 	}
 
-	fn make_property_declarations(metadata: *mut c_void, token: mdTypeDef) -> Vec<PropertyDeclaration> {
-		let enumerator = std::ptr::null_mut();
+	fn make_property_declarations<'b>(metadata: *mut c_void, token: mdTypeDef) -> Vec<PropertyDeclaration<'b>> {
+		let mut enumerator = std::ptr::null_mut();
+		let enumerator_ptr = &mut enumerator;
 		let mut count = 0;
 		let mut tokens = [0; 1024];
-		debug_assert!(
-			imeta_data_import2::enum_pr
-		);
 
 		debug_assert!(
 			imeta_data_import2::enum_properties(
-				metadata, enumerator, token, tokens.as_mut_ptr(), tokens.len(), &mut count,
+				metadata, enumerator_ptr, token, tokens.as_mut_ptr(), tokens.len() as u32, &mut count,
 			).is_ok()
 		);
-		debug_assert!(count < tokens.len() - 1);
+		debug_assert!(count < (tokens.len() - 1) as u32);
 		imeta_data_import2::close_enum(metadata, enumerator);
 
 		let mut result = Vec::new();
-		for i in 0..count {
-			let property = PropertyDeclaration::new(metadata, tokens[i]);
+		for token in tokens.iter() {
+			let property = PropertyDeclaration::new(metadata, *token);
 			if !property.is_exported() {
 				continue;
 			}
@@ -108,22 +112,23 @@ impl BaseClassDeclaration {
 		result
 	}
 
-	fn make_event_declarations(metadata: *mut c_void, token: mdTypeDef) -> Vec<EventDeclaration> {
-		let enumerator = std::ptr::null_mut();
+	fn make_event_declarations<'b>(metadata: *mut c_void, token: mdTypeDef) -> Vec<EventDeclaration<'b>> {
+		let mut enumerator = std::ptr::null_mut();
+		let enumerator_ptr = &mut enumerator;
 		let mut count = 0;
 		let mut tokens = [0; 1024];
 
 		debug_assert!(
 			imeta_data_import2::enum_events(
-				metadata, enumerator, token, tokens.as_mut_ptr(), tokens.len(), &mut count,
+				metadata, enumerator_ptr, token, tokens.as_mut_ptr(), tokens.len() as u32, &mut count,
 			).is_ok()
 		);
-		debug_assert!(count < tokens.len() - 1);
+		debug_assert!(count < (tokens.len() - 1) as u32);
 		imeta_data_import2::close_enum(metadata, enumerator);
 
 		let mut result = Vec::new();
-		for i in 0..count {
-			let event = EventDeclaration::new(metadata, tokens[i]);
+		for token in tokens.iter() {
+			let event = EventDeclaration::new(metadata, *token);
 			if !event.is_exported() {
 				continue;
 			}
@@ -144,90 +149,117 @@ impl BaseClassDeclaration {
 	}
 }
 
-pub trait BaseClassDeclarationImpl {
+pub trait BaseClassDeclarationImpl: Any {
+	fn as_any(&self) -> &dyn Any;
+
 	fn base(&self) -> &TypeDeclaration;
 
-	fn implemented_interfaces(&self) -> &Vec<InterfaceDeclaration>;
+	fn implemented_interfaces<'a>(&self) -> &Vec<InterfaceDeclaration<'a>>;
 
-	fn methods(&self) -> &Vec<MethodDeclaration>;
+	fn methods<'a>(&self) -> &Vec<MethodDeclaration<'a>>;
 
-	fn properties(&self) -> &Vec<PropertyDeclaration>;
+	fn properties<'a>(&self) -> &Vec<PropertyDeclaration<'a>>;
 
-	fn events(&self) -> &Vec<EventDeclaration>;
+	fn events<'a>(&self) -> &Vec<EventDeclaration<'a>>;
 
-	fn find_members_with_name(&self, name: &str) -> Vec<dyn Declaration> {
-		debug_assert!(name);
+	fn find_members_with_name(&self, name: &str) -> Vec<Box<dyn Declaration>> {
+		debug_assert!(!name.is_empty());
 
-		let mut result = Vec::new();
+		let mut result: Vec<Box<dyn Declaration>> = Vec::new();
 
-		let mut methods: Vec<dyn Declaration> = self.find_methods_with_name(name);
-		result.append(&mut methods);
+		// let mut methods = self.find_methods_with_name(name).into_iter().map(|item| Box::new(item)).collect();
+		// result.append(&mut methods);
 
-		let mut properties = self.properties().iter().filter(|prop| prop.full_name() == name).collect();
-		result.append(&mut properties);
-
-		let mut events = self.events().iter().filter(|event| event.full_name() == name).collect();
-		result.append(&mut events);
-
-		return result;
-	}
-
-	fn find_methods_with_name(&self, name: &str) -> Vec<MethodDeclaration> {
-		debug_assert!(name);
-
-		let enumerator = std::ptr::null_mut();
-		let mut method_tokens: Vec<mdMethodDef> = vec![0; 1024];
-		let mut methods_count = 0;
-		let name = OsString::from_str(name).unwrap_or_default().to_wide();
-		let base = self.base();
-		debug_assert!(
-			imeta_data_import2::enum_methods_with_name(
-				base.metadata, base.token, enumerator, name.as_ptr(),
-				method_tokens.as_mut_ptr(), method_tokens.len(), &mut methods_count,
-			).is_ok()
-		);
-		imeta_data_import2::close_enum(base.metadata, enumerator);
-
-		let mut result = Vec::new();
-		for i in 0..methods_count {
-			let method_token = method_tokens[i];
+		let mut methods = self.find_methods_with_name(name);
+		for method in methods.into_iter() {
 			result.push(
-				MethodDeclaration::new(base.metadata, method_token)
-			)
+				Box::new(method)
+			);
+		}
+
+		// let mut properties = self.properties().into_iter().filter(|prop| prop.full_name() == name).collect();
+		// result.append(&mut properties);
+
+		let mut properties = self.properties().clone();
+
+		for property in properties.into_iter() {
+			if property.full_name() == name {
+				result.push(
+					Box::new(property)
+				);
+			}
+		}
+
+		// let mut events = self.events().into_iter().filter(|event| event.full_name() == name).collect();
+		// result.append(&mut events);
+
+		let mut events = self.events().clone();
+
+		for event in events {
+			if event.full_name() == name {
+				result.push(
+					Box::new(event)
+				)
+			}
 		}
 
 		return result;
 	}
+
+	fn find_methods_with_name<'b>(&self, name: &str) -> Vec<MethodDeclaration<'b>> {
+		debug_assert!(!name.is_empty());
+
+		let mut enumerator = std::ptr::null_mut();
+		let enumerator_ptr = &mut enumerator;
+		let mut method_tokens: Vec<mdMethodDef> = vec![0; 1024];
+		let mut methods_count = 0;
+		let name = windows::HSTRING::from(name);
+		let name = name.as_wide();
+		let base = self.base();
+		debug_assert!(
+			imeta_data_import2::enum_methods_with_name(
+				base.metadata, enumerator_ptr, base.token, name.as_ptr(),
+				method_tokens.as_mut_ptr(), method_tokens.len() as u32, &mut methods_count,
+			).is_ok()
+		);
+		imeta_data_import2::close_enum(base.metadata, enumerator);
+
+		method_tokens.into_iter().map(|method_token| MethodDeclaration::new(base.metadata, method_token)).collect()
+	}
 }
 
-impl BaseClassDeclarationImpl for BaseClassDeclaration {
-	fn base<'a>(&self) -> &TypeDeclaration<'a> {
+impl<'a> BaseClassDeclarationImpl for BaseClassDeclaration<'a> {
+	fn as_any(&self) -> &dyn Any {
+		self
+	}
+
+	fn base(&self) -> &TypeDeclaration<'a> {
 		&self.base
 	}
 
-	fn implemented_interfaces<'a>(&self) -> &Vec<InterfaceDeclaration<'a>> {
+	fn implemented_interfaces(&self) -> &Vec<Arc<Box<dyn BaseClassDeclarationImpl>>> {
 		&self.implemented_interfaces
 	}
 
-	fn methods<'a>(&self) -> &Vec<MethodDeclaration<'a>> {
+	fn methods(&self) -> &Vec<MethodDeclaration<'a>> {
 		&self.methods
 	}
 
-	fn properties<'a>(&self) -> &Vec<PropertyDeclaration<'a>> {
+	fn properties(&self) -> &Vec<PropertyDeclaration<'a>> {
 		&self.properties
 	}
 
-	fn events<'a>(&self) -> &Vec<EventDeclaration<'a>> {
+	fn events(&self) -> &Vec<EventDeclaration<'a>> {
 		&self.events
 	}
 }
 
-impl Declaration for BaseClassDeclaration {
-	fn name<'a>(&self) -> Cow<'a, str> {
+impl<'a> Declaration for BaseClassDeclaration<'a> {
+	fn name<'b>(&self) -> Cow<'b, str> {
 		self.full_name()
 	}
 
-	fn full_name<'a>(&self) -> Cow<'a, str> {
+	fn full_name<'b>(&self) -> Cow<'b, str> {
 		self.base().full_name()
 	}
 

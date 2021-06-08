@@ -11,9 +11,7 @@ use std::marker;
 use std::ffi::{OsString};
 use std::borrow::Cow;
 
-
-
-
+#[derive(Clone, Debug)]
 pub struct TypeDeclaration<'a> {
 	pub kind: DeclarationKind,
 	pub metadata: *mut c_void,
@@ -22,7 +20,7 @@ pub struct TypeDeclaration<'a> {
 }
 
 
-impl Declaration for TypeDeclaration {
+impl<'a> Declaration for TypeDeclaration<'a> {
 	fn is_exported(&self) -> bool {
 		let mut flags: DWORD = 0;
 		debug_assert!(
@@ -38,7 +36,7 @@ impl Declaration for TypeDeclaration {
 		return true;
 	}
 
-	fn name<'a>(&self) -> Cow<'a, str> {
+	fn name<'b>(&self) -> Cow<'b, str> {
 		let mut name = self.full_name().to_string();
 		let back_tick_index = name.find('`');
 		if let Some(index) = back_tick_index {
@@ -63,7 +61,7 @@ impl Declaration for TypeDeclaration {
 		name.into()
 	}
 
-	fn full_name<'a>(&self) -> Cow<'a, str> {
+	fn full_name<'b>(&self) -> Cow<'b, str> {
 		let mut full_name_data = [0_u16; MAX_IDENTIFIER_LENGTH];
 		let length = helpers::get_type_name(self.metadata, self.token, full_name_data.as_mut_ptr(), full_name_data.len() as u32);
 		OsString::from_wide(&full_name_data[..length]).into()
@@ -74,7 +72,7 @@ impl Declaration for TypeDeclaration {
 	}
 }
 
-impl TypeDeclaration {
+impl<'a> TypeDeclaration<'a> {
 	pub fn new(kind: DeclarationKind, metadata: *mut c_void, token: mdTypeDef) -> Self {
 		let value = Self {
 			kind,
@@ -84,7 +82,7 @@ impl TypeDeclaration {
 		};
 
 		assert!(!value.metadata.is_null());
-		assert!(enums::type_from_token(value.token) == CorTokenType::mdtTypeDef as u32);
+		assert!(CorTokenType::from(enums::type_from_token(value.token)) == CorTokenType::mdtTypeDef);
 		assert!(value.token != mdTypeDefNil);
 		value
 	}

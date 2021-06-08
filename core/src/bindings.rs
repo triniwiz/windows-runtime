@@ -1,5 +1,22 @@
 use crate::prelude::*;
 
+
+pub(crate) fn ro_resolve_namespace(name: HSTRING,
+								   windows_meta_data_dir: Option<HSTRING>,
+								   package_graph_dirs_count: DWORD,
+								   package_graph_dirs: Option<*const HSTRING>,
+								   meta_data_file_paths_count: Option<*mut DWORD>,
+								   meta_data_file_paths: Option<*mut *mut HSTRING>,
+								   sub_namespaces_count: *mut DWORD,
+								   sub_namespaces: Option<*mut *mut HSTRING>,
+) -> HRESULT {
+	unsafe {
+		core_bindings::RoResolveNamespace(
+			name, windows_meta_data_dir.unwrap_or(0 as _), package_graph_dirs_count, package_graph_dirs.unwrap_or(0 as _), meta_data_file_paths_count.unwrap_or(0 as _), meta_data_file_paths.unwrap_or(0 as _), sub_namespaces_count, sub_namespaces.unwrap_or(0 as _),
+		)
+	}
+}
+
 pub mod rometadataresolution {
 	use crate::prelude::*;
 	use windows::{HRESULT, HSTRING};
@@ -35,7 +52,7 @@ pub mod rometadataresolution {
 		name_element_count: UINT32,
 		name_elements: *mut PCWSTR,
 		fn_: ::core::option::Option<
-			unsafe extern "C" fn(name: PCWSTR, builder: *mut IRoSimpleMetaDataBuilder) -> HRESULT,
+			unsafe extern "C" fn(name: PCWSTR, builder: *mut IRoSimpleMetaDataBuilder) -> i32,
 		>,
 		iid: *mut GUID,
 		p_extra: Option<*mut ROPARAMIIDHANDLE>,
@@ -45,7 +62,7 @@ pub mod rometadataresolution {
 				core_bindings::Rometadataresolution_RoGetParameterizedTypeInstanceIID(
 					name_element_count,
 					name_elements,
-					fn_ as _,
+					fn_,
 					iid,
 					p_extra.unwrap_or(0 as _),
 				) as u32
@@ -82,11 +99,10 @@ pub mod imeta_data_import2 {
 		unsafe {
 			HRESULT(core_bindings::IMetaDataImport2_GetTypeDefPropsNameSize(metadata, md_type_def, pch_type_def) as u32)
 		}
-		//unsafe { IMetaDataImport2_GetTypeDefPropsNameSize(metadata, md_type_def, pch_type_def) }
 	}
 
 	pub(crate) fn get_field_props(metadata: *mut c_void,
-								  mb: MdFieldDef,
+								  mb: mdFieldDef,
 								  p_class: Option<*mut mdTypeDef>,
 								  sz_field: Option<*mut u16>,
 								  cch_field: Option<ULONG>,
@@ -174,7 +190,7 @@ pub mod imeta_data_import2 {
 	}
 
 
-	pub(crate) fn enum_params(metadata: *mut c_void, ph_enum: *mut HCORENUM, mb: MdMethodDef, r_params: *mut MdParamDef, c_max: ULONG,
+	pub(crate) fn enum_params(metadata: *mut c_void, ph_enum: *mut HCORENUM, mb: mdMethodDef, r_params: *mut mdParamDef, c_max: ULONG,
 							  pc_tokens: *mut ULONG) -> windows::HRESULT {
 		unsafe { HRESULT(core_bindings::IMetaDataImport2_EnumParams(metadata, ph_enum, mb, r_params, c_max, pc_tokens) as u32) }
 	}
@@ -471,20 +487,20 @@ pub mod imeta_data_import2 {
 		unsafe {
 			HRESULT(
 				core_bindings::IMetaDataImport2_GetEventProps(
-					meta: *mut ::core::ffi::c_void,
-					ev: mdEvent,
-					p_class: *mut mdTypeDef,
-					sz_event: LPCWSTR,
-					cch_event: ULONG,
-					pch_event: *mut ULONG,
-					pdw_event_flags: *mut DWORD,
-					ptk_event_type: *mut mdToken,
-					pmd_add_on: *mut mdMethodDef,
-					pmd_remove_on: *mut mdMethodDef,
-					pmd_fire: *mut mdMethodDef,
-					rmd_other_method: *mut mdMethodDef,
-					c_max: ULONG,
-					pc_other_method: *mut ULONG,
+					meta,
+					ev,
+					p_class.unwrap_or(0 as _),
+					sz_event.unwrap_or(0 as _),
+					cch_event.unwrap_or_default(),
+					pch_event.unwrap_or(0 as _),
+					pdw_event_flags.unwrap_or(0 as _),
+					ptk_event_type.unwrap_or(0 as _),
+					pmd_add_on.unwrap_or(0 as _),
+					pmd_remove_on.unwrap_or(0 as _),
+					pmd_fire.unwrap_or(0 as _),
+					rmd_other_method.unwrap_or(0 as _),
+					c_max.unwrap_or_default(),
+					pc_other_method.unwrap_or(0 as _),
 				) as u32
 			)
 		}
@@ -678,7 +694,7 @@ pub mod helpers {
 		}
 	}
 
-	pub(crate) fn cor_sig_uncompress_token(p_data: PCCOR_SIGNATURE) -> MdToken {
+	pub(crate) fn cor_sig_uncompress_token(p_data: PCCOR_SIGNATURE) -> mdToken {
 		unsafe {
 			core_bindings::Helpers_CorSigUncompressToken(p_data)
 		}
@@ -743,13 +759,13 @@ pub mod helpers {
 
 	pub(crate) fn is_td_interface(value: DWORD) -> bool {
 		unsafe {
-			core_bindings::Helpers_IsTdInterface(value: DWORD) == 1
+			core_bindings::Helpers_IsTdInterface(value) == 1
 		}
 	}
 
 	pub(crate) fn is_td_class(value: DWORD) -> bool {
 		unsafe {
-			core_bindings::Helpers_IsTdClass(value: DWORD) == 1
+			core_bindings::Helpers_IsTdClass(value) == 1
 		}
 	}
 
@@ -775,11 +791,14 @@ pub mod helpers {
 
 	pub(crate) fn to_string_length(value: PCWSTR, count: *mut usize) {
 		unsafe {
-			core_bindings::Helpers_toString_length(value: PCWSTR, count: *mut usize);
+			core_bindings::Helpers_toString_length(value, count);
 		}
 	}
 
 
+	pub(crate) fn is_td_sealed(value: DWORD) -> bool {
+		unsafe { core_bindings::Helpers_IsTdSealed(value) == 1 }
+	}
 }
 
 

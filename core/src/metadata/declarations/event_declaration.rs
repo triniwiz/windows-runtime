@@ -2,22 +2,23 @@ use crate::prelude::*;
 use crate::bindings::{imeta_data_import2, helpers};
 use crate::metadata::declarations::declaration::{Declaration, DeclarationKind};
 use crate::metadata::declarations::type_declaration::TypeDeclaration;
-use std::sync::Arc;
 use crate::metadata::declarations::delegate_declaration::DelegateDeclaration;
 use crate::metadata::declarations::method_declaration::MethodDeclaration;
 use std::ffi::c_void;
 use crate::metadata::declaration_factory::DeclarationFactory;
 use std::borrow::Cow;
 
+#[derive(Clone, Debug)]
 pub struct EventDeclaration<'a> {
 	base: TypeDeclaration<'a>,
-	type_: Arc<DelegateDeclaration<'a>>,
+	// Arc ??
+	type_: DelegateDeclaration<'a>,
 	add_method: MethodDeclaration<'a>,
 	remove_method: MethodDeclaration<'a>,
 }
 
-impl EventDeclaration {
-	pub fn make_add_method(metadata: *mut c_void, token: mdEvent) -> MethodDeclaration {
+impl<'a> EventDeclaration <'a> {
+	pub fn make_add_method<'b>(metadata: *mut c_void, token: mdEvent) -> MethodDeclaration<'b> {
 		let mut add_method_token = mdTokenNil;
 		debug_assert!(
 			imeta_data_import2::get_event_props(
@@ -29,7 +30,7 @@ impl EventDeclaration {
 		MethodDeclaration::new(metadata, add_method_token)
 	}
 
-	pub fn make_remove_method(metadata: *mut c_void, token: mdEvent) -> MethodDeclaration {
+	pub fn make_remove_method<'b>(metadata: *mut c_void, token: mdEvent) -> MethodDeclaration<'b> {
 		let mut remove_method_token = mdTokenNil;
 		debug_assert!(
 			imeta_data_import2::get_event_props(
@@ -40,10 +41,10 @@ impl EventDeclaration {
 			)
 		);
 
-		MethodDeclaration::new(metadata, removeMethodToken)
+		MethodDeclaration::new(metadata, remove_method_token)
 	}
 
-	pub fn make_type(metadata: *mut c_void, token: mdEvent) -> DelegateDeclaration {
+	pub fn make_type<'b>(metadata: *mut c_void, token: mdEvent) -> DelegateDeclaration<'b> {
 		let mut delegate_token = mdTokenNil;
 		debug_assert!(
 			imeta_data_import2::get_event_props(
@@ -53,7 +54,6 @@ impl EventDeclaration {
 		);
 		return DeclarationFactory::make_delegate_declaration(metadata, delegate_token);
 	}
-
 
 	pub fn new(metadata: *mut c_void, token: mdEvent) -> Self {
 		Self {
@@ -76,7 +76,6 @@ impl EventDeclaration {
 		&self.type_
 	}
 
-
 	pub fn add_method(&self) -> &MethodDeclaration {
 		&self.add_method
 	}
@@ -86,7 +85,7 @@ impl EventDeclaration {
 	}
 }
 
-impl Declaration for EventDeclaration {
+impl<'a> Declaration for EventDeclaration<'a> {
 	fn is_exported(&self) -> bool {
 		let mut flags = 0;
 		debug_assert!(
@@ -104,18 +103,18 @@ impl Declaration for EventDeclaration {
 		return true;
 	}
 
-	fn name<'a>(&self) -> Cow<'a, str> {
+	fn name<'b>(&self) -> Cow<'b, str> {
 		self.full_name()
 	}
 
-	fn full_name<'a>(&self) -> Cow<'a, str> {
+	fn full_name<'b>(&self) -> Cow<'b, str> {
 		let mut name_data = [0_u16; MAX_IDENTIFIER_LENGTH];
 		let mut name_data_length = 0;
 
 		debug_assert!(
 			imeta_data_import2::get_event_props(
 				self.base.metadata, self.base.token,
-				None, Some(name_data.as_mut_ptr()), Some(name_data.len()),
+				None, Some(name_data.as_mut_ptr()), Some(name_data.len() as u32),
 				Some(&mut name_data_length), None, None, None,
 				None, None, None, None, None,
 			).is_ok()

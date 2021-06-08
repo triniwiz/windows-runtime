@@ -8,14 +8,16 @@ use crate::{
 	prelude::*
 };
 use crate::enums::CorCallingConvention;
+use std::borrow::Cow;
 
+#[derive(Clone, Debug)]
 pub struct PropertyDeclaration <'a>{
 	base: FieldDeclaration<'a>,
 	getter: MethodDeclaration<'a>,
 	setter: Option<MethodDeclaration<'a>>
 }
 
-impl <'a> Declaration<'a> for PropertyDeclaration {
+impl <'a> Declaration for PropertyDeclaration<'a> {
 	fn is_exported(&self) -> bool {
 		   let mut property_flags = 0;
 			debug_assert!(
@@ -32,11 +34,11 @@ impl <'a> Declaration<'a> for PropertyDeclaration {
 		true
 	}
 
-	fn name<'a>(&self) -> &'a str {
+	fn name<'b>(&self) -> Cow<'b, str> {
 		self.base.name()
 	}
 
-	fn full_name<'a>(&self) -> &'a str {
+	fn full_name<'b>(&self) -> Cow<'b, str> {
 		let mut full_name_data = vec![0_u16; MAX_IDENTIFIER_LENGTH];
 		let mut name_length = 0;
 		debug_assert!(
@@ -52,7 +54,7 @@ impl <'a> Declaration<'a> for PropertyDeclaration {
 			).is_ok()
 		);
 		full_name_data.resize(name_length as usize, 0);
-		OsString::from_wide(full_name_data.as_slice()).to_string_lossy().as_ref()
+		OsString::from_wide(full_name_data.as_slice()).into()
 	}
 
 	fn kind(&self) -> DeclarationKind {
@@ -60,9 +62,9 @@ impl <'a> Declaration<'a> for PropertyDeclaration {
 	}
 }
 
-impl PropertyDeclaration {
+impl<'a> PropertyDeclaration<'a> {
 
-	fn make_getter(metadata: *mut c_void, token : mdProperty) -> MethodDeclaration {
+	fn make_getter<'b>(metadata: *mut c_void, token : mdProperty) -> MethodDeclaration<'b> {
 		let mut getter_token = mdTokenNil;
 		debug_assert!(
 			imeta_data_import2::get_property_props(
@@ -80,7 +82,7 @@ impl PropertyDeclaration {
 		)
 	}
 
-	fn make_setter(metadata: *mut c_void, token : mdProperty) -> Option<MethodDeclaration>{
+	fn make_setter<'b>(metadata: *mut c_void, token : mdProperty) -> Option<MethodDeclaration<'b>>{
 		let mut setter_token =  mdTokenNil;
 
 		debug_assert!(
@@ -93,7 +95,7 @@ impl PropertyDeclaration {
 		);
 
 
-		if setterToken == mdMethodDefNil {
+		if setter_token == mdMethodDefNil {
 			return None;
 		}
 
@@ -104,7 +106,7 @@ impl PropertyDeclaration {
 	pub fn new(metadata: *mut c_void, token: mdProperty) -> Self{
 		debug_assert!(metadata);
 		debug_assert!(enums::type_from_token(token) == CorTokenType::mdtProperty as u32);
-		debug_assert(token != mdPropertyNil);
+		debug_assert!(token != mdPropertyNil);
 		Self {
 			base: FieldDeclaration::new(
 				DeclarationKind::Property, metadata, token
@@ -142,7 +144,7 @@ impl PropertyDeclaration {
 		&self.getter
 	}
 
-	pub fn setter<'a>(&self) -> Option<&MethodDeclaration<'a>> {
+	pub fn setter(&self) -> Option<&MethodDeclaration<'a>> {
 		self.setter.as_ref()
 	}
 }

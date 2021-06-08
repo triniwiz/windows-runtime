@@ -1,22 +1,25 @@
-use crate::prelude::*;
 use std::sync::Arc;
-use crate::metadata::declarations::declaration::Declaration;
-use crate::metadata::declarations::namespace_declaration::NamespaceDeclaration;
-use crate::metadata::declarations::enum_declaration::EnumDeclaration;
-use crate::metadata::declarations::delegate_declaration::{GenericDelegateDeclaration, InterfaceDeclaration, DelegateDeclaration};
-use crate::bindings::{rometadataresolution, imeta_data_import2, helpers, enums};
+
 use windows::HSTRING;
-use crate::metadata::declarations::declaration::DeclarationKind::GenericInterfaceInstance;
-use crate::metadata::declarations::struct_declaration::StructDeclaration;
+
+use crate::bindings::{enums, helpers, imeta_data_import2, rometadataresolution};
 use crate::metadata::declarations::class_declaration::ClassDeclaration;
-use std::ffi::OsStr;
-use crate::metadata::declarations::interface_declaration::{GenericInterfaceDeclaration, InterfaceDeclaration};
+use crate::metadata::declarations::declaration::Declaration;
+use crate::metadata::declarations::delegate_declaration::DelegateDeclaration;
+use crate::metadata::declarations::delegate_declaration::generic_delegate_declaration::GenericDelegateDeclaration;
+use crate::metadata::declarations::enum_declaration::EnumDeclaration;
+use crate::metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
+use crate::metadata::declarations::interface_declaration::interface_declaration::InterfaceDeclaration;
+use crate::metadata::declarations::namespace_declaration::NamespaceDeclaration;
+use crate::metadata::declarations::struct_declaration::StructDeclaration;
+use crate::prelude::*;
 
-const WINDOWS: &'static src = "Windows";
-const SYSTEM_ENUM: &'static src = "System.Enum";
-const SYSTEM_VALUETYPE: &'static src = "System.ValueType";
-const SYSTEM_MULTICASTDELEGATE: &'static src = "System.MulticastDelegate";
+const WINDOWS: &str = "Windows";
+const SYSTEM_ENUM: &str = "System.Enum";
+const SYSTEM_VALUETYPE: &str = "System.ValueType";
+const SYSTEM_MULTICASTDELEGATE: &str = "System.MulticastDelegate";
 
+#[derive(Debug)]
 pub struct MetadataReader {}
 
 impl MetadataReader {
@@ -44,7 +47,7 @@ impl MetadataReader {
 		);
 
 		if get_metadata_file_result.is_err() {
-			if get_metadata_file_result == RO_E_METADATA_NAME_IS_NAMESPACE {
+			if get_metadata_file_result == windows::HRESULT::from_win32(RO_E_METADATA_NAME_IS_NAMESPACE as u32) {
 				return Some(
 					Arc::new(NamespaceDeclaration::new(full_name))
 				);

@@ -1,29 +1,30 @@
-use crate::prelude::*;
-use crate::{
-    metadata::declarations::method_declaration::MethodDeclaration,
-    metadata::declarations::interface_declaration::InterfaceDeclaration
-};
-
-use crate::bindings::{helpers, imeta_data_import2};
+use std::borrow::Cow;
 use std::str::FromStr;
-use crate::metadata::declaration_factory::DeclarationFactory;
 use std::sync::Arc;
-use crate::metadata::declarations::base_class_declaration::{BaseClassDeclaration, BaseClassDeclarationImpl};
-use crate::metadata::declarations::declaration::DeclarationKind;
-use crate::bindings::helpers::get_type_name;
 
+use crate::{
+    metadata::declarations::method_declaration::MethodDeclaration
+};
+use crate::bindings::{helpers, imeta_data_import2};
+use crate::bindings::helpers::get_type_name;
+use crate::metadata::declaration_factory::DeclarationFactory;
+use crate::metadata::declarations::base_class_declaration::{BaseClassDeclaration, BaseClassDeclarationImpl};
+use crate::metadata::declarations::declaration::{Declaration, DeclarationKind};
+use crate::metadata::declarations::interface_declaration::interface_declaration::InterfaceDeclaration;
+use crate::prelude::*;
 
 const DEFAULT_ATTRIBUTE:&'static str = "Windows.Foundation.Metadata.DefaultAttribute";
 
+#[derive(Clone, Debug)]
 pub struct ClassDeclaration<'a> {
     initializers: Vec<MethodDeclaration<'a>>,
-    default_interface: InterfaceDeclaration<'a>,
+    default_interface: Option<Arc<dyn BaseClassDeclarationImpl>>,
     base: BaseClassDeclaration<'a>
 }
 
-impl ClassDeclaration {
+impl<'a> ClassDeclaration<'a> {
 
-    fn make_initializer_declarations(metadata: *mut c_void, token: mdTypeDef) -> Vec<MethodDeclaration>{
+    fn make_initializer_declarations<'b>(metadata: *mut c_void, token: mdTypeDef) -> Vec<MethodDeclaration<'b>>{
         let mut enumerator = std::ptr::null_mut();
         let enumerator_ptr = &mut enumerator;
         let mut count = 0;
@@ -68,7 +69,7 @@ impl ClassDeclaration {
         return result;
     }
 
-    fn make_default_interface(metadata: *mut c_void, token: mdTypeDef) -> Option<Arc<>> {
+    fn make_default_interface(metadata: *mut c_void, token: mdTypeDef) -> Option<Arc<dyn BaseClassDeclarationImpl>> {
         let mut interface_impl_tokens = vec![0_1024];
         let mut interface_impl_count = 0;
         let mut interface_enumerator = std::ptr::null_mut();
@@ -97,11 +98,7 @@ impl ClassDeclaration {
                         metadata, interface_impl_token, None, Some(&mut interface_token)
                     ).is_ok()
                 );
-                return Some(
-                    Arc::new(
-                        DeclarationFactory::make_interface_declaration(metadata, interface_token)
-                    )
-                )
+                return DeclarationFactory::make_interface_declaration(metadata, interface_token)
             }
         }
 
@@ -118,7 +115,7 @@ impl ClassDeclaration {
         }
     }
 
-    pub fn base_full_name(&self) -> &str {
+    pub fn base_full_name<'b>(&self) -> Cow<'b, str> {
         let mut parent_token = mdTokenNil;
         let base = self.base.base();
         debug_assert!(
@@ -130,19 +127,45 @@ impl ClassDeclaration {
          )
         );
         let mut name = [0_u16; MAX_IDENTIFIER_LENGTH];
-        get_type_name(base.metadata, parent_token, name.as_mut_ptr(), count);
-        return getTypeName(_metadata.Get(), parent_token);
+        let count = get_type_name(base.metadata, parent_token, name.as_mut_ptr(), name.len() as u32);
+        OsString::from_wide(name[..count]).into()
     }
 
     pub fn default_interface(&self) -> &InterfaceDeclaration{
         &self.default_interface
     }
 
-    pub fn is_instantiable(&self) -> bool {}
+    pub fn is_instantiable(&self) -> bool {
+        !self.initializers.is_empty()
+    }
 
-    pub fn is_sealed(&self) -> bool {}
+    pub fn is_sealed(&self) -> bool {
+        let mut flags = 0;
+        let base = self.base.base();
+        debug_assert!(
+            imeta_data_import2::get_type_def_props(
+                base.metadata, base.token, None, None, None, Some(&mut flags), None
+            ).is_ok()
+        );
+        helpers::is_td_sealed(flags)
+    }
 
-    pub fn initializers(&self) -> {
-       // self.initializers.iter()
+    pub fn initializers(&self) -> &[MethodDeclaration<'a>] {
+       self.initializers.as_slice()
+    }
+}
+
+
+impl <'a> Declaration for ClassDeclaration <'a> {
+    fn name<'b>(&self) -> Cow<'b, str> {
+        self.base.name()
+    }
+
+    fn full_name<'b>(&self) -> Cow<'b, str> {
+        self.base.full_name()
+    }
+
+    fn kind(&self) -> DeclarationKind {
+        self.base.kind()
     }
 }

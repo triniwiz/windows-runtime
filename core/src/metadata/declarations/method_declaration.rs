@@ -10,16 +10,18 @@ use crate::{
 use crate::enums::CorCallingConvention;
 use crate::metadata::com_helpers::get_unary_custom_attribute_string_value;
 use crate::metadata::declarations::parameter_declaration::ParameterDeclaration;
+use std::borrow::Cow;
 
+#[derive(Clone, Debug)]
 pub struct MethodDeclaration <'a> {
 	base: TypeDeclaration<'a>,
 	parameters: Vec<ParameterDeclaration<'a>>,
 }
 
-const OVERLOAD_ATTRIBUTE: &'static str = "Windows.Foundation.Metadata.OverloadAttribute";
-const DEFAULT_OVERLOAD_ATTRIBUTE: &'static str ="Windows.Foundation.Metadata.DefaultOverloadAttribute";
+const OVERLOAD_ATTRIBUTE: &str = "Windows.Foundation.Metadata.OverloadAttribute";
+const DEFAULT_OVERLOAD_ATTRIBUTE: &str ="Windows.Foundation.Metadata.DefaultOverloadAttribute";
 
-impl MethodDeclaration {
+impl<'a> MethodDeclaration <'a> {
 	pub fn new(metadata: *mut c_void, token: mdMethodDef) -> Self {
 		debug_assert!(!metadata.is_null());
 		debug_assert!(enums::type_from_token(token) == CorTokenType::mdtMethodDef as u32);
@@ -27,13 +29,13 @@ impl MethodDeclaration {
 
 
 		let mut signature = std::ptr::null_mut();
-		let mut sig = &signature;
+		let mut signature_ptr = &mut signature;
 		let mut signature_size: ULONG = 0;
 
 		debug_assert!(
 			imeta_data_import2::get_method_props(
 				metadata, token, None, None, None,
-				None,None,Some(sig as *mut const* u8), Some(&mut signature_size),
+				None,None,Some(signature), Some(&mut signature_size),
 				None,None
 			).is_ok()
 		);
@@ -50,9 +52,9 @@ impl MethodDeclaration {
 			std::unimplemented!()
 		}
 
-		let mut arguments_count = { helpers::cor_sig_uncompress_data(signature) };
+		let mut arguments_count = { helpers::cor_sig_uncompress_data(signature as *const u8) };
 
-		let return_type = Signature::consumeType(signature);
+		let return_type = Signature::consume_type(signature as *const u8);
 
 		let mut parameters: Vec<ParameterDeclaration> = Vec::new();
 		let mut parameter_enumerator = std::ptr::null_mut();
@@ -71,8 +73,8 @@ impl MethodDeclaration {
 			start_index += 1;
 		}
 
-		for i in start_index..parameters_count {
-			let sig_type = Signature::consume_type(signature);
+		for i in start_index..parameters_count as usize{
+			let sig_type = Signature::consume_type(signature as *const u8);
 			parameters.push(
 				ParameterDeclaration::new(
 					metadata, parameter_tokens[i], sig_type
@@ -80,7 +82,9 @@ impl MethodDeclaration {
 			)
 		}
 
-		ASSERT(startSignature + signatureSize == signature);
+		// todo
+		//debug_assert!(signature_size == signature);
+		//debug_assert!(start_signature + signature_size == signature);
 
 		Self {
 			base: TypeDeclaration::new(DeclarationKind::Method, metadata, token),
@@ -135,12 +139,12 @@ impl MethodDeclaration {
 		self.parameters.len()
 	}
 
-	pub fn overload_name<'a>(&self) ->&'a str {
+	pub fn overload_name<'b>(&self) -> Cow<'b, str> {
 		get_unary_custom_attribute_string_value(self.base.metadata, self.base.token, OVERLOAD_ATTRIBUTE)
 	}
 
 	pub fn is_default_overload(&self) -> bool {
-		let data = OsString::from(DEFAULT_OVERLOAD_ATTRIBUTE).to_wide();
+		let data = windows::HSTRING::from(DEFAULT_OVERLOAD_ATTRIBUTE).as_wide();
 		let get_attribute_result = imeta_data_import2::get_custom_attribute_by_name(
 			self.base.metadata, self.base.token, Some(data.as_ptr()),None,None
 		);
@@ -149,7 +153,7 @@ return get_attribute_result.0 == 0;
 }
 }
 
-impl Declaration for MethodDeclaration {
+impl<'a> Declaration for MethodDeclaration<'a> {
 	fn is_exported(&self) -> bool {
 		let mut method_flags: DWORD = 0;
 		debug_assert!(
@@ -169,21 +173,21 @@ impl Declaration for MethodDeclaration {
 		return true;
 	}
 
-	fn name<'a>(&self) -> &'a str {
+	fn name<'b>(&self) -> Cow<'b, str> {
 		self.full_name()
 	}
 
-	fn full_name<'a>(&self) -> &'a str {
+	fn full_name<'b>(&self) -> Cow<'b, str>{
 		let mut name_length = 0;
-		let mut data = vec![0_u16; MAX_IDENTIFIER_LENGTH];
+		let mut data = [0_u16; MAX_IDENTIFIER_LENGTH];
 		debug_assert!(
 			imeta_data_import2::get_method_props(
 				self.base.metadata, self.base.token, None, Some(data.as_mut_ptr()), Some(data.len() as u32),
 				Some(&mut name_length), None, None, None, None, None
 			).is_ok()
 		);
-		data.resize(name_length as usize, 0);
-		OsString::from_wide(data.as_slice()).to_string_lossy().as_ref()
+		OsString::from_wide(&data[..name_length as usize]).to_string_lossy()
+
 	}
 
 	fn kind(&self) -> DeclarationKind {

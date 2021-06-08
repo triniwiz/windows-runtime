@@ -1,4 +1,4 @@
-//pub mod runtime;
+pub mod runtime;
 pub mod metadata;
 pub mod bindings;
 pub mod prelude;

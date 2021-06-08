@@ -6,6 +6,7 @@ pub use core_bindings::*;
 pub use std::ffi::{OsString};
 pub use std::os::raw::{c_long, c_uint, c_void};
 pub use libc::wchar_t;
+pub use std::os::windows::ffi::*;
 
 pub const mdTokenNil: mdToken = Helpers_mdTokenNil;
 pub const mdModuleNil: mdToken = Helpers_mdModuleNil;
@@ -37,7 +38,7 @@ pub use super::enums::*;
 
 pub type CLSID = GUID;
 
-pub type RO_E_METADATA_NAME_IS_NAMESPACE = Helpers_RO_E_METADATA_NAME_IS_NAMESPACE;
+pub const RO_E_METADATA_NAME_IS_NAMESPACE: HRESULT = Helpers_RO_E_METADATA_NAME_IS_NAMESPACE;
 
 pub const MAX_IDENTIFIER_LENGTH: usize = 511;
 

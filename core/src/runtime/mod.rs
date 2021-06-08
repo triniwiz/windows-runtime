@@ -1,6 +1,7 @@
 mod global;
 mod ffi;
 mod console;
+mod com;
 
 use rusty_v8 as v8;
 use std::ffi::{CString, CStr, c_void, OsStr, OsString};

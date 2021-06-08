@@ -82,7 +82,21 @@ Rometadataresolution_Ro_Locator(HRESULT(*fn)(PCWSTR name, IRoSimpleMetaDataBuild
     locator->locator = Ro::Locator(fn);
 }
 
+/*
+extern "C" void
+Rometadataresolution_RoResolveNamespace(const HSTRING name,
+    const HSTRING windowsMetaDataDir,
+    const DWORD   packageGraphDirsCount,
+    const HSTRING * packageGraphDirs,
+    DWORD * metaDataFilePathsCount,
+    HSTRING * *metaDataFilePaths,
+    DWORD * subNamespacesCount,
+    HSTRING * *subNamespaces) {
+    RoResolveNamespace()
+}
 
+
+*/
 
 extern "C" HRESULT IMetaDataImport2_GetMethodProps(void *metadata,
                                                    mdMethodDef tkMethodDef,
@@ -505,6 +519,10 @@ extern "C" void Helpers_toString_length(PCWSTR value, size_t * count) {
     *count = wcslen(value);
 }
 
+
+extern "C" BOOL Helpers_IsTdSealed(DWORD value) {
+    return IsTdSealed(value);
+}
 
 
 /*

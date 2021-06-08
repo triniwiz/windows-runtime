@@ -3,17 +3,18 @@ use crate::metadata::declarations::declaration::{Declaration, DeclarationKind};
 use crate::metadata::declarations::field_declaration::FieldDeclaration;
 use crate::bindings::{imeta_data_import2, helpers};
 use std::borrow::Cow;
+use crate::metadata::declarations::type_declaration::TypeDeclaration;
 
 pub struct StructFieldDeclaration<'a> {
 	base: FieldDeclaration<'a>,
 }
 
-impl Declaration for StructFieldDeclaration {
-	fn name<'a>(&self) -> &'a str {
+impl<'a> Declaration for StructFieldDeclaration <'a>{
+	fn name<'b>(&self) -> Cow<'b, str> {
 		self.base.name()
 	}
 
-	fn full_name<'a>(&self) -> &'a str {
+	fn full_name<'b>(&self) -> Cow<'b, str> {
 		self.base.full_name()
 	}
 
@@ -22,7 +23,10 @@ impl Declaration for StructFieldDeclaration {
 	}
 }
 
-impl StructFieldDeclaration {
+impl<'a> StructFieldDeclaration<'a> {
+	pub fn base(&self)-> &FieldDeclaration {
+		&self.base
+	}
 	pub fn new(metadata: *mut c_void, token: mdFieldDef) -> Self {
 		Self {
 			base: FieldDeclaration::new(
@@ -33,7 +37,7 @@ impl StructFieldDeclaration {
 		}
 	}
 
-	pub fn type_<'a>(&self) -> Cow<'a, [u8]> {
+	pub fn type_<'b>(&self) -> Cow<'b, [u8]> {
 		let mut signature = [0_u8; MAX_IDENTIFIER_LENGTH];
 		let mut signature_size = 0;
 
@@ -50,7 +54,8 @@ impl StructFieldDeclaration {
 			header == CorCallingConvention::ImageCeeCsCallconvField as u32
 		);
 
-		let result: [u8] = signature[..signature_size];
+		let result = &signature[..signature_size as usize];
 		result.into()
 	}
 }
+

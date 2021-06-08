@@ -37,6 +37,7 @@ fn main() {
         .clang_arg("-std=c++17")
         .clang_args(&["-x", "c++"])
         .clang_arg("-v")
+        .whitelist_function("RoResolveNamespace")
         .whitelist_function("Rometadataresolution_.*")
         .whitelist_function("IMetaDataImport2_.*")
         .whitelist_function("Enums_.*")
