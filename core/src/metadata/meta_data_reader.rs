@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use windows::HSTRING;
 
@@ -9,10 +9,10 @@ use crate::metadata::declarations::delegate_declaration::DelegateDeclaration;
 use crate::metadata::declarations::delegate_declaration::generic_delegate_declaration::GenericDelegateDeclaration;
 use crate::metadata::declarations::enum_declaration::EnumDeclaration;
 use crate::metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
-use crate::metadata::declarations::interface_declaration::interface_declaration::InterfaceDeclaration;
 use crate::metadata::declarations::namespace_declaration::NamespaceDeclaration;
 use crate::metadata::declarations::struct_declaration::StructDeclaration;
 use crate::prelude::*;
+use crate::metadata::declarations::interface_declaration::InterfaceDeclaration;
 
 const WINDOWS: &str = "Windows";
 const SYSTEM_ENUM: &str = "System.Enum";
@@ -23,22 +23,22 @@ const SYSTEM_MULTICASTDELEGATE: &str = "System.MulticastDelegate";
 pub struct MetadataReader {}
 
 impl MetadataReader {
-	pub fn find_by_name_w(full_name: PCWSTR) -> Option<Arc<dyn Declaration>> {
+	pub fn find_by_name_w(full_name: PCWSTR) -> Option<Arc<Mutex<dyn Declaration>>> {
 		let mut count = 0;
 		helpers::to_string_length(full_name, &mut count);
 		let slice = unsafe { std::slice::from_raw_parts(full_name, count) };
 		let name = OsString::from_wide(slice).to_string_lossy();
 		MetadataReader::find_by_name(name.as_ref())
 	}
-	pub fn find_by_name(full_name: &str) -> Option<Arc<dyn Declaration>> {
+	pub fn find_by_name(full_name: &str) -> Option<Arc<Mutex<dyn Declaration>>> {
 		if full_name.is_empty() {
 			return Some(
 				Arc::new(
-					NamespaceDeclaration::new("")
+					Mutex::new(NamespaceDeclaration::new(""))
 				)
 			);
 		}
-		let mut metadata = std::ptr::null_mut();
+		let mut metadata = std::mem::MaybeUninit::uninit();
 		let meta = &mut metadata;
 		let mut token = mdTokenNil;
 		let mut full_name_hstring = HSTRING::from(full_name);
@@ -49,7 +49,9 @@ impl MetadataReader {
 		if get_metadata_file_result.is_err() {
 			if get_metadata_file_result == windows::HRESULT::from_win32(RO_E_METADATA_NAME_IS_NAMESPACE as u32) {
 				return Some(
-					Arc::new(NamespaceDeclaration::new(full_name))
+					Arc::new(
+						Mutex::new(NamespaceDeclaration::new(full_name))
+					)
 				);
 			}
 			return None;
@@ -92,7 +94,7 @@ impl MetadataReader {
 			if parent_name_string == SYSTEM_ENUM {
 				return Some(
 					Arc::new(
-						EnumDeclaration::new(metadata, token)
+						Mutex::new(EnumDeclaration::new(metadata, token))
 					)
 				);
 			}
@@ -100,7 +102,7 @@ impl MetadataReader {
 			if parent_name_string == SYSTEM_VALUETYPE {
 				return Some(
 					Arc::new(
-						StructDeclaration::new(metadata, token)
+						Mutex::new(StructDeclaration::new(metadata, token))
 					)
 				);
 			}
@@ -109,13 +111,13 @@ impl MetadataReader {
 				return if full_name.contains("`") {
 					Some(
 						Arc::new(
-							GenericDelegateDeclaration::new(metadata, token)
+							Mutex::new(GenericDelegateDeclaration::new(metadata, token))
 						)
 					)
 				} else {
 					Some(
 						Arc::new(
-							DelegateDeclaration::new(metadata, token)
+							Mutex::new(DelegateDeclaration::new(metadata, token))
 						)
 					)
 				}
@@ -123,7 +125,7 @@ impl MetadataReader {
 
 			return Some(
 				Arc::new(
-					ClassDeclaration::new(metadata, token)
+					Mutex::new(ClassDeclaration::new(metadata, token))
 				)
 			);
 		}
@@ -132,13 +134,13 @@ impl MetadataReader {
 			return if full_name.contains("`") {
 				Some(
 					Arc::new(
-						GenericInterfaceDeclaration::new(metadata, token)
+						Mutex::new(GenericInterfaceDeclaration::new(metadata, token))
 					)
 				)
 			} else {
 				Some(
 					Arc::new(
-						InterfaceDeclaration::new(metadata, token)
+						Mutex::new(InterfaceDeclaration::new(metadata, token))
 					)
 				)
 			};

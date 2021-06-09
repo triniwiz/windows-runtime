@@ -28,7 +28,7 @@ impl<'a> MethodDeclaration <'a> {
 		assert!(token != mdMethodDefNil);
 
 
-		let mut signature = std::ptr::null_mut();
+		let mut signature = std::mem::MaybeUninit::uninit();
 		let mut signature_ptr = &mut signature;
 		let mut signature_size: ULONG = 0;
 
@@ -57,7 +57,7 @@ impl<'a> MethodDeclaration <'a> {
 		let return_type = Signature::consume_type(signature as *const u8);
 
 		let mut parameters: Vec<ParameterDeclaration> = Vec::new();
-		let mut parameter_enumerator = std::ptr::null_mut();
+		let mut parameter_enumerator = std::mem::MaybeUninit::uninit();
 		let enumerator = &mut parameter_enumerator;
 		let mut parameters_count: ULONG = 0;
 		let mut parameter_tokens: Vec<mdParamDef> = vec![0; 1024];

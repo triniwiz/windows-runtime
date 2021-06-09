@@ -19,7 +19,7 @@ impl DeclarationFactory {
 		{
 			CorTokenType::mdtTypeDef => Box::new(DelegateDeclaration::new(metadata, token)),
 			CorTokenType::mdtTypeRef => {
-				let mut external_metadata = std::ptr::null_mut();
+				let mut external_metadata = std::mem::MaybeUninit::uninit();
 				let mut external_delegate_token = mdTokenNil;
 				let is_resolved = resolve_type_ref(metadata, token, &mut external_metadata, &mut external_delegate_token);
 				debug_assert!(is_resolved);
@@ -51,7 +51,7 @@ impl DeclarationFactory {
 						Box::new(GenericDelegateInstanceDeclaration::new(metadata, open_generic_delegate_token, metadata, token))
 					}
 					CorTokenType::mdtTypeRef => {
-						let mut external_metadata = std::ptr::null_mut();
+						let mut external_metadata = std::mem::MaybeUninit::uninit();
 						let external_metadata_ptr = &mut external_metadata;
 						let mut external_delegate_token = mdTokenNil;
 
@@ -80,7 +80,7 @@ impl DeclarationFactory {
 				)
 			}
 			CorTokenType::mdtTypeRef => {
-				let mut external_metadata = std::ptr::null_mut();
+				let mut external_metadata = std::mem::MaybeUninit::uninit();
 				let external_metadata_ptr = &mut external_metadata;
 				let mut external_interface_token = mdTokenNil;
 
@@ -126,7 +126,7 @@ impl DeclarationFactory {
 							)
 						}
 						CorTokenType::mdtTypeRef => {
-							let mut external_metadata = std::ptr::null_mut();
+							let mut external_metadata = std::mem::MaybeUninit::uninit();
 							let external_metadata_ptr = &mut external_metadata;
 							let mut external_delegate_token = mdTokenNil;
 

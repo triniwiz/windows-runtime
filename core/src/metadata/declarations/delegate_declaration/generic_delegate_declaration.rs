@@ -26,7 +26,7 @@ impl<'a> GenericDelegateDeclaration<'a> {
 	pub fn number_of_generic_parameters(&self) -> usize {
 		let mut count = 0;
 
-		let mut enumerator = std::ptr::null_mut();
+		let mut enumerator = std::mem::MaybeUninit::uninit();
 		let enumerator_ptr = &mut enumerator;
 
 		debug_assert!(

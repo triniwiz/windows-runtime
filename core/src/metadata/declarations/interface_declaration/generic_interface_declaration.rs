@@ -6,11 +6,11 @@ use crate::bindings::imeta_data_import2;
 use crate::metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use crate::metadata::declarations::declaration::{Declaration, DeclarationKind};
 use crate::metadata::declarations::event_declaration::EventDeclaration;
-use crate::metadata::declarations::interface_declaration::interface_declaration::InterfaceDeclaration;
 use crate::metadata::declarations::method_declaration::MethodDeclaration;
 use crate::metadata::declarations::property_declaration::PropertyDeclaration;
 use crate::metadata::declarations::type_declaration::TypeDeclaration;
 use crate::prelude::c_void;
+use crate::metadata::declarations::interface_declaration::InterfaceDeclaration;
 
 #[derive(Clone, Debug)]
 pub struct GenericInterfaceDeclaration<'a> {
@@ -26,7 +26,7 @@ impl<'a> GenericInterfaceDeclaration<'a> {
 
 	pub fn number_of_generic_parameters(&self) -> usize {
 		let mut count = 0;
-		let mut enumerator = std::ptr::null_mut();
+		let mut enumerator = std::mem::MaybeUninit::uninit();
 		let enumerator_ptr = &mut enumerator;
 		let base = self.base.base.base();
 		debug_assert!(

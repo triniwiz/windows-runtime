@@ -22,7 +22,7 @@ pub(crate) fn handle_console_log(scope: &mut v8::HandleScope, args: v8::Function
 	let string = CString::new(value).unwrap();
 	let mut written = 0_u32;
 	unsafe {
-		Console::WriteConsoleA(handle, string.as_ptr() as *const c_void, length, &mut written, std::ptr::null_mut());
+		Console::WriteConsoleA(handle, string.as_ptr() as *const c_void, length, &mut written, std::ptr::null());
 	}
 }
 
@@ -43,6 +43,6 @@ pub(crate) fn handle_console_dir(scope: &mut v8::HandleScope, args: v8::Function
 	let string = CString::new(value).unwrap();
 	let mut written = 0_u32;
 	unsafe {
-		Console::WriteConsoleA(handle, string.as_ptr() as *const c_void, length, &mut written, std::ptr::null_mut());
+		Console::WriteConsoleA(handle, string.as_ptr() as *const c_void, length, &mut written, std::ptr::null());
 	}
 }

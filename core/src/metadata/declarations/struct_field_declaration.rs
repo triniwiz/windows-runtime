@@ -3,8 +3,9 @@ use crate::metadata::declarations::declaration::{Declaration, DeclarationKind};
 use crate::metadata::declarations::field_declaration::FieldDeclaration;
 use crate::bindings::{imeta_data_import2, helpers};
 use std::borrow::Cow;
-use crate::metadata::declarations::type_declaration::TypeDeclaration;
 
+
+#[derive(Clone,Debug)]
 pub struct StructFieldDeclaration<'a> {
 	base: FieldDeclaration<'a>,
 }

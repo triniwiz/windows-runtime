@@ -35,7 +35,8 @@ pub trait Declaration {
 
 	fn kind(&self) -> DeclarationKind;
 
-	fn as_any(&self) -> &dyn Any {
-		self
+	fn as_any<T: Any>(value: &T) -> &dyn Any {
+		value as &dyn Any
 	}
+
 }

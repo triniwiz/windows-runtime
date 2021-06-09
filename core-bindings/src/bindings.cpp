@@ -27,7 +27,6 @@ Rometadataresolution_RoGetMetaDataFile(const HSTRING name, void *metaDataDispens
 
      return proc(name, dispenser, filePath, import, typeDefToken);
      */
-
     return RoGetMetaDataFile(name, dispenser, filePath, import, typeDefToken);
 }
 
@@ -98,7 +97,7 @@ Rometadataresolution_RoResolveNamespace(const HSTRING name,
 
 */
 
-extern "C" HRESULT IMetaDataImport2_GetMethodProps(void *metadata,
+extern "C" HRESULT IMetaDataImport2_GetMethodProps(IMetaDataImport2 *metadata,
                                                    mdMethodDef tkMethodDef,
                                                    mdTypeDef *ptkClass,
                                                    LPWSTR szMethod,
@@ -109,12 +108,11 @@ extern "C" HRESULT IMetaDataImport2_GetMethodProps(void *metadata,
                                                    ULONG *pcbSigBlob,
                                                    ULONG *pulCodeRVA,
                                                    DWORD *pdwImplFlags) {
-    auto meta = static_cast<IMetaDataImport2 *>(metadata);
-    return meta->GetMethodProps(tkMethodDef, ptkClass, szMethod, cchMethod, pchMethod, pdwAttr, ppvSigBlob, pcbSigBlob,
+    return metadata->GetMethodProps(tkMethodDef, ptkClass, szMethod, cchMethod, pchMethod, pdwAttr, ppvSigBlob, pcbSigBlob,
                                 pulCodeRVA, pdwImplFlags);
 }
 
-extern "C" HRESULT IMetaDataImport2_GetPropertyProps(void *metadata, mdProperty prop,
+extern "C" HRESULT IMetaDataImport2_GetPropertyProps(IMetaDataImport2 *metadata, mdProperty prop,
                                                      mdTypeDef *pClass,
                                                      LPCWSTR szProperty,
                                                      ULONG cchProperty,
@@ -130,8 +128,7 @@ extern "C" HRESULT IMetaDataImport2_GetPropertyProps(void *metadata, mdProperty 
                                                      mdMethodDef *rmdOtherMethod,
                                                      ULONG cMax,
                                                      ULONG *pcOtherMethod) {
-    auto meta = static_cast<IMetaDataImport2 *>(metadata);
-    return meta->GetPropertyProps(prop, pClass, szProperty, cchProperty, pchProperty, pdwPropFlags, ppvSig, pbSig,
+    return metadata->GetPropertyProps(prop, pClass, szProperty, cchProperty, pchProperty, pdwPropFlags, ppvSig, pbSig,
                                   pdwCPlusTypeFlag,
                                   ppDefaultValue, pcchDefaultValue, pmdSetter, pmdGetter, rmdOtherMethod, cMax,
                                   pcOtherMethod);
@@ -140,7 +137,7 @@ extern "C" HRESULT IMetaDataImport2_GetPropertyProps(void *metadata, mdProperty 
 
 
 extern "C" HRESULT
-IMetaDataImport2_GetFieldProps(void *metadata,
+IMetaDataImport2_GetFieldProps(IMetaDataImport2 *metadata,
                                mdFieldDef mb,
                                mdTypeDef *pClass,
                                LPWSTR szField,
@@ -152,41 +149,41 @@ IMetaDataImport2_GetFieldProps(void *metadata,
                                DWORD *pdwCPlusTypeFlag,
                                UVCP_CONSTANT *ppValue,
                                ULONG *pcchValue) {
-    auto meta = static_cast<IMetaDataImport2 *>(metadata);
-    return meta->GetFieldProps(mb, pClass, szField, cchField, pchField, pdwAttr, ppvSigBlob, pcbSigBlob,
+    
+    return metadata->GetFieldProps(mb, pClass, szField, cchField, pchField, pdwAttr, ppvSigBlob, pcbSigBlob,
                                pdwCPlusTypeFlag, ppValue, pcchValue);
 }
 
 extern "C" HRESULT
-IMetaDataImport2_GetTypeDefProps(void *metadata, uint32_t mdTypeDef, LPWSTR szTypeDef, ULONG cchTypeDef,
+IMetaDataImport2_GetTypeDefProps(IMetaDataImport2 *metadata, uint32_t mdTypeDef, LPWSTR szTypeDef, ULONG cchTypeDef,
                                  ULONG *pchTypeDef, DWORD *pdwTypeDefFlags, mdToken *ptkExtends) {
-    auto meta = static_cast<IMetaDataImport2 *>(metadata);
-    return meta->GetTypeDefProps(mdTypeDef, szTypeDef, cchTypeDef, pchTypeDef, pdwTypeDefFlags, ptkExtends);
+    
+    return metadata->GetTypeDefProps(mdTypeDef, szTypeDef, cchTypeDef, pchTypeDef, pdwTypeDefFlags, ptkExtends);
 }
 
-extern "C" HRESULT IMetaDataImport2_GetTypeDefPropsNameSize(void *metadata, uint32_t token, ULONG *pchTypeDef) {
-    auto meta = static_cast<IMetaDataImport2 *>(metadata);
+extern "C" HRESULT IMetaDataImport2_GetTypeDefPropsNameSize(IMetaDataImport2 *metadata, uint32_t token, ULONG *pchTypeDef) {
+    
     auto size = reinterpret_cast<ULONG *>(&pchTypeDef);
-    return meta->GetTypeDefProps(token, 0, 0, size, 0, 0);
+    return metadata->GetTypeDefProps(token, 0, 0, size, 0, 0);
 }
 
-extern "C" HRESULT IMetaDataImport2_EnumParams(void *metadata, HCORENUM *phEnum,
+extern "C" HRESULT IMetaDataImport2_EnumParams(IMetaDataImport2 *metadata, HCORENUM *phEnum,
                                                mdMethodDef mb,
                                                mdParamDef *rParams,
                                                ULONG cMax,
                                                ULONG *pcTokens) {
-    auto meta = static_cast<IMetaDataImport2 *>(metadata);
-    return meta->EnumParams(phEnum, mb, rParams, cMax, pcTokens);
+    
+    return metadata->EnumParams(phEnum, mb, rParams, cMax, pcTokens);
 }
 
-extern "C" void IMetaDataImport2_CloseEnum(void *metadata, HCORENUM phEnum) {
-    auto meta = static_cast<IMetaDataImport2 *>(metadata);
-    meta->CloseEnum(phEnum);
+extern "C" void IMetaDataImport2_CloseEnum(IMetaDataImport2 *metadata, HCORENUM phEnum) {
+    
+    metadata->CloseEnum(phEnum);
 }
 
 
 
-extern "C" HRESULT IMetaDataImport2_GetParamProps(void *metadata,
+extern "C" HRESULT IMetaDataImport2_GetParamProps(IMetaDataImport2 *metadata,
                                                   mdParamDef tk,
                                                   mdMethodDef *pmd,
                                                   ULONG *pulSequence,
@@ -197,126 +194,126 @@ extern "C" HRESULT IMetaDataImport2_GetParamProps(void *metadata,
                                                   DWORD *pdwCPlusTypeFlag,
                                                   UVCP_CONSTANT *ppValue,
                                                   ULONG *pcchValue) {
-    auto meta = static_cast<IMetaDataImport2 *>(metadata);
-    return meta->GetParamProps(tk, pmd, pulSequence, szName, cchName, pchName, pdwAttr, pdwCPlusTypeFlag, ppValue,
+    
+    return metadata->GetParamProps(tk, pmd, pulSequence, szName, cchName, pchName, pdwAttr, pdwCPlusTypeFlag, ppValue,
                                pcchValue);
 }
 
-extern "C" HRESULT IMetaDataImport2_GetCustomAttributeByName(void *metadata,
+extern "C" HRESULT IMetaDataImport2_GetCustomAttributeByName(IMetaDataImport2 *metadata,
                                                              mdToken tkObj,
                                                              LPCWSTR szName,
                                                              const void **ppData,
                                                              ULONG *pcbData) {
-    auto meta = static_cast<IMetaDataImport2 *>(metadata);
-    return meta->GetCustomAttributeByName(tkObj, szName, ppData, pcbData);
+    
+    return metadata->GetCustomAttributeByName(tkObj, szName, ppData, pcbData);
 }
 
-extern "C" HRESULT IMetaDataImport2_EnumInterfaceImpls(void *meta, HCORENUM *phEnum,
+extern "C" HRESULT IMetaDataImport2_EnumInterfaceImpls(IMetaDataImport2 *metadata, HCORENUM *phEnum,
                                                        mdTypeDef td,
                                                        mdInterfaceImpl *rImpls,
                                                        ULONG cMax,
                                                        ULONG *pcImpls) {
-    auto metadata = reinterpret_cast<IMetaDataImport2 *>(meta);
+   
     return metadata->EnumInterfaceImpls(phEnum, td, rImpls, cMax, pcImpls);
 }
 
-extern "C" HRESULT IMetaDataImport2_GetTypeRefProps(void *meta, mdTypeRef tr,
+extern "C" HRESULT IMetaDataImport2_GetTypeRefProps(IMetaDataImport2 *metadata, mdTypeRef tr,
                                                     mdToken *ptkResolutionScope,
                                                     LPWSTR szName,
                                                     ULONG cchName,
                                                     ULONG *pchName) {
-    auto metadata = reinterpret_cast<IMetaDataImport2 *>(meta);
+   
     return metadata->GetTypeRefProps(tr, ptkResolutionScope, szName, cchName, pchName);
 }
 
-extern "C" HRESULT IMetaDataImport2_FindMethod(void *meta, mdTypeDef td,
+extern "C" HRESULT IMetaDataImport2_FindMethod(IMetaDataImport2 *metadata, mdTypeDef td,
                                                LPCWSTR szName,
                                                PCCOR_SIGNATURE pvSigBlob,
                                                ULONG cbSigBlob,
                                                mdMethodDef *pmb) {
-    auto metadata = reinterpret_cast<IMetaDataImport2 *>(meta);
+   
     return metadata->FindMethod(td, szName, pvSigBlob, cbSigBlob, pmb);
 }
 
-extern "C" HRESULT IMetaDataImport2_EnumGenericParams(void *meta, HCORENUM *phEnum,
+extern "C" HRESULT IMetaDataImport2_EnumGenericParams(IMetaDataImport2 *metadata, HCORENUM *phEnum,
                                                       mdToken tk,
                                                       mdGenericParam rGenericParams[],
                                                       ULONG cMax,
                                                       ULONG *pcGenericParams) {
-    auto metadata = reinterpret_cast<IMetaDataImport2 *>(meta);
+   
     return metadata->EnumGenericParams(phEnum, tk, rGenericParams, cMax, pcGenericParams);
 }
 
 
-extern "C" HRESULT IMetaDataImport2_CountEnum(void *meta, HCORENUM hEnum, ULONG *pulCount) {
-    auto metadata = reinterpret_cast<IMetaDataImport2 *>(meta);
+extern "C" HRESULT IMetaDataImport2_CountEnum(IMetaDataImport2 *metadata, HCORENUM hEnum, ULONG *pulCount) {
+   
     return metadata->CountEnum(hEnum, pulCount);
 }
 
-extern "C" HRESULT IMetaDataImport2_GetTypeSpecFromToken(void *meta, mdTypeSpec typespec,
+extern "C" HRESULT IMetaDataImport2_GetTypeSpecFromToken(IMetaDataImport2 *metadata, mdTypeSpec typespec,
                                                          PCCOR_SIGNATURE *ppvSig,
                                                          ULONG *pcbSig) {
-    auto metadata = reinterpret_cast<IMetaDataImport2 *>(meta);
+   
     return metadata->GetTypeSpecFromToken(typespec, ppvSig, pcbSig);
 }
 
 
-extern "C" HRESULT IMetaDataImport2_EnumFields(void *meta, HCORENUM *phEnum,
+extern "C" HRESULT IMetaDataImport2_EnumFields(IMetaDataImport2 *metadata, HCORENUM *phEnum,
                                                mdTypeDef tkTypeDef,
                                                mdFieldDef rgFields[],
                                                ULONG cMax,
                                                ULONG *pcTokens) {
-    auto metadata = reinterpret_cast<IMetaDataImport2 *>(meta);
+   
     return metadata->EnumFields(phEnum, tkTypeDef, rgFields, cMax, pcTokens);
 }
 
 
-extern "C" HRESULT IMetaDataImport2_EnumMethodsWithName(void *meta, HCORENUM *phEnum,
+extern "C" HRESULT IMetaDataImport2_EnumMethodsWithName(IMetaDataImport2 *metadata, HCORENUM *phEnum,
                                                         mdTypeDef tkTypeDef,
                                                         LPCWSTR szName,
                                                         mdMethodDef rgMethods[],
                                                         ULONG cMax,
                                                         ULONG *pcTokens) {
-    auto metadata = reinterpret_cast<IMetaDataImport2 *>(meta);
+   
     return metadata->EnumMethodsWithName(phEnum, tkTypeDef, szName, rgMethods, cMax, pcTokens);
 }
 
-extern "C" HRESULT IMetaDataImport2_GetInterfaceImplProps(void *meta, mdInterfaceImpl tkInterfaceImpl,
+extern "C" HRESULT IMetaDataImport2_GetInterfaceImplProps(IMetaDataImport2 *metadata, mdInterfaceImpl tkInterfaceImpl,
                                                           mdTypeDef *ptkClass,
                                                           mdToken *ptkIface) {
-    auto metadata = reinterpret_cast<IMetaDataImport2 *>(meta);
+   
     return metadata->GetInterfaceImplProps(tkInterfaceImpl, ptkClass, ptkIface);
 }
 
-extern "C" HRESULT IMetaDataImport2_EnumMethods(void *meta, HCORENUM *phEnum,
+extern "C" HRESULT IMetaDataImport2_EnumMethods(IMetaDataImport2 *metadata, HCORENUM *phEnum,
                                                 mdTypeDef tkTypeDef,
                                                 mdMethodDef rgMethods[],
                                                 ULONG cMax,
                                                 ULONG *pcTokens) {
-    auto metadata = reinterpret_cast<IMetaDataImport2 *>(meta);
+   
     return metadata->EnumMethods(phEnum, tkTypeDef, rgMethods, cMax, pcTokens);
 }
 
 
-extern "C" HRESULT IMetaDataImport2_EnumProperties(void *meta, HCORENUM *phEnum,
+extern "C" HRESULT IMetaDataImport2_EnumProperties(IMetaDataImport2 *metadata, HCORENUM *phEnum,
                                                    mdTypeDef tkTypDef,
                                                    mdProperty rgProperties[],
                                                    ULONG cMax,
                                                    ULONG *pcProperties) {
-    auto metadata = reinterpret_cast<IMetaDataImport2 *>(meta);
+   
     return metadata->EnumProperties(phEnum, tkTypDef, rgProperties, cMax, pcProperties);
 }
 
-extern "C" HRESULT IMetaDataImport2_EnumEvents(void *meta, HCORENUM *phEnum,
+extern "C" HRESULT IMetaDataImport2_EnumEvents(IMetaDataImport2 *metadata, HCORENUM *phEnum,
                                                mdTypeDef tkTypDef,
                                                mdEvent rgEvents[],
                                                ULONG cMax,
                                                ULONG *pcEvents) {
-    auto metadata = reinterpret_cast<IMetaDataImport2 *>(meta);
+   
     return metadata->EnumEvents(phEnum, tkTypDef, rgEvents, cMax, pcEvents);
 }
 
-extern "C" HRESULT IMetaDataImport2_GetEventProps(void *meta, mdEvent ev,
+extern "C" HRESULT IMetaDataImport2_GetEventProps(IMetaDataImport2 *metadata, mdEvent ev,
                                                   mdTypeDef *pClass,
                                                   LPCWSTR szEvent,
                                                   ULONG cchEvent,
@@ -329,20 +326,54 @@ extern "C" HRESULT IMetaDataImport2_GetEventProps(void *meta, mdEvent ev,
                                                   mdMethodDef rmdOtherMethod[],
                                                   ULONG cMax,
                                                   ULONG *pcOtherMethod) {
-    auto metadata = reinterpret_cast<IMetaDataImport2 *>(meta);
+   
     return metadata->GetEventProps(ev, pClass, szEvent, cchEvent, pchEvent, pdwEventFlags, ptkEventType, pmdAddOn,
                                    pmdRemoveOn, pmdFire, rmdOtherMethod, cMax, pcOtherMethod);
 }
 
 
-extern "C" HRESULT IMetaDataImport2_FindField(void* meta, mdTypeDef   td,
+extern "C" HRESULT IMetaDataImport2_FindField(IMetaDataImport2* metadata, mdTypeDef   td,
     LPCWSTR     szName,                 
     PCCOR_SIGNATURE pvSigBlob,        
     ULONG       cbSigBlob,
     mdFieldDef * pmb) {
-    auto metadata = reinterpret_cast<IMetaDataImport2*>(meta);
     return metadata->FindField(td, szName, pvSigBlob, cbSigBlob, pmb);
 }
+
+extern "C" HRESULT IMetaDataImport2_GetMemberRefProps(IMetaDataImport2* metadata, mdMemberRef     tkMemberRef,
+    mdToken * ptk,
+    LPWSTR          szMember,
+    ULONG           cchMember,
+    ULONG * pchMember,
+    PCCOR_SIGNATURE * ppvSigBlob,
+    ULONG * pcbSigBlob) {
+    return metadata->GetMemberRefProps(tkMemberRef, ptk, szMember, cchMember, pchMember, ppvSigBlob, pcbSigBlob);
+}
+
+extern "C" HRESULT IMetaDataImport2_GetCustomAttributeProps(IMetaDataImport2* metadata, mdCustomAttribute cv,
+    mdToken * ptkObj,
+    mdToken * ptkType,
+    const BYTE * *ppBlob,
+    ULONG * pcbBlob) {
+    auto blob = reinterpret_cast<const void**>(ppBlob);
+    return metadata->GetCustomAttributeProps(cv, ptkObj, ptkType, blob, pcbBlob);
+}
+
+extern "C" HRESULT IMetaDataImport2_EnumCustomAttributes(IMetaDataImport2 * metadata, HCORENUM * phEnum,
+    mdToken              tk,
+    mdToken              tkType,
+    mdCustomAttribute rgCustomAttributes[],
+    ULONG                cMax,
+    ULONG * pcCustomAttributes) {
+    return metadata->EnumCustomAttributes(phEnum, tk, tkType, rgCustomAttributes, cMax, pcCustomAttributes);
+}
+
+extern "C" HRESULT IMetaDataImport2_FindTypeDefByName(IMetaDataImport2 * metadata, LPCWSTR   szTypeDef,
+    mdToken   tkEnclosingClass,
+    mdTypeDef * ptkTypeDef) {
+    return metadata->FindTypeDefByName(szTypeDef, tkEnclosingClass, ptkTypeDef);
+}
+
 
 
 
@@ -391,8 +422,8 @@ extern "C" ULONG32 Enums_TypeFromToken(mdToken token) {
 }
 
 
-extern "C" ULONG Helpers_Get_Type_Name(void *meta, mdToken token, uint16_t *nameData, ULONG nameSize) {
-    auto metadata = reinterpret_cast<IMetaDataImport2 *>(meta);
+extern "C" ULONG Helpers_Get_Type_Name(IMetaDataImport2 *metadata, mdToken token, uint16_t *nameData, ULONG nameSize) {
+   
     ULONG nameLength{0};
     auto data = reinterpret_cast<LPWSTR>(nameData);
 

@@ -99,7 +99,7 @@ impl <'a>NamespaceDeclaration <'a>{
 		Self {
 			base: TypeDeclaration::new(
 				DeclarationKind::Namespace,
-				std::ptr::null_mut(),
+				std::mem::MaybeUninit::uninit(),
 				0
 			),
 			children,

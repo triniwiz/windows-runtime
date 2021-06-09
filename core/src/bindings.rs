@@ -87,21 +87,19 @@ pub mod imeta_data_import2 {
 	use core_bindings::*;
 	use windows::HRESULT;
 
-	pub(crate) fn get_type_def_props(metadata: *mut c_void, md_type_def: c_uint, sz_type_def: Option<LPWSTR>, cch_type_def: Option<ULONG>, pch_type_def: Option<*mut ULONG>, pdw_type_def_flags: Option<*mut ULONG>, md_token: Option<*mut ULONG32>) -> HRESULT {
+	pub(crate) fn get_type_def_props(metadata: *mut IMetaDataImport2, md_type_def: c_uint, sz_type_def: Option<LPWSTR>, cch_type_def: Option<ULONG>, pch_type_def: Option<*mut ULONG>, pdw_type_def_flags: Option<*mut ULONG>, md_token: Option<*mut ULONG32>) -> HRESULT {
 		unsafe {
 			HRESULT(core_bindings::IMetaDataImport2_GetTypeDefProps(metadata, md_type_def, sz_type_def.unwrap_or(0 as _), cch_type_def.unwrap_or(0), pch_type_def.unwrap_or(&mut 0), pdw_type_def_flags.unwrap_or(0 as _), md_token.unwrap_or(&mut 0)) as u32)
 		}
-
-		//unsafe { IMetaDataImport2_GetTypeDefProps(metadata, md_type_def, sz_type_def.unwrap_or(std::ptr::null_mut()), cch_type_def.unwrap_or(0), pch_type_def.unwrap_or(&mut 0), pdw_type_def_flags, md_token.unwrap_or(&mut 0)) }
 	}
 
-	fn get_type_def_props_name_size(metadata: *mut c_void, md_type_def: c_uint, pch_type_def: *mut ULONG) -> HRESULT {
+	fn get_type_def_props_name_size(metadata: *mut IMetaDataImport2, md_type_def: c_uint, pch_type_def: *mut ULONG) -> HRESULT {
 		unsafe {
 			HRESULT(core_bindings::IMetaDataImport2_GetTypeDefPropsNameSize(metadata, md_type_def, pch_type_def) as u32)
 		}
 	}
 
-	pub(crate) fn get_field_props(metadata: *mut c_void,
+	pub(crate) fn get_field_props(metadata: *mut IMetaDataImport2,
 								  mb: mdFieldDef,
 								  p_class: Option<*mut mdTypeDef>,
 								  sz_field: Option<*mut u16>,
@@ -129,7 +127,7 @@ pub mod imeta_data_import2 {
 		}
 	}
 
-	pub(crate) fn get_property_props(metadata: *mut c_void, prop: mdProperty, p_class: Option<*mut mdTypeDef>,
+	pub(crate) fn get_property_props(metadata: *mut IMetaDataImport2, prop: mdProperty, p_class: Option<*mut mdTypeDef>,
 									 sz_property: Option<*mut u16>,
 									 cch_property: Option<ULONG>,
 									 pch_property: Option<*mut ULONG>,
@@ -166,7 +164,7 @@ pub mod imeta_data_import2 {
 		}
 	}
 
-	pub(crate) fn get_method_props(metadata: *mut c_void,
+	pub(crate) fn get_method_props(metadata: *mut IMetaDataImport2,
 								   tk_method_def: mdMethodDef,
 								   ptk_class: Option<*mut mdTypeDef>,
 								   sz_method: Option<*mut u16>,
@@ -190,18 +188,18 @@ pub mod imeta_data_import2 {
 	}
 
 
-	pub(crate) fn enum_params(metadata: *mut c_void, ph_enum: *mut HCORENUM, mb: mdMethodDef, r_params: *mut mdParamDef, c_max: ULONG,
+	pub(crate) fn enum_params(metadata: *mut IMetaDataImport2, ph_enum: *mut HCORENUM, mb: mdMethodDef, r_params: *mut mdParamDef, c_max: ULONG,
 							  pc_tokens: *mut ULONG) -> windows::HRESULT {
 		unsafe { HRESULT(core_bindings::IMetaDataImport2_EnumParams(metadata, ph_enum, mb, r_params, c_max, pc_tokens) as u32) }
 	}
 
-	pub(crate) fn close_enum(metadata: *mut c_void, ph_enum: HCORENUM) {
+	pub(crate) fn close_enum(metadata: *mut IMetaDataImport2, ph_enum: HCORENUM) {
 		unsafe {
 			core_bindings::IMetaDataImport2_CloseEnum(metadata, ph_enum)
 		}
 	}
 
-	pub(crate) fn get_param_props(metadata: *mut c_void, tk: mdParamDef,
+	pub(crate) fn get_param_props(metadata: *mut IMetaDataImport2, tk: mdParamDef,
 								  pmd: Option<*mut mdMethodDef>,
 								  pul_sequence: Option<*mut ULONG>,
 								  sz_name: Option<*mut u16>,
@@ -227,7 +225,7 @@ pub mod imeta_data_import2 {
 		}
 	}
 
-	pub(crate) fn get_custom_attribute_by_name(metadata: *mut c_void,
+	pub(crate) fn get_custom_attribute_by_name(metadata: *mut IMetaDataImport2,
 											   tk_obj: mdToken,
 											   sz_name: Option<*const u16>,
 											   pp_data: Option<*mut *const ::core::ffi::c_void>,
@@ -241,7 +239,7 @@ pub mod imeta_data_import2 {
 		}
 	}
 
-	pub(crate) fn enum_interface_impls(metadata: *mut c_void, ph_enum: *mut HCORENUM,
+	pub(crate) fn enum_interface_impls(metadata: *mut IMetaDataImport2, ph_enum: *mut HCORENUM,
 									   td: Option<mdTypeDef>,
 									   r_impls: Option<*mut mdInterfaceImpl>,
 									   c_max: Option<ULONG>,
@@ -255,14 +253,14 @@ pub mod imeta_data_import2 {
 		}
 	}
 
-	pub(crate) fn get_type_ref_props(meta: *mut c_void, tr: mdTypeRef,
+	pub(crate) fn get_type_ref_props(metadata: *mut IMetaDataImport2, tr: mdTypeRef,
 									 ptk_resolution_scope: Option<*mut mdToken>,
 									 sz_name: Option<*mut u16>,
 									 cch_name: Option<ULONG>,
 									 pch_name: Option<*mut ULONG>) -> windows::HRESULT {
 		unsafe {
 			HRESULT(
-				core_bindings::IMetaDataImport2_GetTypeRefProps(meta, tr,
+				core_bindings::IMetaDataImport2_GetTypeRefProps(metadata, tr,
 																ptk_resolution_scope.unwrap_or(0 as _),
 																sz_name.unwrap_or(0 as _),
 																cch_name.unwrap_or_default(),
@@ -271,7 +269,7 @@ pub mod imeta_data_import2 {
 		}
 	}
 
-	pub(crate) fn find_method(meta: *mut c_void,
+	pub(crate) fn find_method(metadata: *mut IMetaDataImport2,
 							  td: mdTypeDef,
 							  sz_name: LPCWSTR,
 							  pv_sig_blob: Option<PCCOR_SIGNATURE>,
@@ -279,13 +277,13 @@ pub mod imeta_data_import2 {
 							  pmb: *mut mdMethodDef) -> windows::HRESULT {
 		unsafe {
 			HRESULT(
-				IMetaDataImport2_FindMethod(meta, td, sz_name, pv_sig_blob.unwrap_or(0 as _), cb_sig_blob, pmb) as u32
+				IMetaDataImport2_FindMethod(metadata, td, sz_name, pv_sig_blob.unwrap_or(0 as _), cb_sig_blob, pmb) as u32
 			)
 		}
 	}
 
 	pub(crate) fn enum_generic_params(
-		meta: *mut c_void,
+		metadata: *mut IMetaDataImport2,
 		ph_enum: *mut HCORENUM,
 		tk: mdToken,
 		r_generic_params: Option<*mut mdGenericParam>,
@@ -295,7 +293,7 @@ pub mod imeta_data_import2 {
 		unsafe {
 			HRESULT(
 				core_bindings::IMetaDataImport2_EnumGenericParams(
-					meta,
+					metadata,
 					ph_enum,
 					tk,
 					r_generic_params.unwrap_or(0 as _),
@@ -308,19 +306,19 @@ pub mod imeta_data_import2 {
 
 
 	pub fn count_enum(
-		meta: *mut c_void,
+		metadata: *mut IMetaDataImport2,
 		h_enum: HCORENUM,
 		pul_count: *mut ULONG,
 	) -> HRESULT {
 		unsafe {
 			HRESULT(
-				core_bindings::IMetaDataImport2_CountEnum(meta, h_enum, pul_count) as u32
+				core_bindings::IMetaDataImport2_CountEnum(metadata, h_enum, pul_count) as u32
 			)
 		}
 	}
 
 	pub fn get_type_spec_from_token(
-		meta: *mut c_void,
+		metadata: *mut IMetaDataImport2,
 		typespec: mdTypeSpec,
 		ppv_sig: *mut PCCOR_SIGNATURE,
 		pcb_sig: *mut ULONG,
@@ -328,7 +326,7 @@ pub mod imeta_data_import2 {
 		unsafe {
 			HRESULT(
 				IMetaDataImport2_GetTypeSpecFromToken(
-					meta,
+					metadata,
 					typespec,
 					ppv_sig,
 					pcb_sig,
@@ -339,7 +337,7 @@ pub mod imeta_data_import2 {
 
 
 	pub(crate) fn enum_fields(
-		meta: *mut c_void,
+		metadata: *mut IMetaDataImport2,
 		ph_enum: *mut HCORENUM,
 		tk_type_def: mdTypeDef,
 		rg_fields: *mut mdFieldDef,
@@ -349,7 +347,7 @@ pub mod imeta_data_import2 {
 		unsafe {
 			HRESULT(
 				core_bindings::IMetaDataImport2_EnumFields(
-					meta,
+					metadata,
 					ph_enum,
 					tk_type_def,
 					rg_fields,
@@ -361,7 +359,7 @@ pub mod imeta_data_import2 {
 	}
 
 	pub(crate) fn enum_methods_with_name(
-		meta: *mut c_void,
+		metadata: *mut IMetaDataImport2,
 		ph_enum: *mut HCORENUM,
 		tk_type_def: mdTypeDef,
 		sz_name: LPCWSTR,
@@ -372,7 +370,7 @@ pub mod imeta_data_import2 {
 		unsafe {
 			HRESULT(
 				core_bindings::IMetaDataImport2_EnumMethodsWithName(
-					meta,
+					metadata,
 					ph_enum,
 					tk_type_def,
 					sz_name,
@@ -385,7 +383,7 @@ pub mod imeta_data_import2 {
 	}
 
 	pub(crate) fn get_interface_impl_props(
-		meta: *mut ::core::ffi::c_void,
+		metadata: *mut IMetaDataImport2,
 		tk_interface_impl: mdInterfaceImpl,
 		ptk_class: Option<*mut mdTypeDef>,
 		ptk_iface: Option<*mut mdToken>,
@@ -393,7 +391,7 @@ pub mod imeta_data_import2 {
 		unsafe {
 			HRESULT(
 				core_bindings::IMetaDataImport2_GetInterfaceImplProps(
-					meta,
+					metadata,
 					tk_interface_impl,
 					ptk_class.unwrap_or(0 as _),
 					ptk_iface.unwrap_or(0 as _),
@@ -403,7 +401,7 @@ pub mod imeta_data_import2 {
 	}
 
 	pub(crate) fn enum_methods(
-		meta: *mut c_void,
+		metadata: *mut IMetaDataImport2,
 		ph_enum: *mut HCORENUM,
 		tk_type_def: mdTypeDef,
 		rg_methods: *mut mdMethodDef,
@@ -413,7 +411,7 @@ pub mod imeta_data_import2 {
 		unsafe {
 			HRESULT(
 				core_bindings::IMetaDataImport2_EnumMethods(
-					meta,
+					metadata,
 					ph_enum,
 					tk_type_def,
 					rg_methods,
@@ -425,7 +423,7 @@ pub mod imeta_data_import2 {
 	}
 
 	pub(crate) fn enum_properties(
-		meta: *mut c_void,
+		metadata: *mut IMetaDataImport2,
 		ph_enum: *mut HCORENUM,
 		tk_typ_def: mdTypeDef,
 		rg_properties: *mut mdProperty,
@@ -435,7 +433,7 @@ pub mod imeta_data_import2 {
 		unsafe {
 			HRESULT(
 				core_bindings::IMetaDataImport2_EnumProperties(
-					meta,
+					metadata,
 					ph_enum,
 					tk_typ_def,
 					rg_properties,
@@ -447,7 +445,7 @@ pub mod imeta_data_import2 {
 	}
 
 	pub fn enum_events(
-		meta: *mut c_void,
+		metadata: *mut IMetaDataImport2,
 		ph_enum: *mut HCORENUM,
 		tk_typ_def: mdTypeDef,
 		rg_events: *mut mdEvent,
@@ -457,7 +455,7 @@ pub mod imeta_data_import2 {
 		unsafe {
 			HRESULT(
 				core_bindings::IMetaDataImport2_EnumEvents(
-					meta,
+					metadata,
 					ph_enum,
 					tk_typ_def,
 					rg_events,
@@ -469,7 +467,7 @@ pub mod imeta_data_import2 {
 	}
 
 	pub(crate) fn get_event_props(
-		meta: *mut c_void,
+		metadata: *mut IMetaDataImport2,
 		ev: mdEvent,
 		p_class: Option<*mut mdTypeDef>,
 		sz_event: Option<LPCWSTR>,
@@ -487,7 +485,7 @@ pub mod imeta_data_import2 {
 		unsafe {
 			HRESULT(
 				core_bindings::IMetaDataImport2_GetEventProps(
-					meta,
+					metadata,
 					ev,
 					p_class.unwrap_or(0 as _),
 					sz_event.unwrap_or(0 as _),
@@ -508,7 +506,7 @@ pub mod imeta_data_import2 {
 
 
 	pub(crate) fn find_field(
-		meta: *mut c_void,
+		metadata: *mut IMetaDataImport2,
 		td: mdTypeDef,
 		sz_name: Option<LPCWSTR>,
 		pv_sig_blob: Option<PCCOR_SIGNATURE>,
@@ -518,13 +516,101 @@ pub mod imeta_data_import2 {
 		unsafe {
 			HRESULT(
 				core_bindings::IMetaDataImport2_FindField(
-					meta,
+					metadata,
 					td,
 					sz_name.unwrap_or(0 as _),
 					pv_sig_blob.unwrap_or(0 as _),
 					cb_sig_blob.unwrap_or_default(),
 					pmb.unwrap_or(0 as _),
 				) as u32
+			)
+		}
+	}
+
+	pub(crate) fn get_member_ref_props(
+		metadata: *mut IMetaDataImport2,
+		tk_member_ref: mdMemberRef,
+		ptk: Option<*mut mdToken>,
+		sz_member: Option<LPWSTR>,
+		cch_member: Option<ULONG>,
+		pch_member: Option<*mut ULONG>,
+		ppv_sig_blob: Option<*mut PCCOR_SIGNATURE>,
+		pcb_sig_blob: Option<*mut ULONG>,
+	) -> HRESULT {
+		unsafe {
+			HRESULT(core_bindings::IMetaDataImport2_GetMemberRefProps(
+				metadata,
+				tk_member_ref,
+				ptk.unwrap_or(0 as _),
+				sz_member.unwrap_or(0 as _),
+				cch_member.unwrap_or_default(),
+				pch_member.unwrap_or(0 as _),
+				ppv_sig_blob.unwrap_or(0 as _),
+				pcb_sig_blob.unwrap_or(0 as _),
+			) as u32)
+		}
+	}
+
+	pub fn get_custom_attribute_props(
+		metadata: *mut IMetaDataImport2,
+		cv: mdCustomAttribute,
+		ptk_obj: Option<*mut mdToken>,
+		ptk_type: Option<*mut mdToken>,
+		pp_blob: Option<*mut *const BYTE>,
+		pcb_blob: Option<*mut ULONG>,
+	) -> HRESULT {
+		HRESULT::from_win32(
+			unsafe {
+				core_bindings::IMetaDataImport2_GetCustomAttributeProps(
+					metadata,
+					cv,
+					ptk_obj.unwrap_or(0 as _),
+					ptk_type.unwrap_or(0 as _),
+					pp_blob.unwrap_or(0 as _),
+					pcb_blob.unwrap_or(0 as _),
+				)
+			} as u32
+		)
+	}
+
+	pub fn enum_custom_attributes(
+		metadata: *mut IMetaDataImport2,
+		ph_enum: Option<*mut HCORENUM>,
+		tk: Option<mdToken>,
+		tk_type: Option<mdToken>,
+		rg_custom_attributes: Option<*mut mdCustomAttribute>,
+		c_max: Option<ULONG>,
+		pc_custom_attributes: Option<*mut ULONG>,
+	) -> HRESULT {
+		unsafe {
+			HRESULT::from_win32(
+				core_bindings::IMetaDataImport2_EnumCustomAttributes(
+					metadata,
+					ph_enum.unwrap_or(0 as _),
+					tk.unwrap_or_default(),
+					tk_type.unwrap_or_default(),
+					rg_custom_attributes.unwrap_or(0 as _),
+					c_max.unwrap_or_default(),
+					pc_custom_attributes.unwrap_or(0 as _),
+				) as u32
+			)
+		}
+	}
+
+	pub(crate) fn find_type_def_by_name(
+		metadata: *mut IMetaDataImport2,
+		sz_type_def: Option<LPCWSTR>,
+		tk_enclosing_class: Option<mdToken>,
+		ptk_type_def: Option<*mut mdTypeDef>,
+	) -> HRESULT {
+		unsafe {
+			HRESULT::from_win32(
+				core_bindings::IMetaDataImport2_FindTypeDefByName(
+					metadata,
+					sz_type_def.unwrap_or(0 as _),
+					tk_enclosing_class.unwrap_or(0 as _),
+					ptk_type_def.unwrap_or(0 as _),
+			) as u32
 			)
 		}
 	}
@@ -666,8 +752,8 @@ pub mod helpers {
 	use core_bindings::PCCOR_SIGNATURE;
 	use windows::HSTRING;
 
-	pub(crate) fn get_type_name(meta: *mut c_void, md_token: mdToken, name: *mut libc::wchar_t, size: ULONG) -> ULONG {
-		unsafe { core_bindings::Helpers_Get_Type_Name(meta, md_token, name, size) }
+	pub(crate) fn get_type_name(metadata: *mut IMetaDataImport2, md_token: mdToken, name: *mut libc::wchar_t, size: ULONG) -> ULONG {
+		unsafe { core_bindings::Helpers_Get_Type_Name(metadata, md_token, name, size) }
 	}
 
 	pub(crate) fn is_td_public(value: DWORD) -> bool {

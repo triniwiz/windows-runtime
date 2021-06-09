@@ -28,7 +28,7 @@ pub struct BaseClassDeclaration<'a> {
 
 impl<'a> BaseClassDeclaration<'a> {
 	fn make_implemented_interfaces_declarations(metadata: *mut c_void, token: mdTypeDef) -> Vec<Arc<Mutex<dyn BaseClassDeclarationImpl>>> {
-		let mut enumerator = std::ptr::null_mut();
+		let mut enumerator = std::mem::MaybeUninit::uninit();
 		let enumerator_ptr = &mut enumerator;
 		let mut count = 0;
 		let mut tokens = [0; 1024];
@@ -62,7 +62,7 @@ impl<'a> BaseClassDeclaration<'a> {
 	}
 
 	fn make_method_declarations<'b>(metadata: *mut c_void, token: mdTypeDef) -> Vec<MethodDeclaration<'b>> {
-		let mut enumerator = std::ptr::null_mut();
+		let mut enumerator = std::mem::MaybeUninit::uninit();
 		let enumerator_ptr = &mut enumerator;
 		let mut count = 0;
 		let mut tokens = [0; 1024];
@@ -88,7 +88,7 @@ impl<'a> BaseClassDeclaration<'a> {
 	}
 
 	fn make_property_declarations<'b>(metadata: *mut c_void, token: mdTypeDef) -> Vec<PropertyDeclaration<'b>> {
-		let mut enumerator = std::ptr::null_mut();
+		let mut enumerator = std::mem::MaybeUninit::uninit();
 		let enumerator_ptr = &mut enumerator;
 		let mut count = 0;
 		let mut tokens = [0; 1024];
@@ -113,7 +113,7 @@ impl<'a> BaseClassDeclaration<'a> {
 	}
 
 	fn make_event_declarations<'b>(metadata: *mut c_void, token: mdTypeDef) -> Vec<EventDeclaration<'b>> {
-		let mut enumerator = std::ptr::null_mut();
+		let mut enumerator = std::mem::MaybeUninit::uninit();
 		let enumerator_ptr = &mut enumerator;
 		let mut count = 0;
 		let mut tokens = [0; 1024];
@@ -149,9 +149,8 @@ impl<'a> BaseClassDeclaration<'a> {
 	}
 }
 
-pub trait BaseClassDeclarationImpl: Any {
-	fn as_any(&self) -> &dyn Any;
-
+pub trait BaseClassDeclarationImpl {
+	
 	fn base(&self) -> &TypeDeclaration;
 
 	fn implemented_interfaces<'a>(&self) -> &Vec<InterfaceDeclaration<'a>>;
@@ -209,7 +208,7 @@ pub trait BaseClassDeclarationImpl: Any {
 	fn find_methods_with_name<'b>(&self, name: &str) -> Vec<MethodDeclaration<'b>> {
 		debug_assert!(!name.is_empty());
 
-		let mut enumerator = std::ptr::null_mut();
+		let mut enumerator = std::mem::MaybeUninit::uninit();
 		let enumerator_ptr = &mut enumerator;
 		let mut method_tokens: Vec<mdMethodDef> = vec![0; 1024];
 		let mut methods_count = 0;
@@ -229,15 +228,11 @@ pub trait BaseClassDeclarationImpl: Any {
 }
 
 impl<'a> BaseClassDeclarationImpl for BaseClassDeclaration<'a> {
-	fn as_any(&self) -> &dyn Any {
-		self
-	}
-
 	fn base(&self) -> &TypeDeclaration<'a> {
 		&self.base
 	}
 
-	fn implemented_interfaces(&self) -> &Vec<Arc<Box<dyn BaseClassDeclarationImpl>>> {
+	fn implemented_interfaces(&self) -> &Vec<Arc<Mutex<dyn BaseClassDeclarationImpl>>> {
 		&self.implemented_interfaces
 	}
 

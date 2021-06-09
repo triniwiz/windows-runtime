@@ -45,7 +45,7 @@ impl<'a> StructDeclaration<'a> {
 	}
 
 	fn make_field_declarations<'b>(metadata: *mut c_void, token: mdTypeDef) -> Vec<StructFieldDeclaration<'b>> {
-		let mut enumerator = std::ptr::null_mut();
+		let mut enumerator = std::mem::MaybeUninit::uninit();
 		let mut count = 0;
 		let mut tokens = [0; 1024];
 		let mut enumerator_ptr = &mut enumerator;

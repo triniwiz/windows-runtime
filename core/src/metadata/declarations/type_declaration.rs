@@ -6,7 +6,7 @@ use crate::{
 		enums,
 	},
 };
-use super::declaration::{Declaration, DeclarationKind};
+pub use super::declaration::{Declaration, DeclarationKind};
 use std::marker;
 use std::ffi::{OsString};
 use std::borrow::Cow;
@@ -64,7 +64,7 @@ impl<'a> Declaration for TypeDeclaration<'a> {
 	fn full_name<'b>(&self) -> Cow<'b, str> {
 		let mut full_name_data = [0_u16; MAX_IDENTIFIER_LENGTH];
 		let length = helpers::get_type_name(self.metadata, self.token, full_name_data.as_mut_ptr(), full_name_data.len() as u32);
-		OsString::from_wide(&full_name_data[..length]).into()
+		OsString::from_wide(&full_name_data[..length as usize]).to_string_lossy()
 	}
 
 	fn kind(&self) -> DeclarationKind {

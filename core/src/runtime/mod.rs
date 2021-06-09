@@ -9,7 +9,6 @@ use std::os::raw::{c_char, c_uint, c_long};
 use std::io::Read;
 use std::os::windows::prelude::*;
 use std::path::{Path, PathBuf};
-use crate::runtime::metadata::com_helpers::{get_type_name, IMetaDataImport2};
 use windows::HSTRING;
 
 pub struct Runtime {
@@ -193,98 +192,9 @@ impl Runtime {
                   args: v8::FunctionCallbackArguments,
                   mut retval: v8::ReturnValue) {
         println!("handle meta {:?}", args.get(0).to_rust_string_lossy(scope));
-        let typeres_dll = CString::new("api-ms-win-ro-typeresolution-l1-1-0.dll").unwrap();
-        let method = CString::new("RoGetMetaDataFile").unwrap();
 
-
-        let ro_get_meta_data_file: extern "stdcall" fn(windows::HSTRING,
-                                             *const c_void,
-                                             *const c_void,
-                                             *mut *mut c_void,
-                                            *mut u32
-        ) -> windows::HRESULT;
-
-
-
-        let proc = unsafe {
-            bindings::Windows::Win32::System::SystemServices::GetProcAddress(
-                bindings::Windows::Win32::System::SystemServices::LoadLibraryA(
-                    "api-ms-win-ro-typeresolution-l1-1-0.dll"
-                ),
-                "RoGetMetaDataFile"
-            )
-        };
-
-        ro_get_meta_data_file = unsafe { std::mem::transmute(proc) };
-
-        println!("RoGetMetaDataFile Address is {}", ro_get_meta_data_file as i64);
         let class_name = args.get(0).to_rust_string_lossy(scope);
-        let mut metadata = std::ptr::null_mut() as *mut c_void;
-        let mut token = 0_u32;
-        let mut metadata_ptr: *mut *mut c_void = &mut metadata;
-        // let result = ro_get_meta_data_file(
-        //     class_name.into(),
-        //     std::ptr::null(),
-        //     std::ptr::null(),
-        //     metadata,
-        //     &mut token
-        // );
 
-        let result = unsafe {
-            Rometadataresolution_RoGetMetaDataFile(
-                class_name.into(),
-                std::ptr::null(),
-                std::ptr::null(),
-                metadata_ptr,
-                &mut token
-            )
-        };
-
-
-        let COR_CTOR_METHOD_NAME =".ctor";
-
-
-        println!("metadata is {:?}", metadata);
-
-        println!("token is {:?}", token);
-        println!("result is {:?}", result);
-
-
-
-
-
-        let mut md: *mut IMetaDataImport2 = unsafe {std::mem::transmute(metadata)};
-
-        unsafe {
-            let mut name = vec![0_u16;MAX_IDENTIFIER_LENGTH];
-            let length = Helpers_Get_Type_Name(md as *const c_void, token, name.as_mut_ptr(), name.len());
-            name.resize(length as usize, 0);
-            let name = OsString::from_wide(name.as_slice());
-             println!("nameaa {:?}", name);
-             println!("val {:?}", name.to_string_lossy());
-        }
-       // let mut md = unsafe { &mut *md };
-
-        let mut parent_token = 0_u32;
-        let mut string = String::new();
-        let mut name_length = 0;
-
-        unsafe {
-         //   IMetaDataImport2_EnumInterfaceImpls(md as _, token);
-       //     IMetaDataImport2_GetTypeDefPropsNameSize(md as _, token, &mut name_length);
-        }
-
-        println!("name_length {}", name_length);
-
-       // unsafe { IMetaDataImport2_GetTypeDefProps(md as _, token, string.as_mut_ptr() as *mut c_void, string.len() as i64, &mut name_length, 0 as _, &mut parent_token); }
-
-       // md.GetTypeDefProps(token, &mut string, &mut name_length, 0, &mut parent_token);
-
-        println!("parent token {:?}", parent_token);
-
-        let type_name = get_type_name(metadata as *mut c_void, parent_token);
-
-        println!("typename is {:?}", type_name);
     }
 }
 
