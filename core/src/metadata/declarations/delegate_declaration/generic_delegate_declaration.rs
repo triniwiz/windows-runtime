@@ -1,11 +1,10 @@
 use std::borrow::Cow;
 
-use core_bindings::{mdToken};
+use core_bindings::{mdToken, IMetaDataImport2};
 
 use crate::bindings::imeta_data_import2;
 use crate::metadata::declarations::declaration::{Declaration, DeclarationKind};
 use crate::metadata::declarations::delegate_declaration::{DelegateDeclaration, DelegateDeclarationImpl};
-use crate::prelude::c_void;
 use crate::metadata::declarations::method_declaration::MethodDeclaration;
 use crate::metadata::declarations::type_declaration::TypeDeclaration;
 
@@ -15,7 +14,7 @@ pub struct GenericDelegateDeclaration<'a> {
 }
 
 impl<'a> GenericDelegateDeclaration<'a> {
-	pub fn new(metadata: *mut c_void, token: mdToken) -> Self {
+	pub fn new(metadata: *mut IMetaDataImport2, token: mdToken) -> Self {
 		Self {
 			base: DelegateDeclaration::new_overload(
 				DeclarationKind::GenericDelegate, metadata, token,
@@ -26,7 +25,7 @@ impl<'a> GenericDelegateDeclaration<'a> {
 	pub fn number_of_generic_parameters(&self) -> usize {
 		let mut count = 0;
 
-		let mut enumerator = std::mem::MaybeUninit::uninit();
+		let mut enumerator = std::ptr::null_mut();
 		let enumerator_ptr = &mut enumerator;
 
 		debug_assert!(

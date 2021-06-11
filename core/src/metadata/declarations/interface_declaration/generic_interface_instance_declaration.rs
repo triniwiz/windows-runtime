@@ -25,7 +25,7 @@ pub struct GenericInterfaceInstanceDeclaration<'a> {
 }
 
 impl<'a> GenericInterfaceInstanceDeclaration<'a> {
-	pub fn new(open_metadata: *mut c_void, open_token: mdTypeDef, closed_metadata: *mut c_void, closed_token: mdTypeSpec) -> Self {
+	pub fn new(open_metadata: *mut IMetaDataImport2, open_token: mdTypeDef, closed_metadata: *mut c_void, closed_token: mdTypeSpec) -> Self {
 		debug_assert!(!closed_metadata.is_null());
 		debug_assert!(CorTokenType::from(enums::type_from_token(closed_token)) == CorTokenType::mdtTypeSpec);
 		debug_assert!(closed_token != mdTypeSpecNil);

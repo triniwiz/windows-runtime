@@ -62,7 +62,7 @@ impl<'a> BaseClassDeclaration<'a> {
 	}
 
 	fn make_method_declarations<'b>(metadata: *mut c_void, token: mdTypeDef) -> Vec<MethodDeclaration<'b>> {
-		let mut enumerator = std::mem::MaybeUninit::uninit();
+		let mut enumerator = std::ptr::null_mut();
 		let enumerator_ptr = &mut enumerator;
 		let mut count = 0;
 		let mut tokens = [0; 1024];
@@ -88,7 +88,7 @@ impl<'a> BaseClassDeclaration<'a> {
 	}
 
 	fn make_property_declarations<'b>(metadata: *mut c_void, token: mdTypeDef) -> Vec<PropertyDeclaration<'b>> {
-		let mut enumerator = std::mem::MaybeUninit::uninit();
+		let mut enumerator = std::ptr::null_mut();
 		let enumerator_ptr = &mut enumerator;
 		let mut count = 0;
 		let mut tokens = [0; 1024];
@@ -113,7 +113,7 @@ impl<'a> BaseClassDeclaration<'a> {
 	}
 
 	fn make_event_declarations<'b>(metadata: *mut c_void, token: mdTypeDef) -> Vec<EventDeclaration<'b>> {
-		let mut enumerator = std::mem::MaybeUninit::uninit();
+		let mut enumerator = std::ptr::null_mut();
 		let enumerator_ptr = &mut enumerator;
 		let mut count = 0;
 		let mut tokens = [0; 1024];
@@ -161,7 +161,7 @@ pub trait BaseClassDeclarationImpl {
 
 	fn events<'a>(&self) -> &Vec<EventDeclaration<'a>>;
 
-	fn find_members_with_name(&self, name: &str) -> Vec<Box<dyn Declaration>> {
+	fn find_members_with_name(&self, name: &str) -> Vec<dyn Declaration> {
 		debug_assert!(!name.is_empty());
 
 		let mut result: Vec<Box<dyn Declaration>> = Vec::new();
@@ -209,7 +209,7 @@ pub trait BaseClassDeclarationImpl {
 		debug_assert!(!name.is_empty());
 
 		let mut enumerator = std::mem::MaybeUninit::uninit();
-		let enumerator_ptr = &mut enumerator;
+		let enumerator_ptr = &mut enumerator.as_mut_ptr();
 		let mut method_tokens: Vec<mdMethodDef> = vec![0; 1024];
 		let mut methods_count = 0;
 		let name = windows::HSTRING::from(name);
@@ -221,7 +221,7 @@ pub trait BaseClassDeclarationImpl {
 				method_tokens.as_mut_ptr(), method_tokens.len() as u32, &mut methods_count,
 			).is_ok()
 		);
-		imeta_data_import2::close_enum(base.metadata, enumerator);
+		imeta_data_import2::close_enum(base.metadata, enumerator.as_mut_ptr());
 
 		method_tokens.into_iter().map(|method_token| MethodDeclaration::new(base.metadata, method_token)).collect()
 	}

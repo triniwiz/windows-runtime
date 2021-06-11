@@ -69,7 +69,7 @@ pub fn resolve_type_ref(metadata: *mut IMetaDataImport2, token: mdTypeRef, exter
 }
 
 
-pub fn get_guid_attribute_value(metadata: *mut c_void, token: mdToken) -> GUID {
+pub fn get_guid_attribute_value(metadata: *mut IMetaDataImport2, token: mdToken) -> GUID {
 	debug_assert!(!metadata.is_null());
 	debug_assert!(token != mdTokenNil);
 	let mut size = 0;

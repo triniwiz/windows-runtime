@@ -221,7 +221,7 @@ impl DeclaringInterfaceForMethod {
 	}
 
 
-	pub fn declaring_interface_for_initializer<'a>(metadata: *mut IMetaDataImport2, method_token: mdMethodDef, out_index: &mut usize) -> Option<InterfaceDeclaration<'a>> {
+	pub fn declaring_interface_for_initializer<'a>(metadata: *mut IMetaDataImport2, method_token: mdMethodDef, out_index: &mut usize) -> Option<Arc<Mutex<dyn BaseClassDeclarationImpl>>> {
 		// InterfaceDeclaration
 		let method_argument_count = DeclaringInterfaceForMethod::get_method_argument_count(metadata, method_token);
 
@@ -251,7 +251,13 @@ impl DeclaringInterfaceForMethod {
 				}
 
 				*out_index = i;
-				return Some(InterfaceDeclaration::new(metadata, factory_token));
+				return Some(
+					Arc::new(
+						Mutex::new(
+							InterfaceDeclaration::new(metadata, factory_token)
+						)
+					)
+				);
 			}
 		}
 
@@ -290,7 +296,13 @@ impl DeclaringInterfaceForMethod {
 				}
 
 				*out_index = i;
-				return Some(InterfaceDeclaration::new(metadata, factory_token));
+				return Some(
+					Arc::new(
+						Mutex::new(
+							InterfaceDeclaration::new(metadata, factory_token)
+						)
+					)
+				);
 			}
 		}
 
@@ -299,7 +311,7 @@ impl DeclaringInterfaceForMethod {
 	}
 
 
-	pub fn declaring_interface_for_static_method<'a>(metadata: *mut IMetaDataImport2, method_token: mdMethodDef, out_index: &mut usize) -> Option<InterfaceDeclaration<'a>> {
+	pub fn declaring_interface_for_static_method<'a>(metadata: *mut IMetaDataImport2, method_token: mdMethodDef, out_index: &mut usize) -> Option<Arc<Mutex<dyn BaseClassDeclarationImpl>>> {
 		let method_signature = DeclaringInterfaceForMethod::get_method_signature(
 			metadata, method_token,
 		);
@@ -345,7 +357,7 @@ impl DeclaringInterfaceForMethod {
 					}
 				}
 				*out_index = i;
-				return Some(InterfaceDeclaration::new(metadata, statics_token));
+				return Some(Arc::new(Mutex::new(InterfaceDeclaration::new(metadata, statics_token))));
 			}
 		}
 
@@ -583,7 +595,7 @@ impl DeclaringInterfaceForMethod {
 		result
 	}
 
-	pub fn findDeclaringInterfaceForMethod(method: &MethodDeclaration, out_index: &mut usize) {
+	pub fn find_declaring_interface_for_method(method: &MethodDeclaration, out_index: &mut usize) -> Option<Arc<Mutex<dyn BaseClassDeclarationImpl>>> {
 		debug_assert!(
 			out_index
 		);
@@ -594,7 +606,7 @@ impl DeclaringInterfaceForMethod {
 		if method.is_static() {
 			DeclaringInterfaceForMethod::declaring_interface_for_static_method(
 				metadata, method_token, out_index,
-			);
+			)
 		} else if method.is_initializer() {
 			DeclaringInterfaceForMethod::declaring_interface_for_initializer(
 				metadata, method_token, out_index,

@@ -24,9 +24,9 @@ pub struct ClassDeclaration<'a> {
 
 impl<'a> ClassDeclaration<'a> {
 
-    fn make_initializer_declarations<'b>(metadata: *mut c_void, token: mdTypeDef) -> Vec<MethodDeclaration<'b>>{
+    fn make_initializer_declarations<'b>(metadata: *mut IMetaDataImport2, token: mdTypeDef) -> Vec<MethodDeclaration<'b>>{
         let mut enumerator = std::mem::MaybeUninit::uninit();
-        let enumerator_ptr = &mut enumerator;
+        let enumerator_ptr = &mut enumerator.as_mut_ptr();
         let mut count = 0;
         let mut tokens = [0;1024];
 
@@ -41,7 +41,7 @@ impl<'a> ClassDeclaration<'a> {
 
          debug_assert!(count < (tokens.len() - 1) as u32);
 
-        imeta_data_import2::close_enum(metadata, enumerator);
+        imeta_data_import2::close_enum(metadata, enumerator.as_mut_ptr());
 
         let mut result = Vec::new();
 
@@ -70,11 +70,11 @@ impl<'a> ClassDeclaration<'a> {
         return result;
     }
 
-    fn make_default_interface(metadata: *mut c_void, token: mdTypeDef) -> Arc<Mutex<dyn BaseClassDeclarationImpl>> {
+    fn make_default_interface(metadata: *mut IMetaDataImport2, token: mdTypeDef) -> Arc<Mutex<dyn BaseClassDeclarationImpl>> {
         let mut interface_impl_tokens = [0;1024];
         let mut interface_impl_count = 0;
         let mut interface_enumerator = std::mem::MaybeUninit::uninit();
-        let interface_enumerator_ptr = &mut interface_enumerator;
+        let interface_enumerator_ptr = &mut interface_enumerator.as_mut_ptr();
         debug_assert!(
             imeta_data_import2::enum_interface_impls(
                 metadata, interface_enumerator_ptr, Some(token),

@@ -15,12 +15,12 @@ pub mod generic_delegate_instance_declaration;
 
 const INVOKE_METHOD_NAME: &str = "Invoke";
 
-pub fn get_invoke_method_token(meta_data: *mut c_void, token: mdTypeDef) -> mdMethodDef {
+pub fn get_invoke_method_token(meta_data: *mut IMetaDataImport2, token: mdTypeDef) -> mdMethodDef {
 	let mut invoke_method_token = mdTokenNil;
 	let string = windows::HSTRING::from(INVOKE_METHOD_NAME);
 	debug_assert!(
 		imeta_data_import2::find_method(
-			meta_data, token, string.as_wide().as_ptr(), None, 0, &mut invoke_method_token,
+			meta_data, token, string.as_wide().as_ptr(), None, None, Some(&mut invoke_method_token),
 		).is_ok()
 	);
 	return invoke_method_token;
@@ -41,13 +41,13 @@ pub struct DelegateDeclaration<'a> {
 }
 
 impl<'a> DelegateDeclaration<'a> {
-	pub fn new(metadata: *mut c_void, token: mdTypeDef) -> Self {
+	pub fn new(metadata: *mut IMetaDataImport2, token: mdTypeDef) -> Self {
 		Self::new_overload(
 			DeclarationKind::Delegate, metadata, token,
 		)
 	}
 
-	pub fn new_overload(kind: DeclarationKind, metadata: *mut c_void, token: mdTypeDef) -> Self {
+	pub fn new_overload(kind: DeclarationKind, metadata: *mut IMetaDataImport2, token: mdTypeDef) -> Self {
 		Self {
 			base: TypeDeclaration::new(
 				kind, metadata, token,

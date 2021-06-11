@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use core_bindings::{mdTypeDef, mdTypeSpec};
+use core_bindings::{mdTypeDef, mdTypeSpec, IMetaDataImport2};
 
 use crate::bindings::{enums, imeta_data_import2};
 use crate::enums::CorTokenType;
@@ -20,7 +20,7 @@ pub struct GenericDelegateInstanceDeclaration<'a> {
 }
 
 impl<'a> GenericDelegateInstanceDeclaration<'a> {
-	pub fn new(open_metadata: *mut c_void, open_token: mdTypeDef, closed_metadata: *mut c_void, closed_token: mdTypeSpec) -> Self {
+	pub fn new(open_metadata: *mut IMetaDataImport2, open_token: mdTypeDef, closed_metadata: *mut c_void, closed_token: mdTypeSpec) -> Self {
 		debug_assert!(!closed_metadata.is_null());
 		debug_assert!(CorTokenType::from(enums::type_from_token(closed_token)) == CorTokenType::mdtTypeSpec);
 		debug_assert!(closed_token != mdTypeSpecNil);

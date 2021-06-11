@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use core_bindings::{GUID, mdToken};
+use core_bindings::{GUID, mdToken, IMetaDataImport2};
 
 use crate::bindings::imeta_data_import2;
 use crate::metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
@@ -18,7 +18,7 @@ pub struct GenericInterfaceDeclaration<'a> {
 }
 
 impl<'a> GenericInterfaceDeclaration<'a> {
-	pub fn new(metadata: *mut c_void, token: mdToken) -> Self {
+	pub fn new(metadata: *mut IMetaDataImport2, token: mdToken) -> Self {
 		Self {
 			base: InterfaceDeclaration::new_with_kind(DeclarationKind::GenericInterface, metadata, token)
 		}
@@ -26,7 +26,7 @@ impl<'a> GenericInterfaceDeclaration<'a> {
 
 	pub fn number_of_generic_parameters(&self) -> usize {
 		let mut count = 0;
-		let mut enumerator = std::mem::MaybeUninit::uninit();
+		let mut enumerator = std::ptr::null_mut();
 		let enumerator_ptr = &mut enumerator;
 		let base = self.base.base.base();
 		debug_assert!(
