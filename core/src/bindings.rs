@@ -1,25 +1,72 @@
 use crate::prelude::*;
+use windows::Abi;
 
 
-pub(crate) fn ro_resolve_namespace(name: HSTRING,
-								   windows_meta_data_dir: Option<HSTRING>,
+pub(crate) fn ro_resolve_namespace(name: &windows::HSTRING,
+								   windows_meta_data_dir: Option<&windows::HSTRING>,
 								   package_graph_dirs_count: DWORD,
-								   package_graph_dirs: Option<*const HSTRING>,
-								   meta_data_file_paths_count: Option<*mut DWORD>,
-								   meta_data_file_paths: Option<*mut *mut HSTRING>,
-								   sub_namespaces_count: *mut DWORD,
-								   sub_namespaces: Option<*mut *mut HSTRING>,
+								   package_graph_dirs: Option<&windows::HSTRING>,
+								   meta_data_file_paths_count: Option<&mut DWORD>,
+								   meta_data_file_paths: Option<&mut windows::HSTRING>,
+								   sub_namespaces_count: &mut DWORD,
+								   sub_namespaces: Option<&mut windows::HSTRING>,
 ) -> HRESULT {
 	unsafe {
+		let name = name.abi() as HSTRING;
+		let windows_meta_data_dir = match windows_meta_data_dir {
+			None => {
+				0 as _
+			}
+			Some(windows_meta_data_dir) => {
+				windows_meta_data_dir.abi()
+			}
+		} as HSTRING;
+		let mut package_graph_dirs = match package_graph_dirs {
+			None => {
+				0 as _
+			}
+			Some(package_graph_dirs) => {
+				package_graph_dirs.abi()
+			}
+		};
+
+		let package_graph_dirs: *const *mut HSTRING__ = &mut package_graph_dirs as _;
+		let mut meta_data_file_paths = match meta_data_file_paths {
+			None => {
+				0 as _
+			}
+			Some(meta_data_file_paths) => {
+				meta_data_file_paths.abi()
+			}
+		};
+
+		let mut meta_data_file_paths = &mut meta_data_file_paths;
+		let meta_data_file_paths: *mut *mut HSTRING = &mut meta_data_file_paths as _;
+
+
+		let mut sub_namespaces = match sub_namespaces {
+			None => {
+				0 as _
+			}
+			Some(sub_namespaces) => {
+				sub_namespaces.abi()
+			}
+		};
+
+		let mut sub_namespaces = &mut sub_namespaces;
+		let sub_namespaces: *mut *mut HSTRING = &mut sub_namespaces as _;
+
 		core_bindings::RoResolveNamespace(
-			name, windows_meta_data_dir.unwrap_or(0 as _), package_graph_dirs_count, package_graph_dirs.unwrap_or(0 as _), meta_data_file_paths_count.unwrap_or(0 as _), meta_data_file_paths.unwrap_or(0 as _), sub_namespaces_count, sub_namespaces.unwrap_or(0 as _),
+			name, windows_meta_data_dir, package_graph_dirs_count,
+			package_graph_dirs, meta_data_file_paths_count.unwrap_or(0 as _),
+			meta_data_file_paths, sub_namespaces_count, sub_namespaces,
 		)
 	}
 }
 
 pub mod rometadataresolution {
 	use crate::prelude::*;
-	use windows::{HRESULT, HSTRING};
+	use windows::{HRESULT, HSTRING, Abi};
 
 	pub(crate) fn ro_get_meta_data_file(
 		name: &mut windows::HSTRING, meta_data_dispenser: Option<*mut c_void>, meta_data_file_path: Option<*mut c_void>, meta_data_import: Option<*mut *mut c_void>, type_def_token: Option<*mut u32>,
@@ -32,16 +79,18 @@ pub mod rometadataresolution {
 	}
 
 	pub(crate) fn ro_parse_type_name(
-		mut type_name: HSTRING,
-		parts_count: *mut DWORD,
-		type_name_parts: *mut *mut HSTRING,
+		type_name: &mut windows::HSTRING,
+		parts_count: &mut DWORD,
+		type_name_parts: &mut windows::HSTRING,
 	) -> HRESULT {
+		let type_name = type_name.abi() as _;
+		let type_name_parts = type_name_parts.abi() as _;
 		unsafe {
 			HRESULT(
 				core_bindings::Rometadataresolution_RoParseTypeName(
-					std::mem::transmute(&mut type_name),
+					type_name,
 					parts_count,
-					std::mem::transmute(type_name_parts),
+					type_name_parts,
 				) as u32
 			)
 		}
@@ -273,11 +322,11 @@ pub mod imeta_data_import2 {
 							  td: mdTypeDef,
 							  sz_name: LPCWSTR,
 							  pv_sig_blob: Option<PCCOR_SIGNATURE>,
-							  cb_sig_blob: ULONG,
-							  pmb: *mut mdMethodDef) -> windows::HRESULT {
+							  cb_sig_blob: Option<ULONG>,
+							  pmb: Option<*mut mdMethodDef>) -> windows::HRESULT {
 		unsafe {
 			HRESULT(
-				IMetaDataImport2_FindMethod(metadata, td, sz_name, pv_sig_blob.unwrap_or(0 as _), cb_sig_blob, pmb) as u32
+				IMetaDataImport2_FindMethod(metadata, td, sz_name, pv_sig_blob.unwrap_or(0 as _), cb_sig_blob.unwrap_or_default(), pmb.unwrap_or(0 as _)) as u32
 			)
 		}
 	}
@@ -610,7 +659,43 @@ pub mod imeta_data_import2 {
 					sz_type_def.unwrap_or(0 as _),
 					tk_enclosing_class.unwrap_or(0 as _),
 					ptk_type_def.unwrap_or(0 as _),
-			) as u32
+				) as u32
+			)
+		}
+	}
+
+	pub fn enum_method_impls(
+		metadata: *mut IMetaDataImport2,
+		ph_enum: *mut HCORENUM,
+		tk_type_def: Option<mdTypeDef>,
+		r_method_body: Option<&mut [mdToken]>,
+		r_method_decl: Option<&mut [mdToken]>,
+		c_max: Option<ULONG>,
+		pc_tokens: Option<&mut ULONG>,
+	) -> HRESULT {
+		let r_method_body = if let Some(r_method_body) = r_method_body {
+			r_method_body.as_mut_ptr()
+		} else {
+			0 as _
+		};
+
+		let r_method_decl = if let Some(r_method_decl) = r_method_decl {
+			r_method_decl.as_mut_ptr()
+		} else {
+			0 as _
+		};
+
+		unsafe {
+			HRESULT::from_win32(
+				core_bindings::IMetaDataImport2_EnumMethodImpls(
+					metadata,
+					ph_enum,
+					tk_type_def.unwrap_or_default(),
+					r_method_body,
+					r_method_decl,
+					c_max.unwrap_or_default(),
+					pc_tokens.unwrap_or(0 as _),
+				) as u32
 			)
 		}
 	}

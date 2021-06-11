@@ -42,12 +42,11 @@ impl <'a>NamespaceDeclaration <'a>{
 
 		let mut namespaces_count = 0;
 
+		let mut full_name_w = windows::HSTRING::from(full_name);
 		// Grab size
 		unsafe {
 			ro_resolve_namespace(
-				std::mem::transmute(
-					windows::HSTRING::from(full_name)
-				),
+				&mut full_name_w,
 				None,
 				0,
 				None,

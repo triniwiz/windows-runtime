@@ -27,8 +27,8 @@ pub struct BaseClassDeclaration<'a> {
 }
 
 impl<'a> BaseClassDeclaration<'a> {
-	fn make_implemented_interfaces_declarations(metadata: *mut c_void, token: mdTypeDef) -> Vec<Arc<Mutex<dyn BaseClassDeclarationImpl>>> {
-		let mut enumerator = std::mem::MaybeUninit::uninit();
+	fn make_implemented_interfaces_declarations(metadata: *mut IMetaDataImport2, token: mdTypeDef) -> Vec<Arc<Mutex<dyn BaseClassDeclarationImpl>>> {
+		let mut enumerator = std::ptr::null_mut();
 		let enumerator_ptr = &mut enumerator;
 		let mut count = 0;
 		let mut tokens = [0; 1024];
@@ -138,7 +138,7 @@ impl<'a> BaseClassDeclaration<'a> {
 		result
 	}
 
-	pub fn new(kind: DeclarationKind, metadata: *mut c_void, token: mdTypeDef) -> Self {
+	pub fn new(kind: DeclarationKind, metadata: *mut IMetaDataImport2, token: mdTypeDef) -> Self {
 		Self {
 			base: TypeDeclaration::new(kind, metadata, token),
 			implemented_interfaces: BaseClassDeclaration::make_implemented_interfaces_declarations(metadata, token),

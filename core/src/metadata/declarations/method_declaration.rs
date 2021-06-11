@@ -22,6 +22,9 @@ const OVERLOAD_ATTRIBUTE: &str = "Windows.Foundation.Metadata.OverloadAttribute"
 const DEFAULT_OVERLOAD_ATTRIBUTE: &str ="Windows.Foundation.Metadata.DefaultOverloadAttribute";
 
 impl<'a> MethodDeclaration <'a> {
+	pub fn base (&self) -> &TypeDeclaration<'a> {
+		&self.base
+	}
 	pub fn new(metadata: *mut c_void, token: mdMethodDef) -> Self {
 		debug_assert!(!metadata.is_null());
 		debug_assert!(enums::type_from_token(token) == CorTokenType::mdtMethodDef as u32);

@@ -23,13 +23,13 @@ pub struct InterfaceDeclaration<'a> {
 }
 
 impl<'a> InterfaceDeclaration<'a> {
-	pub fn new(metadata: *mut c_void, token: mdToken) -> Self {
+	pub fn new(metadata: *mut IMetaDataImport2, token: mdToken) -> Self {
 		Self::new_with_kind(
 			DeclarationKind::Interface, metadata, token,
 		)
 	}
 
-	pub fn new_with_kind(kind: DeclarationKind, metadata: *mut c_void, token: mdToken) -> Self {
+	pub fn new_with_kind(kind: DeclarationKind, metadata: *mut IMetaDataImport2, token: mdToken) -> Self {
 		Self {
 			base: BaseClassDeclaration::new(
 				kind, metadata, token,

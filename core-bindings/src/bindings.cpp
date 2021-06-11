@@ -374,6 +374,14 @@ extern "C" HRESULT IMetaDataImport2_FindTypeDefByName(IMetaDataImport2 * metadat
     return metadata->FindTypeDefByName(szTypeDef, tkEnclosingClass, ptkTypeDef);
 }
 
+extern "C" HRESULT IMetaDataImport2_EnumMethodImpls(IMetaDataImport2 * metadata, HCORENUM * phEnum,
+    mdTypeDef  tkTypeDef,
+    mdToken rMethodBody[],
+    mdToken rMethodDecl[],
+    ULONG      cMax,
+    ULONG * pcTokens) {
+    return metadata->EnumMethodImpls(phEnum, tkTypeDef, rMethodBody, rMethodDecl, cMax, pcTokens);
+}
 
 
 

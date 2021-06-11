@@ -3,9 +3,15 @@ use crate::bindings::{helpers, imeta_data_import2, enums, rometadataresolution};
 use std::borrow::Cow;
 
 
-const GUID_ATTRIBUTE: &'static str = "Windows.Foundation.Metadata.GuidAttribute";
+const GUID_ATTRIBUTE: &str = "Windows.Foundation.Metadata.GuidAttribute";
 
-pub fn get_string_value_from_blob<'a>(metadata: *mut c_void, signature: PCCOR_SIGNATURE) -> Cow<'a, str> {
+pub const SYSTEM_TYPE: &str = "System.Type";
+pub const STATIC_ATTRIBUTE: &str = "Windows.Foundation.Metadata.StaticAttribute";
+pub const ACTIVATABLE_ATTRIBUTE: &str = "Windows.Foundation.Metadata.ActivatableAttribute";
+pub const COMPOSABLE_ATTRIBUTE: &str = "Windows.Foundation.Metadata.ComposableAttribute";
+
+
+pub fn get_string_value_from_blob<'a>(metadata: *mut IMetaDataImport2, signature: PCCOR_SIGNATURE) -> Cow<'a, str> {
 	debug_assert!(!metadata.is_null());
 	debug_assert!(!signature.is_null());
 
@@ -44,7 +50,7 @@ pub fn get_unary_custom_attribute_string_value<'a>(metadata: *mut c_void, token:
 }
 
 
-pub fn resolve_type_ref(metadata: *mut c_void, token: mdTypeRef, external_metadata: *mut *mut c_void, external_token: *mut mdTypeDef) -> bool {
+pub fn resolve_type_ref(metadata: *mut IMetaDataImport2, token: mdTypeRef, external_metadata: *mut *mut c_void, external_token: *mut mdTypeDef) -> bool {
 	debug_assert!(!metadata.is_null());
 	debug_assert!(enums::type_from_token(token) == CorTokenType::mdtTypeRef as u32);
 	debug_assert!(!external_metadata.is_null());
@@ -84,7 +90,7 @@ pub fn get_guid_attribute_value(metadata: *mut c_void, token: mdToken) -> GUID {
 	guid
 }
 
-pub fn get_type_name<'a>(metadata: *mut c_void, token: mdToken) -> Cow<'a, str> {
+pub fn get_type_name<'a>(metadata: *mut IMetaDataImport2, token: mdToken) -> Cow<'a, str> {
 	debug_assert!(!metadata.is_null());
 	debug_assert!(token != mdTokenNil);
 

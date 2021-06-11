@@ -14,9 +14,9 @@ use std::borrow::Cow;
 #[derive(Clone, Debug)]
 pub struct TypeDeclaration<'a> {
 	pub kind: DeclarationKind,
-	pub metadata: *mut c_void,
+	pub metadata: *mut IMetaDataImport2,
 	pub token: mdTypeDef,
-	_marker: marker::PhantomData<&'a *const c_void>,
+	_marker: marker::PhantomData<&'a ()>,
 }
 
 
@@ -73,7 +73,7 @@ impl<'a> Declaration for TypeDeclaration<'a> {
 }
 
 impl<'a> TypeDeclaration<'a> {
-	pub fn new(kind: DeclarationKind, metadata: *mut c_void, token: mdTypeDef) -> Self {
+	pub fn new(kind: DeclarationKind, metadata: *mut IMetaDataImport2, token: mdTypeDef) -> Self {
 		let value = Self {
 			kind,
 			metadata,
