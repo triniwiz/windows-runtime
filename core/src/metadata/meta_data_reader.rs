@@ -38,8 +38,8 @@ impl MetadataReader {
 				)
 			);
 		}
-		let mut metadata = std::mem::MaybeUninit::uninit();
-		let meta = &mut metadata;
+		let mut metadata = unsafe { std::mem::MaybeUninit::uninit() };
+		let meta = &mut metadata.as_mut_ptr() as *mut *mut c_void;
 		let mut token = mdTokenNil;
 		let mut full_name_hstring = HSTRING::from(full_name);
 		let get_metadata_file_result = rometadataresolution::ro_get_meta_data_file(
@@ -60,19 +60,18 @@ impl MetadataReader {
 		let mut flags = 0;
 		let mut parent_token = mdTokenNil;
 		debug_assert!(imeta_data_import2::get_type_def_props(
-			metadata, token, None, None, None, Some(&mut flags), Some(&mut parent_token),
+			metadata.as_mut_ptr(), token, None, None, None, Some(&mut flags), Some(&mut parent_token),
 		).is_ok());
 
 
 		if helpers::is_td_class(flags) {
-			let mut parent_name = vec![0_u16; MAX_IDENTIFIER_LENGTH];
-
+			let mut parent_name = [0_u16; MAX_IDENTIFIER_LENGTH];
 
 			match CorTokenType::from(enums::type_from_token(parent_token)) {
 				CorTokenType::mdtTypeDef => {
 					debug_assert!(
 						imeta_data_import2::get_type_def_props(
-							metadata, parent_token, Some(parent_name.as_mut_ptr()), Some(parent_name.len() as u32),
+							metadata.as_mut_ptr(), parent_token, Some(parent_name.as_mut_ptr()), Some(parent_name.len() as u32),
 							None, None, None,
 						).is_ok()
 					);
@@ -80,7 +79,7 @@ impl MetadataReader {
 				CorTokenType::mdtTypeRef => {
 					debug_assert!(
 						imeta_data_import2::get_type_ref_props(
-							metadata, parent_token, None, Some(parent_name.as_mut_ptr()), Some(parent_name.len() as u32), None,
+							metadata.as_mut_ptr(), parent_token, None, Some(parent_name.as_mut_ptr()), Some(parent_name.len() as u32), None,
 						).is_ok()
 					)
 				}
@@ -89,8 +88,14 @@ impl MetadataReader {
 				}
 			}
 
-			let mut parent_name_string = OsString::from_wide(parent_name.as_slice()).to_string_lossy().as_ref();
-
+			let mut parent_name_string = OsString::from_wide(&parent_name).to_string_lossy().as_ref();
+			let metadata = unsafe {
+				Arc::new(
+					Mutex::new(
+						metadata.assume_init()
+					)
+				)
+			};
 			if parent_name_string == SYSTEM_ENUM {
 				return Some(
 					Arc::new(
@@ -131,6 +136,13 @@ impl MetadataReader {
 		}
 
 		if helpers::is_td_interface(flags) {
+			let metadata = unsafe {
+				Arc::new(
+					Mutex::new(
+						metadata.assume_init()
+					)
+				)
+			};
 			return if full_name.contains("`") {
 				Some(
 					Arc::new(

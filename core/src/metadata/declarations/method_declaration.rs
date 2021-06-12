@@ -11,34 +11,36 @@ use crate::enums::CorCallingConvention;
 use crate::metadata::com_helpers::get_unary_custom_attribute_string_value;
 use crate::metadata::declarations::parameter_declaration::ParameterDeclaration;
 use std::borrow::Cow;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
-pub struct MethodDeclaration <'a> {
-	base: TypeDeclaration<'a>,
-	parameters: Vec<ParameterDeclaration<'a>>,
+pub struct MethodDeclaration {
+	base: TypeDeclaration,
+	parameters: Vec<ParameterDeclaration>,
 }
 
 const OVERLOAD_ATTRIBUTE: &str = "Windows.Foundation.Metadata.OverloadAttribute";
 const DEFAULT_OVERLOAD_ATTRIBUTE: &str ="Windows.Foundation.Metadata.DefaultOverloadAttribute";
 
-impl<'a> MethodDeclaration <'a> {
-	pub fn base (&self) -> &TypeDeclaration<'a> {
+impl MethodDeclaration {
+	pub fn base <'b>(&self) -> &'b TypeDeclaration {
 		&self.base
 	}
-	pub fn new(metadata: *mut c_void, token: mdMethodDef) -> Self {
+	pub fn new(metadata: Arc<Mutex<IMetaDataImport2>>, token: mdMethodDef) -> Self {
 		debug_assert!(!metadata.is_null());
 		debug_assert!(enums::type_from_token(token) == CorTokenType::mdtMethodDef as u32);
 		assert!(token != mdMethodDefNil);
 
 
 		let mut signature = std::mem::MaybeUninit::uninit();
-		let mut signature_ptr = &mut signature;
+		let mut signature_ptr = &mut signature.as_mut_ptr();
 		let mut signature_size: ULONG = 0;
+
 
 		debug_assert!(
 			imeta_data_import2::get_method_props(
 				metadata, token, None, None, None,
-				None,None,Some(signature), Some(&mut signature_size),
+				None,None,Some(signature_ptr as *mut *const u8), Some(&mut signature_size),
 				None,None
 			).is_ok()
 		);
@@ -55,9 +57,9 @@ impl<'a> MethodDeclaration <'a> {
 			std::unimplemented!()
 		}
 
-		let mut arguments_count = { helpers::cor_sig_uncompress_data(signature as *const u8) };
+		let mut arguments_count = { helpers::cor_sig_uncompress_data(signature.as_ptr()) };
 
-		let return_type = Signature::consume_type(signature as *const u8);
+		let return_type = Signature::consume_type(signature.as_ptr());
 
 		let mut parameters: Vec<ParameterDeclaration> = Vec::new();
 		let mut parameter_enumerator = std::mem::MaybeUninit::uninit();

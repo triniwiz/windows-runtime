@@ -8,6 +8,7 @@ use crate::{
 	metadata::declarations::type_declaration::TypeDeclaration,
 	prelude::*,
 };
+use std::sync::{Arc, Mutex};
 
 
 pub mod generic_delegate_declaration;
@@ -29,25 +30,25 @@ pub fn get_invoke_method_token(meta_data: *mut IMetaDataImport2, token: mdTypeDe
 pub trait DelegateDeclarationImpl {
 	fn base(&self) -> &TypeDeclaration;
 	fn id(&self) -> GUID {
-		get_guid_attribute_value(self.base().metadata, self.base().token)
+		get_guid_attribute_value(self.base().metadata_mut(), self.base().token)
 	}
 	fn invoke_method(&self) -> &MethodDeclaration;
 }
 
 #[derive(Clone, Debug)]
-pub struct DelegateDeclaration<'a> {
-	base: TypeDeclaration<'a>,
-	invoke_method: MethodDeclaration<'a>,
+pub struct DelegateDeclaration {
+	base: TypeDeclaration,
+	invoke_method: MethodDeclaration,
 }
 
-impl<'a> DelegateDeclaration<'a> {
-	pub fn new(metadata: *mut IMetaDataImport2, token: mdTypeDef) -> Self {
+impl<'a> DelegateDeclaration {
+	pub fn new(metadata: Arc<Mutex<IMetaDataImport2>>, token: mdTypeDef) -> Self {
 		Self::new_overload(
 			DeclarationKind::Delegate, metadata, token,
 		)
 	}
 
-	pub fn new_overload(kind: DeclarationKind, metadata: *mut IMetaDataImport2, token: mdTypeDef) -> Self {
+	pub fn new_overload(kind: DeclarationKind, metadata: Arc<Mutex<IMetaDataImport2>>, token: mdTypeDef) -> Self {
 		Self {
 			base: TypeDeclaration::new(
 				kind, metadata, token,
@@ -59,7 +60,7 @@ impl<'a> DelegateDeclaration<'a> {
 	}
 }
 
-impl<'a> Declaration for DelegateDeclaration<'a> {
+impl Declaration for DelegateDeclaration {
 	fn name<'b>(&self) -> Cow<'b, str> {
 		self.base.name()
 	}
@@ -74,12 +75,12 @@ impl<'a> Declaration for DelegateDeclaration<'a> {
 }
 
 
-impl<'a> DelegateDeclarationImpl for DelegateDeclaration<'a> {
-	fn base(&self) -> &TypeDeclaration<'a> {
+impl DelegateDeclarationImpl for DelegateDeclaration {
+	fn base<'b>(&self) -> &'b TypeDeclaration {
 		&self.base
 	}
 
-	fn invoke_method(&self) -> &MethodDeclaration<'a> {
+	fn invoke_method<'b>(&self) -> &'b MethodDeclaration {
 		&self.invoke_method
 	}
 }

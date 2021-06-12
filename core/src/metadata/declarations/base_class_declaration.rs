@@ -18,29 +18,30 @@ use crate::metadata::declarations::interface_declaration::InterfaceDeclaration;
 
 
 #[derive(Clone)]
-pub struct BaseClassDeclaration<'a> {
-	base: TypeDeclaration<'a>,
+pub struct BaseClassDeclaration {
+	base: TypeDeclaration,
 	implemented_interfaces: Vec<Arc<Mutex<dyn BaseClassDeclarationImpl>>>,
-	methods: Vec<MethodDeclaration<'a>>,
-	properties: Vec<PropertyDeclaration<'a>>,
-	events: Vec<EventDeclaration<'a>>,
+	methods: Vec<MethodDeclaration>,
+	properties: Vec<PropertyDeclaration>,
+	events: Vec<EventDeclaration>,
 }
 
-impl<'a> BaseClassDeclaration<'a> {
-	fn make_implemented_interfaces_declarations(metadata: *mut IMetaDataImport2, token: mdTypeDef) -> Vec<Arc<Mutex<dyn BaseClassDeclarationImpl>>> {
+impl BaseClassDeclaration {
+	fn make_implemented_interfaces_declarations(metadata: Arc<Mutex<IMetaDataImport2>>, token: mdTypeDef) -> Vec<Arc<Mutex<dyn BaseClassDeclarationImpl>>> {
 		let mut enumerator = std::ptr::null_mut();
 		let enumerator_ptr = &mut enumerator;
 		let mut count = 0;
 		let mut tokens = [0; 1024];
 
+		let metadata_inner = get_mutex_value_mut(&metadata);
 		debug_assert!(
 			imeta_data_import2::enum_interface_impls(
-				metadata, enumerator_ptr, Some(token), Some(tokens.as_mut_ptr()), Some(tokens.len() as u32), Some(&mut count),
+				metadata_inner, enumerator_ptr, Some(token), Some(tokens.as_mut_ptr()), Some(tokens.len() as u32), Some(&mut count),
 			).is_ok()
 		);
 
 		debug_assert!(count < (tokens.len() - 1) as u32);
-		imeta_data_import2::close_enum(metadata, enumerator);
+		imeta_data_import2::close_enum(metadata_inner, enumerator);
 
 		let mut result = Vec::new();
 
@@ -48,12 +49,12 @@ impl<'a> BaseClassDeclaration<'a> {
 			let mut interface_token = mdTokenNil;
 			debug_assert!(
 				imeta_data_import2::get_interface_impl_props(
-					metadata, *token, None, Some(&mut interface_token),
+					metadata_inner, *token, None, Some(&mut interface_token),
 				).is_ok()
 			);
 			result.push(
 				DeclarationFactory::make_interface_declaration(
-					metadata, interface_token,
+					metadata_inner, interface_token,
 				)
 			);
 		}

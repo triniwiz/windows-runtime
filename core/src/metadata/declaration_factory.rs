@@ -14,16 +14,20 @@ use crate::metadata::declarations::interface_declaration::InterfaceDeclaration;
 pub struct DeclarationFactory {}
 
 impl DeclarationFactory {
-	pub fn make_delegate_declaration<'b>(metadata: *mut c_void, token: mdToken) -> Box<dyn DelegateDeclarationImpl> {
+	pub fn make_delegate_declaration<'b>(metadata: Arc<Mutex<IMetaDataImport2>>, token: mdToken) -> Box<dyn DelegateDeclarationImpl> {
 		match CorTokenType::from(enums::type_from_token(token))
 		{
 			CorTokenType::mdtTypeDef => Box::new(DelegateDeclaration::new(metadata, token)),
 			CorTokenType::mdtTypeRef => {
+				let metadata = get_mutex_value_mut(&metadata);
 				let mut external_metadata = std::mem::MaybeUninit::uninit();
+				let external_metadata_ptr = &mut external_metadata.as_ptr();
 				let mut external_delegate_token = mdTokenNil;
-				let is_resolved = resolve_type_ref(metadata, token, &mut external_metadata, &mut external_delegate_token);
+				let is_resolved = resolve_type_ref(metadata, token, external_metadata_ptr as *mut *mut c_void, &mut external_delegate_token);
 				debug_assert!(is_resolved);
-				Box::new(DelegateDeclaration::new(external_metadata, external_delegate_token))
+				Box::new(DelegateDeclaration::new(Arc::new(Mutex::new(
+					unsafe { external_metadata.assume_init() }
+				)), external_delegate_token))
 			}
 			CorTokenType::mdtTypeSpec => {
 				let mut signature = [0_u8; MAX_IDENTIFIER_LENGTH];
@@ -51,8 +55,8 @@ impl DeclarationFactory {
 						Box::new(GenericDelegateInstanceDeclaration::new(metadata, open_generic_delegate_token, metadata, token))
 					}
 					CorTokenType::mdtTypeRef => {
-						let mut external_metadata = std::mem::MaybeUninit::uninit();
-						let external_metadata_ptr = &mut external_metadata;
+						let mut external_metadata: std::mem::MaybeUninit<IMetaDataImport2> = std::mem::MaybeUninit::uninit();
+						let external_metadata_ptr = &mut external_metadata.as_mut_ptr();
 						let mut external_delegate_token = mdTokenNil;
 
 						let is_resolved = resolve_type_ref(
@@ -72,7 +76,7 @@ impl DeclarationFactory {
 			}
 		}
 	}
-	pub fn make_interface_declaration(metadata: *mut c_void, token: mdToken) -> Arc<Mutex<dyn BaseClassDeclarationImpl>> {
+	pub fn make_interface_declaration(metadata: Arc<Mutex<IMetaDataImport2>>, token: mdToken) -> Arc<Mutex<dyn BaseClassDeclarationImpl>> {
 		match CorTokenType::from(enums::type_from_token(token)) {
 			CorTokenType::mdtTypeDef => {
 				Arc::new(

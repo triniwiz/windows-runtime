@@ -10,13 +10,14 @@ use super::{
 	type_declaration::TypeDeclaration,
 };
 use std::borrow::Cow;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
-pub struct EnumDeclaration<'a> {
-	base: TypeDeclaration<'a>,
+pub struct EnumDeclaration {
+	base: TypeDeclaration,
 }
 
-impl<'a> Declaration for EnumDeclaration<'a> {
+impl Declaration for EnumDeclaration {
 	fn is_exported(&self) -> bool {
 		self.base.is_exported()
 	}
@@ -34,8 +35,8 @@ impl<'a> Declaration for EnumDeclaration<'a> {
 	}
 }
 
-impl<'a> EnumDeclaration<'a> {
-	pub fn new(metadata: *mut c_void, token: mdTypeDef) -> Self {
+impl EnumDeclaration {
+	pub fn new(metadata: Arc<Mutex<IMetaDataImport2>>, token: mdTypeDef) -> Self {
 		Self {
 			base: TypeDeclaration::new(DeclarationKind::Enum, metadata, token)
 		}
@@ -45,14 +46,14 @@ impl<'a> EnumDeclaration<'a> {
 		let mut type_field = mdTokenNil;
 		let name_w = OsString::from(COR_ENUM_FIELD_NAME).to_wide();
 		debug_assert!(imeta_data_import2::find_field(
-			self.base.metadata, self.base.token,
+			self.base.metadata_mut(), self.base.token,
 			Some(name_w.as_ptr()), None, None, Some(&mut type_field),
 		).is_ok());
 		let mut signature = [0_u8; MAX_IDENTIFIER_LENGTH];
 		let mut signature_size = 0;
 		debug_assert!(
 			imeta_data_import2::get_field_props(
-				self.base.metadata,
+				self.base.metadata_mut(),
 				type_field,
 				None, None, None, None, None,
 				Some(&mut signature.as_mut_ptr() as _ as *mut *const u8),

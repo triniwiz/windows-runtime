@@ -6,11 +6,11 @@ use std::borrow::Cow;
 
 
 #[derive(Clone,Debug)]
-pub struct StructFieldDeclaration<'a> {
-	base: FieldDeclaration<'a>,
+pub struct StructFieldDeclaration {
+	base: FieldDeclaration,
 }
 
-impl<'a> Declaration for StructFieldDeclaration <'a>{
+impl Declaration for StructFieldDeclaration{
 	fn name<'b>(&self) -> Cow<'b, str> {
 		self.base.name()
 	}
@@ -24,11 +24,11 @@ impl<'a> Declaration for StructFieldDeclaration <'a>{
 	}
 }
 
-impl<'a> StructFieldDeclaration<'a> {
+impl StructFieldDeclaration {
 	pub fn base(&self)-> &FieldDeclaration {
 		&self.base
 	}
-	pub fn new(metadata: *mut c_void, token: mdFieldDef) -> Self {
+	pub fn new(metadata: IMetaDataImport2, token: mdFieldDef) -> Self {
 		Self {
 			base: FieldDeclaration::new(
 				DeclarationKind::StructField,

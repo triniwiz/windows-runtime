@@ -10,6 +10,7 @@ use std::io::Read;
 use std::os::windows::prelude::*;
 use std::path::{Path, PathBuf};
 use windows::HSTRING;
+use crate::runtime::com::com_interop::COMInterop;
 
 pub struct Runtime {
     isolate: v8::OwnedIsolate,
@@ -42,6 +43,8 @@ impl Runtime {
 
             let mut global_template = v8::ObjectTemplate::new_from_template(scope, global);
 
+            global_template.set_internal_field_count(0);
+
             {
                 {
                     Runtime::init_performance(scope, &mut global_template);
@@ -53,6 +56,7 @@ impl Runtime {
 
 
                 let mut context = v8::Context::new_from_template(scope, global_template);
+
                 let mut local_scope = v8::ContextScope::new(scope, context);
 
                 {
@@ -102,13 +106,17 @@ impl Runtime {
         let result = result.to_string(&mut scope).unwrap();
     }
 
-    fn handle_global(_scope: &mut v8::HandleScope, _args: v8::FunctionCallbackArguments, _retval: v8::ReturnValue) {}
+    fn handle_global(_scope: &mut v8::HandleScope, _args: v8::FunctionCallbackArguments, _retval: v8::ReturnValue) {
+
+    }
     fn init_global(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, context: v8::Local<v8::Context>) {
         let mut global = context.global(scope);
         let value = v8::String::new(
             scope, "global",
         ).unwrap().into();
         global.define_own_property(scope, value, global.into(), v8::READ_ONLY);
+        let interop = COMInterop
+        global.set_internal_field(0, )
     }
 
     fn init_console(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, context: v8::Local<v8::Context>) {
@@ -194,6 +202,10 @@ impl Runtime {
         println!("handle meta {:?}", args.get(0).to_rust_string_lossy(scope));
 
         let class_name = args.get(0).to_rust_string_lossy(scope);
+
+       let global = scope.get_current_context().global(scope);
+        let interop = global.get_internal_field(scope, 0);
+        
 
     }
 }

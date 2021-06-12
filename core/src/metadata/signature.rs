@@ -67,7 +67,7 @@ impl Signature {
 		}
 	}
 
-	pub fn to_string<'a>(metadata: *mut c_void, signature: PCCOR_SIGNATURE) -> Cow<'a, str> {
+	pub fn to_string<'a>(metadata: *mut IMetaDataImport2, signature: PCCOR_SIGNATURE) -> Cow<'a, str> {
 		let element_type = helpers::cor_sig_uncompress_element_type(signature);
 		use crate::enums::CorElementType;
 		return match element_type {

@@ -7,14 +7,15 @@ use crate::metadata::declarations::declaration::{Declaration, DeclarationKind};
 use crate::metadata::declarations::delegate_declaration::{DelegateDeclaration, DelegateDeclarationImpl};
 use crate::metadata::declarations::method_declaration::MethodDeclaration;
 use crate::metadata::declarations::type_declaration::TypeDeclaration;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
-pub struct GenericDelegateDeclaration<'a> {
-	base: DelegateDeclaration<'a>,
+pub struct GenericDelegateDeclaration {
+	base: DelegateDeclaration,
 }
 
-impl<'a> GenericDelegateDeclaration<'a> {
-	pub fn new(metadata: *mut IMetaDataImport2, token: mdToken) -> Self {
+impl GenericDelegateDeclaration {
+	pub fn new(metadata: Arc<Mutex<IMetaDataImport2>>, token: mdToken) -> Self {
 		Self {
 			base: DelegateDeclaration::new_overload(
 				DeclarationKind::GenericDelegate, metadata, token,
@@ -29,18 +30,18 @@ impl<'a> GenericDelegateDeclaration<'a> {
 		let enumerator_ptr = &mut enumerator;
 
 		debug_assert!(
-			imeta_data_import2::enum_generic_params(self.base.base.metadata, enumerator_ptr, self.base.base.token, None, None, None).is_ok()
+			imeta_data_import2::enum_generic_params(self.base.base.metadata_mut(), enumerator_ptr, self.base.base.token, None, None, None).is_ok()
 		);
 		debug_assert!(
-			imeta_data_import2::count_enum(self.base.base.metadata, enumerator, &mut count).is_ok()
+			imeta_data_import2::count_enum(self.base.base.metadata_mut(), enumerator, &mut count).is_ok()
 		);
-		imeta_data_import2::close_enum(self.base.base.metadata, enumerator);
+		imeta_data_import2::close_enum(self.base.base.metadata_mut(), enumerator);
 
 		return count as usize;
 	}
 }
 
-impl<'a> Declaration for GenericDelegateDeclaration<'a> {
+impl Declaration for GenericDelegateDeclaration {
 	fn name<'b>(&self) -> Cow<'b, str> {
 		self.base.name()
 	}
@@ -54,12 +55,12 @@ impl<'a> Declaration for GenericDelegateDeclaration<'a> {
 	}
 }
 
-impl<'a> DelegateDeclarationImpl for GenericDelegateDeclaration<'a> {
-	fn base(&self) -> &TypeDeclaration {
+impl DelegateDeclarationImpl for GenericDelegateDeclaration {
+	fn base<'b>(&self) -> &'b TypeDeclaration {
 		&self.base.base
 	}
 
-	fn invoke_method(&self) -> &MethodDeclaration {
+	fn invoke_method<'b>(&self) -> &'b MethodDeclaration {
 		&self.base.invoke_method
 	}
 }

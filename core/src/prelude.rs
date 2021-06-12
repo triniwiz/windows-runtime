@@ -35,6 +35,8 @@ pub const mdMethodSpecNil: mdToken = Helpers_mdMethodSpecNil;
 pub const mdStringNil: mdToken = Helpers_mdStringNil;
 
 pub use super::enums::*;
+use std::sync::{Arc, Mutex};
+
 
 pub type CLSID = GUID;
 
@@ -43,6 +45,21 @@ pub const RO_E_METADATA_NAME_IS_NAMESPACE: HRESULT = Helpers_RO_E_METADATA_NAME_
 pub const MAX_IDENTIFIER_LENGTH: usize = 511;
 
 
-pub const COR_CTOR_METHOD_NAME: &'static str = ".ctor";
-pub const COR_CCTOR_METHOD_NAME: &'static str = ".cctor";
-pub const COR_ENUM_FIELD_NAME: &'static str = "value__";
+pub const COR_CTOR_METHOD_NAME: &str = ".ctor";
+pub const COR_CCTOR_METHOD_NAME: &str = ".cctor";
+pub const COR_ENUM_FIELD_NAME: &str = "value__";
+
+
+pub fn get_mutex_value_mut<'a, T>(value: &Arc<Mutex<T>>) -> &mut T {
+	match value.lock() {
+		Ok(value) => &mut *value,
+		Err(poisoned) => &mut *poisoned.into_inner()
+	}
+}
+
+pub fn get_mutex_value<'a, T>(value: &Arc<Mutex<T>>) -> &T {
+	match value.lock() {
+		Ok(value) => &*value,
+		Err(poisoned) => &*poisoned.into_inner()
+	}
+}

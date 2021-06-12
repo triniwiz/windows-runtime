@@ -4,14 +4,15 @@ use crate::metadata::declarations::type_declaration::TypeDeclaration;
 use crate::bindings::imeta_data_import2;
 use crate::metadata::declarations::struct_field_declaration::StructFieldDeclaration;
 use std::borrow::Cow;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
-pub struct StructDeclaration<'a> {
-	base: TypeDeclaration<'a>,
-	fields: Vec<StructFieldDeclaration<'a>>,
+pub struct StructDeclaration {
+	base: TypeDeclaration,
+	fields: Vec<StructFieldDeclaration>,
 }
 
-impl<'a> Declaration for StructDeclaration<'a> {
+impl Declaration for StructDeclaration {
 	fn name<'b>(&self) -> Cow<'b, str> {
 		self.base.name()
 	}
@@ -25,8 +26,8 @@ impl<'a> Declaration for StructDeclaration<'a> {
 	}
 }
 
-impl<'a> StructDeclaration<'a> {
-	pub fn new(metadata: *mut c_void, token: mdTypeDef,
+impl StructDeclaration {
+	pub fn new(metadata: Arc<Mutex<IMetaDataImport2>>, token: mdTypeDef,
 	) -> Self {
 		Self {
 			base: TypeDeclaration::new(
@@ -44,26 +45,27 @@ impl<'a> StructDeclaration<'a> {
 		self.fields.as_slice()
 	}
 
-	fn make_field_declarations<'b>(metadata: *mut c_void, token: mdTypeDef) -> Vec<StructFieldDeclaration<'b>> {
-		let mut enumerator = std::mem::MaybeUninit::uninit();
+	fn make_field_declarations<'b>(metadata: Arc<Mutex<IMetaDataImport2>>, token: mdTypeDef) -> Vec<StructFieldDeclaration<'b>> {
+		let metadata_inner = get_mutex_value_mut(&metadata);
+		let mut enumerator = std::ptr::null_mut();
 		let mut count = 0;
 		let mut tokens = [0; 1024];
 		let mut enumerator_ptr = &mut enumerator;
 		debug_assert!(
 			imeta_data_import2::enum_fields(
-				metadata, enumerator_ptr, token, tokens.as_mut_ptr(), tokens.len() as u32, &mut count,
+				metadata_inner, enumerator_ptr, token, tokens.as_mut_ptr(), tokens.len() as u32, &mut count,
 			).is_ok()
 		);
 
 		debug_assert!(count < (tokens.len() - 1) as u32);
 
-		imeta_data_import2::close_enum(metadata, enumerator);
+		imeta_data_import2::close_enum(metadata_inner, enumerator);
 
 		let mut result = Vec::new();
 
 		for i in 0..count {
 			result.push(
-				StructFieldDeclaration::new(metadata, tokens[i])
+				StructFieldDeclaration::new(Arc::clone(&metadata), tokens[i])
 			)
 		}
 

@@ -8,19 +8,20 @@ use crate::metadata::declarations::declaration::{Declaration, DeclarationKind};
 use crate::metadata::declarations::delegate_declaration::{DelegateDeclaration, DelegateDeclarationImpl};
 use crate::metadata::generic_instance_id_builder::GenericInstanceIdBuilder;
 use crate::metadata::signature::Signature;
-use crate::prelude::{c_void, CLSID, MAX_IDENTIFIER_LENGTH, mdTypeSpecNil};
+use crate::prelude::*;
 use crate::metadata::declarations::method_declaration::MethodDeclaration;
 use crate::metadata::declarations::type_declaration::TypeDeclaration;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
-pub struct GenericDelegateInstanceDeclaration<'a> {
-	base: DelegateDeclaration<'a>,
+pub struct GenericDelegateInstanceDeclaration {
+	base: DelegateDeclaration,
 	closed_token: mdTypeSpec,
-	closed_metadata: *mut c_void,
+	closed_metadata: Arc<Mutex<IMetaDataImport2>>,
 }
 
-impl<'a> GenericDelegateInstanceDeclaration<'a> {
-	pub fn new(open_metadata: *mut IMetaDataImport2, open_token: mdTypeDef, closed_metadata: *mut c_void, closed_token: mdTypeSpec) -> Self {
+impl GenericDelegateInstanceDeclaration {
+	pub fn new(open_metadata: Arc<Mutex<IMetaDataImport2>>, open_token: mdTypeDef, closed_metadata: Arc<Mutex<IMetaDataImport2>>, closed_token: mdTypeSpec) -> Self {
 		debug_assert!(!closed_metadata.is_null());
 		debug_assert!(CorTokenType::from(enums::type_from_token(closed_token)) == CorTokenType::mdtTypeSpec);
 		debug_assert!(closed_token != mdTypeSpecNil);
@@ -35,7 +36,7 @@ impl<'a> GenericDelegateInstanceDeclaration<'a> {
 	}
 }
 
-impl<'a> Declaration for GenericDelegateInstanceDeclaration<'a> {
+impl Declaration for GenericDelegateInstanceDeclaration {
 	fn name<'b>(&self) -> Cow<'b, str> {
 		self.base.name()
 	}
@@ -59,8 +60,8 @@ impl<'a> Declaration for GenericDelegateInstanceDeclaration<'a> {
 }
 
 
-impl<'a> DelegateDeclarationImpl for GenericDelegateInstanceDeclaration<'a> {
-	fn base(&self) -> &TypeDeclaration {
+impl DelegateDeclarationImpl for GenericDelegateInstanceDeclaration {
+	fn base<'b>(&self) -> &'b TypeDeclaration {
 		&self.base.base
 	}
 
@@ -68,7 +69,7 @@ impl<'a> DelegateDeclarationImpl for GenericDelegateInstanceDeclaration<'a> {
 		GenericInstanceIdBuilder::generate_id(self)
 	}
 
-	fn invoke_method(&self) -> &MethodDeclaration<'a> {
+	fn invoke_method<'b>(&self) -> &MethodDeclaration<'b> {
 		&self.base.invoke_method
 	}
 }
