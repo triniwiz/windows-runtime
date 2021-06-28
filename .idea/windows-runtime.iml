@@ -19,6 +19,9 @@
       <sourceFolder url="file://$MODULE_DIR$/target/debug/build/rusty_v8-64eaab159aa6b9ee/out" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/target/debug/build/syn-bc855a24c682cbd9/out" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/target/debug/build/winapi-d2151c431529fb9f/out" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/target/debug/build/core_bindings-d1acb8dc9ad915e0/out" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/target/debug/build/libc-2d1baad8358fc305/out" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/target/debug/build/rusty_v8-52faa9f90a1476ff/out" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

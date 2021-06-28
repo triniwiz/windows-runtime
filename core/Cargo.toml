@@ -9,9 +9,9 @@ crate-type = ["dylib"]
 
 
 [dependencies]
-windows = "0.10.0"
-rusty_v8 = "0.21.0"
+windows = "0.13.0"
+rusty_v8 = "0.23.0"
 core_bindings = { package = "core_bindings", path = "../core-bindings" }
 chrono = "0.4.19"
-libc = "0.2.95"
+libc = "0.2.97"
 lazy_static = "1.4.0"

@@ -1,6 +1,6 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
-use crate::bindings::{enums, helpers, imeta_data_import2};
+use crate::bindings::{enums, helpers};
 use crate::metadata::com_helpers::resolve_type_ref;
 use crate::metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 
@@ -14,20 +14,29 @@ use crate::metadata::declarations::interface_declaration::InterfaceDeclaration;
 pub struct DeclarationFactory {}
 
 impl DeclarationFactory {
-	pub fn make_delegate_declaration<'b>(metadata: Arc<Mutex<IMetaDataImport2>>, token: mdToken) -> Box<dyn DelegateDeclarationImpl> {
+	pub fn make_delegate_declaration(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: mdToken) -> Option<Arc<RwLock<dyn DelegateDeclarationImpl>>> {
 		match CorTokenType::from(enums::type_from_token(token))
 		{
 			CorTokenType::mdtTypeDef => Box::new(DelegateDeclaration::new(metadata, token)),
 			CorTokenType::mdtTypeRef => {
-				let metadata = get_mutex_value_mut(&metadata);
-				let mut external_metadata = std::mem::MaybeUninit::uninit();
-				let external_metadata_ptr = &mut external_metadata.as_ptr();
-				let mut external_delegate_token = mdTokenNil;
-				let is_resolved = resolve_type_ref(metadata, token, external_metadata_ptr as *mut *mut c_void, &mut external_delegate_token);
-				debug_assert!(is_resolved);
-				Box::new(DelegateDeclaration::new(Arc::new(Mutex::new(
-					unsafe { external_metadata.assume_init() }
-				)), external_delegate_token))
+				match get_lock_value(&metadata) {
+					None => {}
+					Some(metadata) => {
+						let mut external_metadata = std::mem::MaybeUninit::uninit();
+						let external_metadata_ptr = &mut external_metadata.as_mut_ptr();
+						let mut external_delegate_token = mdTokenNil;
+						let is_resolved = resolve_type_ref(Some(metadata), token, external_metadata_ptr, &mut external_delegate_token);
+						debug_assert!(is_resolved);
+						let external_metadata = unsafe { external_metadata.assume_init() };
+						Some(
+							Arc::new(
+								RwLock::new(
+									external_metadata
+								)
+							)
+						)
+					}
+				}
 			}
 			CorTokenType::mdtTypeSpec => {
 				let mut signature = [0_u8; MAX_IDENTIFIER_LENGTH];
@@ -76,11 +85,13 @@ impl DeclarationFactory {
 			}
 		}
 	}
-	pub fn make_interface_declaration(metadata: Arc<Mutex<IMetaDataImport2>>, token: mdToken) -> Arc<Mutex<dyn BaseClassDeclarationImpl>> {
+	pub fn make_interface_declaration(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: mdToken) -> Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>> {
 		match CorTokenType::from(enums::type_from_token(token)) {
 			CorTokenType::mdtTypeDef => {
-				Arc::new(
-					Mutex::new(InterfaceDeclaration::new(metadata, token))
+				Some(
+					Arc::new(
+						RwLock::new(InterfaceDeclaration::new(metadata, token))
+					)
 				)
 			}
 			CorTokenType::mdtTypeRef => {

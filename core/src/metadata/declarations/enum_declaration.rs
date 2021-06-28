@@ -1,6 +1,6 @@
 use crate::prelude::*;
 use crate::bindings::{
-	imeta_data_import2, helpers,
+	 helpers,
 };
 use super::{
 	declaration::{
@@ -10,7 +10,7 @@ use super::{
 	type_declaration::TypeDeclaration,
 };
 use std::borrow::Cow;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 #[derive(Debug)]
 pub struct EnumDeclaration {
@@ -31,12 +31,12 @@ impl Declaration for EnumDeclaration {
 	}
 
 	fn kind(&self) -> DeclarationKind {
-		self.base.kind
+		self.base.kind()
 	}
 }
 
 impl EnumDeclaration {
-	pub fn new(metadata: Arc<Mutex<IMetaDataImport2>>, token: mdTypeDef) -> Self {
+	pub fn new(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: mdTypeDef) -> Self {
 		Self {
 			base: TypeDeclaration::new(DeclarationKind::Enum, metadata, token)
 		}
@@ -45,30 +45,36 @@ impl EnumDeclaration {
 	pub fn type_<'b>(&self) -> Cow<'b, &[u8]> {
 		let mut type_field = mdTokenNil;
 		let name_w = OsString::from(COR_ENUM_FIELD_NAME).to_wide();
-		debug_assert!(imeta_data_import2::find_field(
-			self.base.metadata_mut(), self.base.token,
-			Some(name_w.as_ptr()), None, None, Some(&mut type_field),
-		).is_ok());
-		let mut signature = [0_u8; MAX_IDENTIFIER_LENGTH];
-		let mut signature_size = 0;
-		debug_assert!(
-			imeta_data_import2::get_field_props(
-				self.base.metadata_mut(),
-				type_field,
-				None, None, None, None, None,
-				Some(&mut signature.as_mut_ptr() as _ as *mut *const u8),
-				Some(&mut signature_size),
-				None, None, None,
-			).is_ok()
-		);
+		match self.base.metadata() {
+			None => Cow::default(),
+			Some(metadata) => {
+				let result = metadata.find_field(
+					self.base.token(),
+					Some(name_w.as_ptr()), None, None, Some(&mut type_field),
+				);
+				debug_assert!(result.is_ok());
+				let mut signature = [0_u8; MAX_IDENTIFIER_LENGTH];
+				let mut signature_size = 0;
+				metadata.get_field_props(
+					type_field,
+					None, None, None, None, None,
+					Some(&mut signature.as_mut_ptr() as _ as *mut *const u8),
+					Some(&mut signature_size),
+					None, None, None,
+				);
+				debug_assert!(
+					result.is_ok()
+				);
 
-		let header = helpers::cor_sig_uncompress_data(signature.as_ptr());
-		debug_assert!(
-			header == CorCallingConvention::ImageCeeCsCallconvField as u32
-		);
+				let header = helpers::cor_sig_uncompress_data(signature.as_ptr());
+				debug_assert!(
+					header == CorCallingConvention::ImageCeeCsCallconvField as u32
+				);
 
-		let result: &[u8] = &signature[0..signature_size];
+				let result: &[u8] = &signature[0..signature_size];
 
-		result.into()
+				result.into()
+			}
+		}
 	}
 }

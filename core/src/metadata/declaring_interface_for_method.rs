@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex};
 use crate::metadata::declarations::method_declaration::MethodDeclaration;
 
 #[derive(Debug)]
-pub struct DeclaringInterfaceForMethod {}
+pub struct Metadata {}
 
-impl DeclaringInterfaceForMethod {
+impl Metadata {
 	pub fn get_method_containing_class_token(metadata: *mut IMetaDataImport2, method_token: mdMethodDef) -> u32 {
 		let mut class_token = mdTokenNil;
 
@@ -53,7 +53,7 @@ impl DeclaringInterfaceForMethod {
 	}
 
 	pub fn get_custom_attribute_class_token(metadata: *mut IMetaDataImport2, custom_attribute: mdCustomAttribute) -> u32 {
-		DeclaringInterfaceForMethod::get_method_containing_class_token(metadata, DeclaringInterfaceForMethod::get_custom_attribute_constructor_token(metadata, custom_attribute))
+		Metadata::get_method_containing_class_token(metadata, Metadata::get_custom_attribute_constructor_token(metadata, custom_attribute))
 	}
 
 	pub fn get_method_signature<'a>(metadata: *mut IMetaDataImport2, token: mdMethodDef) -> Cow<'a, [u8]> {
@@ -91,8 +91,8 @@ impl DeclaringInterfaceForMethod {
 	}
 
 	pub fn get_method_argument_count(metadata: *mut IMetaDataImport2, token: mdToken) -> u32 {
-		let signature = DeclaringInterfaceForMethod::get_method_signature(metadata, token);
-		DeclaringInterfaceForMethod::get_signature_argument_count(metadata, signature)
+		let signature = Metadata::get_method_signature(metadata, token);
+		Metadata::get_signature_argument_count(metadata, signature)
 	}
 
 
@@ -121,7 +121,7 @@ impl DeclaringInterfaceForMethod {
 		let mut filtered_attributes: Vec<u32> = Vec::new();
 		let new_attributes: [u32] = attributes[..attributes_count];
 		for attribute in new_attributes.iter() {
-			let class_attribute_class_token = DeclaringInterfaceForMethod::get_custom_attribute_class_token(metadata, attribute);
+			let class_attribute_class_token = Metadata::get_custom_attribute_class_token(metadata, attribute);
 			let mut name = [0_u16; MAX_IDENTIFIER_LENGTH];
 			let length = helpers::get_type_name(metadata, class_attribute_class_token, name.as_mut_ptr(), name.len() as u32);
 			let mut class_attribute_class_name = windows::HSTRING::from_wide(name[..length]);
@@ -186,7 +186,7 @@ impl DeclaringInterfaceForMethod {
 
 
 	pub fn has_method_first_type_argument(metadata: *mut IMetaDataImport2, token: mdToken) -> bool {
-		let mut signature = DeclaringInterfaceForMethod::get_method_signature(
+		let mut signature = Metadata::get_method_signature(
 			metadata, token,
 		);
 		let argument_count = helpers::cor_sig_uncompress_data(signature.as_ptr());
@@ -223,29 +223,29 @@ impl DeclaringInterfaceForMethod {
 
 	pub fn declaring_interface_for_initializer<'a>(metadata: *mut IMetaDataImport2, method_token: mdMethodDef, out_index: &mut usize) -> Option<Arc<Mutex<dyn BaseClassDeclarationImpl>>> {
 		// InterfaceDeclaration
-		let method_argument_count = DeclaringInterfaceForMethod::get_method_argument_count(metadata, method_token);
+		let method_argument_count = Metadata::get_method_argument_count(metadata, method_token);
 
-		let class_token = DeclaringInterfaceForMethod::get_method_containing_class_token(metadata, method_token);
+		let class_token = Metadata::get_method_containing_class_token(metadata, method_token);
 
 		debug_assert!(
 			CorTokenType::from(enums::type_from_token(class_token)) == crate::enums::CorTokenType::mdtTypeDef
 		);
 
-		let composable_attributes = DeclaringInterfaceForMethod::get_custom_attributes_with_name(
+		let composable_attributes = Metadata::get_custom_attributes_with_name(
 			metadata, class_token, COMPOSABLE_ATTRIBUTE,
 		);
 
 		for attributeToken in composable_attributes.iter() {
-			let factory_token = DeclaringInterfaceForMethod::get_custom_attribute_type_argument(
+			let factory_token = Metadata::get_custom_attribute_type_argument(
 				metadata, attributeToken,
 			);
 
-			let factory_methods = DeclaringInterfaceForMethod::get_class_methods(
+			let factory_methods = Metadata::get_class_methods(
 				metadata, attributeToken,
 			);
 
 			for (i, factoryMethod) in factory_methods.iter().enumerate() {
-				let factory_method_arguments_count = DeclaringInterfaceForMethod::get_method_argument_count(metadata, factoryMethod);
+				let factory_method_arguments_count = Metadata::get_method_argument_count(metadata, factoryMethod);
 				if factory_method_arguments_count - 2 != method_argument_count {
 					continue;
 				}
@@ -267,27 +267,27 @@ impl DeclaringInterfaceForMethod {
 		}
 
 
-		let mut activatable_attributes = DeclaringInterfaceForMethod::get_custom_attributes_with_name(
+		let mut activatable_attributes = Metadata::get_custom_attributes_with_name(
 			metadata, class_token, ACTIVATABLE_ATTRIBUTE,
 		);
 		for attributeToken in activatable_attributes.iter() {
-			let attribute_constructor_token = DeclaringInterfaceForMethod::get_custom_attribute_constructor_token(
+			let attribute_constructor_token = Metadata::get_custom_attribute_constructor_token(
 				metadata, attributeToken,
 			);
 
-			if !DeclaringInterfaceForMethod::has_method_first_type_argument(metadata, attribute_constructor_token) {
+			if !Metadata::has_method_first_type_argument(metadata, attribute_constructor_token) {
 				continue;
 			}
 
-			let factory_token = DeclaringInterfaceForMethod::get_custom_attribute_type_argument(metadata, attributeToken);
+			let factory_token = Metadata::get_custom_attribute_type_argument(metadata, attributeToken);
 
 
-			let factory_methods = DeclaringInterfaceForMethod::get_class_methods(
+			let factory_methods = Metadata::get_class_methods(
 				metadata, factory_token,
 			);
 
 			for (i, factory_method) in factory_methods.iter().enumerate() {
-				let factory_method_arguments_count = DeclaringInterfaceForMethod::get_method_argument_count(
+				let factory_method_arguments_count = Metadata::get_method_argument_count(
 					metadata, factory_method,
 				);
 
@@ -312,26 +312,26 @@ impl DeclaringInterfaceForMethod {
 
 
 	pub fn declaring_interface_for_static_method<'a>(metadata: *mut IMetaDataImport2, method_token: mdMethodDef, out_index: &mut usize) -> Option<Arc<Mutex<dyn BaseClassDeclarationImpl>>> {
-		let method_signature = DeclaringInterfaceForMethod::get_method_signature(
+		let method_signature = Metadata::get_method_signature(
 			metadata, method_token,
 		);
-		let class_token = DeclaringInterfaceForMethod::get_method_containing_class_token(
+		let class_token = Metadata::get_method_containing_class_token(
 			metadata, method_token,
 		);
 		debug_assert!(
 			CorTokenType::from(enums::type_from_token(class_token)) == CorTokenType::mdtTypeDef
 		);
 
-		let static_attributes = DeclaringInterfaceForMethod::get_custom_attributes_with_name(
+		let static_attributes = Metadata::get_custom_attributes_with_name(
 			metadata, class_token, STATIC_ATTRIBUTE,
 		);
 
 		for attributeToken in static_attributes.iter() {
-			let statics_token = DeclaringInterfaceForMethod::get_custom_attribute_type_argument(
+			let statics_token = Metadata::get_custom_attribute_type_argument(
 				metadata, attributeToken,
 			);
 
-			let static_methods = DeclaringInterfaceForMethod::get_class_methods(
+			let static_methods = Metadata::get_class_methods(
 				metadata, statics_token,
 			);
 
@@ -384,7 +384,7 @@ impl DeclaringInterfaceForMethod {
 
 
 	pub fn declaring_interface_for_instance_method(metadata: *mut IMetaDataImport2, method_token: mdMethodDef, out_index: &mut usize) -> Option<Arc<Mutex<dyn BaseClassDeclarationImpl>>> {
-		let class_token = DeclaringInterfaceForMethod::get_method_containing_class_token(
+		let class_token = Metadata::get_method_containing_class_token(
 			metadata, method_token,
 		);
 		debug_assert!(
@@ -434,7 +434,7 @@ impl DeclaringInterfaceForMethod {
 							None, None, None,
 						).is_ok()
 					);
-					*out_index = DeclaringInterfaceForMethod::find_method_index(
+					*out_index = Metadata::find_method_index(
 						metadata, declaring_interface_token, method_decl_token,
 					);
 					result = Some(
@@ -484,7 +484,7 @@ impl DeclaringInterfaceForMethod {
 									external_metadata as _, declaring_interface_token, declaring_method_name.as_mut_ptr(), Some(signature.as_ptr()), Some(signature_size), Some(&mut declaring_method),
 								).is_ok()
 							);
-							*out_index = DeclaringInterfaceForMethod::find_method_index(
+							*out_index = Metadata::find_method_index(
 								external_metadata as _, declaring_interface_token, declaring_method,
 							);
 							result = Some(
@@ -537,7 +537,7 @@ impl DeclaringInterfaceForMethod {
 									debug_assert!(imeta_data_import2::find_method(
 										metadata, open_generic_class_token, declaring_method_name.as_ptr(), None, None, Some(&mut declaring_method),
 									).is_ok());
-									*out_index = DeclaringInterfaceForMethod::find_method_index(metadata, open_generic_class_token, 0);
+									*out_index = Metadata::find_method_index(metadata, open_generic_class_token, 0);
 
 									result = Some(
 										Arc::new(
@@ -568,7 +568,7 @@ impl DeclaringInterfaceForMethod {
 										).is_ok()
 									);
 
-									*out_index = DeclaringInterfaceForMethod::find_method_index(external_metadata as _, external_class_token, declaring_method);
+									*out_index = Metadata::find_method_index(external_metadata as _, external_class_token, declaring_method);
 									result = Some(
 										Arc::new(
 											Mutex::new(
@@ -604,15 +604,15 @@ impl DeclaringInterfaceForMethod {
 		let method_token = method.base().token;
 
 		if method.is_static() {
-			DeclaringInterfaceForMethod::declaring_interface_for_static_method(
+			Metadata::declaring_interface_for_static_method(
 				metadata, method_token, out_index,
 			)
 		} else if method.is_initializer() {
-			DeclaringInterfaceForMethod::declaring_interface_for_initializer(
+			Metadata::declaring_interface_for_initializer(
 				metadata, method_token, out_index,
 			)
 		} else {
-			DeclaringInterfaceForMethod::declaring_interface_for_instance_method(
+			Metadata::declaring_interface_for_instance_method(
 				metadata, method_token, out_index,
 			)
 		}

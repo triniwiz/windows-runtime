@@ -1,66 +1,74 @@
 use std::borrow::Cow;
 
-use core_bindings::{mdToken, IMetaDataImport2};
-
-use crate::bindings::imeta_data_import2;
 use crate::metadata::declarations::declaration::{Declaration, DeclarationKind};
-use crate::metadata::declarations::delegate_declaration::{DelegateDeclaration, DelegateDeclarationImpl};
+use crate::metadata::declarations::delegate_declaration::{
+    DelegateDeclaration, DelegateDeclarationImpl,
+};
 use crate::metadata::declarations::method_declaration::MethodDeclaration;
 use crate::metadata::declarations::type_declaration::TypeDeclaration;
-use std::sync::{Arc, Mutex};
+use crate::prelude::*;
+use core_bindings::mdToken;
+use std::sync::{Arc, RwLock};
 
 #[derive(Clone, Debug)]
 pub struct GenericDelegateDeclaration {
-	base: DelegateDeclaration,
+    base: DelegateDeclaration,
 }
 
 impl GenericDelegateDeclaration {
-	pub fn new(metadata: Arc<Mutex<IMetaDataImport2>>, token: mdToken) -> Self {
-		Self {
-			base: DelegateDeclaration::new_overload(
-				DeclarationKind::GenericDelegate, metadata, token,
-			)
-		}
-	}
+    pub fn new(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: mdToken) -> Self {
+        Self {
+            base: DelegateDeclaration::new_overload(
+                DeclarationKind::GenericDelegate,
+                Option::as_ref(&metadata).map(|v| Arc::clone(v)),
+                token,
+            ),
+        }
+    }
 
-	pub fn number_of_generic_parameters(&self) -> usize {
-		let mut count = 0;
+    pub fn number_of_generic_parameters(&self) -> usize {
+        let mut count = 0;
 
-		let mut enumerator = std::ptr::null_mut();
-		let enumerator_ptr = &mut enumerator;
+        if let Some(metadata) = self.base.base.metadata() {
+            let mut enumerator = std::ptr::null_mut();
+            let enumerator_ptr = &mut enumerator;
+            let result = metadata.enum_generic_params(
+                enumerator_ptr,
+                self.base.base.token(),
+                None,
+                None,
+                None,
+            );
+            debug_assert!(result.is_ok());
 
-		debug_assert!(
-			imeta_data_import2::enum_generic_params(self.base.base.metadata_mut(), enumerator_ptr, self.base.base.token, None, None, None).is_ok()
-		);
-		debug_assert!(
-			imeta_data_import2::count_enum(self.base.base.metadata_mut(), enumerator, &mut count).is_ok()
-		);
-		imeta_data_import2::close_enum(self.base.base.metadata_mut(), enumerator);
-
-		return count as usize;
-	}
+            let result = metadata.count_enum(enumerator, &mut count);
+            debug_assert!(result.is_ok());
+            metadata.close_enum(enumerator);
+        }
+        return count as usize;
+    }
 }
 
 impl Declaration for GenericDelegateDeclaration {
-	fn name<'b>(&self) -> Cow<'b, str> {
-		self.base.name()
-	}
+    fn name<'b>(&self) -> Cow<'b, str> {
+        self.base.name()
+    }
 
-	fn full_name<'b>(&self) -> Cow<'b, str> {
-		self.base.full_name()
-	}
+    fn full_name<'b>(&self) -> Cow<'b, str> {
+        self.base.full_name()
+    }
 
-	fn kind(&self) -> DeclarationKind {
-		self.base.kind()
-	}
+    fn kind(&self) -> DeclarationKind {
+        self.base.kind()
+    }
 }
 
 impl DelegateDeclarationImpl for GenericDelegateDeclaration {
-	fn base<'b>(&self) -> &'b TypeDeclaration {
-		&self.base.base
-	}
+    fn base<'b>(&self) -> &'b TypeDeclaration {
+        &self.base.base
+    }
 
-	fn invoke_method<'b>(&self) -> &'b MethodDeclaration {
-		&self.base.invoke_method
-	}
+    fn invoke_method<'b>(&self) -> &'b MethodDeclaration {
+        &self.base.invoke_method
+    }
 }

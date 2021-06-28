@@ -1,83 +1,92 @@
 use std::borrow::Cow;
 
-use core_bindings::{GUID, mdToken, IMetaDataImport2};
-
-use crate::bindings::imeta_data_import2;
 use crate::metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use crate::metadata::declarations::declaration::{Declaration, DeclarationKind};
 use crate::metadata::declarations::event_declaration::EventDeclaration;
+use crate::metadata::declarations::interface_declaration::InterfaceDeclaration;
 use crate::metadata::declarations::method_declaration::MethodDeclaration;
 use crate::metadata::declarations::property_declaration::PropertyDeclaration;
 use crate::metadata::declarations::type_declaration::TypeDeclaration;
-use crate::prelude::c_void;
-use crate::metadata::declarations::interface_declaration::InterfaceDeclaration;
+use crate::prelude::*;
+use core_bindings::{mdToken, GUID};
+use std::sync::{Arc, RwLock};
 
 #[derive(Clone, Debug)]
-pub struct GenericInterfaceDeclaration<'a> {
-	base: InterfaceDeclaration<'a>,
+pub struct GenericInterfaceDeclaration {
+    base: InterfaceDeclaration,
 }
 
-impl<'a> GenericInterfaceDeclaration<'a> {
-	pub fn new(metadata: *mut IMetaDataImport2, token: mdToken) -> Self {
-		Self {
-			base: InterfaceDeclaration::new_with_kind(DeclarationKind::GenericInterface, metadata, token)
-		}
-	}
+impl GenericInterfaceDeclaration {
+    pub fn new(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: mdToken) -> Self {
+        Self {
+            base: InterfaceDeclaration::new_with_kind(
+                DeclarationKind::GenericInterface,
+                metadata,
+                token,
+            ),
+        }
+    }
 
-	pub fn number_of_generic_parameters(&self) -> usize {
-		let mut count = 0;
-		let mut enumerator = std::ptr::null_mut();
-		let enumerator_ptr = &mut enumerator;
-		let base = self.base.base.base();
-		debug_assert!(
-			imeta_data_import2::enum_generic_params(
-				base.metadata, enumerator_ptr, base.token, None, None, None,
-			).is_ok()
-		);
-		debug_assert!(
-			imeta_data_import2::count_enum(base.metadata, enumerator, &mut count).is_ok()
-		);
+    pub fn number_of_generic_parameters(&self) -> usize {
+        let mut count = 0;
+        let mut enumerator = std::ptr::null_mut();
+        let enumerator_ptr = &mut enumerator;
+        let base = self.base();
+        match self.base().metadata() {
+            None => {}
+            Some(metadata) => {
+                let result_1 =
+                    metadata.enum_generic_params(enumerator_ptr, base.token(), None, None, None);
+                debug_assert!(result_1.is_ok());
+                let result_2 = metadata.count_enum(enumerator, &mut count);
+                debug_assert!(result_2.is_ok());
+                let result_1 =
+                    metadata.enum_generic_params(enumerator_ptr, base.token(), None, None, None);
+                debug_assert!(result_1.is_ok());
+                let result_2 = metadata.count_enum(enumerator, &mut count);
+                debug_assert!(result_2.is_ok());
+            }
+        }
+        return count as usize;
+    }
 
-		return count as usize;
-	}
-
-	pub fn id(&self) -> GUID {
-		self.base.id()
-	}
+    pub fn id(&self) -> GUID {
+        self.base.id()
+    }
 }
 
-impl<'a> BaseClassDeclarationImpl for GenericInterfaceDeclaration<'a> {
-	fn base(&self) -> &TypeDeclaration {
-		self.base.base()
-	}
+impl BaseClassDeclarationImpl for GenericInterfaceDeclaration {
+    fn base(&self) -> &TypeDeclaration {
+        self.base.base()
+    }
 
-	fn implemented_interfaces(&self) -> &Vec<InterfaceDeclaration> {
-		self.base.implemented_interfaces()
-	}
+    fn implemented_interfaces(&self) -> &Vec<InterfaceDeclaration> {
+        self.base.implemented_interfaces()
+    }
 
-	fn methods(&self) -> &Vec<MethodDeclaration> {
-		self.base.methods()
-	}
+    fn methods(&self) -> &[MethodDeclaration] {
+        self.base.methods()
+    }
 
-	fn properties(&self) -> &Vec<PropertyDeclaration> {
-		self.base.properties()
-	}
+    fn properties(&self) -> &[PropertyDeclaration] {
+        self.base.properties()
+    }
 
-	fn events(&self) -> &Vec<EventDeclaration> {
-		self.base.events()
-	}
+    fn events(&self) -> &[EventDeclaration] {
+        self.base.events()
+    }
 }
 
-impl<'a> Declaration for GenericInterfaceDeclaration<'a> {
-	fn name<'b>(&self) -> Cow<'b, str> {
-		self.base.name()
-	}
+impl Declaration for GenericInterfaceDeclaration {
+    fn name<'b>(&self) -> Cow<'b, str> {
+        self.base.name()
+    }
 
-	fn full_name<'b>(&self) -> Cow<'b, str> {
-		self.base.full_name()
-	}
+    fn full_name<'b>(&self) -> Cow<'b, str> {
+        self.base.full_name()
+    }
 
-	fn kind(&self) -> DeclarationKind {
-		self.base.kind()
-	}
+    fn kind(&self) -> DeclarationKind {
+        self.base.kind()
+    }
 }
