@@ -20,6 +20,7 @@
     <ClCompile Include="Runtime\WeakRef.cpp" />
     <ClCompile Include="Runtime\MetadataBuilder.cpp" />
     <ClCompile Include="Metadata\MetadataReader.cpp" />
+    <ClCompile Include="Metadata\NamespaceDeclaration.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="NativeScript.h" />
@@ -38,5 +39,8 @@
     <ClInclude Include="Runtime\WeakRef.h" />
     <ClInclude Include="Runtime\MetadataBuilder.h" />
     <ClInclude Include="Metadata\MetadataReader.h" />
+    <ClInclude Include="Metadata\Declaration.h" />
+    <ClInclude Include="Metadata\NamespaceDeclaration.h" />
+    <ClInclude Include="Metadata\IteratorRange.h" />
   </ItemGroup>
 </Project>

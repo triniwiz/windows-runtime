@@ -231,7 +231,10 @@
     </Lib>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="Metadata\Declaration.h" />
+    <ClInclude Include="Metadata\IteratorRange.h" />
     <ClInclude Include="Metadata\MetadataReader.h" />
+    <ClInclude Include="Metadata\NamespaceDeclaration.h" />
     <ClInclude Include="NativeScript.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="Runtime\Caches.h" />
@@ -250,6 +253,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Metadata\MetadataReader.cpp" />
+    <ClCompile Include="Metadata\NamespaceDeclaration.cpp" />
     <ClCompile Include="NativeScript.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>

@@ -21,20 +21,20 @@ namespace org {
 
 
         
-        void MetadataReader::findByName(const std::string& fullName) {
+        std::shared_ptr<Declaration> MetadataReader::findByName(const std::string& fullName) {
             std::wstring name(fullName.begin(), fullName.end());
             findByName(name.c_str());
         }
 
-		void MetadataReader::findByName(const wchar_t* fullName) {
+        std::shared_ptr<Declaration> MetadataReader::findByName(const wchar_t* fullName) {
 			HStringReference fullNameRef{ fullName };
 			findByName(fullNameRef.Get());
 		}
 
 
-        void MetadataReader::findByName(HSTRING fullName) {
+        std::shared_ptr<Declaration> MetadataReader::findByName(HSTRING fullName) {
             if (WindowsGetStringLen(fullName) == 0) {
-                return; //make_shared<NamespaceDeclaration>(L"");
+                return nullptr; //make_shared<NamespaceDeclaration>(L"");
             }
 
             ComPtr<IMetaDataImport2> metadata;
@@ -46,10 +46,10 @@ namespace org {
                 if (getMetadataFileResult == RO_E_METADATA_NAME_IS_NAMESPACE) {
                     std::wstring ns(WindowsGetStringRawBuffer(fullName, nullptr));
                     Log("NamespaceDeclaration: " + std::string(ns.begin(), ns.end()));
-                   // return make_shared<NamespaceDeclaration>(WindowsGetStringRawBuffer(fullName, nullptr));
+                   return std::make_shared<NamespaceDeclaration>(WindowsGetStringRawBuffer(fullName, nullptr));
                 }
 
-                return; //nullptr;
+                return nullptr;
             }
 
             DWORD flags{ 0 };
