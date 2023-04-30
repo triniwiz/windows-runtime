@@ -1,0 +1,16 @@
+[package]
+name = "metadata"
+version = "0.1.0"
+edition = "2021"
+
+#[lib]
+#crate-type = ["dylib"]
+
+
+[dependencies]
+windows = {version = "0.48.0", features = ["Foundation","Win32_Foundation", "Win32_System_WinRT_Metadata", "Win32_System_Com", "Win32_System_WinRT"] }
+parking_lot = "0.12.1"
+cxx = "1.0"
+
+[build-dependencies]
+cxx-build = "1.0"
