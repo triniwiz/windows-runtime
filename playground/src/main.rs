@@ -80,6 +80,7 @@ fn run_js_app() {
    //console.log(Windows.UI.Xaml);
    console.log('Default', Windows.UI.Popups.Placement.Default, Windows.UI.Popups.Placement.Default === 0);
    console.log('Right', Windows.UI.Popups.Placement.Right, Windows.UI.Popups.Placement.Right === 4);
+   console.log('Bar', Windows.UI.Text.TabAlignment.Bar, Windows.UI.Text.TabAlignment.Bar == 4);
    console.log("\n");
    "#;
     let rt = nativescript::runtime_init(0 as _);

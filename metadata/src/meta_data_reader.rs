@@ -8,10 +8,14 @@ use windows::{s, w};
 use windows::Win32::Foundation::RO_E_METADATA_NAME_IS_NAMESPACE;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoCreateInstanceEx};
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataDispenserEx, IMetaDataImport2, mdtTypeDef, mdtTypeRef, RoGetMetaDataFile};
+use crate::declarations::class_declaration::ClassDeclaration;
 use crate::declarations::declaration::Declaration;
 use crate::declarations::declaration::DeclarationKind::Struct;
+use crate::declarations::delegate_declaration::DelegateDeclaration;
+use crate::declarations::delegate_declaration::generic_delegate_declaration::GenericDelegateDeclaration;
 use crate::declarations::enum_declaration::EnumDeclaration;
 use crate::declarations::namespace_declaration::NamespaceDeclaration;
+use crate::declarations::struct_declaration::StructDeclaration;
 use crate::prelude::*;
 
 
@@ -121,46 +125,35 @@ impl MetadataReader {
                         RwLock::new(EnumDeclaration::new(Some(metadata), CorTokenType(token as i32)))
                     )
                 );
-            }
-
-            /*
-            if let Some(name) = parent_name_string.to_str() {
-                if name == SYSTEM_ENUM {
-                    return Some(
+            } else if parent_name_string == SYSTEM_VALUETYPE {
+                return Some(
+                    Arc::new(
+                        RwLock::new(StructDeclaration::new(Some(metadata), CorTokenType(token as i32)))
+                    )
+                );
+            } else if parent_name_string == SYSTEM_MULTICASTDELEGATE {
+                return if full_name.contains("`") {
+                    Some(
                         Arc::new(
-                            RwLock::new(EnumDeclaration::new(Some(metadata), token))
+                            RwLock::new(GenericDelegateDeclaration::new(Some(metadata), CorTokenType(token as i32)))
                         )
-                    );
-                } else if name == SYSTEM_VALUETYPE {
-                    return Some(
+                    )
+                } else {
+                    Some(
                         Arc::new(
-                            RwLock::new(StructDeclaration::new(Some(metadata), token))
+                            RwLock::new(DelegateDeclaration::new(Some(metadata), CorTokenType(token as i32)))
                         )
-                    );
-                } else if name == SYSTEM_MULTICASTDELEGATE {
-                    return if full_name.contains("`") {
-                        Some(
-                            Arc::new(
-                                RwLock::new(GenericDelegateDeclaration::new(Some(metadata), token))
-                            )
-                        )
-                    } else {
-                        Some(
-                            Arc::new(
-                                RwLock::new(DelegateDeclaration::new(Some(metadata), token))
-                            )
-                        )
-                    };
-                }
+                    )
+                };
             }
 
 
             return Some(
                 Arc::new(
-                    RwLock::new(ClassDeclaration::new(Some(metadata), token))
+                    RwLock::new(ClassDeclaration::new(Some(metadata), CorTokenType(token as i32)))
                 )
             );
-            */
+
         }
 
 

@@ -35,7 +35,16 @@ impl EnumMemberDeclaration {
             Some(metadata) => {
                 let result = unsafe {
                     metadata.GetFieldProps(
-                        self.base.token().0 as u32, 0 as _, None, 0 as _, 0 as _, 0 as _, 0 as _, &mut value_type, &mut value, 0 as _,
+                        self.base.token().0 as u32,
+                        0 as _,
+                        None,
+                        0 as _,
+                        0 as _,
+                        0 as _,
+                        0 as _,
+                        &mut value_type,
+                        &mut value,
+                        0 as _,
                     )
                 };
 

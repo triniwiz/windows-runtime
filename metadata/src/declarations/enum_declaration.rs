@@ -97,7 +97,8 @@ impl EnumDeclaration {
                         &mut signature,
                         &mut signature_size,
                         0 as _,
-                        0 as _, 0 as _,
+                        0 as _,
+                        0 as _,
                     )
                 };
                 assert!(
@@ -105,6 +106,7 @@ impl EnumDeclaration {
                 );
 
                 let buf = unsafe { std::slice::from_raw_parts(signature, signature_size as usize) };
+
                 let header = crate::cor_sig_uncompress_data(buf);
 
                 assert_eq!(header, IMAGE_CEE_CS_CALLCONV_FIELD.0 as u32);

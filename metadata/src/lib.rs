@@ -1,11 +1,14 @@
 use std::borrow::Cow;
 use windows::Win32::System::WinRT::Metadata::{IMetaDataImport2, MDTypeRefToDef};
 
-mod com_helpers;
+pub mod com_helpers;
 pub mod declarations;
-mod prelude;
+pub mod prelude;
 pub mod meta_data_reader;
 pub mod value;
+pub mod signature;
+pub mod generic_instance_id_builder;
+pub mod declaration_factory;
 
 
 #[cxx::bridge]
@@ -25,20 +28,20 @@ mod ffi {
 }
 
 pub fn cor_sig_uncompress_calling_conv(sig: &[u8]) -> u32 {
-    ffi::BindingsCCorSigUncompressCallingConv(sig)
+    unsafe { ffi::BindingsCCorSigUncompressCallingConv(sig) }
 }
 
 
 pub fn cor_sig_uncompress_data(sig: &[u8]) -> u32 {
-    ffi::BindingsCCorSigUncompressData(sig)
+    unsafe { ffi::BindingsCCorSigUncompressData(sig) }
 }
 
 pub fn cor_sig_uncompress_element_type(sig: &[u8]) -> i32 {
-    ffi::BindingsCCorSigUncompressElementType(sig)
+    unsafe { ffi::BindingsCCorSigUncompressElementType(sig) }
 }
 
 pub fn cor_sig_uncompress_token(sig: &[u8]) -> i32 {
-    ffi::BindingsCCorSigUncompressToken(sig)
+    unsafe { ffi::BindingsCCorSigUncompressToken(sig) }
 }
 
 

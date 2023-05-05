@@ -1,0 +1,102 @@
+use std::any::Any;
+use crate::prelude::*;
+use std::borrow::Cow;
+use std::sync::{Arc};
+use parking_lot::RwLock;
+use windows::Win32::System::WinRT::Metadata::{CorTokenType, ELEMENT_TYPE_BYREF, IMetaDataImport2, mdtParamDef};
+use crate::cor_sig_uncompress_token;
+use crate::declarations::declaration::{Declaration, DeclarationKind};
+use crate::declarations::type_declaration::TypeDeclaration;
+
+#[derive(Clone, Debug)]
+pub struct ParameterDeclaration {
+    base: TypeDeclaration,
+    parameter_type: Vec<u8>,
+    full_name: String,
+}
+
+impl ParameterDeclaration {
+    pub fn new(
+        metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        token: CorTokenType,
+        sig_type: Vec<u8>,
+    ) -> Self {
+        //assert!(metadata.is_none());
+        assert_eq!(type_from_token(token), mdtParamDef.0);
+        assert_ne!(token.0, 0);
+
+        let full_name = match metadata.as_ref() {
+            None => String::new(),
+            Some(metadata) => {
+                let mut length = 0;
+                let metadata = metadata.read();
+
+                let result = unsafe {
+                    metadata.GetParamProps(
+                        token.0 as u32,
+                        0 as _,
+                        0 as _,
+                        None,
+                        &mut length,
+                        0 as _,
+                        0 as _,
+                        0 as _,
+                        0 as _,
+                    )
+                };
+
+                assert!(result.is_ok());
+
+                let mut full_name_data = vec![0u16; length as usize];
+
+                let result = unsafe {
+                    metadata.GetParamProps(
+                        token.0 as u32,
+                        0 as _,
+                        0 as _,
+                        Some(full_name_data.as_mut_slice()),
+                        0 as _,
+                        0 as _,
+                        0 as _,
+                        0 as _,
+                        0 as _,
+                    )
+                };
+                assert!(result.is_ok());
+                String::from_utf16_lossy(full_name_data.as_mut_slice())
+            }
+        };
+
+        Self {
+            base: TypeDeclaration::new(DeclarationKind::Parameter, metadata, token),
+            parameter_type: sig_type,
+            full_name,
+        }
+    }
+    pub fn is_out(&self) -> bool {
+        cor_sig_uncompress_token(self.parameter_type.as_slice())
+            == ELEMENT_TYPE_BYREF.0
+    }
+}
+
+impl Declaration for ParameterDeclaration {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        self.full_name()
+    }
+
+    fn full_name(&self) -> &str {
+        self.full_name.as_str()
+    }
+
+    fn kind(&self) -> DeclarationKind {
+        self.base.kind()
+    }
+}
