@@ -9,7 +9,7 @@ use crate::declarations::event_declaration::EventDeclaration;
 use crate::declarations::method_declaration::MethodDeclaration;
 use crate::declarations::property_declaration::PropertyDeclaration;
 use crate::declarations::type_declaration::TypeDeclaration;
-
+use crate::prelude::*;
 pub mod generic_interface_declaration;
 pub mod generic_interface_instance_declaration;
 
@@ -35,7 +35,13 @@ impl InterfaceDeclaration {
 
     pub fn id(&self) -> GUID {
         let base = self.base.base();
-        get_guid_attribute_value(base.metadata(), base.token())
+        match base.metadata.as_ref() {
+            None => GUID::zeroed(),
+            Some(metadata) => {
+                let metadata = metadata.read();
+                get_guid_attribute_value(Some(&*metadata), base.token())
+            }
+        }
     }
 }
 
@@ -62,11 +68,19 @@ impl Declaration for InterfaceDeclaration {
 }
 
 impl BaseClassDeclarationImpl for InterfaceDeclaration {
+    fn as_declaration(&self) -> &dyn Declaration {
+        self
+    }
+
+    fn as_declaration_mut(&mut self) -> &mut dyn Declaration {
+        self
+    }
+
     fn base(&self) -> &TypeDeclaration {
         self.base.base()
     }
 
-    fn implemented_interfaces(&self) -> &[InterfaceDeclaration] {
+    fn implemented_interfaces(&self) -> &[&InterfaceDeclaration] {
         self.base.implemented_interfaces()
     }
 

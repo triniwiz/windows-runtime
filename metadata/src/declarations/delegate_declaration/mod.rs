@@ -3,6 +3,7 @@ pub mod generic_delegate_instance_declaration;
 
 
 use std::any::Any;
+use std::fmt::{Debug, Formatter};
 use std::sync::{Arc};
 use parking_lot::RwLock;
 use windows::core::{GUID, HSTRING, PCWSTR};
@@ -11,6 +12,7 @@ use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::method_declaration::MethodDeclaration;
 use crate::declarations::type_declaration::TypeDeclaration;
+use crate::prelude::get_guid_attribute_value;
 
 const INVOKE_METHOD_NAME: &str = "Invoke";
 
@@ -37,11 +39,30 @@ pub fn get_invoke_method_token(
 }
 
 pub trait DelegateDeclarationImpl {
+    fn as_declaration(&self) -> &dyn Declaration;
+    fn as_declaration_mut(&mut self) -> &mut dyn Declaration;
     fn base(&self) -> &TypeDeclaration;
     fn id(&self) -> GUID {
-        get_guid_attribute_value(self.base().metadata_mut(), self.base().token())
+        match self.base().metadata.as_ref() {
+            None => GUID::zeroed(),
+            Some(metadata) => {
+                let metadata = metadata.read();
+                get_guid_attribute_value(Some(&*metadata), self.base().token())
+            }
+        }
     }
     fn invoke_method(&self) -> &MethodDeclaration;
+}
+
+
+impl Debug for dyn DelegateDeclarationImpl {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DelegateDeclarationImpl")
+            .field("base", self.base())
+            //.field("id", self.id())
+            .field("invoke_method", self.invoke_method())
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +118,14 @@ impl Declaration for DelegateDeclaration {
 }
 
 impl DelegateDeclarationImpl for DelegateDeclaration {
+    fn as_declaration(&self) -> &dyn Declaration {
+        self
+    }
+
+    fn as_declaration_mut(&mut self) -> &mut dyn Declaration {
+        self
+    }
+
     fn base(&self) -> &TypeDeclaration {
         &self.base
     }

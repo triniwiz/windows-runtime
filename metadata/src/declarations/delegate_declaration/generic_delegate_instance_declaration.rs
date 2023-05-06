@@ -88,6 +88,14 @@ impl Declaration for GenericDelegateInstanceDeclaration {
 }
 
 impl DelegateDeclarationImpl for GenericDelegateInstanceDeclaration {
+    fn as_declaration(&self) -> &dyn Declaration {
+        self
+    }
+
+    fn as_declaration_mut(&mut self) -> &mut dyn Declaration {
+        self
+    }
+
     fn base(&self) -> &TypeDeclaration {
         &self.base.base
     }

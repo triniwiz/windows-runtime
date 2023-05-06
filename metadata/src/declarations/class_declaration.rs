@@ -2,7 +2,7 @@ use std::any::Any;
 use std::sync::{Arc};
 use parking_lot::RwLock;
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::System::WinRT::Metadata::{COR_CTOR_METHOD_NAME, CorTokenType, IMetaDataImport2};
+use windows::Win32::System::WinRT::Metadata::{COR_CTOR_METHOD_NAME, COR_CTOR_METHOD_NAME_W, CorTokenType, IMetaDataImport2};
 use crate::declaration_factory::DeclarationFactory;
 use crate::declarations::base_class_declaration::{BaseClassDeclaration, BaseClassDeclarationImpl};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
@@ -16,7 +16,7 @@ const DEFAULT_ATTRIBUTE: &str = "Windows.Foundation.Metadata.DefaultAttribute";
 #[derive(Clone)]
 pub struct ClassDeclaration {
     initializers: Vec<MethodDeclaration>,
-    default_interface: Option<Arc<dyn BaseClassDeclarationImpl>>,
+    default_interface: Option<Box<dyn BaseClassDeclarationImpl>>,
     base: BaseClassDeclaration,
     base_full_name: String,
 }
@@ -26,7 +26,7 @@ impl ClassDeclaration {
         metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
         token: CorTokenType,
     ) -> Vec<MethodDeclaration> {
-        let mut result = Vec::new();
+        let mut ret = Vec::new();
 
         if let Some(metadata) = Option::as_ref(&metadata) {
             let meta = Arc::clone(metadata);
@@ -36,14 +36,11 @@ impl ClassDeclaration {
             let mut count = 0;
             let mut tokens = [0_u32; 1024];
 
-            let name = HSTRING::from(COR_CTOR_METHOD_NAME);
-            let name = name.as_wide();
-
             let result = unsafe {
                 metadata.EnumMembersWithName(
                     enumerator_ptr,
                     token.0 as u32,
-                    name.as_ptr(),
+                    COR_CTOR_METHOD_NAME_W,
                     tokens.as_mut_ptr(),
                     tokens.len() as u32,
                     &mut count,
@@ -80,19 +77,19 @@ impl ClassDeclaration {
                     continue;
                 }
 
-                result.push(MethodDeclaration::new(
+                ret.push(MethodDeclaration::new(
                     Some(Arc::clone(&meta)),
                     CorTokenType(method_token as i32),
                 ));
             }
         }
-        result
+        ret
     }
 
     pub fn make_default_interface(
         metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
         token: CorTokenType,
-    ) -> Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>> {
+    ) -> Option<Box<dyn BaseClassDeclarationImpl>> {
         match Option::as_ref(&metadata) {
             None => {}
             Some(metadata) => {
@@ -143,11 +140,7 @@ impl ClassDeclaration {
                         return DeclarationFactory::make_interface_declaration(
                             Some(Arc::clone(&meta)),
                             CorTokenType(interface_token as i32),
-                        ).map(|f|{
-                            Arc::new(RwLock::new(
-                                f.into()
-                            ))
-                        });
+                        )
                     }
                 }
             }
@@ -198,8 +191,12 @@ impl ClassDeclaration {
         self.base_full_name.as_str()
     }
 
-    pub fn default_interface(&self) -> &InterfaceDeclaration {
-        &self.default_interface
+    pub fn default_interface(&self) -> Option<&InterfaceDeclaration> {
+        self.default_interface.as_ref().map(|f|{
+            let f = f.as_declaration();
+           let declaration =  f;
+            declaration.as_any().downcast_ref::<InterfaceDeclaration>()
+        }).flatten()
     }
 
     pub fn is_instantiable(&self) -> bool {
@@ -212,7 +209,7 @@ impl ClassDeclaration {
             let result = unsafe {
                 metadata.GetTypeDefProps(
                     self.base.base().token().0 as u32,
-                    0 as _,
+                    None,
                     0 as _,
                     &mut flags,
                     0 as _,

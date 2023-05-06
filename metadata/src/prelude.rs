@@ -1,10 +1,11 @@
 use std::ffi::{c_void, OsStr, OsString};
+use std::fmt::{Debug, Formatter};
 use std::mem::MaybeUninit;
 use windows::core::{GUID, HSTRING, PCSTR, PCWSTR};
-use windows::Win32::System::WinRT::Metadata::{tdAbstract, tdAnsiClass, tdAutoClass, tdAutoLayout, tdBeforeFieldInit, tdClass, tdClassSemanticsMask, tdCustomFormatClass, tdExplicitLayout, tdForwarder, tdHasSecurity, tdImport, tdInterface, tdLayoutMask, tdNestedAssembly, tdNestedFamANDAssem, tdNestedFamORAssem, tdNestedFamily, tdNestedPrivate, tdNestedPublic, tdNotPublic, tdPublic, tdRTSpecialName, tdSealed, tdSequentialLayout, tdSerializable, tdSpecialName, tdStringFormatMask, tdUnicodeClass, tdVisibilityMask, tdWindowsRuntime, CorTokenType, IMetaDataImport2, mdtTypeDef, mdtTypeRef, RoParseTypeName, mdMemberAccessMask, mdPrivateScope, mdPrivate, mdFamANDAssem, mdAssem, mdFamily, mdFamORAssem, mdPublic, mdStatic, mdFinal, mdVirtual, mdHideBySig, mdVtableLayoutMask, mdReuseSlot, mdNewSlot, mdCheckAccessOnOverride, mdAbstract, mdSpecialName, mdPinvokeImpl, mdUnmanagedExport, mdRTSpecialName, COR_CTOR_METHOD_NAME, COR_CTOR_METHOD_NAME_W, COR_CCTOR_METHOD_NAME, COR_CCTOR_METHOD_NAME_W, mdHasSecurity, mdRequireSecObject, prSpecialName, prHasDefault, prRTSpecialName, RoGetMetaDataFile, IMetaDataDispenserEx};
+use windows::Win32::System::WinRT::Metadata::{tdAbstract, tdAnsiClass, tdAutoClass, tdAutoLayout, tdBeforeFieldInit, tdClass, tdClassSemanticsMask, tdCustomFormatClass, tdExplicitLayout, tdForwarder, tdHasSecurity, tdImport, tdInterface, tdLayoutMask, tdNestedAssembly, tdNestedFamANDAssem, tdNestedFamORAssem, tdNestedFamily, tdNestedPrivate, tdNestedPublic, tdNotPublic, tdPublic, tdRTSpecialName, tdSealed, tdSequentialLayout, tdSerializable, tdSpecialName, tdStringFormatMask, tdUnicodeClass, tdVisibilityMask, tdWindowsRuntime, CorTokenType, IMetaDataImport2, mdtTypeDef, mdtTypeRef, RoParseTypeName, mdMemberAccessMask, mdPrivateScope, mdPrivate, mdFamANDAssem, mdAssem, mdFamily, mdFamORAssem, mdPublic, mdStatic, mdFinal, mdVirtual, mdHideBySig, mdVtableLayoutMask, mdReuseSlot, mdNewSlot, mdCheckAccessOnOverride, mdAbstract, mdSpecialName, mdPinvokeImpl, mdUnmanagedExport, mdRTSpecialName, COR_CTOR_METHOD_NAME, COR_CTOR_METHOD_NAME_W, COR_CCTOR_METHOD_NAME, COR_CCTOR_METHOD_NAME_W, mdHasSecurity, mdRequireSecObject, prSpecialName, prHasDefault, prRTSpecialName, RoGetMetaDataFile, IMetaDataDispenserEx, evSpecialName, evRTSpecialName};
 use crate::cor_sig_uncompress_data;
 use std::os::windows::prelude::*;
-use std::ptr::addr_of;
+use std::ptr::{addr_of, addr_of_mut};
 
 
 pub fn str_from_u8_nul_utf8(utf8_src: &[u8]) -> Result<&str, std::str::Utf8Error> {
@@ -27,6 +28,47 @@ pub const WINDOWS: &str = "Windows";
 pub const SYSTEM_ENUM: &str = "System.Enum";
 pub const SYSTEM_VALUETYPE: &str = "System.ValueType";
 pub const SYSTEM_MULTICASTDELEGATE: &str = "System.MulticastDelegate";
+
+pub fn get_guid_attribute_value(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> GUID {
+    debug_assert!(metadata.is_none());
+    debug_assert!(token.0 != 0);
+
+    let mut guid = GUID::default();
+
+    match metadata {
+        None => {}
+        Some(metadata) => {
+            let mut size = 0;
+            let mut data = MaybeUninit::uninit();
+            let name = HSTRING::from(GUID_ATTRIBUTE);
+            let name = PCWSTR(name.as_ptr());
+
+            let result = unsafe {
+                metadata.GetCustomAttributeByName(
+                    token.0 as u32,
+                    name,
+                    &mut data.as_mut_ptr() as *const *const c_void,
+                    &mut size,
+                )
+            };
+
+            let mut data = unsafe { data.assume_init() as *mut u8 };
+            // Skip prolog
+            let os_data = unsafe { data.offset(2) };
+
+            println!("guid {:?}", &guid);
+
+            let addr = addr_of_mut!(&mut guid) as *mut *mut u8;
+
+            unsafe { std::ptr::write(addr, os_data); }
+
+            println!("guid {:?}", &guid);
+
+            //bytes_to_guid(os_data, &mut guid);
+        }
+    }
+    guid
+}
 
 pub fn get_string_value_from_blob(
     signature: &[u8],
@@ -56,10 +98,10 @@ pub fn get_unary_custom_attribute_string_value(
     let name = OsStr::new(attribute_name);
     let name: Vec<u16> = name.encode_wide().collect();
     let name = PCWSTR(name.as_ptr());
-    let data_ptr = &mut data as *const *const c_void;
+    let data_ptr = &mut data;
     let mut size = 0_u32;
     let result =
-        unsafe { metadata.GetCustomAttributeByName(token.0 as u32, name, data_ptr, &mut size) };
+        unsafe { metadata.GetCustomAttributeByName(token.0 as u32, name, data_ptr as *const *const c_void, &mut size) };
     debug_assert!(result.is_ok());
     if result.is_err() {
         return "".into();
@@ -108,7 +150,7 @@ pub fn resolve_type_ref(
                     dispenser.assume_init_ref(),
                     None,
                     Some(external_metadata as *mut Option<IMetaDataImport2>),
-                    Some(external_token),
+                    Some(&mut (external_token.0 as u32)),
                 ).is_ok()
             }
         }
@@ -142,6 +184,11 @@ pub fn get_type_name(metadata: &IMetaDataImport2, token: CorTokenType) -> String
         }
     }
 }
+
+
+pub const fn is_ev_special_name(x: i32) -> bool { ((x) & evSpecialName.0) == evSpecialName.0 }
+
+pub const fn is_ev_rtspecial_name(x: i32) -> bool { ((x) & evRTSpecialName.0) == evRTSpecialName.0 }
 
 pub const fn is_td_not_public(x: i32) -> bool {
     ((x) & tdVisibilityMask.0) == tdNotPublic.0

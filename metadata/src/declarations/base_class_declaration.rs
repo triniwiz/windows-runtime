@@ -1,7 +1,8 @@
 use std::any::Any;
+use std::fmt::{Debug, Formatter, Pointer};
 use std::sync::Arc;
 use parking_lot::{MappedRwLockReadGuard, RwLock};
-use windows::core::HSTRING;
+use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 use crate::declaration_factory::DeclarationFactory;
 use crate::declarations::declaration::{Declaration, DeclarationKind};
@@ -14,10 +15,20 @@ use crate::declarations::type_declaration::TypeDeclaration;
 #[derive(Clone)]
 pub struct BaseClassDeclaration {
     base: TypeDeclaration,
-    implemented_interfaces: Vec<Arc<RwLock<dyn BaseClassDeclarationImpl>>>,
+    implemented_interfaces: Vec<Box<dyn BaseClassDeclarationImpl>>,
     methods: Vec<MethodDeclaration>,
     properties: Vec<PropertyDeclaration>,
     events: Vec<EventDeclaration>,
+}
+
+impl Debug for BaseClassDeclaration {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.methods.iter())
+            .entries(self.properties.iter())
+            .entries(self.events.iter())
+            .finish()
+    }
 }
 
 impl BaseClassDeclaration {
@@ -66,10 +77,13 @@ impl BaseClassDeclaration {
                         )
                     };
                     debug_assert!(result_inner.is_ok());
-                    result.push(DeclarationFactory::make_interface_declaration(
+                    if let Some(dec) = DeclarationFactory::make_interface_declaration(
                         Some(Arc::clone(&meta)),
                         CorTokenType(interface_token as i32),
-                    ));
+                    )
+                    {
+                        result.push(dec);
+                    }
                 }
             }
         }
@@ -103,7 +117,7 @@ impl BaseClassDeclaration {
                 debug_assert!(result_inner.is_ok());
 
                 debug_assert!(count < (tokens.len().saturating_sub(1)) as u32);
-                metadata.close_enum(enumerator);
+                unsafe { metadata.CloseEnum(enumerator)};
 
                 for token in tokens.iter() {
                     let method = MethodDeclaration::new(Some(Arc::clone(&meta)), CorTokenType(*token as i32));
@@ -230,9 +244,14 @@ impl BaseClassDeclaration {
 }
 
 pub trait BaseClassDeclarationImpl {
+
+    fn as_declaration(&self) -> &dyn Declaration;
+
+    fn as_declaration_mut(&mut self) -> &mut dyn Declaration;
+
     fn base(&self) -> &TypeDeclaration;
 
-    fn implemented_interfaces(&self) -> &[InterfaceDeclaration];
+    fn implemented_interfaces(&self) -> &[&InterfaceDeclaration];
 
     fn methods(&self) -> &[MethodDeclaration];
 
@@ -256,7 +275,7 @@ pub trait BaseClassDeclarationImpl {
         // let mut properties = self.properties().into_iter().filter(|prop| prop.full_name() == name).collect();
         // result.append(&mut properties);
 
-        let mut properties = self.properties().clone();
+        let mut properties = self.properties().to_vec();
 
         for property in properties.into_iter() {
             if property.full_name() == name {
@@ -267,7 +286,7 @@ pub trait BaseClassDeclarationImpl {
         // let mut events = self.events().into_iter().filter(|event| event.full_name() == name).collect();
         // result.append(&mut events);
 
-        let mut events = self.events().clone();
+        let mut events = self.events().to_vec();
 
         for event in events {
             if event.full_name() == name {
@@ -281,25 +300,27 @@ pub trait BaseClassDeclarationImpl {
     fn find_methods_with_name(&self, name: &str) -> Vec<MethodDeclaration> {
         debug_assert!(!name.is_empty());
         let mut method_tokens = [0_u32; 1024];
-        let mut meta = Arc::clone(&self.base().metadata);
+        let mut meta = self.base().metadata.clone();
         if let Some(metadata) = self.base().metadata() {
             let mut enumerator = std::ptr::null_mut();
             let enumerator_ptr = &mut enumerator;
 
             let mut methods_count = 0;
             let name = HSTRING::from(name);
-            let name = name.as_wide();
+            let name = PCWSTR(name.as_ptr());
             let base = self.base();
-            let result = unsafe {metadata.EnumMethodsWithName(
-                enumerator_ptr,
-                base.token().0 as u32,
-                name.as_ptr(),
-                method_tokens.as_mut_ptr(),
-                method_tokens.len() as u32,
-                &mut methods_count,
-            )};
+            let result = unsafe {
+                metadata.EnumMethodsWithName(
+                    enumerator_ptr,
+                    base.token().0 as u32,
+                    name,
+                    method_tokens.as_mut_ptr(),
+                    method_tokens.len() as u32,
+                    &mut methods_count,
+                )
+            };
             debug_assert!(result.is_ok());
-            unsafe { metadata.CloseEnum(enumerator)};
+            unsafe { metadata.CloseEnum(enumerator) };
         }
 
         method_tokens
@@ -312,12 +333,25 @@ pub trait BaseClassDeclarationImpl {
 }
 
 impl BaseClassDeclarationImpl for BaseClassDeclaration {
+    fn as_declaration(&self) -> &dyn Declaration {
+        self
+    }
+
+    fn as_declaration_mut(&mut self) -> &mut dyn Declaration {
+        self
+    }
+
     fn base(&self) -> &TypeDeclaration {
         &self.base
     }
 
-    fn implemented_interfaces(&self) -> &[Arc<RwLock<dyn BaseClassDeclarationImpl>>] {
-        &self.implemented_interfaces
+    fn implemented_interfaces(&self) -> &[&InterfaceDeclaration]{
+        let ret = self.implemented_interfaces
+            .iter()
+            .filter_map(|f| f.as_declaration().as_any().downcast_ref::<InterfaceDeclaration>())
+            .collect::<Vec<_>>();
+
+        ret.as_slice()
     }
 
     fn methods(&self) -> &[MethodDeclaration] {
@@ -352,5 +386,11 @@ impl Declaration for BaseClassDeclaration {
 
     fn kind(&self) -> DeclarationKind {
         self.base().kind()
+    }
+}
+
+impl Clone for Box<dyn BaseClassDeclarationImpl> {
+    fn clone(&self) -> Self {
+        self.clone()
     }
 }

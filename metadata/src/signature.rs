@@ -1,6 +1,6 @@
 #![allow(non_upper_case_globals)]
 
-use windows::Win32::System::WinRT::Metadata::{ELEMENT_TYPE_VOID, ELEMENT_TYPE_BOOLEAN, ELEMENT_TYPE_CHAR, ELEMENT_TYPE_I1, ELEMENT_TYPE_U1, ELEMENT_TYPE_I2, ELEMENT_TYPE_U2, ELEMENT_TYPE_I4, ELEMENT_TYPE_U4, ELEMENT_TYPE_I8, ELEMENT_TYPE_U8, ELEMENT_TYPE_R4, ELEMENT_TYPE_R8, ELEMENT_TYPE_STRING, IMetaDataImport2, ELEMENT_TYPE_VALUETYPE, ELEMENT_TYPE_CLASS, ELEMENT_TYPE_OBJECT, ELEMENT_TYPE_SZARRAY, ELEMENT_TYPE_VAR, ELEMENT_TYPE_GENERICINST, ELEMENT_TYPE_BYREF, CorTokenType};
+use windows::Win32::System::WinRT::Metadata::{ELEMENT_TYPE_VOID, ELEMENT_TYPE_BOOLEAN, ELEMENT_TYPE_CHAR, ELEMENT_TYPE_I1, ELEMENT_TYPE_U1, ELEMENT_TYPE_I2, ELEMENT_TYPE_U2, ELEMENT_TYPE_I4, ELEMENT_TYPE_U4, ELEMENT_TYPE_I8, ELEMENT_TYPE_U8, ELEMENT_TYPE_R4, ELEMENT_TYPE_R8, ELEMENT_TYPE_STRING, IMetaDataImport2, ELEMENT_TYPE_VALUETYPE, ELEMENT_TYPE_CLASS, ELEMENT_TYPE_OBJECT, ELEMENT_TYPE_SZARRAY, ELEMENT_TYPE_VAR, ELEMENT_TYPE_GENERICINST, ELEMENT_TYPE_BYREF, CorTokenType, CorElementType};
 use crate::{cor_sig_uncompress_data, cor_sig_uncompress_element_type, cor_sig_uncompress_token};
 use crate::prelude::get_type_name;
 
@@ -12,7 +12,7 @@ impl Signature {
     pub fn consume_type(signature: &[u8]) -> &[u8] {
         let start = signature;
         let element_type = cor_sig_uncompress_element_type(signature);
-        match element_type {
+        match CorElementType(element_type) {
             ELEMENT_TYPE_VOID
             | ELEMENT_TYPE_BOOLEAN
             | ELEMENT_TYPE_CHAR
@@ -41,14 +41,14 @@ impl Signature {
                 start
             }
             ELEMENT_TYPE_VAR => {
-                helpers::cor_sig_uncompress_data(signature);
+                cor_sig_uncompress_data(signature);
                 start
             }
             ELEMENT_TYPE_GENERICINST => {
                 cor_sig_uncompress_element_type(signature);
                 cor_sig_uncompress_token(signature);
 
-                let generic_arguments_count = helpers::cor_sig_uncompress_data(signature);
+                let generic_arguments_count = cor_sig_uncompress_data(signature);
                 for _ in 0..generic_arguments_count {
                     Signature::consume_type(signature);
                 }
@@ -66,7 +66,7 @@ impl Signature {
 
     pub fn to_string(metadata: &IMetaDataImport2, signature: &[u8]) -> String {
         let element_type = cor_sig_uncompress_element_type(signature);
-        return match element_type {
+        return match CorElementType(element_type) {
             ELEMENT_TYPE_VOID => "Void".to_string(),
             ELEMENT_TYPE_BOOLEAN => "Boolean".to_string(),
             ELEMENT_TYPE_CHAR => "Char16".to_string(),
@@ -114,7 +114,7 @@ impl Signature {
 
                 result += "<";
 
-                let generic_arguments_count = helpers::cor_sig_uncompress_data(signature);
+                let generic_arguments_count = cor_sig_uncompress_data(signature);
                 for i in 0..generic_arguments_count {
                     let sig_type = Signature::consume_type(signature);
                     let data = Signature::to_string(metadata, sig_type);

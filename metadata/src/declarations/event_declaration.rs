@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::fmt::{Debug, Formatter, Pointer};
 use std::sync::Arc;
 use parking_lot::RwLock;
 use windows::core::{HSTRING, PCWSTR};
@@ -8,16 +9,27 @@ use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::delegate_declaration::{DelegateDeclaration, DelegateDeclarationImpl};
 use crate::declarations::method_declaration::MethodDeclaration;
 use crate::declarations::type_declaration::TypeDeclaration;
-use crate::prelude::MAX_IDENTIFIER_LENGTH;
+use crate::prelude::*;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EventDeclaration {
     base: TypeDeclaration,
     // Arc ??
-    type_: Option<Arc<RwLock<dyn DelegateDeclarationImpl>>>,
+    type_: Option<Box<dyn DelegateDeclarationImpl>>,
     add_method: MethodDeclaration,
     remove_method: MethodDeclaration,
     full_name: String,
+}
+
+impl Debug for EventDeclaration {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventDeclaration")
+            .field("type_", &self.type_.as_ref())
+            .field("add_method", &self.add_method)
+            .field("remove_method", &self.remove_method)
+            .field("full_name", &self.full_name)
+            .finish()
+    }
 }
 
 impl EventDeclaration {
@@ -33,7 +45,7 @@ impl EventDeclaration {
                 metadata.GetEventProps(
                     token.0 as u32,
                     0 as _,
-                    0 as _,
+                    None,
                     0 as _,
                     0 as _,
                     0 as _,
@@ -67,7 +79,7 @@ impl EventDeclaration {
                     metadata.GetEventProps(
                         token.0 as u32,
                         0 as _,
-                        0 as _,
+                        None,
                         0 as _,
                         0 as _,
                         0 as _,
@@ -93,7 +105,7 @@ impl EventDeclaration {
     pub fn make_type(
         metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
         token: CorTokenType,
-    ) -> Option<Arc<RwLock<dyn DelegateDeclarationImpl>>> {
+    ) -> Option<Box<dyn DelegateDeclarationImpl>> {
         let mut delegate_token = 0 as u32;
         match Option::as_ref(&metadata) {
             None => {}
@@ -122,13 +134,7 @@ impl EventDeclaration {
         return DeclarationFactory::make_delegate_declaration(
             Option::as_ref(&metadata).map(|v| Arc::clone(v)),
             CorTokenType(delegate_token as i32),
-        ).map(|f|{
-            Arc::new(
-                RwLock::new(
-                    f.into()
-                )
-            )
-        });
+        );
     }
 
     pub fn new(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: CorTokenType) -> Self {
@@ -146,7 +152,7 @@ impl EventDeclaration {
                 metadata.GetEventProps(
                     token.0 as u32,
                     0 as _,
-                    name_data,
+                    name,
                     name_data.len() as u32,
                     &mut name_data_length,
                     0 as _,
@@ -162,7 +168,7 @@ impl EventDeclaration {
             debug_assert!(result.is_ok());
 
             if name_data_length > 0 {
-                full_name = HSTRING::from_wide(&name_data[..name_data_length]).unwrap().to_string();
+                full_name = HSTRING::from_wide(&name_data[..name_data_length as usize]).unwrap().to_string();
             }
         }
 
@@ -197,8 +203,9 @@ impl EventDeclaration {
         self.add_method.is_sealed()
     }
 
-    pub fn type_(&self) -> &DelegateDeclaration {
-        &self.type_
+    pub fn type_(&self) -> Option<&DelegateDeclaration> {
+        self.type_.map(|f|f.as_declaration().as_any().downcast_ref::<DelegateDeclaration>())
+            .flatten()
     }
 
     pub fn add_method(&self) -> &MethodDeclaration {
@@ -222,24 +229,24 @@ impl Declaration for EventDeclaration {
     fn is_exported(&self) -> bool {
         let mut flags = 0;
         if let Some(metadata) = self.base.metadata() {
-            let result = metadata.get_event_props(
-                self.base.token(),
+            let result = unsafe { metadata.GetEventProps(
+                self.base.token().0 as u32,
+                0 as _,
                 None,
-                None,
-                None,
-                None,
-                Some(&mut flags),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            );
+                0 as _,
+                0 as _,
+                &mut flags,
+                0 as _,
+                0 as _,
+                0 as _,
+                0 as _,
+                0 as _,
+                0 as _,
+                0 as _,
+            )};
             debug_assert!(result.is_ok());
         }
-        if helpers::is_ev_special_name(flags) {
+        if is_ev_special_name(flags as i32) {
             return false;
         }
 

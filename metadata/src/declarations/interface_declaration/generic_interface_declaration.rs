@@ -52,11 +52,19 @@ impl GenericInterfaceDeclaration {
 }
 
 impl BaseClassDeclarationImpl for GenericInterfaceDeclaration {
+    fn as_declaration(&self) -> &dyn Declaration {
+        self
+    }
+
+    fn as_declaration_mut(&mut self) -> &mut dyn Declaration {
+        self
+    }
+
     fn base(&self) -> &TypeDeclaration {
         self.base.base()
     }
 
-    fn implemented_interfaces(&self) -> &[InterfaceDeclaration] {
+    fn implemented_interfaces(&self) -> &[&InterfaceDeclaration] {
         self.base.implemented_interfaces()
     }
 

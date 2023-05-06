@@ -15,24 +15,24 @@ pub struct DeclarationFactory {}
 impl DeclarationFactory {
     pub fn make_delegate_declaration(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: CorTokenType) -> Option<Box<dyn DelegateDeclarationImpl>> {
         let meta = metadata.clone();
-        if let Some(metadata) = metadata {
+        if let Some(metadata) = metadata.as_ref() {
             let metadata = metadata.read();
-            match type_from_token(token)
+            return match CorTokenType(type_from_token(token))
             {
                 mdtTypeDef => Some(Box::new(DelegateDeclaration::new(meta, token))),
                 mdtTypeRef => {
                     let mut external_metadata = MaybeUninit::uninit();
-                    let mut external_delegate_token = 0_u32;
-                    let is_resolved = unsafe { resolve_type_ref(Some(&*metadata), token, &mut *external_metadata.as_mut_ptr(), &mut external_delegate_token)};
+                    let mut external_delegate_token = CorTokenType::default();
+                    let is_resolved = unsafe { resolve_type_ref(Some(&*metadata), token, &mut *external_metadata.as_mut_ptr(), &mut external_delegate_token) };
                     debug_assert!(is_resolved);
                     let external_metadata = unsafe { external_metadata.assume_init() };
                     // todo
                     Some(
-                            Box::new(
-                                DelegateDeclaration::new(
-                                    Some(Arc::new(RwLock::new(external_metadata))), CorTokenType(external_delegate_token as i32)
-                                )
+                        Box::new(
+                            DelegateDeclaration::new(
+                                Some(Arc::new(RwLock::new(external_metadata))), external_delegate_token,
                             )
+                        )
                     )
                 }
                 mdtTypeSpec => {
@@ -40,9 +40,11 @@ impl DeclarationFactory {
                     let mut signature_ptr = signature.as_mut_ptr();
                     let mut signature_size = 0;
 
-                    let result = unsafe { metadata.GetTypeSpecFromToken(
-                        token.0 as u32, &mut signature_ptr, &mut signature_size
-                    )};
+                    let result = unsafe {
+                        metadata.GetTypeSpecFromToken(
+                            token.0 as u32, &mut signature_ptr, &mut signature_size,
+                        )
+                    };
                     debug_assert!(
                         result.is_ok()
                     );
@@ -60,17 +62,19 @@ impl DeclarationFactory {
                     );
 
                     let open_generic_delegate_token = cor_sig_uncompress_token(signature);
-                    let ret = match type_from_token(CorTokenType(open_generic_delegate_token)) {
+                    let ret = match CorTokenType(type_from_token(CorTokenType(open_generic_delegate_token))) {
                         mdtTypeDef => {
                             Box::new(GenericDelegateInstanceDeclaration::new(meta.clone(), CorTokenType(open_generic_delegate_token), meta, token))
                         }
                         mdtTypeRef => {
                             let mut external_metadata: MaybeUninit<IMetaDataImport2> = MaybeUninit::uninit();
-                            let mut external_delegate_token = 0_u32;
+                            let mut external_delegate_token = CorTokenType::default();
 
-                            let is_resolved = unsafe { resolve_type_ref(
-                                Some(&*metadata), CorTokenType(open_generic_delegate_token as i32), &mut* external_metadata.as_mut_ptr(), &mut external_delegate_token,
-                            )};
+                            let is_resolved = unsafe {
+                                resolve_type_ref(
+                                    Some(&*metadata), CorTokenType(open_generic_delegate_token as i32), &mut *external_metadata.as_mut_ptr(), &mut external_delegate_token,
+                                )
+                            };
 
                             debug_assert!(is_resolved);
 
@@ -86,7 +90,7 @@ impl DeclarationFactory {
                                 )
                             };
 
-                            Box::new(GenericDelegateInstanceDeclaration::new(external_metadata, CorTokenType(external_delegate_token as i32), meta, token))
+                            Box::new(GenericDelegateInstanceDeclaration::new(external_metadata, external_delegate_token, meta, token))
                         }
                         _ => {
                             std::unreachable!()
@@ -103,39 +107,39 @@ impl DeclarationFactory {
         None
     }
     pub fn make_interface_declaration(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: CorTokenType) -> Option<Box<dyn BaseClassDeclarationImpl>> {
-        if let Some(metadata) = metadata.as_ref(){
+        if let Some(metadata) = metadata.as_ref() {
             let meta = Arc::clone(metadata);
             let metadata = metadata.read();
-            match type_from_token(token) {
+           let ret = match CorTokenType(type_from_token(token)) {
                 mdtTypeDef => {
-                    Some(
-                            Box::new(InterfaceDeclaration::new(Some(meta), token))
-                    )
+                        Box::new(InterfaceDeclaration::new(Some(meta), token))
                 }
                 mdtTypeRef => {
-                    let mut external_metadata:MaybeUninit<IMetaDataImport2> = MaybeUninit::uninit();
-                    let mut external_interface_token = 0_u32;
+                    let mut external_metadata: MaybeUninit<IMetaDataImport2> = MaybeUninit::uninit();
+                    let mut external_interface_token = CorTokenType::default();
 
-                    let is_resolved = unsafe { resolve_type_ref(Some(&*metadata), token, &mut*external_metadata.as_mut_ptr(), &mut external_interface_token)};
+                    let is_resolved = unsafe { resolve_type_ref(Some(&*metadata), token, &mut *external_metadata.as_mut_ptr(), &mut external_interface_token) };
 
                     debug_assert!(is_resolved);
 
                     let external_metadata = if is_resolved {
                         unsafe { Some(Arc::new(RwLock::new(external_metadata.assume_init()))) }
-                    }else {None};
+                    } else { None };
 
-                        Box::new(InterfaceDeclaration::new(
-                            external_metadata, CorTokenType(external_interface_token as i32),
-                        ))
+                    Box::new(InterfaceDeclaration::new(
+                        external_metadata, external_interface_token,
+                    ))
                 }
                 mdtTypeSpec => {
                     let mut signature = [0_u8; MAX_IDENTIFIER_LENGTH];
                     let mut signature_size = 0;
-                    let result = unsafe { metadata.GetTypeSpecFromToken(
-                        token.0 as u32,
-                        &mut signature.as_mut_ptr(),
-                        &mut signature_size
-                    ) };
+                    let result = unsafe {
+                        metadata.GetTypeSpecFromToken(
+                            token.0 as u32,
+                            &mut signature.as_mut_ptr(),
+                            &mut signature_size,
+                        )
+                    };
                     debug_assert!(
                         result.is_ok()
                     );
@@ -158,16 +162,16 @@ impl DeclarationFactory {
                     let open_generic_delegate_token = CorTokenType(cor_sig_uncompress_token(signature));
 
                     match type_from_token(token) {
-                        mdtTypeSpec => match type_from_token(open_generic_delegate_token) {
+                        mdtTypeSpec => match CorTokenType(type_from_token(open_generic_delegate_token)) {
                             mdtTypeDef => {
-                                    Box::new(GenericInterfaceInstanceDeclaration::new(
-                                        Some(meta.clone()), open_generic_delegate_token, Some(meta), token,
-                                    ))
+                                Box::new(GenericInterfaceInstanceDeclaration::new(
+                                    Some(meta.clone()), open_generic_delegate_token, Some(meta), token,
+                                ))
                             }
                             mdtTypeRef => {
                                 let mut external_metadata = MaybeUninit::uninit();
                                 let external_metadata_ptr = &mut external_metadata;
-                                let mut external_delegate_token = 0_u32;
+                                let mut external_delegate_token = CorTokenType::default();
 
                                 let is_resolved = resolve_type_ref(
                                     Some(&*metadata), open_generic_delegate_token, external_metadata_ptr, &mut external_delegate_token,
@@ -179,13 +183,13 @@ impl DeclarationFactory {
 
                                 let external_metadata = if is_resolved {
                                     unsafe { Some(Arc::new(RwLock::new(external_metadata.assume_init()))) }
-                                }else {None};
+                                } else { None };
 
-                                    Box::new(
-                                        GenericInterfaceInstanceDeclaration::new(
-                                            external_metadata, CorTokenType(external_delegate_token as i32), Some(meta), token,
-                                        )
+                                Box::new(
+                                    GenericInterfaceInstanceDeclaration::new(
+                                        external_metadata, external_delegate_token, Some(meta), token,
                                     )
+                                )
                             }
                             _ => {
                                 std::unreachable!()
@@ -199,7 +203,9 @@ impl DeclarationFactory {
                 _ => {
                     std::unreachable!()
                 }
-            }
+            };
+
+           return Some(ret);
         }
         None
     }

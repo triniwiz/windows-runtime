@@ -3,7 +3,7 @@ use std::sync::{Arc};
 use parking_lot::RwLock;
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMAGE_CEE_CS_CALLCONV_GENERIC, IMetaDataImport2, mdtMethodDef};
-use crate::cor_sig_uncompress_calling_conv;
+use crate::{cor_sig_uncompress_calling_conv, cor_sig_uncompress_data};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::parameter_declaration::ParameterDeclaration;
 use crate::declarations::type_declaration::TypeDeclaration;
@@ -76,7 +76,7 @@ impl MethodDeclaration {
                     }
 
                     let mut arguments_count =
-                        { helpers::cor_sig_uncompress_data(signature.as_ptr()) };
+                        { cor_sig_uncompress_data(signature) };
 
                     return_type = Signature::consume_type(signature).to_vec();
 
@@ -265,7 +265,7 @@ impl Declaration for MethodDeclaration {
                 metadata.GetMethodProps(
                     self.base.token().0 as u32,
                     0 as _,
-                    0 as _,
+                    None,
                     0 as _,
                     &mut method_flags,
                     0 as _,

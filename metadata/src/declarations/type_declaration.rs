@@ -103,7 +103,6 @@ impl TypeDeclaration {
             }
         };
 
-
         let mut name = fullname.clone();
         let back_tick_index = name.find('`');
         if let Some(index) = back_tick_index {

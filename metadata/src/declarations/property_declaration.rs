@@ -92,7 +92,7 @@ impl PropertyDeclaration {
                     metadata.GetPropertyProps(
                         token.0 as u32,
                         0 as _,
-                        0 as _,
+                        None,
                         0 as _,
                         0 as _,
                         0 as _,
@@ -128,7 +128,7 @@ impl PropertyDeclaration {
                 metadata.GetPropertyProps(
                     token.0 as u32,
                     0 as _,
-                    0 as _,
+                    None,
                     0 as _,
                     0 as _,
                     0 as _,
@@ -189,7 +189,7 @@ impl PropertyDeclaration {
             debug_assert!(result.is_ok());
 
             if name_length > 0 {
-                full_name = HSTRING::from_wide(&full_name_data[..name_length]).unwrap().to_string()
+                full_name = HSTRING::from_wide(&full_name_data[..name_length as usize]).unwrap().to_string()
             }
         }
 
@@ -243,7 +243,7 @@ impl PropertyDeclaration {
             debug_assert!(signature_count > 0);
         }
 
-        (signature[0] & IMAGE_CEE_CS_CALLCONV_GENERICINST) == 0
+        (signature[0] as i32 & IMAGE_CEE_CS_CALLCONV_GENERICINST.0) == 0
     }
 
     pub fn is_sealed(&self) -> bool {

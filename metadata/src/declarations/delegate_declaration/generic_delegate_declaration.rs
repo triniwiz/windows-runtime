@@ -30,18 +30,18 @@ impl GenericDelegateDeclaration {
         if let Some(metadata) = self.base.base.metadata() {
             let mut enumerator = std::ptr::null_mut();
             let enumerator_ptr = &mut enumerator;
-            let result = metadata.enum_generic_params(
+            let result = unsafe { metadata.EnumGenericParams(
                 enumerator_ptr,
-                self.base.base.token(),
-                None,
-                None,
-                None,
-            );
+                self.base.base.token().0 as u32,
+                0 as _,
+                0,
+                0 as _,
+            )};
             assert!(result.is_ok());
 
-            let result = metadata.count_enum(enumerator, &mut count);
+            let result = unsafe { metadata.CountEnum(enumerator, &mut count)};
             assert!(result.is_ok());
-            metadata.close_enum(enumerator);
+            unsafe { metadata.CloseEnum(enumerator)};
         }
         return count as usize;
     }
@@ -70,6 +70,14 @@ impl Declaration for GenericDelegateDeclaration {
 }
 
 impl DelegateDeclarationImpl for GenericDelegateDeclaration {
+    fn as_declaration(&self) -> &dyn Declaration {
+        self
+    }
+
+    fn as_declaration_mut(&mut self) -> &mut dyn Declaration {
+        self
+    }
+
     fn base(&self) -> &TypeDeclaration {
         &self.base.base
     }

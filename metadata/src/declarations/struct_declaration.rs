@@ -69,7 +69,7 @@ impl StructDeclaration {
             let lock = metadata.read();
             let mut enumerator = std::ptr::null_mut();
             let mut count = 0;
-            let mut tokens = [0; 1024];
+            let mut tokens = [0_u32; 1024];
             let mut enumerator_ptr = &mut enumerator;
             let result_inner = unsafe { lock.EnumFields(
                 enumerator_ptr,
@@ -87,10 +87,10 @@ impl StructDeclaration {
 
             result.reserve(count as usize);
 
-            for i in 0..count {
+            for i in 0..count as usize {
                 result.push(StructFieldDeclaration::new(
                     Some(Arc::clone(&meta)),
-                    tokens[i],
+                    CorTokenType(tokens[i] as i32),
                 ))
             }
         }
