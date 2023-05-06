@@ -40,7 +40,7 @@ impl StructDeclaration {
         Self {
             base: TypeDeclaration::new(
                 DeclarationKind::Struct,
-                metadata,
+                metadata.clone(),
                 token,
             ),
             fields: StructDeclaration::make_field_declarations(

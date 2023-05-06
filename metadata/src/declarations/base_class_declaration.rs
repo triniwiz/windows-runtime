@@ -217,12 +217,16 @@ impl BaseClassDeclaration {
         metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
         token: CorTokenType,
     ) -> Self {
+        println!("??");
+        let base = TypeDeclaration::new(
+            kind,
+            metadata.clone(),
+            token,
+        );
+
+        println!("base");
         Self {
-            base: TypeDeclaration::new(
-                kind,
-                Option::as_ref(&metadata).map(|v| Arc::clone(v)),
-                token,
-            ),
+            base,
             implemented_interfaces: BaseClassDeclaration::make_implemented_interfaces_declarations(
                 Option::as_ref(&metadata).map(|v| Arc::clone(v)),
                 token,
@@ -251,7 +255,7 @@ pub trait BaseClassDeclarationImpl {
 
     fn base(&self) -> &TypeDeclaration;
 
-    fn implemented_interfaces(&self) -> &[&InterfaceDeclaration];
+    fn implemented_interfaces(&self) -> Vec<&InterfaceDeclaration>;
 
     fn methods(&self) -> &[MethodDeclaration];
 
@@ -345,13 +349,12 @@ impl BaseClassDeclarationImpl for BaseClassDeclaration {
         &self.base
     }
 
-    fn implemented_interfaces(&self) -> &[&InterfaceDeclaration]{
-        let ret = self.implemented_interfaces
+    fn implemented_interfaces(&self) -> Vec<&InterfaceDeclaration>{
+        self.implemented_interfaces
             .iter()
             .filter_map(|f| f.as_declaration().as_any().downcast_ref::<InterfaceDeclaration>())
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
 
-        ret.as_slice()
     }
 
     fn methods(&self) -> &[MethodDeclaration] {

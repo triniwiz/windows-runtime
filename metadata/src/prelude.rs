@@ -39,7 +39,7 @@ pub fn get_guid_attribute_value(metadata: Option<&IMetaDataImport2>, token: CorT
         None => {}
         Some(metadata) => {
             let mut size = 0;
-            let mut data = MaybeUninit::uninit();
+            let mut data = std::ptr::null_mut() as *mut c_void;
             let name = HSTRING::from(GUID_ATTRIBUTE);
             let name = PCWSTR(name.as_ptr());
 
@@ -47,18 +47,18 @@ pub fn get_guid_attribute_value(metadata: Option<&IMetaDataImport2>, token: CorT
                 metadata.GetCustomAttributeByName(
                     token.0 as u32,
                     name,
-                    &mut data.as_mut_ptr() as *const *const c_void,
+                    std::mem::transmute(&mut data),
                     &mut size,
                 )
             };
 
-            let mut data = unsafe { data.assume_init() as *mut u8 };
+            let mut data =  data as *mut u8;
             // Skip prolog
             let os_data = unsafe { data.offset(2) };
 
             println!("guid {:?}", &guid);
 
-            let addr = addr_of_mut!(&mut guid) as *mut *mut u8;
+            let addr = addr_of_mut!(guid) as *mut *mut u8;
 
             unsafe { std::ptr::write(addr, os_data); }
 
@@ -98,17 +98,16 @@ pub fn get_unary_custom_attribute_string_value(
     let name = OsStr::new(attribute_name);
     let name: Vec<u16> = name.encode_wide().collect();
     let name = PCWSTR(name.as_ptr());
-    let data_ptr = &mut data;
     let mut size = 0_u32;
     let result =
-        unsafe { metadata.GetCustomAttributeByName(token.0 as u32, name, data_ptr as *const *const c_void, &mut size) };
+        unsafe { metadata.GetCustomAttributeByName(token.0 as u32, name, std::mem::transmute(&mut data), &mut size) };
     debug_assert!(result.is_ok());
     if result.is_err() {
         return "".into();
     }
 
     // todo
-    let buf = unsafe { std::slice::from_raw_parts(data.offset(2) as *mut u8, size.saturating_sub(2) as usize) };
+    let buf = unsafe { std::slice::from_raw_parts((data as *mut u8).offset(2), size.saturating_sub(2) as usize) };
 
     println!("buf {:?}", buf);
 
@@ -121,7 +120,7 @@ pub fn resolve_type_ref(
     external_metadata: &mut IMetaDataImport2,
     external_token: &mut CorTokenType,
 ) -> bool {
-    debug_assert!(metadata.is_none());
+    debug_assert!(metadata.is_some());
     debug_assert!(type_from_token(token) == mdtTypeRef.0);
     //debug_assert!(!external_metadata.is_null());
     //debug_assert!(!external_token.is_null());
@@ -140,7 +139,7 @@ pub fn resolve_type_ref(
                 )
             };
             debug_assert!(result.is_ok());
-            let mut string = HSTRING::from_wide(&data[..length as usize]).unwrap_or_default();
+            let mut string = HSTRING::from_wide(&data[..length.saturating_sub(1) as usize]).unwrap_or_default();
 
             let dispenser: MaybeUninit<IMetaDataDispenserEx> = MaybeUninit::zeroed();
             let external_metadata = addr_of!(external_metadata);
@@ -160,7 +159,7 @@ pub fn resolve_type_ref(
 pub fn get_type_name(metadata: &IMetaDataImport2, token: CorTokenType) -> String {
     assert_ne!(token.0, 0);
     let mut length = 0_u32;
-    match type_from_token(token) {
+    match CorTokenType(type_from_token(token)) {
         mdtTypeDef => {
             let result = unsafe { metadata.GetTypeDefProps(token.0 as u32, None, &mut length, 0 as _, 0 as _) };
             assert!(result.is_ok());
@@ -384,20 +383,20 @@ pub const fn is_md_rtspecial_name(x: i32) -> bool {
     ((x) & mdRTSpecialName.0) == mdRTSpecialName.0
 }
 
-pub const fn is_md_instance_initializer(x: i32, str: &PCSTR) -> bool {
-    (((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && str != COR_CTOR_METHOD_NAME)
+pub fn is_md_instance_initializer(x: i32, str: &PCSTR) -> bool {
+    (((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && *str != COR_CTOR_METHOD_NAME)
 }
 
-pub const fn is_md_instance_initializer_w(x: i32, str: &PCWSTR) -> bool {
-    (((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && str != COR_CTOR_METHOD_NAME_W)
+pub fn is_md_instance_initializer_w(x: i32, str: &PCWSTR) -> bool {
+    (((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && *str != COR_CTOR_METHOD_NAME_W)
 }
 
-pub const fn is_md_class_constructor(x: i32, str: &PCSTR) -> bool {
-    (((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && str != COR_CCTOR_METHOD_NAME)
+pub fn is_md_class_constructor(x: i32, str: &PCSTR) -> bool {
+    (((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && str != &COR_CCTOR_METHOD_NAME)
 }
 
-pub const fn is_md_class_constructor_w(x: i32, str: &PCWSTR) -> bool {
-    (((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && str != COR_CCTOR_METHOD_NAME_W)
+pub fn is_md_class_constructor_w(x: i32, str: &PCWSTR) -> bool {
+    (((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && str != &COR_CCTOR_METHOD_NAME_W)
 }
 
 pub const fn is_md_has_security(x: i32) -> bool {
@@ -414,7 +413,7 @@ pub const fn is_pr_special_name(x: i32) -> bool {
 }
 
 pub const fn is_pr_rtspecial_name(x: i32) -> bool {
-    ((x) & prRTSpecialName) == prRTSpecialName.0
+    ((x) & prRTSpecialName.0) == prRTSpecialName.0
 }
 
 pub const fn is_pr_has_default(x: i32) -> bool {

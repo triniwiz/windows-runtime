@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::os::windows::prelude::OsStringExt;
 use std::sync::Arc;
 use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2, mdtTypeDef};
+use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2, mdtTypeDef, mdtTypeRef};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::prelude::*;
 
@@ -85,6 +85,7 @@ impl TypeDeclaration {
             Some(metadata) => {
                 let mut length  = 0;
                 let metadata = metadata.read();
+                println!("type_from_token {} .. {:?} ... {:?}",type_from_token(token), mdtTypeDef,mdtTypeRef);
                 match CorTokenType(type_from_token(token)){
                     mdtTypeDef => {
                         let _ = unsafe { metadata.GetTypeDefProps(token.0 as u32, Some(&mut full_name_data), &mut length, 0 as _, 0 as _) };
@@ -121,6 +122,7 @@ impl TypeDeclaration {
                 .chain(name.chars().skip(index + 1))
                 .collect()
         }
+
 
         Self {
             kind,

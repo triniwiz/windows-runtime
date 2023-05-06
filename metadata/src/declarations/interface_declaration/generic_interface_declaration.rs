@@ -64,7 +64,7 @@ impl BaseClassDeclarationImpl for GenericInterfaceDeclaration {
         self.base.base()
     }
 
-    fn implemented_interfaces(&self) -> &[&InterfaceDeclaration] {
+    fn implemented_interfaces(&self) -> Vec<&InterfaceDeclaration> {
         self.base.implemented_interfaces()
     }
 

@@ -204,7 +204,7 @@ impl EventDeclaration {
     }
 
     pub fn type_(&self) -> Option<&DelegateDeclaration> {
-        self.type_.map(|f|f.as_declaration().as_any().downcast_ref::<DelegateDeclaration>())
+        self.type_.as_ref().map(|f|f.as_declaration().as_any().downcast_ref::<DelegateDeclaration>())
             .flatten()
     }
 

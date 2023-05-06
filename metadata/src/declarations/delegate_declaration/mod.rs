@@ -38,7 +38,7 @@ pub fn get_invoke_method_token(
     CorTokenType(invoke_method_token as i32)
 }
 
-pub trait DelegateDeclarationImpl {
+pub trait DelegateDeclarationImpl: dyn_clone::DynClone {
     fn as_declaration(&self) -> &dyn Declaration;
     fn as_declaration_mut(&mut self) -> &mut dyn Declaration;
     fn base(&self) -> &TypeDeclaration;
@@ -53,6 +53,8 @@ pub trait DelegateDeclarationImpl {
     }
     fn invoke_method(&self) -> &MethodDeclaration;
 }
+
+dyn_clone::clone_trait_object!(DelegateDeclarationImpl);
 
 
 impl Debug for dyn DelegateDeclarationImpl {
@@ -88,7 +90,7 @@ impl<'a> DelegateDeclaration {
                 token,
             ),
             invoke_method: MethodDeclaration::new(
-                metadata,
+                metadata.clone(),
                 get_invoke_method_token(Option::as_ref(&metadata).map(|v| Arc::clone(v)), token),
             ),
         }
