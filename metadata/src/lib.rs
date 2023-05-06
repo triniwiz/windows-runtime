@@ -17,34 +17,56 @@ mod ffi {
     unsafe extern "C++" {
         include!("metadata/src/bindings.h");
 
-        pub fn BindingsCCorSigUncompressCallingConv(sig: &[u8])-> u32;
+        pub fn BindingsCCorSigUncompressCallingConv(sig: &[u8])-> i32;
 
-        pub fn BindingsCCorSigUncompressData(sig: &[u8])-> u32;
+        pub fn BindingsCCorSigUncompressData(sig: &[u8])-> i32;
 
         pub fn BindingsCCorSigUncompressElementType(sig: &[u8])-> i32;
 
         pub fn BindingsCCorSigUncompressToken(sig: &[u8])-> i32;
+
+        pub unsafe fn BindingsCCorSigUncompressCallingConvRaw(sig: *mut u8)-> i32;
+
+        pub unsafe fn BindingsCCorSigUncompressDataRaw(sig: *mut u8)-> i32;
+
+        pub unsafe fn BindingsCCorSigUncompressElementTypeRaw(sig: *mut u8)-> i32;
+
+        pub unsafe fn BindingsCCorSigUncompressTokenRaw(sig: *mut u8)-> i32;
     }
 }
 
-pub fn cor_sig_uncompress_calling_conv(sig: &[u8]) -> u32 {
+pub fn cor_sig_uncompress_calling_conv(sig: &[u8]) -> i32 {
     unsafe { ffi::BindingsCCorSigUncompressCallingConv(sig) }
 }
 
+pub fn cor_sig_uncompress_calling_conv_raw(sig: *mut u8) -> i32 {
+    unsafe { ffi::BindingsCCorSigUncompressCallingConvRaw(sig) }
+}
 
-pub fn cor_sig_uncompress_data(sig: &[u8]) -> u32 {
+
+pub fn cor_sig_uncompress_data(sig: &[u8]) -> i32 {
     unsafe { ffi::BindingsCCorSigUncompressData(sig) }
+}
+
+pub fn cor_sig_uncompress_data_raw(sig: *mut u8) -> i32 {
+    unsafe { ffi::BindingsCCorSigUncompressDataRaw(sig) }
 }
 
 pub fn cor_sig_uncompress_element_type(sig: &[u8]) -> i32 {
     unsafe { ffi::BindingsCCorSigUncompressElementType(sig) }
 }
 
+pub fn cor_sig_uncompress_element_type_raw(sig: *mut u8) -> i32 {
+    unsafe { ffi::BindingsCCorSigUncompressElementTypeRaw(sig) }
+}
+
 pub fn cor_sig_uncompress_token(sig: &[u8]) -> i32 {
     unsafe { ffi::BindingsCCorSigUncompressToken(sig) }
 }
 
-
+pub fn cor_sig_uncompress_token_raw(sig: *mut u8) -> i32 {
+    unsafe { ffi::BindingsCCorSigUncompressTokenRaw(sig) }
+}
 
 /*
 pub fn get_string_value_from_blob<'a>(

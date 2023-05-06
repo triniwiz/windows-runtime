@@ -109,7 +109,7 @@ impl EnumDeclaration {
 
                 let header = crate::cor_sig_uncompress_data(buf);
 
-                assert_eq!(header, IMAGE_CEE_CS_CALLCONV_FIELD.0 as u32);
+                assert_eq!(header, IMAGE_CEE_CS_CALLCONV_FIELD.0);
 
                 let result: &[u8] = &buf[0..signature_size as usize];
 

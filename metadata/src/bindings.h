@@ -19,13 +19,21 @@
 #include <cor.h>
 #include "rust/cxx.h"
 
-uint32_t BindingsCCorSigUncompressCallingConv(rust::Slice<const uint8_t> pData);
+int32_t BindingsCCorSigUncompressCallingConv(rust::Slice<const uint8_t> pData);
 
-uint32_t BindingsCCorSigUncompressData(rust::Slice<const uint8_t> pData);
+int32_t BindingsCCorSigUncompressData(rust::Slice<const uint8_t> pData);
 
 int32_t BindingsCCorSigUncompressElementType(rust::Slice<const uint8_t> pData);
 
 int32_t BindingsCCorSigUncompressToken(rust::Slice<const uint8_t> pData);
+
+int32_t BindingsCCorSigUncompressCallingConvRaw(uint8_t* pData);
+
+int32_t BindingsCCorSigUncompressDataRaw(uint8_t* pData);
+
+int32_t BindingsCCorSigUncompressElementTypeRaw(uint8_t* pData);
+
+int32_t BindingsCCorSigUncompressTokenRaw(uint8_t* pData);
 
 
 #endif //WINDOWS_RUNTIME_BINDINGS_H

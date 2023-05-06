@@ -3,7 +3,7 @@ use std::sync::{Arc};
 use parking_lot::RwLock;
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMAGE_CEE_CS_CALLCONV_GENERIC, IMetaDataImport2, mdtMethodDef};
-use crate::{cor_sig_uncompress_calling_conv, cor_sig_uncompress_data};
+use crate::{cor_sig_uncompress_calling_conv, cor_sig_uncompress_data, cor_sig_uncompress_data_raw,cor_sig_uncompress_element_type, cor_sig_uncompress_element_type_raw};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::parameter_declaration::ParameterDeclaration;
 use crate::declarations::type_declaration::TypeDeclaration;
@@ -28,14 +28,14 @@ impl MethodDeclaration {
         &self.base
     }
     pub fn new(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: CorTokenType) -> Self {
-        assert!(metadata.is_none());
+        assert!(metadata.is_some());
         assert_eq!(type_from_token(token), mdtMethodDef.0);
         assert_ne!(token.0, 0);
 
         let mut parameters: Vec<ParameterDeclaration> = Vec::new();
 
         let mut signature = std::ptr::null_mut();
-        let mut signature_ptr = &mut signature;
+        let signature_ptr = &mut signature;
         let mut signature_size = 0;
         let mut return_type = Vec::new();
         let mut full_name = String::new();
@@ -68,15 +68,24 @@ impl MethodDeclaration {
 
                     let signature = std::slice::from_raw_parts(signature as *const u8, signature_size as usize);
 
-
                     if cor_sig_uncompress_calling_conv(signature as _)
-                        == IMAGE_CEE_CS_CALLCONV_GENERIC.0 as u32
+                        == IMAGE_CEE_CS_CALLCONV_GENERIC.0
                     {
                         unimplemented!()
                     }
 
                     let mut arguments_count =
-                        { cor_sig_uncompress_data(signature) };
+                        { cor_sig_uncompress_data(signature) as u32 };
+
+
+
+                    println!("{arguments_count}");
+
+                   // let a = signature + signature_size;
+
+                    println!("signature {:?}", cor_sig_uncompress_element_type(signature));
+
+                    println!("data {}", Signature::to_string(&*metadata, signature));
 
                     return_type = Signature::consume_type(signature).to_vec();
 

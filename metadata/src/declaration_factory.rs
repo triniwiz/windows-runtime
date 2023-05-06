@@ -127,14 +127,9 @@ impl DeclarationFactory {
                         unsafe { Some(Arc::new(RwLock::new(external_metadata.assume_init()))) }
                     } else { None };
 
-
-                   let ret =  Box::new(InterfaceDeclaration::new(
+                    Box::new(InterfaceDeclaration::new(
                         external_metadata, external_interface_token,
-                    ));
-
-                    println!("{:?}", &ret);
-
-                    ret
+                    ))
                 }
                 mdtTypeSpec => {
                     let mut signature = [0_u8; MAX_IDENTIFIER_LENGTH];

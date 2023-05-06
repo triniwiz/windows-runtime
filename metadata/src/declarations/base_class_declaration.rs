@@ -48,26 +48,27 @@ impl BaseClassDeclaration {
                 let metadata = metadata.read();
 
                 let mut enumerator = std::ptr::null_mut();
-                let enumerator_ptr = &mut enumerator;
                 let mut count = 0;
                 let mut tokens = [0_u32; 1024];
 
                 let result_inner = unsafe {
                     metadata.EnumInterfaceImpls(
-                        enumerator_ptr,
+                        &mut enumerator,
                         token.0 as u32,
                         tokens.as_mut_ptr(),
                         tokens.len() as u32,
                         &mut count,
                     )
                 };
+
                 debug_assert!(result_inner.is_ok());
 
                 debug_assert!(count < (tokens.len().saturating_sub(1)) as u32);
 
                 unsafe { metadata.CloseEnum(enumerator) };
 
-                for token in tokens.into_iter() {
+                for i in 0..count as usize {
+                    let token = tokens[i];
                     let mut interface_token = 0_u32;
                     let result_inner = unsafe {
                         metadata.GetInterfaceImplProps(
@@ -217,30 +218,26 @@ impl BaseClassDeclaration {
         metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
         token: CorTokenType,
     ) -> Self {
-        println!("??");
-        let base = TypeDeclaration::new(
-            kind,
-            metadata.clone(),
-            token,
-        );
-
-        println!("base");
         Self {
-            base,
+            base: TypeDeclaration::new(
+                kind,
+                metadata.clone(),
+                token,
+            ),
             implemented_interfaces: BaseClassDeclaration::make_implemented_interfaces_declarations(
-                Option::as_ref(&metadata).map(|v| Arc::clone(v)),
+                metadata.clone(),
                 token,
             ),
             methods: BaseClassDeclaration::make_method_declarations(
-                Option::as_ref(&metadata).map(|v| Arc::clone(v)),
+                metadata.clone(),
                 token,
             ),
             properties: BaseClassDeclaration::make_property_declarations(
-                Option::as_ref(&metadata).map(|v| Arc::clone(v)),
+                metadata.clone(),
                 token,
             ),
             events: BaseClassDeclaration::make_event_declarations(
-                Option::as_ref(&metadata).map(|v| Arc::clone(v)),
+                metadata.clone(),
                 token,
             ),
         }

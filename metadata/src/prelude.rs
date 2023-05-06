@@ -142,15 +142,19 @@ pub fn resolve_type_ref(
             let mut string = HSTRING::from_wide(&data[..length.saturating_sub(1) as usize]).unwrap_or_default();
 
             let dispenser: MaybeUninit<IMetaDataDispenserEx> = MaybeUninit::zeroed();
-            let external_metadata = addr_of!(external_metadata);
+            let mut value = 0_u32;
             unsafe {
-                RoGetMetaDataFile(
+               let ret = RoGetMetaDataFile(
                     &string,
                     dispenser.assume_init_ref(),
                     None,
-                    Some(external_metadata as *mut Option<IMetaDataImport2>),
-                    Some(&mut (external_token.0 as u32)),
-                ).is_ok()
+                    Some(std::mem::transmute(external_metadata)),
+                    Some(&mut value),
+                ).is_ok();
+
+                external_token.0 = value as i32;
+
+                ret
             }
         }
     }
