@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
-use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock};
+use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2, mdtFieldDef};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 
@@ -10,7 +10,9 @@ use crate::prelude::*;
 
 #[derive(Clone, Debug)]
 pub struct FieldDeclaration {
-    base: TypeDeclaration,
+    kind: DeclarationKind,
+    pub(crate) metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+    token: CorTokenType,
     fullname: String,
 }
 
@@ -38,7 +40,7 @@ impl Declaration for FieldDeclaration {
     }
 
     fn kind(&self) -> DeclarationKind {
-        self.base.kind()
+        self.kind
     }
 }
 
@@ -81,24 +83,36 @@ impl FieldDeclaration {
         };
 
         Self {
-            base: TypeDeclaration::new(kind, metadata, token),
+            kind,
+            metadata,
+            token,
             fullname,
         }
     }
 
     pub fn kind(&self) -> DeclarationKind {
-        self.base.kind()
+        self.kind
     }
 
     pub fn token(&self) -> CorTokenType {
-        self.base.token()
+        self.token
     }
 
     pub fn metadata(&self) -> Option<MappedRwLockReadGuard<'_, IMetaDataImport2>> {
-        self.base.metadata()
+        self.metadata.as_ref().map(|metadata| {
+            RwLockReadGuard::map(
+                metadata.read(),
+                |metadata| metadata,
+            )
+        })
     }
 
     pub fn metadata_mut(&self) -> Option<MappedRwLockWriteGuard<'_, IMetaDataImport2>> {
-        self.base.metadata_mut()
+        self.metadata.as_ref().map(|metadata| {
+            RwLockWriteGuard::map(
+                metadata.write(),
+                |metadata| metadata,
+            )
+        })
     }
 }

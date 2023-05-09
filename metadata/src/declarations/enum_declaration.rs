@@ -75,10 +75,10 @@ impl EnumDeclaration {
         size as isize
     }
 
-    pub fn type_(&self) -> &[u8] {
+    pub fn type_(&self) -> PCCOR_SIGNATURE {
         let mut type_field = 0_u32;
         match self.base.metadata() {
-            None => &[],
+            None => PCCOR_SIGNATURE::default(),
             Some(metadata) => {
                 let result = unsafe {
                     metadata.FindField(
@@ -88,30 +88,28 @@ impl EnumDeclaration {
                 };
                 assert!(result.is_ok());
 
-                let mut signature = std::ptr::null_mut();
+                let mut signature = PCCOR_SIGNATURE::default();
                 let mut signature_size = 0;
                 let result = unsafe {
                     metadata.GetFieldProps(
                         type_field,
                         0 as _, None, 0 as _, 0 as _,
-                        &mut signature,
+                        &mut signature.as_abi_mut(),
                         &mut signature_size,
                         0 as _,
-                        0 as _, 0 as _,
+                        0 as _,
+                        0 as _,
                     )
                 };
                 assert!(
                     result.is_ok()
                 );
 
-                let buf = unsafe { std::slice::from_raw_parts(signature, signature_size as usize) };
-                let header = crate::cor_sig_uncompress_data(buf);
+                let header = cor_sig_uncompress_data(&mut signature);
 
                 assert_eq!(header, IMAGE_CEE_CS_CALLCONV_FIELD.0 as u32);
 
-                let result: &[u8] = &buf[0..signature_size as usize];
-
-                result
+                signature
             }
         }
     }

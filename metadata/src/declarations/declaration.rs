@@ -24,7 +24,25 @@ pub enum DeclarationKind {
 
 impl Display for DeclarationKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f,"{}", self)
+       let value = match self {
+           DeclarationKind::Namespace => "Namespace",
+           DeclarationKind::Class => "Class",
+           DeclarationKind::Interface => "Interface",
+           DeclarationKind::GenericInterface => "GenericInterface",
+           DeclarationKind::GenericInterfaceInstance => "GenericInterfaceInstance",
+           DeclarationKind::Enum => "Enum",
+           DeclarationKind::EnumMember => "EnumMember",
+           DeclarationKind::Struct => "Struct",
+           DeclarationKind::StructField => "StructField",
+           DeclarationKind::Delegate => "Delegate",
+           DeclarationKind::GenericDelegate => "GenericDelegate",
+           DeclarationKind::GenericDelegateInstance => "GenericDelegateInstance",
+           DeclarationKind::Event => "Event",
+           DeclarationKind::Property => "Property",
+           DeclarationKind::Method => "Method",
+           DeclarationKind::Parameter => "Parameter"
+       };
+        write!(f,"{}", value)
     }
 }
 

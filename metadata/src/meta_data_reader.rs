@@ -8,10 +8,16 @@ use windows::{s, w};
 use windows::Win32::Foundation::RO_E_METADATA_NAME_IS_NAMESPACE;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoCreateInstanceEx};
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataDispenserEx, IMetaDataImport2, mdtTypeDef, mdtTypeRef, RoGetMetaDataFile};
+use crate::declarations::class_declaration::ClassDeclaration;
 use crate::declarations::declaration::Declaration;
 use crate::declarations::declaration::DeclarationKind::Struct;
+use crate::declarations::delegate_declaration::DelegateDeclaration;
+use crate::declarations::delegate_declaration::generic_delegate_declaration::GenericDelegateDeclaration;
 use crate::declarations::enum_declaration::EnumDeclaration;
+use crate::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
+use crate::declarations::interface_declaration::InterfaceDeclaration;
 use crate::declarations::namespace_declaration::NamespaceDeclaration;
+use crate::declarations::struct_declaration::StructDeclaration;
 use crate::prelude::*;
 
 
@@ -102,6 +108,7 @@ impl MetadataReader {
             let parent_name_buf = &parent_name[0..size as usize];
             let parent_name_string = unsafe { PCWSTR::from_raw(parent_name_buf.as_ptr()).to_string().unwrap_or("".to_string())};
 
+            println!("{}", parent_name_string.as_str());
             // todo find a better way
             // let parent_name_string = String::from_utf16_lossy(&parent_name[0..size as usize]);
             // let parent_name_string = unsafe { CString::from_vec_with_nul_unchecked(parent_name_string.into_bytes())}.into_string().unwrap();
@@ -121,50 +128,38 @@ impl MetadataReader {
                         RwLock::new(EnumDeclaration::new(Some(metadata), CorTokenType(token as i32)))
                     )
                 );
-            }
-
-            /*
-            if let Some(name) = parent_name_string.to_str() {
-                if name == SYSTEM_ENUM {
-                    return Some(
+            } else if parent_name_string == SYSTEM_VALUETYPE {
+                return Some(
+                    Arc::new(
+                        RwLock::new(StructDeclaration::new(Some(metadata), CorTokenType(token as i32)))
+                    )
+                );
+            } else if parent_name_string == SYSTEM_MULTICASTDELEGATE {
+                return if full_name.contains("`") {
+                    Some(
                         Arc::new(
-                            RwLock::new(EnumDeclaration::new(Some(metadata), token))
+                            RwLock::new(GenericDelegateDeclaration::new(Some(metadata), CorTokenType(token as i32)))
                         )
-                    );
-                } else if name == SYSTEM_VALUETYPE {
-                    return Some(
+                    )
+                } else {
+                    Some(
                         Arc::new(
-                            RwLock::new(StructDeclaration::new(Some(metadata), token))
+                            RwLock::new(DelegateDeclaration::new(Some(metadata), CorTokenType(token as i32)))
                         )
-                    );
-                } else if name == SYSTEM_MULTICASTDELEGATE {
-                    return if full_name.contains("`") {
-                        Some(
-                            Arc::new(
-                                RwLock::new(GenericDelegateDeclaration::new(Some(metadata), token))
-                            )
-                        )
-                    } else {
-                        Some(
-                            Arc::new(
-                                RwLock::new(DelegateDeclaration::new(Some(metadata), token))
-                            )
-                        )
-                    };
-                }
+                    )
+                };
             }
 
 
             return Some(
                 Arc::new(
-                    RwLock::new(ClassDeclaration::new(Some(metadata), token))
+                    RwLock::new(ClassDeclaration::new(Some(metadata), CorTokenType(token as i32)))
                 )
             );
-            */
+
         }
 
 
-        /*
         if is_td_interface(flags as i32) {
             let metadata = unsafe {
                 Arc::new(
@@ -176,19 +171,18 @@ impl MetadataReader {
             return if full_name.contains("`") {
                 Some(
                     Arc::new(
-                        RwLock::new(GenericInterfaceDeclaration::new(metadata, token))
+                        RwLock::new(GenericInterfaceDeclaration::new(Some(metadata), CorTokenType(token as i32)))
                     )
                 )
             } else {
                 Some(
                     Arc::new(
-                        RwLock::new(InterfaceDeclaration::new(metadata, token))
+                        RwLock::new(InterfaceDeclaration::new(Some(metadata), CorTokenType(token as i32)))
                     )
                 )
             };
         }
 
-        */
 
         std::unreachable!();
     }

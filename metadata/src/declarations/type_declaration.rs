@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::os::windows::prelude::OsStringExt;
 use std::sync::Arc;
 use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2, mdtTypeDef};
+use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2, mdtTypeDef, mdtTypeRef};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::prelude::*;
 
@@ -94,7 +94,12 @@ impl TypeDeclaration {
                             metadata.GetTypeRefProps(token.0 as u32, 0 as _, Some(&mut full_name_data), &mut length)
                         };
                     }
-                    _ => {unreachable!()}
+                    _ => {
+                        // match being weird
+                        if length == 0 {
+                            unreachable!()
+                        }
+                    }
                 }
 
                 length = length.saturating_sub(1);
@@ -102,7 +107,6 @@ impl TypeDeclaration {
                 String::from_utf16_lossy(&full_name_data[..(length) as usize])
             }
         };
-
 
         let mut name = fullname.clone();
         let back_tick_index = name.find('`');
@@ -122,6 +126,7 @@ impl TypeDeclaration {
                 .chain(name.chars().skip(index + 1))
                 .collect()
         }
+
 
         Self {
             kind,
