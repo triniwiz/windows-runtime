@@ -37,38 +37,40 @@ impl DeclarationFactory {
                     )
                 }
                 mdtTypeSpec => {
-                    let mut signature = [0_u8; MAX_IDENTIFIER_LENGTH];
-                    let mut signature_ptr = signature.as_mut_ptr();
+                    let mut signature = PCCOR_SIGNATURE::default(); //[0_u8; MAX_IDENTIFIER_LENGTH];
+                    // let mut signature_ptr = signature.as_mut_ptr();
                     let mut signature_size = 0;
 
                     let result = unsafe {
                         metadata.GetTypeSpecFromToken(
-                            token.0 as u32, &mut signature_ptr, &mut signature_size,
+                            token.0 as u32, &mut signature.as_abi_mut(), &mut signature_size,
                         )
                     };
                     debug_assert!(
                         result.is_ok()
                     );
 
-                    let signature = &signature[..signature_size as usize];
+                    println!("make_delegate_declaration {:?}", &signature);
 
-                    let type1 = cor_sig_uncompress_element_type(signature);
+                    //let signature = &signature[..signature_size as usize];
+
+                    let type1 = cor_sig_uncompress_element_type(&mut signature);
                     debug_assert!(
                         type1 == ELEMENT_TYPE_GENERICINST.0
                     );
 
-                    let type2 = cor_sig_uncompress_element_type(signature);
+                    let type2 = cor_sig_uncompress_element_type(&mut signature);
                     debug_assert!(
                         type2 == ELEMENT_TYPE_CLASS.0
                     );
 
-                    let open_generic_delegate_token = cor_sig_uncompress_token(signature);
+                    let open_generic_delegate_token = cor_sig_uncompress_token(&mut signature);
                     let ret = match CorTokenType(type_from_token(CorTokenType(open_generic_delegate_token))) {
                         mdtTypeDef => {
                             Box::new(GenericDelegateInstanceDeclaration::new(meta.clone(), CorTokenType(open_generic_delegate_token), meta, token))
                         }
                         mdtTypeRef => {
-                            let mut external_metadata: MaybeUninit<IMetaDataImport2> = MaybeUninit::uninit();
+                            let mut external_metadata: MaybeUninit<IMetaDataImport2> = MaybeUninit::zeroed();
                             let mut external_delegate_token = CorTokenType::default();
 
                             let is_resolved = unsafe {
@@ -103,7 +105,7 @@ impl DeclarationFactory {
                 _ => {
                     std::unreachable!()
                 }
-            }
+            };
         }
         None
     }
@@ -111,13 +113,13 @@ impl DeclarationFactory {
         if let Some(metadata) = metadata.as_ref() {
             let meta = Arc::clone(metadata);
             let metadata = metadata.read();
-           let ret = match CorTokenType(type_from_token(token)) {
+            let ret = match CorTokenType(type_from_token(token)) {
                 mdtTypeDef => {
-                        Box::new(InterfaceDeclaration::new(Some(meta), token)) as Box<dyn BaseClassDeclarationImpl>
+                    Box::new(InterfaceDeclaration::new(Some(meta), token)) as Box<dyn BaseClassDeclarationImpl>
                 }
                 mdtTypeRef => {
-                    let mut external_metadata: MaybeUninit<IMetaDataImport2> = MaybeUninit::uninit();
-                    let mut external_interface_token = CorTokenType::default();
+                    let mut external_metadata: MaybeUninit<IMetaDataImport2> = MaybeUninit::zeroed();
+                    let mut external_interface_token = CorTokenType::default();//mdtTypeDef;
 
                     let is_resolved = unsafe { resolve_type_ref(Some(&*metadata), token, &mut *external_metadata.as_mut_ptr(), &mut external_interface_token) };
 
@@ -132,12 +134,12 @@ impl DeclarationFactory {
                     ))
                 }
                 mdtTypeSpec => {
-                    let mut signature = [0_u8; MAX_IDENTIFIER_LENGTH];
+                    let mut signature = std::ptr::null_mut();//[0_u8; MAX_IDENTIFIER_LENGTH];
                     let mut signature_size = 0;
                     let result = unsafe {
                         metadata.GetTypeSpecFromToken(
                             token.0 as u32,
-                            &mut signature.as_mut_ptr(),
+                            &mut signature,
                             &mut signature_size,
                         )
                     };
@@ -145,22 +147,29 @@ impl DeclarationFactory {
                         result.is_ok()
                     );
 
-                    let signature = &signature[..signature_size as usize];
+                    let mut signature = PCCOR_SIGNATURE::from_ptr(signature);
 
-                    let type1 = cor_sig_uncompress_element_type(signature);
+                    // let signature = &signature[..signature_size as usize];
+
+                    let type1 = cor_sig_uncompress_element_type(&mut signature);
+
+                    let mut signature = PCCOR_SIGNATURE::from_ptr(unsafe { (signature.0 as *mut u8).offset(1)});
 
                     debug_assert!(
                         type1 == ELEMENT_TYPE_GENERICINST.0
                     );
 
-                    let type2 = cor_sig_uncompress_element_type(signature);
+                    let type2 = cor_sig_uncompress_element_type(&mut signature);
 
+                    let mut signature = PCCOR_SIGNATURE::from_ptr(unsafe { (signature.0 as *mut u8).offset(1)});
 
                     debug_assert!(
                         type2 == ELEMENT_TYPE_CLASS.0
                     );
 
-                    let open_generic_delegate_token = CorTokenType(cor_sig_uncompress_token(signature));
+                    let open_generic_delegate_token = CorTokenType(cor_sig_uncompress_token(&mut signature));
+
+                   // let mut signature = PCCOR_SIGNATURE::from_ptr(unsafe { (signature.0 as *mut u8).offset(1)});
 
                     match CorTokenType(type_from_token(token)) {
                         mdtTypeSpec => match CorTokenType(type_from_token(open_generic_delegate_token)) {
@@ -170,12 +179,14 @@ impl DeclarationFactory {
                                 ))
                             }
                             mdtTypeRef => {
-                                let mut external_metadata:MaybeUninit<IMetaDataImport2> = MaybeUninit::uninit();
+                                let mut external_metadata: MaybeUninit<IMetaDataImport2> = MaybeUninit::zeroed();
                                 let mut external_delegate_token = CorTokenType::default();
 
-                                let is_resolved = unsafe { resolve_type_ref(
-                                    Some(&*metadata), open_generic_delegate_token, &mut *external_metadata.as_mut_ptr(), &mut external_delegate_token,
-                                )};
+                                let is_resolved = unsafe {
+                                    resolve_type_ref(
+                                        Some(&*metadata), open_generic_delegate_token, &mut *external_metadata.as_mut_ptr(), &mut external_delegate_token,
+                                    )
+                                };
 
                                 debug_assert!(
                                     is_resolved
@@ -205,7 +216,7 @@ impl DeclarationFactory {
                 }
             };
 
-           return Some(ret);
+            return Some(ret);
         }
         None
     }

@@ -44,7 +44,7 @@ impl StructDeclaration {
                 token,
             ),
             fields: StructDeclaration::make_field_declarations(
-                Option::as_ref(&metadata).map(|v| Arc::clone(v)),
+                metadata.clone(),
                 token,
             ),
         }

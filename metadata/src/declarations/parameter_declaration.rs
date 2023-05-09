@@ -10,8 +10,10 @@ use crate::declarations::type_declaration::TypeDeclaration;
 
 #[derive(Clone, Debug)]
 pub struct ParameterDeclaration {
-    base: TypeDeclaration,
-    parameter_type: Vec<u8>,
+    kind: DeclarationKind,
+    pub(crate) metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+    token: CorTokenType,
+    parameter_type: PCCOR_SIGNATURE,
     full_name: String,
 }
 
@@ -19,7 +21,7 @@ impl ParameterDeclaration {
     pub fn new(
         metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
         token: CorTokenType,
-        sig_type: Vec<u8>,
+        sig_type: PCCOR_SIGNATURE,
     ) -> Self {
         //assert!(metadata.is_none());
         assert_eq!(type_from_token(token), mdtParamDef.0);
@@ -68,13 +70,16 @@ impl ParameterDeclaration {
         };
 
         Self {
-            base: TypeDeclaration::new(DeclarationKind::Parameter, metadata, token),
+            kind:DeclarationKind::Parameter,
+            metadata,
+            token,
             parameter_type: sig_type,
             full_name,
         }
     }
     pub fn is_out(&self) -> bool {
-        cor_sig_uncompress_token(self.parameter_type.as_slice())
+        let mut parameter_type = self.parameter_type.clone();
+        cor_sig_uncompress_token(&mut parameter_type)
             == ELEMENT_TYPE_BYREF.0
     }
 }
@@ -97,6 +102,6 @@ impl Declaration for ParameterDeclaration {
     }
 
     fn kind(&self) -> DeclarationKind {
-        self.base.kind()
+        self.kind
     }
 }

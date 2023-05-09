@@ -14,6 +14,8 @@ use crate::declarations::declaration::DeclarationKind::Struct;
 use crate::declarations::delegate_declaration::DelegateDeclaration;
 use crate::declarations::delegate_declaration::generic_delegate_declaration::GenericDelegateDeclaration;
 use crate::declarations::enum_declaration::EnumDeclaration;
+use crate::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
+use crate::declarations::interface_declaration::InterfaceDeclaration;
 use crate::declarations::namespace_declaration::NamespaceDeclaration;
 use crate::declarations::struct_declaration::StructDeclaration;
 use crate::prelude::*;
@@ -157,7 +159,6 @@ impl MetadataReader {
         }
 
 
-        /*
         if is_td_interface(flags as i32) {
             let metadata = unsafe {
                 Arc::new(
@@ -169,19 +170,18 @@ impl MetadataReader {
             return if full_name.contains("`") {
                 Some(
                     Arc::new(
-                        RwLock::new(GenericInterfaceDeclaration::new(metadata, token))
+                        RwLock::new(GenericInterfaceDeclaration::new(Some(metadata), CorTokenType(token as i32)))
                     )
                 )
             } else {
                 Some(
                     Arc::new(
-                        RwLock::new(InterfaceDeclaration::new(metadata, token))
+                        RwLock::new(InterfaceDeclaration::new(Some(metadata), CorTokenType(token as i32)))
                     )
                 )
             };
         }
 
-        */
 
         std::unreachable!();
     }

@@ -3,7 +3,7 @@ use std::sync::{Arc};
 use parking_lot::RwLock;
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMAGE_CEE_CS_CALLCONV_GENERIC, IMetaDataImport2, mdtMethodDef};
-use crate::{cor_sig_uncompress_calling_conv, cor_sig_uncompress_data, cor_sig_uncompress_data_raw,cor_sig_uncompress_element_type, cor_sig_uncompress_element_type_raw};
+use crate::{cor_sig_uncompress_calling_conv, cor_sig_uncompress_data, cor_sig_uncompress_element_type};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::parameter_declaration::ParameterDeclaration;
 use crate::declarations::type_declaration::TypeDeclaration;
@@ -13,9 +13,11 @@ use crate::prelude::*;
 
 #[derive(Clone, Debug)]
 pub struct MethodDeclaration {
-    base: TypeDeclaration,
+    kind: DeclarationKind,
+    pub(crate) metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+    token: CorTokenType,
     parameters: Vec<ParameterDeclaration>,
-    return_type: Vec<u8>,
+    return_type: PCCOR_SIGNATURE,
     full_name: String,
     overload_name: String,
 }
@@ -24,9 +26,6 @@ const OVERLOAD_ATTRIBUTE: &str = "Windows.Foundation.Metadata.OverloadAttribute"
 const DEFAULT_OVERLOAD_ATTRIBUTE: &str = "Windows.Foundation.Metadata.DefaultOverloadAttribute";
 
 impl MethodDeclaration {
-    pub fn base(&self) -> &TypeDeclaration {
-        &self.base
-    }
     pub fn new(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: CorTokenType) -> Self {
         assert!(metadata.is_some());
         assert_eq!(type_from_token(token), mdtMethodDef.0);
@@ -34,10 +33,10 @@ impl MethodDeclaration {
 
         let mut parameters: Vec<ParameterDeclaration> = Vec::new();
 
-        let mut signature = std::ptr::null_mut();
-        let signature_ptr = &mut signature;
+        let mut signature =  std::ptr::null_mut() as *mut u8;
+       // let signature_ptr = &mut signature;
         let mut signature_size = 0;
-        let mut return_type = Vec::new();
+        let mut return_type = PCCOR_SIGNATURE::default();
         let mut full_name = String::new();
         let mut overload_name = String::new();
         unsafe {
@@ -53,12 +52,13 @@ impl MethodDeclaration {
                             None,
                             0 as _,
                             0 as _,
-                            signature_ptr,
+                            &mut signature,
                             &mut signature_size,
                             0 as _,
                             0 as _,
                         )
                     };
+                    println!("{:?}",&result);
                     assert!(result.is_ok());
                     /*
                             #if _DEBUG
@@ -66,28 +66,24 @@ impl MethodDeclaration {
                     #endif
                              */
 
-                    let signature = std::slice::from_raw_parts(signature as *const u8, signature_size as usize);
+                    let mut sig = PCCOR_SIGNATURE::from_ptr(signature);
 
-                    if cor_sig_uncompress_calling_conv(signature as _)
+                    if cor_sig_uncompress_calling_conv(&mut sig)
                         == IMAGE_CEE_CS_CALLCONV_GENERIC.0
                     {
                         unimplemented!()
                     }
 
+                    let mut sig = PCCOR_SIGNATURE::from_ptr(signature.offset(1));
+
                     let mut arguments_count =
-                        { cor_sig_uncompress_data(signature) as u32 };
+                        { cor_sig_uncompress_data(&mut sig) as u32 };
 
+                    let mut sig = PCCOR_SIGNATURE::from_ptr(signature.offset(2));
 
+                    println!("signature {:?}", unsafe{std::slice::from_raw_parts(signature, signature_size as usize)});
 
-                    println!("{arguments_count}");
-
-                   // let a = signature + signature_size;
-
-                    println!("signature {:?}", cor_sig_uncompress_element_type(signature));
-
-                    println!("data {}", Signature::to_string(&*metadata, signature));
-
-                    return_type = Signature::consume_type(signature).to_vec();
+                    return_type = Signature::consume_type(&mut sig);
 
                     let mut parameter_enumerator = std::ptr::null_mut();
                     let enumerator = &mut parameter_enumerator;
@@ -104,6 +100,8 @@ impl MethodDeclaration {
                     );
                     assert!(result.is_ok());
                     assert!(parameters_count < (parameter_tokens.len().saturating_sub(1)) as u32);
+
+
                     metadata.CloseEnum(parameter_enumerator);
 
                     let mut start_index = 0_usize;
@@ -113,11 +111,12 @@ impl MethodDeclaration {
                     }
 
                     for i in start_index..parameters_count as usize {
-                        let sig_type = Signature::consume_type(signature);
+                        let sig_type = Signature::consume_type(&mut sig);
+                        sig = PCCOR_SIGNATURE::from_ptr(sig.0.offset(1) as *mut u8);
                         parameters.push(ParameterDeclaration::new(
                             Some(Arc::clone(&meta)),
                             CorTokenType(parameter_tokens[i] as i32),
-                            sig_type.to_vec(),
+                            sig_type,
                         ))
                     }
 
@@ -138,9 +137,11 @@ impl MethodDeclaration {
                     debug_assert!(result.is_ok());
 
 
-                    let name = &data[0..name_length as usize];
-                    full_name = unsafe { PCWSTR::from_raw(name.as_ptr()).to_string().unwrap_or("".to_string()) };
+                    //let name = &data[0..name_length as usize];
+                    full_name = String::from_utf16_lossy(&data[0..name_length.saturating_sub(1) as usize]);
+                    //full_name = unsafe { PCWSTR::from_raw(name.as_ptr()).to_string().unwrap_or("".to_string()) };
 
+                    println!("full_name {}", full_name.as_str());
 
                     overload_name = get_unary_custom_attribute_string_value(
                         &*metadata,
@@ -157,7 +158,9 @@ impl MethodDeclaration {
 
 
         Self {
-            base: TypeDeclaration::new(DeclarationKind::Method, metadata, token),
+            kind:DeclarationKind::Method,
+            metadata,
+            token,
             parameters,
             return_type,
             full_name,
@@ -168,10 +171,11 @@ impl MethodDeclaration {
     pub fn is_initializer(&self) -> bool {
         let mut full_name_data = [0_u16; MAX_IDENTIFIER_LENGTH];
         let mut method_flags = 0;
-        if let Some(metadata) = self.base.metadata() {
+        if let Some(metadata) = self.metadata.as_ref() {
+            let metadata = metadata.read();
             let result = unsafe {
                 metadata.GetMethodProps(
-                    self.base.token().0 as u32,
+                    self.token.0 as u32,
                     0 as _,
                     Some(&mut full_name_data),
                     0 as _,
@@ -193,10 +197,11 @@ impl MethodDeclaration {
 
     pub fn is_static(&self) -> bool {
         let mut method_flags = 0;
-        if let Some(metadata) = self.base.metadata() {
+        if let Some(metadata) = self.metadata.as_ref() {
+            let metadata = metadata.read();
             let result = unsafe {
                 metadata.GetMethodProps(
-                    self.base.token().0 as u32,
+                    self.token.0 as u32,
                     0 as _,
                     None,
                     0 as _,
@@ -214,10 +219,11 @@ impl MethodDeclaration {
 
     pub fn is_sealed(&self) -> bool {
         let mut method_flags = 0;
-        if let Some(metadata) = self.base.metadata() {
+        if let Some(metadata) = self.metadata.as_ref() {
+            let metadata = metadata.read();
             let result = unsafe {
                 metadata.GetMethodProps(
-                    self.base.token().0 as u32,
+                    self.token.0 as u32,
                     0 as _,
                     None,
                     0 as _,
@@ -248,9 +254,10 @@ impl MethodDeclaration {
     pub fn is_default_overload(&self) -> bool {
         let data = HSTRING::from(DEFAULT_OVERLOAD_ATTRIBUTE);
         let data = PCWSTR(data.as_ptr());
-        if let Some(metadata) = self.base.metadata() {
+        if let Some(metadata) = self.metadata.as_ref() {
+            let metadata = metadata.read();
             let get_attribute_result =
-                unsafe { metadata.GetCustomAttributeByName(self.base.token().0 as u32, data, 0 as _, 0 as _) };
+                unsafe { metadata.GetCustomAttributeByName(self.token.0 as u32, data, 0 as _, 0 as _) };
             debug_assert!(get_attribute_result.is_ok());
             return get_attribute_result.is_ok();
         }
@@ -269,10 +276,11 @@ impl Declaration for MethodDeclaration {
 
     fn is_exported(&self) -> bool {
         let mut method_flags = 0_u32;
-        if let Some(metadata) = self.base.metadata() {
+        if let Some(metadata) = self.metadata.as_ref() {
+            let metadata = metadata.read();
             let result = unsafe {
                 metadata.GetMethodProps(
-                    self.base.token().0 as u32,
+                    self.token.0 as u32,
                     0 as _,
                     None,
                     0 as _,
@@ -311,6 +319,6 @@ impl Declaration for MethodDeclaration {
     }
 
     fn kind(&self) -> DeclarationKind {
-        self.base.kind()
+        self.kind
     }
 }

@@ -2,7 +2,7 @@ use std::any::Any;
 use std::sync::{Arc};
 use parking_lot::RwLock;
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::System::WinRT::Metadata::{COR_CTOR_METHOD_NAME, COR_CTOR_METHOD_NAME_W, CorTokenType, IMetaDataImport2};
+use windows::Win32::System::WinRT::Metadata::{COR_CTOR_METHOD_NAME, COR_CTOR_METHOD_NAME_W, CorTokenType, IMetaDataImport2, mdtInterfaceImpl, mdtTypeDef};
 use crate::declaration_factory::DeclarationFactory;
 use crate::declarations::base_class_declaration::{BaseClassDeclaration, BaseClassDeclarationImpl};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
@@ -96,7 +96,7 @@ impl ClassDeclaration {
                 let meta = Arc::clone(metadata);
                 let metadata = metadata.read();
 
-                let mut interface_impl_tokens = [0_u32; 1024];
+                let mut interface_impl_tokens = [0 as u32; 1024];
                 let mut interface_impl_count = 0;
                 let mut interface_enumerator = std::ptr::null_mut();
                 let interface_enumerator_ptr = &mut interface_enumerator;

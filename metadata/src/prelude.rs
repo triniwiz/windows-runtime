@@ -5,7 +5,10 @@ use windows::core::{GUID, HSTRING, PCSTR, PCWSTR};
 use windows::Win32::System::WinRT::Metadata::{tdAbstract, tdAnsiClass, tdAutoClass, tdAutoLayout, tdBeforeFieldInit, tdClass, tdClassSemanticsMask, tdCustomFormatClass, tdExplicitLayout, tdForwarder, tdHasSecurity, tdImport, tdInterface, tdLayoutMask, tdNestedAssembly, tdNestedFamANDAssem, tdNestedFamORAssem, tdNestedFamily, tdNestedPrivate, tdNestedPublic, tdNotPublic, tdPublic, tdRTSpecialName, tdSealed, tdSequentialLayout, tdSerializable, tdSpecialName, tdStringFormatMask, tdUnicodeClass, tdVisibilityMask, tdWindowsRuntime, CorTokenType, IMetaDataImport2, mdtTypeDef, mdtTypeRef, RoParseTypeName, mdMemberAccessMask, mdPrivateScope, mdPrivate, mdFamANDAssem, mdAssem, mdFamily, mdFamORAssem, mdPublic, mdStatic, mdFinal, mdVirtual, mdHideBySig, mdVtableLayoutMask, mdReuseSlot, mdNewSlot, mdCheckAccessOnOverride, mdAbstract, mdSpecialName, mdPinvokeImpl, mdUnmanagedExport, mdRTSpecialName, COR_CTOR_METHOD_NAME, COR_CTOR_METHOD_NAME_W, COR_CCTOR_METHOD_NAME, COR_CCTOR_METHOD_NAME_W, mdHasSecurity, mdRequireSecObject, prSpecialName, prHasDefault, prRTSpecialName, RoGetMetaDataFile, IMetaDataDispenserEx, evSpecialName, evRTSpecialName};
 use crate::cor_sig_uncompress_data;
 use std::os::windows::prelude::*;
-use std::ptr::{addr_of, addr_of_mut};
+use std::ptr::{addr_of, addr_of_mut, NonNull};
+use std::str::FromStr;
+use windows::w;
+use crate::signature::Signature;
 
 
 pub fn str_from_u8_nul_utf8(utf8_src: &[u8]) -> Result<&str, std::str::Utf8Error> {
@@ -13,6 +16,45 @@ pub fn str_from_u8_nul_utf8(utf8_src: &[u8]) -> Result<&str, std::str::Utf8Error
         .position(|&c| c == b'\0')
         .unwrap_or(utf8_src.len()); // default to length if no `\0` present
     ::std::str::from_utf8(&utf8_src[0..nul_range_end])
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct PCCOR_SIGNATURE(pub(crate) *mut c_void);
+
+impl PCCOR_SIGNATURE {
+    pub fn new() -> Self {
+        Self(std::ptr::null_mut())
+    }
+
+    pub fn from_ptr(value: *mut u8) -> Self {
+        PCCOR_SIGNATURE(value as *mut c_void)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_null()
+    }
+
+    pub fn as_abi(&self) -> *const u8 {
+        //addr_of!(self.0)
+        self.0 as *const u8
+    }
+
+    pub fn as_abi_mut(&mut self) -> *mut u8 {
+       // addr_of_mut!(self.0)
+        self.0 as *mut u8
+    }
+}
+
+impl Default for PCCOR_SIGNATURE {
+    fn default() -> Self {
+        PCCOR_SIGNATURE::new()
+    }
+}
+
+impl PartialEq<u8> for PCCOR_SIGNATURE {
+    fn eq(&self, other: &u8) -> bool {
+        unsafe { self.0 as *const c_void == std::mem::transmute(other) }
+    }
 }
 
 pub const MAX_IDENTIFIER_LENGTH: usize = 511;
@@ -52,7 +94,7 @@ pub fn get_guid_attribute_value(metadata: Option<&IMetaDataImport2>, token: CorT
                 )
             };
 
-            let mut data =  data as *mut u8;
+            let mut data = data as *mut u8;
             // Skip prolog
             let os_data = unsafe { data.offset(2) };
 
@@ -71,17 +113,19 @@ pub fn get_guid_attribute_value(metadata: Option<&IMetaDataImport2>, token: CorT
 }
 
 pub fn get_string_value_from_blob(
-    signature: &[u8],
+    signature: &PCCOR_SIGNATURE,
 ) -> String {
-    assert!(signature.is_empty());
+    assert!(!signature.is_empty());
 
-    if signature.as_ptr() as u8 == u8::MAX {
+    if *signature == u8::MAX {
         return "".to_string();
     }
 
-    let size = cor_sig_uncompress_data(signature);
+    let mut signature = signature.clone();
 
-    let slice = unsafe { std::slice::from_raw_parts(signature.as_ptr() as *mut u16, size as usize) };
+    let size = cor_sig_uncompress_data(&mut signature);
+
+    let slice = unsafe { std::slice::from_raw_parts(signature.as_abi() as *const u16, size as usize) };
 
     HSTRING::from_wide(slice).unwrap_or_default().to_string()
 }
@@ -92,26 +136,32 @@ pub fn get_unary_custom_attribute_string_value(
     attribute_name: &str,
 ) -> String {
     assert_ne!(token.0, 0);
-    assert!(attribute_name.is_empty());
+    assert!(!attribute_name.is_empty());
 
-    let mut data = std::ptr::null_mut() as *mut c_void;
-    let name = OsStr::new(attribute_name);
+    let mut data = std::ptr::null_mut() as *const c_void;
+    let name = OsString::from_str(attribute_name).unwrap();
     let name: Vec<u16> = name.encode_wide().collect();
     let name = PCWSTR(name.as_ptr());
     let mut size = 0_u32;
     let result =
-        unsafe { metadata.GetCustomAttributeByName(token.0 as u32, name, std::mem::transmute(&mut data), &mut size) };
+        unsafe { metadata.GetCustomAttributeByName(token.0 as u32, name, &data as *const *const c_void, &mut size) };
     debug_assert!(result.is_ok());
+
+    println!("result {}", result.is_ok());
     if result.is_err() {
         return "".into();
     }
 
-    // todo
-    let buf = unsafe { std::slice::from_raw_parts((data as *mut u8).offset(2), size.saturating_sub(2) as usize) };
+    // todo validate
+    if size == 0 {
+        return "".into();
+    }
 
-    println!("buf {:?}", buf);
+    let signature = PCCOR_SIGNATURE::from_ptr(unsafe { (data as *mut u8).offset(2) });
 
-    get_string_value_from_blob(buf)
+    println!("signature {:?}", signature);
+
+    get_string_value_from_blob(&signature)
 }
 
 pub fn resolve_type_ref(
@@ -142,13 +192,14 @@ pub fn resolve_type_ref(
             let mut string = HSTRING::from_wide(&data[..length.saturating_sub(1) as usize]).unwrap_or_default();
 
             let dispenser: MaybeUninit<IMetaDataDispenserEx> = MaybeUninit::zeroed();
-            let mut value = 0_u32;
+            let mut value = external_token.0 as u32;//0_u32;
+
             unsafe {
-               let ret = RoGetMetaDataFile(
+                let ret = RoGetMetaDataFile(
                     &string,
                     dispenser.assume_init_ref(),
                     None,
-                    Some(std::mem::transmute(external_metadata)),
+                    Some(std::mem::transmute::<&mut IMetaDataImport2, *mut IMetaDataImport2>(external_metadata) as *mut Option<IMetaDataImport2>),
                     Some(&mut value),
                 ).is_ok();
 
@@ -163,14 +214,16 @@ pub fn resolve_type_ref(
 pub fn get_type_name(metadata: &IMetaDataImport2, token: CorTokenType) -> String {
     assert_ne!(token.0, 0);
     let mut length = 0_u32;
+    println!("type_from_token(token) {} {}", type_from_token(token), token.0 as u32 & 0xff000000 as u32);
     match CorTokenType(type_from_token(token)) {
         mdtTypeDef => {
-            let result = unsafe { metadata.GetTypeDefProps(token.0 as u32, None, &mut length, 0 as _, 0 as _) };
+            // let result = unsafe { metadata.GetTypeDefProps(token.0 as u32, None, &mut length, 0 as _, 0 as _) };
+            // assert!(result.is_ok());
+            // let mut buf = vec![0_u16; length as usize];
+            let mut buf = [0_u16; MAX_IDENTIFIER_LENGTH];
+            let result = unsafe { metadata.GetTypeDefProps(token.0 as u32, Some(buf.as_mut_slice()), &mut length, 0 as _, 0 as _) };
             assert!(result.is_ok());
-            let mut buf = vec![0_u16; length as usize];
-            let result = unsafe { metadata.GetTypeDefProps(token.0 as u32, Some(buf.as_mut_slice()), 0 as _, 0 as _, 0 as _) };
-            assert!(result.is_ok());
-            return String::from_utf16_lossy(buf.as_slice());
+            return String::from_utf16_lossy(&buf[..length as usize]);
         }
         mdtTypeRef => {
             let result = unsafe { metadata.GetTypeRefProps(token.0 as u32, 0 as _, None, &mut length) };
@@ -306,7 +359,7 @@ pub const fn is_td_has_security(x: i32) -> bool {
 }
 
 pub fn type_from_token(tk: CorTokenType) -> i32 {
-    ((tk.0 as u32) & 0xff000000_u32) as i32
+    (tk.0 as u32 & 0xff000000 as u32) as i32
 }
 
 

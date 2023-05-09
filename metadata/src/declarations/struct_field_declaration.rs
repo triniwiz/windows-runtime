@@ -44,11 +44,11 @@ impl StructFieldDeclaration {
         }
     }
 
-    pub fn type_(&self) -> &[u8] {
-        let mut signature = std::ptr::null_mut();
+    pub fn type_(&self) -> PCCOR_SIGNATURE {
+        let mut signature = PCCOR_SIGNATURE::new();
         let mut signature_size = 0;
         match self.base.metadata() {
-            None => &[],
+            None => {},
             Some(metadata) => {
                 let result = unsafe { metadata.GetFieldProps(
                     self.base.token().0 as u32,
@@ -56,7 +56,7 @@ impl StructFieldDeclaration {
                     None,
                     0 as _,
                     0 as _,
-                    &mut signature,
+                    &mut signature.as_abi_mut(),
                     &mut signature_size,
                     0 as _,
                     0 as _,
@@ -65,17 +65,13 @@ impl StructFieldDeclaration {
 
                 assert!(result.is_ok());
 
-                let buf = unsafe { std::slice::from_raw_parts(signature, signature_size as usize) };
-
-                let header = crate::cor_sig_uncompress_data(buf);
+                let header = crate::cor_sig_uncompress_data(&mut signature);
 
                 assert_eq!(header, IMAGE_CEE_CS_CALLCONV_FIELD.0);
 
-
-                let result: &[u8] = &buf[0..signature_size as usize];
-
-                result
             }
         }
+
+        signature
     }
 }

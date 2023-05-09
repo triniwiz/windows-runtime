@@ -28,7 +28,7 @@ impl GenericInterfaceInstanceDeclaration {
         closed_metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
         closed_token: CorTokenType,
     ) -> Self {
-        debug_assert!(closed_metadata.is_none());
+        debug_assert!(closed_metadata.is_some());
         debug_assert!(
             type_from_token(closed_token) == mdtTypeSpec.0 as i32
         );
@@ -40,23 +40,25 @@ impl GenericInterfaceInstanceDeclaration {
         if let Some(metadata) = closed_metadata.as_ref() {
             let metadata = metadata.read();
 
-            let mut signature = std::ptr::null_mut() as *mut u8;
+            let mut signature = std::ptr::null_mut();//PCCOR_SIGNATURE::default();
             //let mut signature = [0_u8; MAX_IDENTIFIER_LENGTH];
-            let signature_ptr = &mut signature;
+            //let signature_ptr = &mut signature;
             let mut signature_size = 0;
 
 
             let result = unsafe {
                 metadata.GetTypeSpecFromToken(
                     closed_token.0 as u32,
-                    signature_ptr as _,
+                    &mut signature,
                     &mut signature_size,
                 )
             };
+            println!("{:?}", unsafe {std::slice::from_raw_parts(signature, signature_size as usize)});
             debug_assert!(result.is_ok());
             if signature_size > 0 {
-                let signature = unsafe { std::slice::from_raw_parts(signature, signature_size as usize) };
-                full_name = Signature::to_string(&metadata, signature);
+                let mut signature = PCCOR_SIGNATURE::from_ptr(signature);
+               // let signature = unsafe { std::slice::from_raw_parts(signature, signature_size as usize) };
+                full_name = Signature::to_string(&metadata, &signature);
             }
         }
 

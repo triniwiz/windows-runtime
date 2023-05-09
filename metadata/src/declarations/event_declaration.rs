@@ -13,7 +13,9 @@ use crate::prelude::*;
 
 #[derive(Clone)]
 pub struct EventDeclaration {
-    base: TypeDeclaration,
+    kind: DeclarationKind,
+    pub(crate) metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+    token: CorTokenType,
     // Arc ??
     type_: Option<Box<dyn DelegateDeclarationImpl>>,
     add_method: MethodDeclaration,
@@ -168,17 +170,15 @@ impl EventDeclaration {
             debug_assert!(result.is_ok());
 
             if name_data_length > 0 {
-                full_name = HSTRING::from_wide(&name_data[..name_data_length as usize]).unwrap().to_string();
+                full_name = String::from_utf16_lossy(&name_data[..name_data_length.saturating_sub(1) as usize]);
             }
         }
 
 
         Self {
-            base: TypeDeclaration::new(
-                DeclarationKind::Event,
-                Option::as_ref(&metadata).map(|v| Arc::clone(v)),
-                token,
-            ),
+            kind: DeclarationKind::Event,
+            metadata: metadata.clone(),
+            token,
             type_: EventDeclaration::make_type(
                 Option::as_ref(&metadata).map(|v| Arc::clone(v)),
                 token,
@@ -228,9 +228,10 @@ impl Declaration for EventDeclaration {
 
     fn is_exported(&self) -> bool {
         let mut flags = 0;
-        if let Some(metadata) = self.base.metadata() {
+        if let Some(metadata) = self.metadata.as_ref() {
+            let metadata = metadata.read();
             let result = unsafe { metadata.GetEventProps(
-                self.base.token().0 as u32,
+                self.token.0 as u32,
                 0 as _,
                 None,
                 0 as _,
@@ -262,6 +263,6 @@ impl Declaration for EventDeclaration {
     }
 
     fn kind(&self) -> DeclarationKind {
-        self.base.kind()
+        self.kind
     }
 }

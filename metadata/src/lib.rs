@@ -1,5 +1,6 @@
 use std::borrow::Cow;
-use windows::Win32::System::WinRT::Metadata::{IMetaDataImport2, MDTypeRefToDef};
+use windows::Win32::System::WinRT::Metadata::{CorElementType, CorTokenType, IMetaDataImport2, MDTypeRefToDef};
+use crate::prelude::PCCOR_SIGNATURE;
 
 pub mod com_helpers;
 pub mod declarations;
@@ -17,55 +18,31 @@ mod ffi {
     unsafe extern "C++" {
         include!("metadata/src/bindings.h");
 
-        pub fn BindingsCCorSigUncompressCallingConv(sig: &[u8])-> i32;
+        pub unsafe fn BindingsCCorSigUncompressCallingConv(sig: *mut u8)-> i32;
 
-        pub fn BindingsCCorSigUncompressData(sig: &[u8])-> i32;
+        pub unsafe fn BindingsCCorSigUncompressData(sig: *mut u8)-> i32;
 
-        pub fn BindingsCCorSigUncompressElementType(sig: &[u8])-> i32;
+        pub unsafe fn BindingsCCorSigUncompressElementType(sig: *mut u8)-> i32;
 
-        pub fn BindingsCCorSigUncompressToken(sig: &[u8])-> i32;
+        pub unsafe fn BindingsCCorSigUncompressToken(sig: *mut u8)-> i32;
 
-        pub unsafe fn BindingsCCorSigUncompressCallingConvRaw(sig: *mut u8)-> i32;
-
-        pub unsafe fn BindingsCCorSigUncompressDataRaw(sig: *mut u8)-> i32;
-
-        pub unsafe fn BindingsCCorSigUncompressElementTypeRaw(sig: *mut u8)-> i32;
-
-        pub unsafe fn BindingsCCorSigUncompressTokenRaw(sig: *mut u8)-> i32;
     }
 }
 
-pub fn cor_sig_uncompress_calling_conv(sig: &[u8]) -> i32 {
-    unsafe { ffi::BindingsCCorSigUncompressCallingConv(sig) }
+pub fn cor_sig_uncompress_calling_conv(sig: &mut PCCOR_SIGNATURE) -> i32 {
+    unsafe { ffi::BindingsCCorSigUncompressCallingConv(sig.as_abi_mut()) }
 }
 
-pub fn cor_sig_uncompress_calling_conv_raw(sig: *mut u8) -> i32 {
-    unsafe { ffi::BindingsCCorSigUncompressCallingConvRaw(sig) }
+pub fn cor_sig_uncompress_data(sig: &mut PCCOR_SIGNATURE) -> i32 {
+    unsafe { ffi::BindingsCCorSigUncompressData(sig.as_abi_mut()) }
 }
 
-
-pub fn cor_sig_uncompress_data(sig: &[u8]) -> i32 {
-    unsafe { ffi::BindingsCCorSigUncompressData(sig) }
+pub fn cor_sig_uncompress_element_type(sig: &mut PCCOR_SIGNATURE) -> i32 {
+    unsafe { ffi::BindingsCCorSigUncompressElementType(sig.as_abi_mut()) }
 }
 
-pub fn cor_sig_uncompress_data_raw(sig: *mut u8) -> i32 {
-    unsafe { ffi::BindingsCCorSigUncompressDataRaw(sig) }
-}
-
-pub fn cor_sig_uncompress_element_type(sig: &[u8]) -> i32 {
-    unsafe { ffi::BindingsCCorSigUncompressElementType(sig) }
-}
-
-pub fn cor_sig_uncompress_element_type_raw(sig: *mut u8) -> i32 {
-    unsafe { ffi::BindingsCCorSigUncompressElementTypeRaw(sig) }
-}
-
-pub fn cor_sig_uncompress_token(sig: &[u8]) -> i32 {
-    unsafe { ffi::BindingsCCorSigUncompressToken(sig) }
-}
-
-pub fn cor_sig_uncompress_token_raw(sig: *mut u8) -> i32 {
-    unsafe { ffi::BindingsCCorSigUncompressTokenRaw(sig) }
+pub fn cor_sig_uncompress_token(sig: &mut PCCOR_SIGNATURE) -> i32 {
+    unsafe { ffi::BindingsCCorSigUncompressToken(sig.as_abi_mut()) }
 }
 
 /*

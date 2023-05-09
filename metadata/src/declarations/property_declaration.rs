@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMAGE_CEE_CS_CALLCONV_GENERICINST, IMetaDataImport2, mdtProperty};
+use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMAGE_CEE_CS_CALLCONV_GENERICINST, IMetaDataImport2, mdtMethodDef, mdtProperty};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::field_declaration::FieldDeclaration;
 use crate::declarations::method_declaration::MethodDeclaration;
@@ -12,10 +12,12 @@ use crate::prelude::*;
 
 #[derive(Clone, Debug)]
 pub struct PropertyDeclaration {
-    base: FieldDeclaration,
+    kind: DeclarationKind,
+    pub(crate) metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+    token: CorTokenType,
+    full_name: String,
     getter: MethodDeclaration,
     setter: Option<MethodDeclaration>,
-    full_name: String,
 }
 
 impl Declaration for PropertyDeclaration {
@@ -29,33 +31,30 @@ impl Declaration for PropertyDeclaration {
 
     fn is_exported(&self) -> bool {
         let mut property_flags = 0_u32;
-        {
-            match self.base.metadata() {
-                None => {}
-                Some(metadata) => {
-                    let result = unsafe {
-                        metadata.GetPropertyProps(
-                            self.base.token().0 as u32,
-                            0 as _,
-                            PCWSTR::null(),
-                            0 as _,
-                            0 as _,
-                            &mut property_flags,
-                            0 as _,
-                            0 as _,
-                            0 as _,
-                            0 as _,
-                            0 as _,
-                            0 as _,
-                            0 as _,
-                            0 as _,
-                            0 as _,
-                            0 as _,
-                        )
-                    };
-                    debug_assert!(result.is_ok());
-                }
-            }
+
+        if let Some(metadata) = self.metadata.as_ref() {
+            let metadata = metadata.read();
+            let result = unsafe {
+                metadata.GetPropertyProps(
+                    self.token.0 as u32,
+                    0 as _,
+                    PCWSTR::null(),
+                    0 as _,
+                    0 as _,
+                    &mut property_flags,
+                    0 as _,
+                    0 as _,
+                    0 as _,
+                    0 as _,
+                    0 as _,
+                    0 as _,
+                    0 as _,
+                    0 as _,
+                    0 as _,
+                    0 as _,
+                )
+            };
+            debug_assert!(result.is_ok());
         }
 
         if is_pr_special_name(property_flags as i32) {
@@ -65,7 +64,7 @@ impl Declaration for PropertyDeclaration {
     }
 
     fn name(&self) -> &str {
-        self.base.name()
+        self.full_name.as_str()
     }
 
     fn full_name(&self) -> &str {
@@ -73,11 +72,12 @@ impl Declaration for PropertyDeclaration {
     }
 
     fn kind(&self) -> DeclarationKind {
-        self.base.kind()
+        self.kind
     }
 }
 
 impl PropertyDeclaration {
+
     fn make_getter(
         metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
         token: CorTokenType,
@@ -147,7 +147,7 @@ impl PropertyDeclaration {
             debug_assert!(result.is_ok());
         }
 
-        if setter_token == 0 {
+        if setter_token == mdtMethodDef.0 as u32 {
             return None;
         }
 
@@ -155,13 +155,13 @@ impl PropertyDeclaration {
     }
 
     pub fn new(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: CorTokenType) -> Self {
-        debug_assert!(metadata.is_none());
+        debug_assert!(metadata.is_some());
         debug_assert!(type_from_token(token) == mdtProperty.0);
         debug_assert!(token.0 != 0);
 
         let mut full_name = String::new();
 
-        let mut full_name_data = [0_u16; MAX_IDENTIFIER_LENGTH];
+        let mut full_name_data = [0_u16; MAX_IDENTIFIER_LENGTH + 1];
         let mut name_length = 0;
         if let Some(metadata) = metadata.as_ref() {
             let metadata = metadata.read();
@@ -189,23 +189,20 @@ impl PropertyDeclaration {
             debug_assert!(result.is_ok());
 
             if name_length > 0 {
-                full_name = HSTRING::from_wide(&full_name_data[..name_length as usize]).unwrap().to_string()
+                full_name = String::from_utf16_lossy(&full_name_data[..name_length.saturating_sub(1) as usize]);
             }
         }
 
-
         Self {
-            base: FieldDeclaration::new(
-                DeclarationKind::Property,
-                Option::as_ref(&metadata).map(|v| Arc::clone(v)),
-                token,
-            ),
+            kind: DeclarationKind::Property,
+            metadata: metadata.clone(),
+            token,
             getter: PropertyDeclaration::make_getter(
-                Option::as_ref(&metadata).map(|v| Arc::clone(v)),
+                metadata.clone(),
                 token,
             ),
             setter: PropertyDeclaration::make_setter(
-                Option::as_ref(&metadata).map(|v| Arc::clone(v)),
+                metadata.clone(),
                 token,
             ),
             full_name,
@@ -216,10 +213,11 @@ impl PropertyDeclaration {
         let mut signature = [0_u8; MAX_IDENTIFIER_LENGTH];
         let mut signature_count = 0;
 
-        if let Some(metadata) = self.base.metadata() {
+        if let Some(metadata) = self.metadata.as_ref() {
+            let metadata = metadata.read();
             let result = unsafe {
                 metadata.GetPropertyProps(
-                    self.base.token().0 as u32,
+                    self.token.0 as u32,
                     0 as _,
                     None,
                     0 as _,

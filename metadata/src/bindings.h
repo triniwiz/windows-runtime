@@ -19,21 +19,89 @@
 #include <cor.h>
 #include "rust/cxx.h"
 
-int32_t BindingsCCorSigUncompressCallingConv(rust::Slice<const uint8_t> pData);
 
-int32_t BindingsCCorSigUncompressData(rust::Slice<const uint8_t> pData);
+// This limit is only for C# and not for the CLI, but it is good enough
+const size_t MAX_IDENTIFIER_LENGTH{ 511 };
+using identifier = std::array<wchar_t, MAX_IDENTIFIER_LENGTH + 1>;
 
-int32_t BindingsCCorSigUncompressElementType(rust::Slice<const uint8_t> pData);
+#define NO_RETURN __declspec(noreturn)
 
-int32_t BindingsCCorSigUncompressToken(rust::Slice<const uint8_t> pData);
+NO_RETURN void CRASH_IMPL();
 
-int32_t BindingsCCorSigUncompressCallingConvRaw(uint8_t* pData);
+#define CRASH(hresult)                                                        \
+    do {                                                                      \
+        if (IsDebuggerPresent()) {                                            \
+            OutputDebugString(_com_error{ hresult, nullptr }.ErrorMessage()); \
+            __debugbreak();                                                   \
+        }                                                                     \
+                                                                              \
+        CRASH_IMPL();                                                         \
+    } while (0)
 
-int32_t BindingsCCorSigUncompressDataRaw(uint8_t* pData);
+#define NOT_IMPLEMENTED() \
+    do {                  \
+        CRASH(E_NOTIMPL); \
+    } while (0)
 
-int32_t BindingsCCorSigUncompressElementTypeRaw(uint8_t* pData);
+#ifdef _DEBUG
+        #define ASSERT(booleanExpression)           \
+    do {                                    \
+        if (!(booleanExpression)) {         \
+            CRASH(ERROR_ASSERTION_FAILURE); \
+        }                                   \
+    } while (0)
+#else
+#define ASSERT(booleanExpression)
+#endif
 
-int32_t BindingsCCorSigUncompressTokenRaw(uint8_t* pData);
+#ifdef _DEBUG
+#define ASSERT_NOT_REACHED() ASSERT(false)
+#else
+#define ASSERT_NOT_REACHED()
+#endif
+
+#ifdef _DEBUG
+        #define ASSERT_SUCCESS(hr)       \
+    do {                         \
+        HRESULT __hresult{ hr }; \
+        if (FAILED(__hresult)) { \
+            CRASH(__hresult);    \
+        }                        \
+    } while (0)
+#else
+#define ASSERT_SUCCESS(hr) ((void)hr)
+#endif
+
+#ifdef _DEBUG
+        void DEBUG_LOG(_Printf_format_string_ const wchar_t* format, ...);
+#else
+#define DEBUG_LOG(format, ...)
+#endif
+
+using c_void = void;
+
+int32_t BindingsCCorSigUncompressCallingConv(uint8_t* pData);
+
+int32_t BindingsCCorSigUncompressData(uint8_t* pData);
+
+int32_t BindingsCCorSigUncompressDataWithOutput(uint8_t* pData, uint32_t* output);
+
+int32_t BindingsCCorSigUncompressElementType(uint8_t* pData);
+
+int32_t BindingsCCorSigUncompressElementTypeWithOutput(uint8_t* pData, int32_t* output);
+
+int32_t BindingsCCorSigUncompressToken(uint8_t* pData);
+
+int32_t BindingsCCorSigUncompressTokenWithOutput(uint8_t* pData, int32_t* token);
+
+PCCOR_SIGNATURE BindingsSignatureConsumeType(PCCOR_SIGNATURE& signature);
+
+void BindingsSignatureToString(IMetaDataImport2* metadata, PCCOR_SIGNATURE signature, std::wstring& result);
+
+std::wstring BindingsSignatureToString(IMetaDataImport2* metadata, PCCOR_SIGNATURE signature);
+
+std::wstring getTypeName(IMetaDataImport2* metadata, mdToken token);
+
 
 
 #endif //WINDOWS_RUNTIME_BINDINGS_H

@@ -36,19 +36,19 @@ impl GenericDelegateInstanceDeclaration {
             None => String::new(),
             Some(metadata) => {
                 let metadata = metadata.read();
-                let mut signature = std::ptr::null_mut();
-                let mut sig = &mut signature;
+                let mut signature = PCCOR_SIGNATURE::default(); //std::ptr::null_mut();
+                //let mut sig = &mut signature;
                 let mut signature_size = 0;
                 let result = unsafe {
                     metadata.GetTypeSpecFromToken(
                         closed_token.0 as u32,
-                        sig,
+                        &mut signature.as_abi_mut(),
                         &mut signature_size,
                     )
                 };
                 assert!(result.is_ok());
-                let signature = unsafe { std::slice::from_raw_parts(signature as *const u8, signature_size as usize) };
-                Signature::to_string(&*metadata, signature)
+               // let signature = unsafe { std::slice::from_raw_parts(signature as *const u8, signature_size as usize) };
+                Signature::to_string(&*metadata, &signature)
             }
         };
 

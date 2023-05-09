@@ -3,7 +3,7 @@ use std::fmt::{Debug, Formatter, Pointer};
 use std::sync::Arc;
 use parking_lot::{MappedRwLockReadGuard, RwLock};
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
+use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2, mdtFieldDef, mdtMethodDef, mdtProperty};
 use crate::declaration_factory::DeclarationFactory;
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::event_declaration::EventDeclaration;
@@ -11,6 +11,7 @@ use crate::declarations::interface_declaration::InterfaceDeclaration;
 use crate::declarations::method_declaration::MethodDeclaration;
 use crate::declarations::property_declaration::PropertyDeclaration;
 use crate::declarations::type_declaration::TypeDeclaration;
+use crate::prelude::type_from_token;
 
 #[derive(Clone)]
 pub struct BaseClassDeclaration {
@@ -120,8 +121,10 @@ impl BaseClassDeclaration {
                 debug_assert!(count < (tokens.len().saturating_sub(1)) as u32);
                 unsafe { metadata.CloseEnum(enumerator)};
 
-                for token in tokens.iter() {
-                    let method = MethodDeclaration::new(Some(Arc::clone(&meta)), CorTokenType(*token as i32));
+                result.reserve(count as usize);
+                for i in 0..count as usize {
+                    let token = tokens[i];
+                    let method = MethodDeclaration::new(Some(Arc::clone(&meta)), CorTokenType(token as i32));
                     if !method.is_exported() {
                         continue;
                     }
@@ -147,7 +150,7 @@ impl BaseClassDeclaration {
                 let mut enumerator = std::ptr::null_mut();
                 let enumerator_ptr = &mut enumerator;
                 let mut count = 0;
-                let mut tokens = [0_u32; 1024];
+                let mut tokens = [0 as u32; 1024];
                 let result_inner = unsafe {
                     metadata.EnumProperties(
                         enumerator_ptr,
@@ -160,10 +163,12 @@ impl BaseClassDeclaration {
                 debug_assert!(result_inner.is_ok());
                 debug_assert!(count < (tokens.len().saturating_sub(1)) as u32);
                 unsafe { metadata.CloseEnum(enumerator) };
+                result.reserve(count as usize);
 
-                for token in tokens.iter() {
+                for i in 0.. count as usize {
+                    let propertyToken = tokens[i];
                     let property =
-                        PropertyDeclaration::new(Some(Arc::clone(&meta)), CorTokenType(*token as i32));
+                        PropertyDeclaration::new(Some(Arc::clone(&meta)), CorTokenType(propertyToken as i32));
                     if !property.is_exported() {
                         continue;
                     }
@@ -199,10 +204,12 @@ impl BaseClassDeclaration {
             };
             debug_assert!(result_inner.is_ok());
             debug_assert!(count < (tokens.len().saturating_sub(1)) as u32);
+            result.reserve(count as usize);
             unsafe { metadata.CloseEnum(enumerator) };
 
-            for token in tokens.iter() {
-                let event = EventDeclaration::new(Some(Arc::clone(&meta)), CorTokenType(*token as i32));
+            for i in 0..count as usize {
+                let token = tokens[i];
+                let event = EventDeclaration::new(Some(Arc::clone(&meta)), CorTokenType(token as i32));
                 if !event.is_exported() {
                     continue;
                 }
@@ -228,15 +235,15 @@ impl BaseClassDeclaration {
                 metadata.clone(),
                 token,
             ),
-            methods: BaseClassDeclaration::make_method_declarations(
-                metadata.clone(),
-                token,
-            ),
             properties: BaseClassDeclaration::make_property_declarations(
                 metadata.clone(),
                 token,
             ),
             events: BaseClassDeclaration::make_event_declarations(
+                metadata.clone(),
+                token,
+            ),
+            methods: BaseClassDeclaration::make_method_declarations(
                 metadata.clone(),
                 token,
             ),

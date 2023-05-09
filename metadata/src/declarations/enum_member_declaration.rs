@@ -52,12 +52,12 @@ impl EnumMemberDeclaration {
 
                 match CorElementType(value_type as i32) {
                     windows::Win32::System::WinRT::Metadata::ELEMENT_TYPE_I4 => {
-                        let value = unsafe { &mut *(value).cast::<i32>()};
+                        let value: &mut i32 = unsafe {std::mem::transmute(value)};
                         Value::Int32(*value)
                     }
 
                     windows::Win32::System::WinRT::Metadata::ELEMENT_TYPE_U4 => {
-                        let value = unsafe { &mut *(value).cast::<u32>()};
+                        let value:&mut u32 = unsafe {std::mem::transmute(value)};
                         Value::Uint32(*value)
                     }
                     _ => {
