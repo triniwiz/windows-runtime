@@ -65,9 +65,9 @@ impl StructFieldDeclaration {
 
                 assert!(result.is_ok());
 
-                let header = crate::cor_sig_uncompress_data(&mut signature);
+                let header = cor_sig_uncompress_data(&mut signature);
 
-                assert_eq!(header, IMAGE_CEE_CS_CALLCONV_FIELD.0);
+                assert_eq!(header, IMAGE_CEE_CS_CALLCONV_FIELD.0 as u32);
 
             }
         }

@@ -2,14 +2,81 @@ use std::ffi::{c_void, OsStr, OsString};
 use std::fmt::{Debug, Formatter};
 use std::mem::MaybeUninit;
 use windows::core::{GUID, HSTRING, PCSTR, PCWSTR};
-use windows::Win32::System::WinRT::Metadata::{tdAbstract, tdAnsiClass, tdAutoClass, tdAutoLayout, tdBeforeFieldInit, tdClass, tdClassSemanticsMask, tdCustomFormatClass, tdExplicitLayout, tdForwarder, tdHasSecurity, tdImport, tdInterface, tdLayoutMask, tdNestedAssembly, tdNestedFamANDAssem, tdNestedFamORAssem, tdNestedFamily, tdNestedPrivate, tdNestedPublic, tdNotPublic, tdPublic, tdRTSpecialName, tdSealed, tdSequentialLayout, tdSerializable, tdSpecialName, tdStringFormatMask, tdUnicodeClass, tdVisibilityMask, tdWindowsRuntime, CorTokenType, IMetaDataImport2, mdtTypeDef, mdtTypeRef, RoParseTypeName, mdMemberAccessMask, mdPrivateScope, mdPrivate, mdFamANDAssem, mdAssem, mdFamily, mdFamORAssem, mdPublic, mdStatic, mdFinal, mdVirtual, mdHideBySig, mdVtableLayoutMask, mdReuseSlot, mdNewSlot, mdCheckAccessOnOverride, mdAbstract, mdSpecialName, mdPinvokeImpl, mdUnmanagedExport, mdRTSpecialName, COR_CTOR_METHOD_NAME, COR_CTOR_METHOD_NAME_W, COR_CCTOR_METHOD_NAME, COR_CCTOR_METHOD_NAME_W, mdHasSecurity, mdRequireSecObject, prSpecialName, prHasDefault, prRTSpecialName, RoGetMetaDataFile, IMetaDataDispenserEx, evSpecialName, evRTSpecialName};
-use crate::cor_sig_uncompress_data;
+use windows::Win32::System::WinRT::Metadata::{tdAbstract, tdAnsiClass, tdAutoClass, tdAutoLayout, tdBeforeFieldInit, tdClass, tdClassSemanticsMask, tdCustomFormatClass, tdExplicitLayout, tdForwarder, tdHasSecurity, tdImport, tdInterface, tdLayoutMask, tdNestedAssembly, tdNestedFamANDAssem, tdNestedFamORAssem, tdNestedFamily, tdNestedPrivate, tdNestedPublic, tdNotPublic, tdPublic, tdRTSpecialName, tdSealed, tdSequentialLayout, tdSerializable, tdSpecialName, tdStringFormatMask, tdUnicodeClass, tdVisibilityMask, tdWindowsRuntime, CorTokenType, IMetaDataImport2, mdtTypeDef, mdtTypeRef, RoParseTypeName, mdMemberAccessMask, mdPrivateScope, mdPrivate, mdFamANDAssem, mdAssem, mdFamily, mdFamORAssem, mdPublic, mdStatic, mdFinal, mdVirtual, mdHideBySig, mdVtableLayoutMask, mdReuseSlot, mdNewSlot, mdCheckAccessOnOverride, mdAbstract, mdSpecialName, mdPinvokeImpl, mdUnmanagedExport, mdRTSpecialName, COR_CTOR_METHOD_NAME, COR_CTOR_METHOD_NAME_W, COR_CCTOR_METHOD_NAME, COR_CCTOR_METHOD_NAME_W, mdHasSecurity, mdRequireSecObject, prSpecialName, prHasDefault, prRTSpecialName, RoGetMetaDataFile, IMetaDataDispenserEx, evSpecialName, evRTSpecialName, CorElementType, mdtTypeSpec, mdtBaseType};
 use std::os::windows::prelude::*;
 use std::ptr::{addr_of, addr_of_mut, NonNull};
 use std::str::FromStr;
 use windows::w;
 use crate::signature::Signature;
 
+pub fn cor_sig_uncompress_calling_conv(p_data: &mut PCCOR_SIGNATURE) -> u32 {
+    let p_data = &mut p_data.0;
+    let data = unsafe { **p_data };
+    unsafe { *p_data = p_data.offset(1) };
+    data as u32
+}
+
+
+pub fn cor_sig_uncompress_data(p_data: &mut PCCOR_SIGNATURE) -> u32 {
+    // Handle smallest data inline.
+    if (unsafe { **(&mut p_data.0) } & 0x80) == 0x00 { // 0??? ????
+        let p_data = &mut p_data.0;
+        let data = unsafe { **p_data };
+        unsafe { *p_data = p_data.offset(1) };
+        data as u32
+    } else {
+        cor_sig_uncompress_big_data(p_data)
+    }
+}
+
+pub fn cor_sig_uncompress_big_data(p_data: &mut PCCOR_SIGNATURE) -> u32 {
+    let mut res: u32;
+
+    let p_data = &mut p_data.0;
+    // Medium.
+    if (unsafe { **p_data } & 0xC0) == 0x80 { // 10?? ????
+        res = (unsafe { **p_data } & 0x3f) as u32;
+        res <<= 8;
+        unsafe { *p_data = p_data.offset(1) };
+        res |= unsafe { **p_data } as u32;
+        unsafe { *p_data = p_data.offset(1) };
+    } else { // 110? ????
+        res = (unsafe { **p_data } & 0x1f) as u32;
+        res <<= 24;
+        unsafe { *p_data = p_data.offset(1) };
+        res |= (unsafe { **p_data } as u32) << 16;
+        unsafe { *p_data = p_data.offset(1) };
+        res |= (unsafe { **p_data } as u32) << 8;
+        unsafe { *p_data = p_data.offset(1) };
+        res |= unsafe { **p_data } as u32;
+        unsafe { *p_data = p_data.offset(1) };
+    }
+
+    res
+}
+
+// SELECTANY const mdToken g_tkCorEncodeToken[4] ={mdtTypeDef, mdtTypeRef, mdtTypeSpec, mdtBaseType};
+pub const g_tkCorEncodeToken: [u32; 4] = [mdtTypeDef.0 as u32, mdtTypeRef.0 as u32, mdtTypeSpec.0 as u32, mdtBaseType.0 as u32];
+pub fn cor_sig_uncompress_token(p_data: &mut PCCOR_SIGNATURE) -> u32 {
+    let mut tk = 0_u32;
+    let mut tk_type = 0_u32;
+
+    tk = cor_sig_uncompress_data(p_data);
+    tk_type = g_tkCorEncodeToken[(tk & 0x3) as usize];
+    tk = TokenFromRid(tk >> 2, tk_type);
+    tk
+}
+
+pub fn TokenFromRid(rid: u32, tktype: u32) -> u32 {
+    ((rid) | (tktype))
+}
+
+pub fn cor_sig_uncompress_element_type(p_data: &mut PCCOR_SIGNATURE) -> CorElementType {
+    let p_data = &mut p_data.0;
+    let data = unsafe { **p_data };
+    unsafe { *p_data = p_data.offset(1) };
+    CorElementType(data as i32)
+}
 
 pub fn str_from_u8_nul_utf8(utf8_src: &[u8]) -> Result<&str, std::str::Utf8Error> {
     let nul_range_end = utf8_src.iter()
@@ -18,8 +85,9 @@ pub fn str_from_u8_nul_utf8(utf8_src: &[u8]) -> Result<&str, std::str::Utf8Error
     ::std::str::from_utf8(&utf8_src[0..nul_range_end])
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub struct PCCOR_SIGNATURE(pub(crate) *mut c_void);
+#[allow(non_camel_case_types)]
+#[derive(Debug, Copy, Eq, PartialEq)]
+pub struct PCCOR_SIGNATURE(pub(crate) *mut u8);
 
 impl PCCOR_SIGNATURE {
     pub fn new() -> Self {
@@ -27,7 +95,12 @@ impl PCCOR_SIGNATURE {
     }
 
     pub fn from_ptr(value: *mut u8) -> Self {
-        PCCOR_SIGNATURE(value as *mut c_void)
+        if value.is_null() {
+           return  Self(std::ptr::null_mut());
+        }
+        let mut ptr = MaybeUninit::uninit();
+        ptr.write(value);
+        unsafe { PCCOR_SIGNATURE(ptr.assume_init()) }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -35,13 +108,20 @@ impl PCCOR_SIGNATURE {
     }
 
     pub fn as_abi(&self) -> *const u8 {
-        //addr_of!(self.0)
         self.0 as *const u8
     }
 
     pub fn as_abi_mut(&mut self) -> *mut u8 {
-       // addr_of_mut!(self.0)
-        self.0 as *mut u8
+        self.0
+    }
+}
+
+
+impl Clone for PCCOR_SIGNATURE {
+    fn clone(&self) -> Self {
+        let mut ptr = MaybeUninit::uninit();
+        ptr.write(self.0);
+        unsafe { Self(ptr.assume_init()) }
     }
 }
 
@@ -147,7 +227,6 @@ pub fn get_unary_custom_attribute_string_value(
         unsafe { metadata.GetCustomAttributeByName(token.0 as u32, name, &data as *const *const c_void, &mut size) };
     debug_assert!(result.is_ok());
 
-    println!("result {}", result.is_ok());
     if result.is_err() {
         return "".into();
     }
@@ -157,9 +236,7 @@ pub fn get_unary_custom_attribute_string_value(
         return "".into();
     }
 
-    let signature = PCCOR_SIGNATURE::from_ptr(unsafe { (data as *mut u8).offset(2) });
-
-    println!("signature {:?}", signature);
+    let signature = PCCOR_SIGNATURE(unsafe { (data as *mut u8).offset(2) });
 
     get_string_value_from_blob(&signature)
 }
@@ -214,7 +291,6 @@ pub fn resolve_type_ref(
 pub fn get_type_name(metadata: &IMetaDataImport2, token: CorTokenType) -> String {
     assert_ne!(token.0, 0);
     let mut length = 0_u32;
-    println!("type_from_token(token) {} {}", type_from_token(token), token.0 as u32 & 0xff000000 as u32);
     match CorTokenType(type_from_token(token)) {
         mdtTypeDef => {
             // let result = unsafe { metadata.GetTypeDefProps(token.0 as u32, None, &mut length, 0 as _, 0 as _) };
@@ -463,7 +539,6 @@ pub const fn is_md_has_security(x: i32) -> bool {
 pub const fn is_md_require_sec_object(x: i32) -> bool {
     ((x) & mdRequireSecObject.0) == mdRequireSecObject.0
 }
-
 
 pub const fn is_pr_special_name(x: i32) -> bool {
     ((x) & prSpecialName.0) == prSpecialName.0

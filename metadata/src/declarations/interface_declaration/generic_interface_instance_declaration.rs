@@ -53,7 +53,6 @@ impl GenericInterfaceInstanceDeclaration {
                     &mut signature_size,
                 )
             };
-            println!("{:?}", unsafe {std::slice::from_raw_parts(signature, signature_size as usize)});
             debug_assert!(result.is_ok());
             if signature_size > 0 {
                 let mut signature = PCCOR_SIGNATURE::from_ptr(signature);

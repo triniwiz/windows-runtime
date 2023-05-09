@@ -3,7 +3,6 @@ use std::sync::{Arc};
 use parking_lot::RwLock;
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMAGE_CEE_CS_CALLCONV_GENERIC, IMetaDataImport2, mdtMethodDef};
-use crate::{cor_sig_uncompress_calling_conv, cor_sig_uncompress_data, cor_sig_uncompress_element_type};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::parameter_declaration::ParameterDeclaration;
 use crate::declarations::type_declaration::TypeDeclaration;
@@ -58,7 +57,6 @@ impl MethodDeclaration {
                             0 as _,
                         )
                     };
-                    println!("{:?}",&result);
                     assert!(result.is_ok());
                     /*
                             #if _DEBUG
@@ -66,22 +64,16 @@ impl MethodDeclaration {
                     #endif
                              */
 
-                    let mut sig = PCCOR_SIGNATURE::from_ptr(signature);
+                    let mut sig = PCCOR_SIGNATURE(signature);
 
                     if cor_sig_uncompress_calling_conv(&mut sig)
-                        == IMAGE_CEE_CS_CALLCONV_GENERIC.0
+                        == IMAGE_CEE_CS_CALLCONV_GENERIC.0 as u32
                     {
                         unimplemented!()
                     }
 
-                    let mut sig = PCCOR_SIGNATURE::from_ptr(signature.offset(1));
-
                     let mut arguments_count =
-                        { cor_sig_uncompress_data(&mut sig) as u32 };
-
-                    let mut sig = PCCOR_SIGNATURE::from_ptr(signature.offset(2));
-
-                    println!("signature {:?}", unsafe{std::slice::from_raw_parts(signature, signature_size as usize)});
+                        { cor_sig_uncompress_data(&mut sig) };
 
                     return_type = Signature::consume_type(&mut sig);
 
@@ -112,7 +104,6 @@ impl MethodDeclaration {
 
                     for i in start_index..parameters_count as usize {
                         let sig_type = Signature::consume_type(&mut sig);
-                        sig = PCCOR_SIGNATURE::from_ptr(sig.0.offset(1) as *mut u8);
                         parameters.push(ParameterDeclaration::new(
                             Some(Arc::clone(&meta)),
                             CorTokenType(parameter_tokens[i] as i32),
@@ -141,7 +132,6 @@ impl MethodDeclaration {
                     full_name = String::from_utf16_lossy(&data[0..name_length.saturating_sub(1) as usize]);
                     //full_name = unsafe { PCWSTR::from_raw(name.as_ptr()).to_string().unwrap_or("".to_string()) };
 
-                    println!("full_name {}", full_name.as_str());
 
                     overload_name = get_unary_custom_attribute_string_value(
                         &*metadata,

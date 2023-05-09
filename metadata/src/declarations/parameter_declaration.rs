@@ -4,7 +4,6 @@ use std::borrow::Cow;
 use std::sync::{Arc};
 use parking_lot::RwLock;
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, ELEMENT_TYPE_BYREF, IMetaDataImport2, mdtParamDef};
-use crate::cor_sig_uncompress_token;
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::type_declaration::TypeDeclaration;
 
@@ -80,7 +79,7 @@ impl ParameterDeclaration {
     pub fn is_out(&self) -> bool {
         let mut parameter_type = self.parameter_type.clone();
         cor_sig_uncompress_token(&mut parameter_type)
-            == ELEMENT_TYPE_BYREF.0
+            == ELEMENT_TYPE_BYREF.0 as u32
     }
 }
 

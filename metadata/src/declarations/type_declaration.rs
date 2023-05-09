@@ -85,7 +85,6 @@ impl TypeDeclaration {
             Some(metadata) => {
                 let mut length  = 0;
                 let metadata = metadata.read();
-                println!("{} type_from_token {} .. {:?} ... {:?}",kind, type_from_token(token), mdtTypeDef,mdtTypeRef);
                 match CorTokenType(type_from_token(token)){
                     mdtTypeDef => {
                         let _ = unsafe { metadata.GetTypeDefProps(token.0 as u32, Some(&mut full_name_data), &mut length, 0 as _, 0 as _) };

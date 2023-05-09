@@ -3,7 +3,6 @@ use std::mem::MaybeUninit;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, ELEMENT_TYPE_CLASS, ELEMENT_TYPE_GENERICINST, IMetaDataImport2, mdtTypeDef, mdtTypeRef, mdtTypeSpec};
-use crate::{cor_sig_uncompress_element_type, cor_sig_uncompress_token};
 use crate::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use crate::declarations::delegate_declaration::{DelegateDeclaration, DelegateDeclarationImpl};
 use crate::declarations::delegate_declaration::generic_delegate_instance_declaration::GenericDelegateInstanceDeclaration;
@@ -50,24 +49,20 @@ impl DeclarationFactory {
                         result.is_ok()
                     );
 
-                    println!("make_delegate_declaration {:?}", &signature);
-
-                    //let signature = &signature[..signature_size as usize];
-
                     let type1 = cor_sig_uncompress_element_type(&mut signature);
                     debug_assert!(
-                        type1 == ELEMENT_TYPE_GENERICINST.0
+                        type1 == ELEMENT_TYPE_GENERICINST
                     );
 
                     let type2 = cor_sig_uncompress_element_type(&mut signature);
                     debug_assert!(
-                        type2 == ELEMENT_TYPE_CLASS.0
+                        type2 == ELEMENT_TYPE_CLASS
                     );
 
                     let open_generic_delegate_token = cor_sig_uncompress_token(&mut signature);
-                    let ret = match CorTokenType(type_from_token(CorTokenType(open_generic_delegate_token))) {
+                    let ret = match CorTokenType(type_from_token(CorTokenType(open_generic_delegate_token as i32))) {
                         mdtTypeDef => {
-                            Box::new(GenericDelegateInstanceDeclaration::new(meta.clone(), CorTokenType(open_generic_delegate_token), meta, token))
+                            Box::new(GenericDelegateInstanceDeclaration::new(meta.clone(), CorTokenType(open_generic_delegate_token as i32), meta, token))
                         }
                         mdtTypeRef => {
                             let mut external_metadata: MaybeUninit<IMetaDataImport2> = MaybeUninit::zeroed();
@@ -149,27 +144,19 @@ impl DeclarationFactory {
 
                     let mut signature = PCCOR_SIGNATURE::from_ptr(signature);
 
-                    // let signature = &signature[..signature_size as usize];
-
                     let type1 = cor_sig_uncompress_element_type(&mut signature);
 
-                    let mut signature = PCCOR_SIGNATURE::from_ptr(unsafe { (signature.0 as *mut u8).offset(1)});
-
                     debug_assert!(
-                        type1 == ELEMENT_TYPE_GENERICINST.0
+                        type1 == ELEMENT_TYPE_GENERICINST
                     );
 
                     let type2 = cor_sig_uncompress_element_type(&mut signature);
 
-                    let mut signature = PCCOR_SIGNATURE::from_ptr(unsafe { (signature.0 as *mut u8).offset(1)});
-
                     debug_assert!(
-                        type2 == ELEMENT_TYPE_CLASS.0
+                        type2 == ELEMENT_TYPE_CLASS
                     );
 
-                    let open_generic_delegate_token = CorTokenType(cor_sig_uncompress_token(&mut signature));
-
-                   // let mut signature = PCCOR_SIGNATURE::from_ptr(unsafe { (signature.0 as *mut u8).offset(1)});
+                    let open_generic_delegate_token = CorTokenType(cor_sig_uncompress_token(&mut signature) as i32);
 
                     match CorTokenType(type_from_token(token)) {
                         mdtTypeSpec => match CorTokenType(type_from_token(open_generic_delegate_token)) {

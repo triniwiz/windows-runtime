@@ -78,9 +78,9 @@ fn run_js_app() {
    console.log(performance.now() + '\n');
    console.dir(global + '\n');
    //console.log(Windows.UI.Xaml);
-   console.log('Default', Windows.UI.Popups.Placement.Default, Windows.UI.Popups.Placement.Default === 0);
-    console.log('Right', Windows.UI.Popups.Placement.Right, Windows.UI.Popups.Placement.Right === 4);
-     console.log('Bar', Windows.UI.Text.TabAlignment.Bar, Windows.UI.Text.TabAlignment.Bar == 4);
+   // console.log('Default', Windows.UI.Popups.Placement.Default, Windows.UI.Popups.Placement.Default === 0);
+   //  console.log('Right', Windows.UI.Popups.Placement.Right, Windows.UI.Popups.Placement.Right === 4);
+   //   console.log('Bar', Windows.UI.Text.TabAlignment.Bar, Windows.UI.Text.TabAlignment.Bar == 4);
     const dialog = new Windows.UI.Popups.MessageDialog("Hello, World!");
   //  dialog.ShowAsync();
   // console.log('Windows.UI.Popups.MessageDialog', dialog);

@@ -7,6 +7,7 @@ use std::sync::{Arc, Once};
 use parking_lot::{RawRwLock, RwLock};
 use parking_lot::lock_api::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLockReadGuard, RwLockWriteGuard};
 use v8::{Local, Object};
+use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration;
 use metadata::declarations::declaration::{
     DeclarationKind,
@@ -27,12 +28,12 @@ pub struct Runtime {
 static INIT: Once = Once::new();
 
 struct DeclarationFFI {
-    inner: Arc<RwLock<dyn Declaration>>
+    inner: Arc<RwLock<dyn Declaration>>,
 }
 
 impl DeclarationFFI {
-    pub fn new (declaration: Arc<RwLock<dyn Declaration>>) -> Self{
-        Self {inner: declaration}
+    pub fn new(declaration: Arc<RwLock<dyn Declaration>>) -> Self {
+        Self { inner: declaration }
     }
 
     pub fn as_any(&self) -> MappedRwLockReadGuard<'_, RawRwLock, dyn Any> {
@@ -134,7 +135,7 @@ fn handle_now(scope: &mut v8::HandleScope,
     )
 }
 
-fn create_ns_object<'a>(name:&str, declaration: Arc<RwLock<dyn Declaration>>, scope: &mut v8::HandleScope<'a>) -> Local<'a, v8::Value> {
+fn create_ns_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, scope: &mut v8::HandleScope<'a>) -> Local<'a, v8::Value> {
     let scope = &mut v8::EscapableHandleScope::new(scope);
     let name = v8::String::new(scope, name).unwrap();
     let tmpl = v8::FunctionTemplate::new(scope, handle_ns_func);
@@ -169,15 +170,13 @@ fn init_meta(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, context
         for ns in global_namespaces.children() {
             let full_name = if full_name.is_empty() {
                 ns.to_string()
-            }else {
+            } else {
                 format!("{}.{}", full_name, ns)
             };
 
             let name: Local<v8::Name> = v8::String::new(scope, ns.as_str()).unwrap().into();
-            if let Some(name_space) = MetadataReader::find_by_name(full_name.as_str()){
-
+            if let Some(name_space) = MetadataReader::find_by_name(full_name.as_str()) {
                 let object = create_ns_object(ns, name_space, scope);
-
                 global.define_own_property(scope, name, object, v8::READ_ONLY | v8::DONT_DELETE);
             }
         }
@@ -239,7 +238,7 @@ fn handle_ns_meta_getter(scope: &mut v8::HandleScope,
     let dec = this.get_internal_field(scope, 0).unwrap();
     let dec = unsafe { Local::<v8::External>::cast(dec) };
     let dec = dec.value() as *mut DeclarationFFI;
-    let dec = unsafe{&*dec};
+    let dec = unsafe { &*dec };
     let lock = dec.read();
     let store = this.get_internal_field(scope, 1).unwrap();
     let store = unsafe { Local::<v8::Map>::cast(store) };
@@ -254,12 +253,12 @@ fn handle_ns_meta_getter(scope: &mut v8::HandleScope,
                     if let Some(cache) = cached_item {
                         if !cache.is_null_or_undefined() {
                             rv.set(cache);
-                            return
+                            return;
                         }
                     }
 
                     let full_name = format!("{}.{}", dec.full_name(), name.as_str());
-                    if let Some(declaration) = MetadataReader::find_by_name(full_name.as_str()){
+                    if let Some(declaration) = MetadataReader::find_by_name(full_name.as_str()) {
                         let ret: Local<v8::Value> = create_ns_object(name.as_str(), declaration, scope).into();
                         rv.set(ret.into());
                         store.set(scope, key.into(), ret.into());
@@ -281,7 +280,7 @@ fn handle_ns_meta_getter(scope: &mut v8::HandleScope,
                     if let Some(cache) = cached_item {
                         if !cache.is_null_or_undefined() {
                             rv.set(cache);
-                            return
+                            return;
                         }
                     }
 
@@ -299,12 +298,12 @@ fn handle_ns_meta_getter(scope: &mut v8::HandleScope,
                                 store.set(scope, key.into(), ret);
                                 return;
                             }
-                            _ =>{}
+                            _ => {}
                         }
                     }
 
                     rv.set_undefined();
-                    return
+                    return;
                 }
             }
             DeclarationKind::EnumMember => {}
