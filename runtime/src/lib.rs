@@ -7,6 +7,7 @@ use std::sync::{Arc, Once};
 use parking_lot::{RawRwLock, RwLock};
 use parking_lot::lock_api::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLockReadGuard, RwLockWriteGuard};
 use v8::{Local, Object};
+use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration;
 use metadata::declarations::declaration::{
@@ -16,7 +17,9 @@ use metadata::declarations::declaration::{
 use metadata::declarations::enum_declaration::EnumDeclaration;
 use metadata::declarations::namespace_declaration::NamespaceDeclaration;
 use metadata::declarations::type_declaration::TypeDeclaration;
+use metadata::declaring_interface_for_method::Metadata;
 use metadata::meta_data_reader::MetadataReader;
+use metadata::signature::Signature;
 use metadata::value::Value;
 
 pub struct Runtime {
@@ -27,9 +30,14 @@ pub struct Runtime {
 
 static INIT: Once = Once::new();
 
+#[derive(Clone)]
 struct DeclarationFFI {
     inner: Arc<RwLock<dyn Declaration>>,
 }
+
+unsafe impl Sync for DeclarationFFI {}
+
+unsafe impl Send for DeclarationFFI {}
 
 impl DeclarationFFI {
     pub fn new(declaration: Arc<RwLock<dyn Declaration>>) -> Self {
@@ -160,6 +168,92 @@ fn create_ns_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, s
     ret.into()
 }
 
+fn create_ns_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, scope: &mut v8::HandleScope<'a>) -> Local<'a, v8::Value> {
+    let scope = &mut v8::EscapableHandleScope::new(scope);
+
+
+    let name = v8::String::new(scope, name).unwrap();
+
+    let declaration = Box::into_raw(Box::new(DeclarationFFI::new(declaration)));
+
+    let ext = v8::External::new(scope, declaration as _);
+
+    let tmpl = v8::FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                                              args: v8::FunctionCallbackArguments,
+                                              mut retval: v8::ReturnValue| {
+        let length = args.length();
+
+        let dec = unsafe { Local::<v8::External>::cast(args.data()) };
+
+        let dec = dec.value() as *mut DeclarationFFI;
+
+        let dec = unsafe { &*dec };
+
+        let lock = dec.read();
+
+        let kind = lock.kind();
+
+        let ext = args.data();
+
+        match kind {
+            DeclarationKind::Class => {
+                let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
+                // todo
+                for method in clazz.methods() {
+                    let param_count = method.number_of_parameters();
+                    println!("count {param_count}");
+                    if param_count == length as usize {
+                        println!("{:?}", method.parameters());
+                    }
+                }
+
+                for ctor in clazz.initializers() {
+                    let param_count = ctor.number_of_parameters();
+                    println!("ctor param_count {:?}", param_count);
+                    if param_count == length as usize {
+                        for param in ctor.parameters().iter() {
+                            let type_ = param.type_();
+                            let metadata = param.metadata();
+                            if let Some(metadata) = metadata {
+                                println!("{:?}", Signature::to_string(&*metadata, &type_));
+                            }
+
+                        }
+
+
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let object_tmpl = v8::ObjectTemplate::new(scope);
+        object_tmpl.set_named_property_handler(
+            v8::NamedPropertyHandlerConfiguration::new()
+                .getter(handle_ns_meta_getter)
+                .setter(handle_ns_meta_setter)
+        );
+        object_tmpl.set_internal_field_count(2);
+        let object = object_tmpl.new_instance(scope).unwrap();
+
+        object.set_internal_field(0, ext);
+
+        let object_store = v8::Map::new(scope);
+        object.set_internal_field(1, object_store.into());
+
+        retval.set(object.into());
+    })
+        .data(ext.into()).build(scope);
+    tmpl.set_class_name(name);
+
+    let func = tmpl.get_function(scope).unwrap();
+    let ret = scope.escape(func);
+
+    ret.into()
+}
+
+
 fn init_meta(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, context: Local<v8::Context>) {
     let mut global = context.global(scope);
     let global_metadata = MetadataReader::find_by_name("").unwrap();
@@ -184,21 +278,22 @@ fn init_meta(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, context
 }
 
 fn handle_ns_meta_setter(scope: &mut v8::HandleScope,
-                         key: v8::Local<v8::Name>,
-                         value: v8::Local<v8::Value>,
+                         key: Local<v8::Name>,
+                         value: Local<v8::Value>,
                          args: v8::PropertyCallbackArguments) {
     let this = args.holder();
     let dec = this.get_internal_field(scope, 0).unwrap();
     let dec = unsafe { Local::<v8::External>::cast(dec) };
-    let dec = dec.value() as *mut Box<dyn Declaration>;
-    let dec = unsafe { &mut *dec };
-    let kind = dec.kind();
+    let dec = dec.value() as *mut DeclarationFFI;
+    let dec = unsafe { &*dec };
+    let lock = dec.read();
+    let kind = lock.kind();
     let store = this.get_internal_field(scope, 1).unwrap();
     let store = unsafe { Local::<v8::Map>::cast(store) };
     let name = key.to_rust_string_lossy(scope);
     match kind {
         DeclarationKind::Namespace => {
-            let dec = unsafe { (*dec).as_any().downcast_ref::<NamespaceDeclaration>() };
+            let dec = unsafe { lock.as_any().downcast_ref::<NamespaceDeclaration>() };
             if let Some(dec) = dec {
                 if !dec.children().contains(&name) {
                     store.set(scope, key.into(), value);
@@ -210,7 +305,7 @@ fn handle_ns_meta_setter(scope: &mut v8::HandleScope,
         DeclarationKind::GenericInterface => {}
         DeclarationKind::GenericInterfaceInstance => {}
         DeclarationKind::Enum => {
-            let dec = unsafe { (*dec).as_any().downcast_ref::<EnumDeclaration>() };
+            let dec = unsafe { lock.as_any().downcast_ref::<EnumDeclaration>() };
             if let Some(dec) = dec {
                 if dec.enum_for_name(&name).is_none() {
                     store.set(scope, key.into(), value);
@@ -249,19 +344,32 @@ fn handle_ns_meta_getter(scope: &mut v8::HandleScope,
             DeclarationKind::Namespace => {
                 let dec = lock.as_any().downcast_ref::<NamespaceDeclaration>();
                 if let Some(dec) = dec {
-                    let cached_item = store.get(scope, key.into());
-                    if let Some(cache) = cached_item {
-                        if !cache.is_null_or_undefined() {
-                            rv.set(cache);
-                            return;
-                        }
-                    }
+                    // let cached_item = store.get(scope, key.into());
+                    // if let Some(cache) = cached_item {
+                    //     if !cache.is_null_or_undefined() {
+                    //         rv.set(cache);
+                    //         return;
+                    //     }
+                    // }
 
                     let full_name = format!("{}.{}", dec.full_name(), name.as_str());
-                    if let Some(declaration) = MetadataReader::find_by_name(full_name.as_str()) {
-                        let ret: Local<v8::Value> = create_ns_object(name.as_str(), declaration, scope).into();
-                        rv.set(ret.into());
-                        store.set(scope, key.into(), ret.into());
+                    if let Some(dec) = MetadataReader::find_by_name(full_name.as_str()) {
+                        let declaration = Arc::clone(&dec);
+                        let lock = dec.read();
+
+                        match lock.kind() {
+                            DeclarationKind::Class => {
+                                let ret: Local<v8::Value> = create_ns_ctor_object(lock.name(), declaration, scope).into();
+                                rv.set(ret.into());
+                            }
+                            _ => {
+                                let ret: Local<v8::Value> = create_ns_object(name.as_str(), declaration, scope).into();
+                                rv.set(ret.into());
+                            }
+                        }
+
+
+                        //  store.set(scope, key.into(), ret.into());
                         return;
                     }
 

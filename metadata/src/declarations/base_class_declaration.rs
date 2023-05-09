@@ -15,7 +15,7 @@ use crate::prelude::type_from_token;
 
 #[derive(Clone)]
 pub struct BaseClassDeclaration {
-    base: TypeDeclaration,
+    pub(crate) base: TypeDeclaration,
     implemented_interfaces: Vec<Box<dyn BaseClassDeclarationImpl>>,
     methods: Vec<MethodDeclaration>,
     properties: Vec<PropertyDeclaration>,

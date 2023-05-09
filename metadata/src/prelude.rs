@@ -299,17 +299,19 @@ pub fn get_type_name(metadata: &IMetaDataImport2, token: CorTokenType) -> String
             let mut buf = [0_u16; MAX_IDENTIFIER_LENGTH];
             let result = unsafe { metadata.GetTypeDefProps(token.0 as u32, Some(buf.as_mut_slice()), &mut length, 0 as _, 0 as _) };
             assert!(result.is_ok());
-            return String::from_utf16_lossy(&buf[..length as usize]);
+            return String::from_utf16_lossy(&buf[..length.saturating_sub(1) as usize]);
         }
         mdtTypeRef => {
-            let result = unsafe { metadata.GetTypeRefProps(token.0 as u32, 0 as _, None, &mut length) };
-            assert!(result.is_ok());
-            let mut buf = vec![0_u16; length as usize];
+            // let result = unsafe { metadata.GetTypeRefProps(token.0 as u32, 0 as _, None, &mut length) };
+            // assert!(result.is_ok());
+            // let mut buf = vec![0_u16; length.saturating_sub(1) as usize];
 
-            let result = unsafe { metadata.GetTypeRefProps(token.0 as u32, 0 as _, Some(buf.as_mut_slice()), 0 as _) };
+            let mut buf = [0_u16; MAX_IDENTIFIER_LENGTH];
+
+            let result = unsafe { metadata.GetTypeRefProps(token.0 as u32, 0 as _, Some(buf.as_mut_slice()), &mut length) };
             assert!(result.is_ok());
 
-            return String::from_utf16_lossy(buf.as_slice());
+            return String::from_utf16_lossy(&buf[..length.saturating_sub(1) as usize]);
         }
         _ => {
             unreachable!()
@@ -465,7 +467,7 @@ pub const fn is_md_fam_orassem(x: i32) -> bool {
 }
 
 pub const fn is_md_public(x: i32) -> bool {
-    (((x) & mdMemberAccessMask.0) == mdPublic.0)
+    (x) & mdMemberAccessMask.0 == mdPublic.0
 }
 
 pub const fn is_md_static(x: i32) -> bool {

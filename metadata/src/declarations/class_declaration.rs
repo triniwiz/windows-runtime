@@ -6,8 +6,11 @@ use windows::Win32::System::WinRT::Metadata::{COR_CTOR_METHOD_NAME, COR_CTOR_MET
 use crate::declaration_factory::DeclarationFactory;
 use crate::declarations::base_class_declaration::{BaseClassDeclaration, BaseClassDeclarationImpl};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
+use crate::declarations::event_declaration::EventDeclaration;
 use crate::declarations::interface_declaration::InterfaceDeclaration;
 use crate::declarations::method_declaration::MethodDeclaration;
+use crate::declarations::property_declaration::PropertyDeclaration;
+use crate::declarations::type_declaration::TypeDeclaration;
 
 use crate::prelude::*;
 
@@ -73,7 +76,7 @@ impl ClassDeclaration {
                 };
                 debug_assert!(result_inner.is_ok());
 
-                if is_md_public(flags as i32) {
+                if !is_md_public(flags as i32) {
                     continue;
                 }
 
@@ -175,14 +178,14 @@ impl ClassDeclaration {
 
         Self {
             initializers: ClassDeclaration::make_initializer_declarations(
-                Option::as_ref(&metadata).map(|v| Arc::clone(v)),
+                metadata.clone(),
                 token,
             ),
             default_interface: ClassDeclaration::make_default_interface(
-                Option::as_ref(&metadata).map(|v| Arc::clone(v)),
+                metadata.clone(),
                 token,
             ),
-            base: BaseClassDeclaration::new(DeclarationKind::Class, metadata, token),
+            base: BaseClassDeclaration::new(DeclarationKind::Class, metadata.clone(), token),
             base_full_name,
         }
     }
@@ -244,5 +247,35 @@ impl Declaration for ClassDeclaration {
 
     fn kind(&self) -> DeclarationKind {
         self.base.kind()
+    }
+}
+
+impl BaseClassDeclarationImpl for ClassDeclaration {
+    fn as_declaration(&self) -> &dyn Declaration {
+        self
+    }
+
+    fn as_declaration_mut(&mut self) -> &mut dyn Declaration {
+        self
+    }
+
+    fn base(&self) -> &TypeDeclaration {
+        self.base.base()
+    }
+
+    fn implemented_interfaces(&self) -> Vec<&InterfaceDeclaration>{
+        self.base.implemented_interfaces()
+    }
+
+    fn methods(&self) -> &[MethodDeclaration] {
+        self.base.methods()
+    }
+
+    fn properties(&self) -> &[PropertyDeclaration] {
+        self.base.properties()
+    }
+
+    fn events(&self) -> &[EventDeclaration] {
+        self.base.events()
     }
 }

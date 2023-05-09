@@ -2,7 +2,7 @@ use std::any::Any;
 use crate::prelude::*;
 use std::borrow::Cow;
 use std::sync::{Arc};
-use parking_lot::RwLock;
+use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, ELEMENT_TYPE_BYREF, IMetaDataImport2, mdtParamDef};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::type_declaration::TypeDeclaration;
@@ -64,7 +64,7 @@ impl ParameterDeclaration {
                     )
                 };
                 assert!(result.is_ok());
-                String::from_utf16_lossy(full_name_data.as_mut_slice())
+                String::from_utf16_lossy(&full_name_data[..length.saturating_sub(1) as usize])
             }
         };
 
@@ -80,6 +80,30 @@ impl ParameterDeclaration {
         let mut parameter_type = self.parameter_type.clone();
         cor_sig_uncompress_token(&mut parameter_type)
             == ELEMENT_TYPE_BYREF.0 as u32
+    }
+
+
+
+    pub fn type_(&self) -> PCCOR_SIGNATURE {
+        self.parameter_type
+    }
+
+    pub fn metadata(&self) -> Option<MappedRwLockReadGuard<'_, IMetaDataImport2>> {
+        self.metadata.as_ref().map(|metadata| {
+            RwLockReadGuard::map(
+                metadata.read(),
+                |metadata| metadata,
+            )
+        })
+    }
+
+    pub fn metadata_mut(&self) -> Option<MappedRwLockWriteGuard<'_, IMetaDataImport2>> {
+        self.metadata.as_ref().map(|metadata| {
+            RwLockWriteGuard::map(
+                metadata.write(),
+                |metadata| metadata,
+            )
+        })
     }
 }
 

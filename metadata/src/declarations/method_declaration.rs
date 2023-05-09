@@ -14,7 +14,7 @@ use crate::prelude::*;
 pub struct MethodDeclaration {
     kind: DeclarationKind,
     pub(crate) metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
-    token: CorTokenType,
+    pub(crate) token: CorTokenType,
     parameters: Vec<ParameterDeclaration>,
     return_type: PCCOR_SIGNATURE,
     full_name: String,
@@ -101,6 +101,7 @@ impl MethodDeclaration {
                     if arguments_count + 1 == parameters_count {
                         start_index += 1;
                     }
+
 
                     for i in start_index..parameters_count as usize {
                         let sig_type = Signature::consume_type(&mut sig);

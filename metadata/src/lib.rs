@@ -10,3 +10,4 @@ pub mod value;
 pub mod signature;
 pub mod generic_instance_id_builder;
 pub mod declaration_factory;
+pub mod declaring_interface_for_method;
