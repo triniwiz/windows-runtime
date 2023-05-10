@@ -11,3 +11,7 @@ edition = "2021"
 windows = {version = "0.48.0", features = ["implement","Foundation","Win32_Foundation", "Win32_System_WinRT_Metadata", "Win32_System_Com", "Win32_System_WinRT"] }
 parking_lot = "0.12.1"
 dyn-clone = "1.0.11"
+cxx = "1.0"
+
+[build-dependencies]
+cxx-build = "1.0"

@@ -1,7 +1,7 @@
 use std::ffi::{c_void, OsStr, OsString};
 use std::fmt::{Debug, Formatter};
 use std::mem::MaybeUninit;
-use windows::core::{GUID, HSTRING, PCSTR, PCWSTR};
+use windows::core::{GUID, HSTRING, PCSTR, PCWSTR, Type};
 use windows::Win32::System::WinRT::Metadata::{tdAbstract, tdAnsiClass, tdAutoClass, tdAutoLayout, tdBeforeFieldInit, tdClass, tdClassSemanticsMask, tdCustomFormatClass, tdExplicitLayout, tdForwarder, tdHasSecurity, tdImport, tdInterface, tdLayoutMask, tdNestedAssembly, tdNestedFamANDAssem, tdNestedFamORAssem, tdNestedFamily, tdNestedPrivate, tdNestedPublic, tdNotPublic, tdPublic, tdRTSpecialName, tdSealed, tdSequentialLayout, tdSerializable, tdSpecialName, tdStringFormatMask, tdUnicodeClass, tdVisibilityMask, tdWindowsRuntime, CorTokenType, IMetaDataImport2, mdtTypeDef, mdtTypeRef, RoParseTypeName, mdMemberAccessMask, mdPrivateScope, mdPrivate, mdFamANDAssem, mdAssem, mdFamily, mdFamORAssem, mdPublic, mdStatic, mdFinal, mdVirtual, mdHideBySig, mdVtableLayoutMask, mdReuseSlot, mdNewSlot, mdCheckAccessOnOverride, mdAbstract, mdSpecialName, mdPinvokeImpl, mdUnmanagedExport, mdRTSpecialName, COR_CTOR_METHOD_NAME, COR_CTOR_METHOD_NAME_W, COR_CCTOR_METHOD_NAME, COR_CCTOR_METHOD_NAME_W, mdHasSecurity, mdRequireSecObject, prSpecialName, prHasDefault, prRTSpecialName, RoGetMetaDataFile, IMetaDataDispenserEx, evSpecialName, evRTSpecialName, CorElementType, mdtTypeSpec, mdtBaseType};
 use std::os::windows::prelude::*;
 use std::ptr::{addr_of, addr_of_mut, NonNull};
@@ -151,11 +151,21 @@ pub const SYSTEM_ENUM: &str = "System.Enum";
 pub const SYSTEM_VALUETYPE: &str = "System.ValueType";
 pub const SYSTEM_MULTICASTDELEGATE: &str = "System.MulticastDelegate";
 
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct IGUID {
+    pub Data1: u32,
+    pub Data2: u16,
+    pub Data3: u16,
+    pub Data4: [u8; 8],
+}
+
 pub fn get_guid_attribute_value(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> GUID {
-    debug_assert!(metadata.is_none());
+    debug_assert!(metadata.is_some());
     debug_assert!(token.0 != 0);
 
-    let mut guid = GUID::default();
+    let mut guid = GUID::zeroed();
 
     match metadata {
         None => {}
@@ -174,19 +184,13 @@ pub fn get_guid_attribute_value(metadata: Option<&IMetaDataImport2>, token: CorT
                 )
             };
 
+            assert!(result.is_ok());
+
             let mut data = data as *mut u8;
             // Skip prolog
             let os_data = unsafe { data.offset(2) };
 
-            println!("guid {:?}", &guid);
-
-            let addr = addr_of_mut!(guid) as *mut *mut u8;
-
-            unsafe { std::ptr::write(addr, os_data); }
-
-            println!("guid {:?}", &guid);
-
-            //bytes_to_guid(os_data, &mut guid);
+            guid = crate::get_guid(os_data);
         }
     }
     guid
@@ -205,9 +209,9 @@ pub fn get_string_value_from_blob(
 
     let size = cor_sig_uncompress_data(&mut signature);
 
-    let slice = unsafe { std::slice::from_raw_parts(signature.as_abi() as *const u16, size as usize) };
+    let slice = unsafe { std::slice::from_raw_parts(signature.0, size as usize) };
 
-    HSTRING::from_wide(slice).unwrap_or_default().to_string()
+    String::from_utf8_lossy(slice).to_string()
 }
 
 pub fn get_unary_custom_attribute_string_value(

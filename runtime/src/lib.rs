@@ -7,6 +7,9 @@ use std::sync::{Arc, Once};
 use parking_lot::{RawRwLock, RwLock};
 use parking_lot::lock_api::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLockReadGuard, RwLockWriteGuard};
 use v8::{Local, Object};
+use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, IUnknown_Vtbl};
+use windows::Win32::System::Com::CoInitialize;
+use windows::Win32::System::WinRT::RoGetActivationFactory;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration;
@@ -15,6 +18,7 @@ use metadata::declarations::declaration::{
     Declaration,
 };
 use metadata::declarations::enum_declaration::EnumDeclaration;
+use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::declarations::namespace_declaration::NamespaceDeclaration;
 use metadata::declarations::type_declaration::TypeDeclaration;
 use metadata::declaring_interface_for_method::Metadata;
@@ -209,8 +213,39 @@ fn create_ns_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration
 
                 for ctor in clazz.initializers() {
                     let param_count = ctor.number_of_parameters();
-                    println!("ctor param_count {:?}", param_count);
+                    println!("ctor param_count {:?} {} {}", param_count, clazz.full_name(), clazz.name());
+
+                    let id = HSTRING::from(clazz.full_name());
+                    let result = unsafe { CoInitialize(None) };
+
+
+                    let ret = unsafe { RoGetActivationFactory::<IUnknown>(&id)};
+
+                    let ret = ret.unwrap();
+
+
+                    let mut index = 0 as usize;
+                    let interface = Metadata::find_declaring_interface_for_method(ctor, &mut index);
+
+                    let interface = interface.unwrap();
+
+                    let ii_lock = interface.read();
+                    let ii = ii_lock.as_declaration().as_any().downcast_ref::<InterfaceDeclaration>();
+                    let id = ii.unwrap().id();
+                    let mut interface_ptr = std::ptr::null_mut() as *const c_void;
+                    let raw = ret.vtable();
+
+                     let result = unsafe { ((*raw).QueryInterface)(ret.as_raw(), &id, &mut interface_ptr)};
+                    //
+                    //
+                    println!("result {:?} {:?}", result, interface_ptr);
+
+                    // TODO handling ctor
+                  //  println!("{:?}",  ret.GetRuntimeClassName());
+
+                    let mut index = 0;
                     if param_count == length as usize {
+
                         for param in ctor.parameters().iter() {
                             let type_ = param.type_();
                             let metadata = param.metadata();

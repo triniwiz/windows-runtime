@@ -15,7 +15,7 @@ use crate::prelude::*;
 pub struct Metadata {}
 
 impl Metadata {
-    pub fn get_method_containing_class_token(metadata: &mut IMetaDataImport2, method_token: CorTokenType) -> u32 {
+    pub fn get_method_containing_class_token(metadata: &IMetaDataImport2, method_token: CorTokenType) -> u32 {
         let mut class_token = 0_u32;
 
         match CorTokenType(type_from_token(method_token)) {
@@ -55,7 +55,7 @@ impl Metadata {
         class_token
     }
 
-    pub fn get_custom_attribute_constructor_token(metadata: &mut IMetaDataImport2, custom_attribute: CorTokenType) -> u32 {
+    pub fn get_custom_attribute_constructor_token(metadata: &IMetaDataImport2, custom_attribute: CorTokenType) -> u32 {
         let mut constructor_token = 0_u32;
         let result = unsafe {
             metadata.GetCustomAttributeProps(
@@ -70,12 +70,12 @@ impl Metadata {
         constructor_token
     }
 
-    pub fn get_custom_attribute_class_token(metadata: &mut IMetaDataImport2, custom_attribute: CorTokenType) -> u32 {
+    pub fn get_custom_attribute_class_token(metadata: &IMetaDataImport2, custom_attribute: CorTokenType) -> u32 {
         let token = Metadata::get_custom_attribute_constructor_token(metadata, custom_attribute);
         Metadata::get_method_containing_class_token(metadata, CorTokenType(token as i32))
     }
 
-    pub fn get_method_signature(metadata: &mut IMetaDataImport2, token: CorTokenType) -> PCCOR_SIGNATURE {
+    pub fn get_method_signature(metadata: &IMetaDataImport2, token: CorTokenType) -> PCCOR_SIGNATURE {
         let mut signature = std::ptr::null_mut();
         let mut signature_size = 0;
 
@@ -107,26 +107,26 @@ impl Metadata {
                         &mut signature_size,
                     )
                 };
-               assert!( result.is_ok());
+                assert!(result.is_ok());
             }
             _ => {
                 std::unreachable!()
             }
         }
-        PCCOR_SIGNATURE(signature)
+        unsafe { PCCOR_SIGNATURE(signature.offset(1)) }
     }
 
-    pub fn get_signature_argument_count(metadata: &mut IMetaDataImport2, signature: &mut PCCOR_SIGNATURE) -> u32 {
+    pub fn get_signature_argument_count(metadata: &IMetaDataImport2, signature: &mut PCCOR_SIGNATURE) -> u32 {
         cor_sig_uncompress_data(signature)
     }
 
-    pub fn get_method_argument_count(metadata: &mut IMetaDataImport2, token: CorTokenType) -> u32 {
+    pub fn get_method_argument_count(metadata: &IMetaDataImport2, token: CorTokenType) -> u32 {
         let mut signature = Metadata::get_method_signature(metadata, token);
         Metadata::get_signature_argument_count(metadata, &mut signature)
     }
 
 
-    pub fn get_custom_attributes_with_name(metadata: &mut IMetaDataImport2, token: CorTokenType, attribute_name: &str) -> Vec<u32> {
+    pub fn get_custom_attributes_with_name(metadata: &IMetaDataImport2, token: CorTokenType, attribute_name: &str) -> Vec<u32> {
         // mdCustomAttribute
         let mut attributes = [0_u32; 512];
         let mut attributes_count = 0;
@@ -157,26 +157,26 @@ impl Metadata {
 
 
         let mut filtered_attributes: Vec<u32> = Vec::new();
-        let new_attributes = &attributes[..attributes_count as usize];
-        for attribute in new_attributes.iter() {
-            let class_attribute_class_token = Metadata::get_custom_attribute_class_token(metadata, CorTokenType(*attribute as i32));
+        for i in 0..attributes_count as usize {
+            let attribute = attributes[i];
+            let class_attribute_class_token = Metadata::get_custom_attribute_class_token(metadata, CorTokenType(attribute as i32));
             // let mut name = [0_u16; MAX_IDENTIFIER_LENGTH];
             let class_attribute_class_name = get_type_name(metadata, CorTokenType(class_attribute_class_token as i32));
-            println!("class_attribute_class_name {}", class_attribute_class_name.as_str());
             //let mut class_attribute_class_name = windows::HSTRING::from_wide(name[..length]);
             // TODO
-            if class_attribute_class_name != attribute_name {
+            if class_attribute_class_name.as_str() != attribute_name {
                 continue;
             }
 
             filtered_attributes.push(
-                *attribute
+                attribute
             );
         }
+
         filtered_attributes
     }
 
-    pub fn get_custom_attribute_type_argument(metadata: &mut IMetaDataImport2, token: CorTokenType) -> u32 {
+    pub fn get_custom_attribute_type_argument(metadata: &IMetaDataImport2, token: CorTokenType) -> u32 {
         let mut attribute_value = std::ptr::null_mut() as *const c_void;
         let mut attribute_value_size = 0_u32;
 
@@ -192,8 +192,12 @@ impl Metadata {
 
         debug_assert!(result.is_ok());
 
+        let attribute_value = attribute_value as *mut u8;
+        let signature = unsafe { PCCOR_SIGNATURE((attribute_value as *mut u8).offset(2)) };
+
+
         let type_name = get_string_value_from_blob(
-            &PCCOR_SIGNATURE(unsafe { (attribute_value as *mut u8).offset(2) })
+            &signature
         );
 
         let type_name = OsString::from(type_name);
@@ -209,12 +213,13 @@ impl Metadata {
                 &mut type_token,
             )
         };
+
         debug_assert!(result.is_ok());
-        return type_token;
+        type_token
     }
 
 
-    pub fn get_class_methods(metadata: &mut IMetaDataImport2, token: CorTokenType) -> Vec<u32> {
+    pub fn get_class_methods(metadata: &IMetaDataImport2, token: CorTokenType) -> Vec<u32> {
         let mut methods = [0_u32; 1024];
         let mut methods_count = 0;
         let mut methods_enumerator = std::ptr::null_mut();
@@ -242,9 +247,9 @@ impl Metadata {
     }
 
 
-    pub fn has_method_first_type_argument(metadata: &mut IMetaDataImport2, token: CorTokenType) -> bool {
+    pub fn has_method_first_type_argument(metadata: &IMetaDataImport2, token: CorTokenType) -> bool {
         let mut signature = Metadata::get_method_signature(
-            metadata, token
+            metadata, token,
         );
         let argument_count = cor_sig_uncompress_data(&mut signature);
 
@@ -254,16 +259,14 @@ impl Metadata {
 
         let return_type = cor_sig_uncompress_element_type(&mut signature);
 
-        println!("{:?} {:?}", return_type, ELEMENT_TYPE_VOID);
-
         debug_assert!(
-            return_type.0 == ELEMENT_TYPE_VOID.0
+            return_type == ELEMENT_TYPE_VOID
         );
 
 
         let first_argument = cor_sig_uncompress_element_type(&mut signature);
 
-        if first_argument == ELEMENT_TYPE_CLASS {
+        if first_argument != ELEMENT_TYPE_CLASS {
             return false;
         }
 
@@ -279,7 +282,6 @@ impl Metadata {
         return true;
     }
 
-
     pub fn declaring_interface_for_initializer(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, method_token: CorTokenType, out_index: &mut usize) -> Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>> {
         // InterfaceDeclaration
 
@@ -288,7 +290,7 @@ impl Metadata {
         match metadata {
             None => None,
             Some(metadata) => {
-                let metadata = &mut *metadata.write();
+                let metadata = &*metadata.read();
 
                 let method_argument_count = Metadata::get_method_argument_count(metadata, method_token);
 
@@ -318,6 +320,9 @@ impl Metadata {
                             continue;
                         }
 
+                        //drop early to force unlock
+                        drop(metadata);
+
                         *out_index = i;
                         return Some(
                             Arc::new(
@@ -339,16 +344,16 @@ impl Metadata {
                     metadata, CorTokenType(class_token as i32), ACTIVATABLE_ATTRIBUTE,
                 );
 
-                for attributeToken in activatable_attributes.iter() {
+                for attributeToken in activatable_attributes.into_iter() {
                     let attribute_constructor_token = Metadata::get_custom_attribute_constructor_token(
-                        metadata, CorTokenType(*attributeToken as i32),
+                        metadata, CorTokenType(attributeToken as i32),
                     );
 
                     if !Metadata::has_method_first_type_argument(metadata, CorTokenType(attribute_constructor_token as i32)) {
                         continue;
                     }
 
-                    let factory_token = Metadata::get_custom_attribute_type_argument(metadata, CorTokenType(*attributeToken as i32));
+                    let factory_token = Metadata::get_custom_attribute_type_argument(metadata, CorTokenType(attributeToken as i32));
 
 
                     let factory_methods = Metadata::get_class_methods(
@@ -363,6 +368,10 @@ impl Metadata {
                         if factory_method_arguments_count != method_argument_count {
                             continue;
                         }
+
+                        //drop early to force unlock
+
+                        drop(metadata);
 
                         *out_index = i;
                         return Some(
@@ -380,13 +389,12 @@ impl Metadata {
         }
     }
 
-
     pub fn declaring_interface_for_static_method(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, method_token: CorTokenType, out_index: &mut usize) -> Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>> {
         let meta = metadata.clone();
         match metadata {
             None => None,
             Some(metadata) => {
-                let metadata = &mut *metadata.write();
+                let metadata = &*metadata.read();
 
                 let method_signature = Metadata::get_method_signature(
                     metadata, method_token,
@@ -403,7 +411,7 @@ impl Metadata {
                 );
 
 
-                let mut ret:Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>> = None;
+                let mut ret: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>> = None;
                 for attributeToken in static_attributes.iter() {
                     let statics_token = Metadata::get_custom_attribute_type_argument(
                         metadata, CorTokenType(*attributeToken as i32),
@@ -437,14 +445,14 @@ impl Metadata {
                         let a = unsafe {
                             std::slice::from_raw_parts(
                                 static_signature.offset(1),
-                                static_signature_size as usize
+                                static_signature_size as usize,
                             )
                         };
 
                         let b = unsafe {
                             std::slice::from_raw_parts(
                                 method_signature.0,
-                                static_signature_size as usize
+                                static_signature_size as usize,
                             )
                         };
 
@@ -453,9 +461,8 @@ impl Metadata {
                         }
                         *out_index = i;
                         ret = Some(Arc::new(RwLock::new(InterfaceDeclaration::new(meta.clone(), CorTokenType(statics_token as i32)))));
-                        break
+                        break;
                     }
-
                 }
 
                 if ret.is_some() {
@@ -467,8 +474,7 @@ impl Metadata {
         }
     }
 
-
-    pub fn find_method_index(metadata: &mut IMetaDataImport2, class_token: CorTokenType, method_token: CorTokenType) -> usize {
+    pub fn find_method_index(metadata: &IMetaDataImport2, class_token: CorTokenType, method_token: CorTokenType) -> usize {
         let mut first_method = 0_u32;
 
         let mut methods_enumerator = std::ptr::null_mut();
@@ -493,13 +499,12 @@ impl Metadata {
         return (method_token.0 as u32 - first_method) as usize;
     }
 
-
     pub fn declaring_interface_for_instance_method(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, method_token: CorTokenType, out_index: &mut usize) -> Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>> {
         let meta = metadata.clone();
         match metadata {
             None => None,
             Some(metadata) => {
-                let metadata = &mut *metadata.write();
+                let metadata = &*metadata.read();
                 let class_token = Metadata::get_method_containing_class_token(
                     metadata, method_token,
                 );
@@ -806,7 +811,7 @@ impl Metadata {
         if method.is_static() {
             return Metadata::declaring_interface_for_static_method(
                 method.metadata.clone(), method_token, out_index,
-            )
+            );
         } else if method.is_initializer() {
             return Metadata::declaring_interface_for_initializer(
                 method.metadata.clone(), method_token, out_index,
