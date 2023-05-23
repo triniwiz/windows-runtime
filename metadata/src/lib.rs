@@ -1,7 +1,11 @@
 use std::borrow::Cow;
+use std::ffi::OsString;
 use std::fmt::{Debug, Formatter};
+use std::os::windows::ffi::EncodeWide;
+use std::os::windows::prelude::OsStrExt;
 use cxx::UniquePtr;
-use windows::core::GUID;
+use windows::core::{GUID, HSTRING, PCWSTR};
+use windows::Win32::System::Com::{CLSIDFromProgID, CLSIDFromString};
 use windows::Win32::System::WinRT::Metadata::{CorElementType, CorTokenType, IMetaDataImport2, MDTypeRefToDef};
 use crate::prelude::PCCOR_SIGNATURE;
 

@@ -1,15 +1,23 @@
 mod console;
+mod converter;
 
 use std::any::Any;
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void, CString};
+use std::mem::MaybeUninit;
 use std::ops::Deref;
+use std::ptr::addr_of_mut;
+use std::result;
 use std::sync::{Arc, Once};
+use libffi::middle::{arg, Arg};
 use parking_lot::{RawRwLock, RwLock};
 use parking_lot::lock_api::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLockReadGuard, RwLockWriteGuard};
 use v8::{Local, Object};
-use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, IUnknown_Vtbl};
-use windows::Win32::System::Com::CoInitialize;
-use windows::Win32::System::WinRT::RoGetActivationFactory;
+use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, IUnknown_Vtbl, ComInterface, PCWSTR, Type, IInspectable};
+use windows::Foundation::GuidHelper;
+use windows::Win32::Foundation::CO_E_INIT_ONLY_SINGLE_THREADED;
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, CLSIDFromProgID, CLSIDFromString, CoCreateInstance, CoGetClassObject, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED, CoInitialize, CoInitializeEx, CoUninitialize, DISPATCH_METHOD, DISPPARAMS, EXCEPINFO, IClassFactory, IDispatch, IDispatch_Vtbl, ITypeLib, VARIANT, VT_UI2};
+use windows::Win32::System::WinRT::{IActivationFactory, RoActivateInstance, RoGetActivationFactory};
+use windows::Win32::UI::WindowsAndMessaging::LB_GETLOCALE;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration;
@@ -23,8 +31,10 @@ use metadata::declarations::namespace_declaration::NamespaceDeclaration;
 use metadata::declarations::type_declaration::TypeDeclaration;
 use metadata::declaring_interface_for_method::Metadata;
 use metadata::meta_data_reader::MetadataReader;
+use metadata::prelude::{get_guid_attribute_value, get_string_value_from_blob, get_type_name, LOCALE_SYSTEM_DEFAULT};
+use metadata::signature;
 use metadata::signature::Signature;
-use metadata::value::Value;
+use metadata::value::{Value, Variant};
 
 pub struct Runtime {
     isolate: v8::OwnedIsolate,
@@ -205,59 +215,224 @@ fn create_ns_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration
                 // todo
                 for method in clazz.methods() {
                     let param_count = method.number_of_parameters();
-                    println!("count {param_count}");
+                    //  println!("count {param_count}");
                     if param_count == length as usize {
                         println!("{:?}", method.parameters());
                     }
                 }
 
+                let clazz_name = HSTRING::from(clazz.full_name());
+
+                println!("{} {} {}", clazz_name, clazz.name(), clazz.base_full_name());
+
+
+                let clazz_factory = unsafe { RoGetActivationFactory::<IUnknown>(&clazz_name) };
+
+                assert!(clazz_factory.is_ok());
+
+                let clazz_factory = clazz_factory.unwrap();
+
+
                 for ctor in clazz.initializers() {
-                    let param_count = ctor.number_of_parameters();
-                    println!("ctor param_count {:?} {} {}", param_count, clazz.full_name(), clazz.name());
-
-                    let id = HSTRING::from(clazz.full_name());
-                    let result = unsafe { CoInitialize(None) };
-
-
-                    let ret = unsafe { RoGetActivationFactory::<IUnknown>(&id)};
-
-                    let ret = ret.unwrap();
-
+                    let number_of_parameters = ctor.number_of_parameters();
 
                     let mut index = 0 as usize;
-                    let interface = Metadata::find_declaring_interface_for_method(ctor, &mut index);
 
-                    let interface = interface.unwrap();
-
-                    let ii_lock = interface.read();
-                    let ii = ii_lock.as_declaration().as_any().downcast_ref::<InterfaceDeclaration>();
-                    let id = ii.unwrap().id();
-                    let mut interface_ptr = std::ptr::null_mut() as *const c_void;
-                    let raw = ret.vtable();
-
-                     let result = unsafe { ((*raw).QueryInterface)(ret.as_raw(), &id, &mut interface_ptr)};
-                    //
-                    //
-                    println!("result {:?} {:?}", result, interface_ptr);
-
-                    // TODO handling ctor
-                  //  println!("{:?}",  ret.GetRuntimeClassName());
-
-                    let mut index = 0;
-                    if param_count == length as usize {
-
-                        for param in ctor.parameters().iter() {
-                            let type_ = param.type_();
-                            let metadata = param.metadata();
-                            if let Some(metadata) = metadata {
-                                println!("{:?}", Signature::to_string(&*metadata, &type_));
-                            }
-
+                    let iid = match Metadata::find_declaring_interface_for_method(ctor, &mut index) {
+                        None => {
+                            index = 0;
+                            IActivationFactory::IID
                         }
+                        Some(interface) => {
+                            let ii_lock = interface.read();
+                            let ii = ii_lock.as_declaration().as_any().downcast_ref::<InterfaceDeclaration>();
+                            let ii = ii.unwrap();
 
+                            ii.id()
+                        }
+                    };
 
-                        break;
+                    index = index.saturating_add(6); // account for IInspectable vtable overhead
+
+                    let vtable = Interface::vtable(&clazz_factory); //clazz_factory.vtable();
+
+                    let mut interface_ptr: *mut c_void = std::ptr::null_mut();  // IActivationFactory
+
+                    let factory = clazz_factory.as_raw();
+
+                    let interface_ptr_ptr = addr_of_mut!(interface_ptr);
+
+                    let result = unsafe { ((*vtable).QueryInterface)(factory, &iid, interface_ptr_ptr as _) };
+
+                    assert!(result.is_ok());
+                    assert!(!interface_ptr.is_null());
+
+                    let number_of_abi_parameters = number_of_parameters + if clazz.is_sealed() { 1 } else { 2 }; //if clazz.is_sealed() { 2 } else { 4 };
+
+                    let mut parameter_types: Vec<libffi::middle::Type> = Vec::new();
+
+                    parameter_types.reserve(number_of_abi_parameters);
+
+                    parameter_types.push(libffi::middle::Type::pointer());
+
+                    let mut arguments: Vec<Arg> = Vec::new();
+
+                    arguments.reserve(number_of_abi_parameters);
+
+                    arguments.push(Arg::new(&interface_ptr));
+
+                    let mut string_buf = Vec::new();
+
+                    for (i, parameter) in ctor.parameters().iter().enumerate() {
+                        let type_ = parameter.type_();
+                        let metadata = parameter.metadata().unwrap();
+
+                        let signature = Signature::to_string(&*metadata, &type_);
+                        match signature.as_str() {
+                            "String" => {
+                                parameter_types.push(libffi::middle::Type::pointer());
+                                let string = args.get(i as i32).to_string(scope).unwrap();
+                                let string = HSTRING::from(string.to_rust_string_lossy(scope));
+
+                                arguments.push(
+                                    Arg::new(&string.as_ptr())
+                                );
+
+                                string_buf.push(string);
+                            }
+                            _ => {}
+                        }
                     }
+
+                  //  parameter_types.push(libffi::middle::Type::pointer());
+
+                  //  let result: *mut c_void = std::ptr::null_mut();
+
+                   // arguments.push(Arg::new(&result));
+
+
+                    let mut cif = libffi::middle::Cif::new(
+                        parameter_types,
+                        libffi::middle::Type::pointer(),
+                    );
+
+                    let af = unsafe { IActivationFactory::from_raw(interface_ptr as _)};
+
+                    // let vt = addr_of_mut!(interface_ptr);
+                    //
+                    // let func = unsafe {
+                    //     *(vt.offset(index as isize))
+                    // };
+
+                    // let a = unsafe { af.ActivateInstance().unwrap()};
+                    //
+                    //
+                    // let func =  a.as_raw();
+
+                    let result: *mut c_void = unsafe {
+                        cif.call(
+                            libffi::middle::CodePtr::from_ptr(func),
+                            arguments.as_slice(),
+                        )
+                    };
+
+
+
+                    /*
+                       let class_id = HSTRING::from(clazz.full_name());
+
+                            //  let class_id = HSTRING::from(ii.full_name());
+
+                            println!("class_id {}", class_id);
+
+
+                            let result = unsafe { CoInitialize(None) };
+
+
+                            let ret = unsafe { RoGetActivationFactory::<IUnknown>(&class_id)};
+
+
+                            let instance: windows::core::Result<IDispatch> = unsafe { CoCreateInstance(&id, None, CLSCTX_INPROC_SERVER)};
+
+                            println!("instaaance {:?}", instance);
+
+                            let ret = ret.unwrap();
+
+                            let mut interface_ptr = std::ptr::null_mut() as *const c_void;
+
+                            let raw = ret.vtable();
+
+                            let result = unsafe { ((*raw).QueryInterface)(ret.as_raw(), &id, &mut interface_ptr)};
+
+                            let name = HSTRING::from(ii.full_name());
+
+                            let GUID_NULL = GUID::default();
+
+                            let mut dispid = 0_i32;
+                            let ds = unsafe { IDispatch::from_raw(interface_ptr as *mut c_void)};
+                            let result = unsafe {ds.GetIDsOfNames(
+                                &GUID_NULL,
+                                &PCWSTR(name.as_ptr()),
+                                1,
+                                LOCALE_SYSTEM_DEFAULT,
+                                &mut dispid
+                            )};
+
+                            println!("name {} {} {:?} {:?} {}", ctor.name(), dispid, result, ctor.is_initializer(), ii.full_name());
+
+                            let val: Variant = Value::String("Hello".to_string()).into();
+                            let mut rgvarg = vec![val.as_abi()];
+
+
+                            let mut disparams = DISPPARAMS {
+                                rgvarg: unsafe { rgvarg.as_mut_ptr() as *mut VARIANT},
+                                rgdispidNamedArgs: std::ptr::null_mut(),
+                                cArgs: 1,
+                                cNamedArgs: 0,
+                            };
+
+
+                            let mut pvarresult = VARIANT::default();
+                            let mut excep = EXCEPINFO::default();
+                            let mut err = 0_u32;
+                            let result = unsafe {
+                                ds.Invoke(
+                                    dispid,
+                                    &GUID_NULL,
+                                    LOCALE_SYSTEM_DEFAULT,
+                                    DISPATCH_METHOD,
+                                    &mut disparams,
+                                    Some(&mut pvarresult),
+                                    Some(&mut excep),
+                                    Some(&mut err)
+                                )
+                            };
+
+                            // let instance: windows::core::Result<IDispatch> = unsafe { CoCreateInstance(&id, None, CLSCTX_INPROC_SERVER)};
+
+
+                            // println!("instance {:?} {:?}", instance, ret);
+                            //println!("result {:?} {:?}", result.is_ok(), interface_ptr);
+
+                            // TODO handling ctor
+
+                            let mut index = 0;
+                            if param_count == length as usize {
+
+                                for param in ctor.parameters().iter() {
+                                    let type_ = param.type_();
+                                    let metadata = param.metadata();
+                                    if let Some(metadata) = metadata {
+                                        println!("{:?}", Signature::to_string(&*metadata, &type_));
+                                    }
+
+                                }
+
+
+                                break;
+                            }
+                        }
+                     */
                 }
             }
             _ => {}
@@ -492,6 +667,10 @@ fn handle_meta(scope: &mut v8::HandleScope,
 impl Runtime {
     pub fn new(app_root: &str) -> Self {
         INIT.call_once(|| {
+            let _ = unsafe {
+                // CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)
+                CoInitialize(None)
+            };
             let platform = v8::Platform::new(0, false).make_shared();
             v8::V8::initialize_platform(platform);
             v8::V8::initialize();
@@ -547,5 +726,11 @@ impl Runtime {
         let code = v8::String::new(scope, script).unwrap();
         let script = v8::Script::compile(scope, code, None).unwrap();
         let _ = script.run(scope);
+    }
+
+    pub fn dispose(&self) {
+        unsafe {
+            CoUninitialize();
+        }
     }
 }

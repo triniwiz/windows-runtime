@@ -9,6 +9,8 @@ use std::str::FromStr;
 use windows::w;
 use crate::signature::Signature;
 
+pub const LOCALE_SYSTEM_DEFAULT: u32 = 0x0800;
+
 pub fn cor_sig_uncompress_calling_conv(p_data: &mut PCCOR_SIGNATURE) -> u32 {
     let p_data = &mut p_data.0;
     let data = unsafe { **p_data };

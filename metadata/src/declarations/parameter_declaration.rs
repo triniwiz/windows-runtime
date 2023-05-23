@@ -76,13 +76,16 @@ impl ParameterDeclaration {
             full_name,
         }
     }
+
     pub fn is_out(&self) -> bool {
         let mut parameter_type = self.parameter_type.clone();
         cor_sig_uncompress_token(&mut parameter_type)
             == ELEMENT_TYPE_BYREF.0 as u32
     }
 
-
+    pub fn token(&self) -> CorTokenType {
+        self.token
+    }
 
     pub fn type_(&self) -> PCCOR_SIGNATURE {
         self.parameter_type

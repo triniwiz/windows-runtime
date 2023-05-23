@@ -13,8 +13,8 @@ use crate::prelude::*;
 #[derive(Clone, Debug)]
 pub struct MethodDeclaration {
     kind: DeclarationKind,
-    pub(crate) metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
-    pub(crate) token: CorTokenType,
+    pub metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+    pub token: CorTokenType,
     parameters: Vec<ParameterDeclaration>,
     return_type: PCCOR_SIGNATURE,
     full_name: String,

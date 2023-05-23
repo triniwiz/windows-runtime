@@ -6,6 +6,8 @@
 #define WINDOWS_RUNTIME_BINDINGS_H
 
 #include <windows.h>
+#include <objbase.h>
+#include <combaseapi.h>
 
 #include <wrl.h>
 #include <wrl/wrappers/corewrappers.h>
@@ -28,6 +30,8 @@ uint16_t GetData2(const GUID& guid);
 uint16_t GetData3(const GUID& guid);
 
 rust::Slice<const uint8_t> GetData4(const GUID& guid);
+
+std::unique_ptr<GUID> GetGUIDForClassName(rust::Str data);
 
 
 #endif //WINDOWS_RUNTIME_BINDINGS_H
