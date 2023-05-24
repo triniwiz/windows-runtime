@@ -254,6 +254,10 @@ impl MethodDeclaration {
         }
         false
     }
+
+    pub fn return_type(&self) -> PCCOR_SIGNATURE {
+        self.return_type
+    }
 }
 
 impl Declaration for MethodDeclaration {

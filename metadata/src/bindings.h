@@ -21,6 +21,8 @@
 #include <cor.h>
 #include "rust/cxx.h"
 
+typedef void c_void;
+
 std::unique_ptr<GUID> GetGUID(const uint8_t* data);
 
 uint32_t GetData1(const GUID& guid);
@@ -33,5 +35,8 @@ rust::Slice<const uint8_t> GetData4(const GUID& guid);
 
 std::unique_ptr<GUID> GetGUIDForClassName(rust::Str data);
 
+void QueryInterface(size_t index, c_void* factory, uint32_t Data1, uint16_t Data2, uint16_t Data3, rust::Slice<const uint8_t> Data4, c_void* activation_factory, c_void** func);
+
+rust::String GUIDToString(uint32_t Data1, uint16_t Data2, uint16_t Data3, rust::Slice<const uint8_t> Data4);
 
 #endif //WINDOWS_RUNTIME_BINDINGS_H

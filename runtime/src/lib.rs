@@ -5,14 +5,16 @@ use std::any::Any;
 use std::ffi::{c_char, c_void, CString};
 use std::mem::MaybeUninit;
 use std::ops::Deref;
-use std::ptr::addr_of_mut;
+use std::ptr::{addr_of, addr_of_mut};
 use std::result;
 use std::sync::{Arc, Once};
-use libffi::middle::{arg, Arg};
+use libffi::low::ffi_type;
+use libffi::middle::Cif;
 use parking_lot::{RawRwLock, RwLock};
 use parking_lot::lock_api::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLockReadGuard, RwLockWriteGuard};
 use v8::{Local, Object};
-use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, IUnknown_Vtbl, ComInterface, PCWSTR, Type, IInspectable};
+use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, IUnknown_Vtbl, ComInterface, PCWSTR, Type, IInspectable, Error};
+use windows::Data::Json::{IJsonValue, JsonValue};
 use windows::Foundation::GuidHelper;
 use windows::Win32::Foundation::CO_E_INIT_ONLY_SINGLE_THREADED;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, CLSIDFromProgID, CLSIDFromString, CoCreateInstance, CoGetClassObject, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED, CoInitialize, CoInitializeEx, CoUninitialize, DISPATCH_METHOD, DISPPARAMS, EXCEPINFO, IClassFactory, IDispatch, IDispatch_Vtbl, ITypeLib, VARIANT, VT_UI2};
@@ -32,7 +34,8 @@ use metadata::declarations::type_declaration::TypeDeclaration;
 use metadata::declaring_interface_for_method::Metadata;
 use metadata::meta_data_reader::MetadataReader;
 use metadata::prelude::{get_guid_attribute_value, get_string_value_from_blob, get_type_name, LOCALE_SYSTEM_DEFAULT};
-use metadata::signature;
+use metadata::{guid_to_string, query_interface, signature};
+use metadata::declarations::method_declaration::MethodDeclaration;
 use metadata::signature::Signature;
 use metadata::value::{Value, Variant};
 
@@ -47,6 +50,7 @@ static INIT: Once = Once::new();
 #[derive(Clone)]
 struct DeclarationFFI {
     inner: Arc<RwLock<dyn Declaration>>,
+    pub(crate) instance: Option<IUnknown>
 }
 
 unsafe impl Sync for DeclarationFFI {}
@@ -55,7 +59,11 @@ unsafe impl Send for DeclarationFFI {}
 
 impl DeclarationFFI {
     pub fn new(declaration: Arc<RwLock<dyn Declaration>>) -> Self {
-        Self { inner: declaration }
+        Self { inner: declaration, instance: None }
+    }
+
+    pub fn new_with_instance(declaration: Arc<RwLock<dyn Declaration>>, instance: Option<IUnknown>) -> Self {
+        Self { inner: declaration, instance }
     }
 
     pub fn as_any(&self) -> MappedRwLockReadGuard<'_, RawRwLock, dyn Any> {
@@ -182,9 +190,36 @@ fn create_ns_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, s
     ret.into()
 }
 
+fn create_ns_ctor_instance_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>,instance: Option<IUnknown>,scope: &mut v8::HandleScope<'a>) -> Local<'a, v8::Value> {
+    let scope = &mut v8::EscapableHandleScope::new(scope);
+    let name = v8::String::new(scope, name).unwrap();
+    let tmpl = v8::FunctionTemplate::new(scope, handle_ns_func);
+    tmpl.set_class_name(name);
+    let object_tmpl = tmpl.instance_template(scope);
+    object_tmpl.set_named_property_handler(
+        v8::NamedPropertyHandlerConfiguration::new()
+            .getter(handle_ns_meta_getter)
+            .setter(handle_ns_meta_setter)
+    );
+    object_tmpl.set_internal_field_count(2);
+    let object = object_tmpl.new_instance(scope).unwrap();
+    let declaration = Box::new(DeclarationFFI::new_with_instance(declaration, instance));
+    let ext = v8::External::new(scope, Box::into_raw(declaration) as _);
+    object.set_internal_field(0, ext.into());
+
+    let object_store = v8::Map::new(scope);
+    object.set_internal_field(1, object_store.into());
+
+    let ret = scope.escape(object);
+
+    ret.into()
+}
+
+
 fn create_ns_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, scope: &mut v8::HandleScope<'a>) -> Local<'a, v8::Value> {
     let scope = &mut v8::EscapableHandleScope::new(scope);
 
+    println!("name {}", name);
 
     let name = v8::String::new(scope, name).unwrap();
 
@@ -212,19 +247,8 @@ fn create_ns_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration
         match kind {
             DeclarationKind::Class => {
                 let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
-                // todo
-                for method in clazz.methods() {
-                    let param_count = method.number_of_parameters();
-                    //  println!("count {param_count}");
-                    if param_count == length as usize {
-                        println!("{:?}", method.parameters());
-                    }
-                }
 
                 let clazz_name = HSTRING::from(clazz.full_name());
-
-                println!("{} {} {}", clazz_name, clazz.name(), clazz.base_full_name());
-
 
                 let clazz_factory = unsafe { RoGetActivationFactory::<IUnknown>(&clazz_name) };
 
@@ -232,207 +256,253 @@ fn create_ns_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration
 
                 let clazz_factory = clazz_factory.unwrap();
 
+                unsafe {
+                    for ctor in clazz.initializers() {
+                        let number_of_parameters = ctor.number_of_parameters();
 
-                for ctor in clazz.initializers() {
-                    let number_of_parameters = ctor.number_of_parameters();
+                        let mut index = 0 as usize;
 
-                    let mut index = 0 as usize;
-
-                    let iid = match Metadata::find_declaring_interface_for_method(ctor, &mut index) {
-                        None => {
-                            index = 0;
-                            IActivationFactory::IID
-                        }
-                        Some(interface) => {
-                            let ii_lock = interface.read();
-                            let ii = ii_lock.as_declaration().as_any().downcast_ref::<InterfaceDeclaration>();
-                            let ii = ii.unwrap();
-
-                            ii.id()
-                        }
-                    };
-
-                    index = index.saturating_add(6); // account for IInspectable vtable overhead
-
-                    let vtable = Interface::vtable(&clazz_factory); //clazz_factory.vtable();
-
-                    let mut interface_ptr: *mut c_void = std::ptr::null_mut();  // IActivationFactory
-
-                    let factory = clazz_factory.as_raw();
-
-                    let interface_ptr_ptr = addr_of_mut!(interface_ptr);
-
-                    let result = unsafe { ((*vtable).QueryInterface)(factory, &iid, interface_ptr_ptr as _) };
-
-                    assert!(result.is_ok());
-                    assert!(!interface_ptr.is_null());
-
-                    let number_of_abi_parameters = number_of_parameters + if clazz.is_sealed() { 1 } else { 2 }; //if clazz.is_sealed() { 2 } else { 4 };
-
-                    let mut parameter_types: Vec<libffi::middle::Type> = Vec::new();
-
-                    parameter_types.reserve(number_of_abi_parameters);
-
-                    parameter_types.push(libffi::middle::Type::pointer());
-
-                    let mut arguments: Vec<Arg> = Vec::new();
-
-                    arguments.reserve(number_of_abi_parameters);
-
-                    arguments.push(Arg::new(&interface_ptr));
-
-                    let mut string_buf = Vec::new();
-
-                    for (i, parameter) in ctor.parameters().iter().enumerate() {
-                        let type_ = parameter.type_();
-                        let metadata = parameter.metadata().unwrap();
-
-                        let signature = Signature::to_string(&*metadata, &type_);
-                        match signature.as_str() {
-                            "String" => {
-                                parameter_types.push(libffi::middle::Type::pointer());
-                                let string = args.get(i as i32).to_string(scope).unwrap();
-                                let string = HSTRING::from(string.to_rust_string_lossy(scope));
-
-                                arguments.push(
-                                    Arg::new(&string.as_ptr())
-                                );
-
-                                string_buf.push(string);
+                        let iid = match Metadata::find_declaring_interface_for_method(ctor, &mut index) {
+                            None => {
+                                index = 0;
+                                IActivationFactory::IID
                             }
-                            _ => {}
+                            Some(interface) => {
+                                let ii_lock = interface.read();
+                                let ii = ii_lock.as_declaration().as_any().downcast_ref::<InterfaceDeclaration>();
+                                let ii = ii.unwrap();
+                                ii.id()
+                            }
+                        };
+
+                        index = index.saturating_add(6); // account for IInspectable vtable overhead
+
+                        let mut interface_ptr: *mut c_void = std::ptr::null_mut(); // IActivationFactory
+
+                        let vtable = clazz_factory.vtable();
+
+                        let interface_ptr_ptr = addr_of_mut!(interface_ptr);
+
+                        let result = ((*vtable).QueryInterface)(clazz_factory.as_raw(), &iid, interface_ptr_ptr as *mut *const c_void);
+
+                        assert!(result.is_ok());
+
+                        let is_composition = !clazz.is_sealed();
+
+                        let number_of_abi_parameters = number_of_parameters + if clazz.is_sealed() { 2 } else { 4 };
+
+                        let mut parameter_types: Vec<*mut ffi_type> = Vec::new();
+
+                        parameter_types.reserve(number_of_abi_parameters);
+
+                        unsafe { parameter_types.push(&mut libffi::low::types::pointer); }
+
+                        let mut arguments: Vec<*mut c_void> = Vec::new();
+
+                        arguments.reserve(number_of_abi_parameters);
+
+                        unsafe { arguments.push(interface_ptr) };
+
+                        let mut string_buf = Vec::new();
+
+                        for (i, parameter) in ctor.parameters().iter().enumerate() {
+                            let type_ = parameter.type_();
+                            let metadata = parameter.metadata().unwrap();
+
+                            let signature = Signature::to_string(&*metadata, &type_);
+                            match signature.as_str() {
+                                "String" => {
+                                    unsafe { parameter_types.push(&mut libffi::low::types::pointer); }
+                                    let string = args.get(i as i32).to_string(scope).unwrap();
+
+                                    let string = HSTRING::from(string.to_rust_string_lossy(scope));
+
+
+                                    arguments.push(
+                                        addr_of!(string) as *mut c_void
+                                    );
+
+                                    string_buf.push(string);
+                                }
+                                _ => {}
+                            }
                         }
-                    }
 
-                  //  parameter_types.push(libffi::middle::Type::pointer());
+                        if is_composition {
+                            unsafe { parameter_types.push(&mut libffi::low::types::pointer); }
+                            unsafe { parameter_types.push(&mut libffi::low::types::pointer); }
+                        }
 
-                  //  let result: *mut c_void = std::ptr::null_mut();
+                        unsafe { parameter_types.push(&mut libffi::low::types::pointer); }
 
-                   // arguments.push(Arg::new(&result));
+                        let mut result: MaybeUninit<IUnknown> = MaybeUninit::zeroed();
 
+                        arguments.push(&mut result.as_mut_ptr() as *mut _ as *mut c_void);
 
-                    let mut cif = libffi::middle::Cif::new(
-                        parameter_types,
-                        libffi::middle::Type::pointer(),
-                    );
+                        let interface = unsafe { IUnknown::from_raw(interface_ptr as *mut c_void) };
 
-                    let af = unsafe { IActivationFactory::from_raw(interface_ptr as _)};
+                        let mut vtable = interface.vtable();
 
-                    // let vt = addr_of_mut!(interface_ptr);
-                    //
-                    // let func = unsafe {
-                    //     *(vt.offset(index as isize))
-                    // };
+                        let mut vtable: *mut *mut c_void = std::mem::transmute(vtable);
 
-                    // let a = unsafe { af.ActivateInstance().unwrap()};
-                    //
-                    //
-                    // let func =  a.as_raw();
+                        let func = unsafe {
+                            *vtable.offset(index as isize)
+                        };
 
-                    let result: *mut c_void = unsafe {
-                        cif.call(
-                            libffi::middle::CodePtr::from_ptr(func),
-                            arguments.as_slice(),
-                        )
-                    };
+                        let mut cif: libffi::low::ffi_cif = Default::default();
 
+                        let prep_result = unsafe {
+                            libffi::low::prep_cif(&mut cif,
+                                                  libffi::low::ffi_abi_FFI_DEFAULT_ABI,
+                                                  arguments.len(),
+                                                  &mut libffi::low::types::sint32,
+                                                  parameter_types.as_mut_ptr(),
+                            )
+                        };
 
+                        let ret = unsafe {
+                            libffi::low::call::<i32>(&mut cif, libffi::low::CodePtr::from_ptr(func), arguments.as_mut_ptr())
+                        };
 
-                    /*
-                       let class_id = HSTRING::from(clazz.full_name());
+                        let ret = HRESULT(ret);
 
-                            //  let class_id = HSTRING::from(ii.full_name());
-
-                            println!("class_id {}", class_id);
-
-
-                            let result = unsafe { CoInitialize(None) };
-
-
-                            let ret = unsafe { RoGetActivationFactory::<IUnknown>(&class_id)};
-
-
-                            let instance: windows::core::Result<IDispatch> = unsafe { CoCreateInstance(&id, None, CLSCTX_INPROC_SERVER)};
-
-                            println!("instaaance {:?}", instance);
-
-                            let ret = ret.unwrap();
-
-                            let mut interface_ptr = std::ptr::null_mut() as *const c_void;
-
-                            let raw = ret.vtable();
-
-                            let result = unsafe { ((*raw).QueryInterface)(ret.as_raw(), &id, &mut interface_ptr)};
-
-                            let name = HSTRING::from(ii.full_name());
-
-                            let GUID_NULL = GUID::default();
-
-                            let mut dispid = 0_i32;
-                            let ds = unsafe { IDispatch::from_raw(interface_ptr as *mut c_void)};
-                            let result = unsafe {ds.GetIDsOfNames(
-                                &GUID_NULL,
-                                &PCWSTR(name.as_ptr()),
-                                1,
-                                LOCALE_SYSTEM_DEFAULT,
-                                &mut dispid
-                            )};
-
-                            println!("name {} {} {:?} {:?} {}", ctor.name(), dispid, result, ctor.is_initializer(), ii.full_name());
-
-                            let val: Variant = Value::String("Hello".to_string()).into();
-                            let mut rgvarg = vec![val.as_abi()];
+                        if ret.is_ok() {
+                            let result = result.assume_init();
+                            let ctor = Arc::clone(&dec.inner);
+                            let instance = create_ns_ctor_instance_object(clazz.name(), ctor, Some(result), scope);
+                            retval.set(instance);
+                            return;
+                        } else {
+                            let error = Error::from(ret);
 
 
-                            let mut disparams = DISPPARAMS {
-                                rgvarg: unsafe { rgvarg.as_mut_ptr() as *mut VARIANT},
-                                rgdispidNamedArgs: std::ptr::null_mut(),
-                                cArgs: 1,
-                                cNamedArgs: 0,
-                            };
+                            println!("ret {:?} {:?}", ret.to_string(), result);
+                        }
+
+                        // let mut cif = libffi::middle::Cif::new(
+                        //     parameter_types,
+                        //     libffi::middle::Type::pointer(),
+                        // );
 
 
-                            let mut pvarresult = VARIANT::default();
-                            let mut excep = EXCEPINFO::default();
-                            let mut err = 0_u32;
-                            let result = unsafe {
-                                ds.Invoke(
-                                    dispid,
+                        // let af = unsafe { IActivationFactory::from_raw(interface_ptr as _)};
+
+                        // let vt = addr_of_mut!(interface_ptr);
+                        //
+                        // let func = unsafe {
+                        //     *(vt.offset(index as isize))
+                        // };
+
+                        // let a = unsafe { af.ActivateInstance().unwrap()};
+                        //
+                        //
+                        // let func =  a.as_raw();
+
+                        // let result: *mut c_void = unsafe {
+                        //     cif.call(
+                        //         libffi::middle::CodePtr::from_ptr(*func),
+                        //         arguments.as_slice(),
+                        //     )
+                        // };
+
+
+
+                        /*
+                           let class_id = HSTRING::from(clazz.full_name());
+
+                                //  let class_id = HSTRING::from(ii.full_name());
+
+                                println!("class_id {}", class_id);
+
+
+                                let result = unsafe { CoInitialize(None) };
+
+
+                                let ret = unsafe { RoGetActivationFactory::<IUnknown>(&class_id)};
+
+
+                                let instance: windows::core::Result<IDispatch> = unsafe { CoCreateInstance(&id, None, CLSCTX_INPROC_SERVER)};
+
+                                println!("instaaance {:?}", instance);
+
+                                let ret = ret.unwrap();
+
+                                let mut interface_ptr = std::ptr::null_mut() as *const c_void;
+
+                                let raw = ret.vtable();
+
+                                let result = unsafe { ((*raw).QueryInterface)(ret.as_raw(), &id, &mut interface_ptr)};
+
+                                let name = HSTRING::from(ii.full_name());
+
+                                let GUID_NULL = GUID::default();
+
+                                let mut dispid = 0_i32;
+                                let ds = unsafe { IDispatch::from_raw(interface_ptr as *mut c_void)};
+                                let result = unsafe {ds.GetIDsOfNames(
                                     &GUID_NULL,
+                                    &PCWSTR(name.as_ptr()),
+                                    1,
                                     LOCALE_SYSTEM_DEFAULT,
-                                    DISPATCH_METHOD,
-                                    &mut disparams,
-                                    Some(&mut pvarresult),
-                                    Some(&mut excep),
-                                    Some(&mut err)
-                                )
-                            };
+                                    &mut dispid
+                                )};
 
-                            // let instance: windows::core::Result<IDispatch> = unsafe { CoCreateInstance(&id, None, CLSCTX_INPROC_SERVER)};
+                                println!("name {} {} {:?} {:?} {}", ctor.name(), dispid, result, ctor.is_initializer(), ii.full_name());
+
+                                let val: Variant = Value::String("Hello".to_string()).into();
+                                let mut rgvarg = vec![val.as_abi()];
 
 
-                            // println!("instance {:?} {:?}", instance, ret);
-                            //println!("result {:?} {:?}", result.is_ok(), interface_ptr);
+                                let mut disparams = DISPPARAMS {
+                                    rgvarg: unsafe { rgvarg.as_mut_ptr() as *mut VARIANT},
+                                    rgdispidNamedArgs: std::ptr::null_mut(),
+                                    cArgs: 1,
+                                    cNamedArgs: 0,
+                                };
 
-                            // TODO handling ctor
 
-                            let mut index = 0;
-                            if param_count == length as usize {
+                                let mut pvarresult = VARIANT::default();
+                                let mut excep = EXCEPINFO::default();
+                                let mut err = 0_u32;
+                                let result = unsafe {
+                                    ds.Invoke(
+                                        dispid,
+                                        &GUID_NULL,
+                                        LOCALE_SYSTEM_DEFAULT,
+                                        DISPATCH_METHOD,
+                                        &mut disparams,
+                                        Some(&mut pvarresult),
+                                        Some(&mut excep),
+                                        Some(&mut err)
+                                    )
+                                };
 
-                                for param in ctor.parameters().iter() {
-                                    let type_ = param.type_();
-                                    let metadata = param.metadata();
-                                    if let Some(metadata) = metadata {
-                                        println!("{:?}", Signature::to_string(&*metadata, &type_));
+                                // let instance: windows::core::Result<IDispatch> = unsafe { CoCreateInstance(&id, None, CLSCTX_INPROC_SERVER)};
+
+
+                                // println!("instance {:?} {:?}", instance, ret);
+                                //println!("result {:?} {:?}", result.is_ok(), interface_ptr);
+
+                                // TODO handling ctor
+
+                                let mut index = 0;
+                                if param_count == length as usize {
+
+                                    for param in ctor.parameters().iter() {
+                                        let type_ = param.type_();
+                                        let metadata = param.metadata();
+                                        if let Some(metadata) = metadata {
+                                            println!("{:?}", Signature::to_string(&*metadata, &type_));
+                                        }
+
                                     }
 
+
+                                    break;
                                 }
-
-
-                                break;
                             }
-                        }
-                     */
+                         */
+                    }
                 }
             }
             _ => {}
@@ -530,7 +600,33 @@ fn handle_ns_meta_setter(scope: &mut v8::HandleScope,
         DeclarationKind::GenericDelegateInstance => {}
         DeclarationKind::Event => {}
         DeclarationKind::Property => {}
-        DeclarationKind::Method => {}
+        DeclarationKind::Method => {
+
+
+           // let length = args.length();
+
+            println!("setter {}", name);
+
+
+
+           /* let json = windows::Data::Json::JsonObject::from_raw(result.into_raw());
+
+            let runtime = JsonValue::CreateStringValue(&HSTRING::from("NativeScript")).unwrap();
+            json.SetNamedValue(&HSTRING::from("runtime"), &runtime);
+
+            println!("runtime key: {:?}", json.GetNamedValue(&HSTRING::from("runtime")).unwrap().GetString().unwrap());
+
+
+            // todo
+            for method in clazz.methods() {
+                let param_count = method.number_of_parameters();
+                //  println!("count {param_count}");
+                if param_count == length as usize {
+                    println!("{:?}", method.parameters());
+                }
+            }
+            */
+        }
         DeclarationKind::Parameter => {}
     }
 }
@@ -587,7 +683,177 @@ fn handle_ns_meta_getter(scope: &mut v8::HandleScope,
                     return;
                 }
             }
-            DeclarationKind::Class => {}
+            DeclarationKind::Class => {
+                let clazz_dec = lock.as_any().downcast_ref::<ClassDeclaration>();
+
+                if let Some(clazz_dec) = clazz_dec {
+                    for method in clazz_dec.methods() {
+                        let mut method_name = method.overload_name();
+                        if method_name.is_empty() {
+                            method_name = method.name();
+                        }
+
+                        if method_name == name {
+                            let mut declaration = Arc::new(RwLock::new(method.clone()));
+
+                            let declaration = Box::into_raw(Box::new(DeclarationFFI::new_with_instance(declaration, dec.instance.clone() )));
+
+                            let ext = v8::External::new(scope, declaration as _);
+
+
+                            let builder = v8::Function::builder(|scope: &mut v8::HandleScope,
+                                                              args: v8::FunctionCallbackArguments,
+                                                              mut retval: v8::ReturnValue| {
+                                let length = args.length();
+
+                                let dec = unsafe { Local::<v8::External>::cast(args.data()) };
+
+                                let dec = dec.value() as *mut DeclarationFFI;
+
+                                let dec = unsafe { &*dec };
+
+                                let lock = dec.read();
+
+                                let method = lock.as_any().downcast_ref::<MethodDeclaration>();
+
+                                let method = method.unwrap();
+
+                                let mut index = 0_usize;
+
+                                if let Some(interface) = Metadata::find_declaring_interface_for_method(method, &mut index) {
+                                    let interface = interface.read();
+                                    println!("base {}", interface.base().name());
+                                    let method_interface = interface.as_declaration().as_any().downcast_ref::<InterfaceDeclaration>();
+                                    let method_interface = method_interface.unwrap();
+                                    let iid = method_interface.id();
+
+                                    let metadata = method.metadata.as_ref();
+                                    let metadata = metadata.unwrap();
+                                    let metadata = metadata.read();
+
+                                    let return_type = method.return_type();
+                                    let is_void = Signature::to_string(&*metadata, &return_type) == "Void";
+
+                                    let number_of_parameters = method.number_of_parameters();
+                                    let number_of_abi_parameters = number_of_parameters + if is_void {1} else {2};
+
+
+                                    index = index.saturating_add(6);
+
+                                    let instance = dec.instance.clone().unwrap();
+
+                                    let mut interface_ptr: *mut c_void = std::ptr::null_mut();
+
+                                    let vtable = instance.vtable();
+
+                                    let interface_ptr_ptr = addr_of_mut!(interface_ptr);
+
+                                    let result = unsafe { ((*vtable).QueryInterface)(instance.as_raw(), &iid, interface_ptr_ptr as *mut *const c_void)};
+
+                                    assert!(result.is_ok());
+
+                                    let mut parameter_types: Vec<*mut ffi_type> = Vec::new();
+
+                                    parameter_types.reserve(number_of_abi_parameters);
+
+                                    unsafe { parameter_types.push(&mut libffi::low::types::pointer); }
+
+                                    let mut arguments: Vec<*mut c_void> = Vec::new();
+
+                                    arguments.reserve(number_of_abi_parameters);
+
+                                    unsafe { arguments.push(interface_ptr) };
+
+                                    let mut string_buf = Vec::new();
+
+                                    for (i, parameter) in method.parameters().iter().enumerate() {
+                                        let type_ = parameter.type_();
+                                        let metadata = parameter.metadata().unwrap();
+
+                                        let signature = Signature::to_string(&*metadata, &type_);
+
+                                        println!("signature {}", signature.as_str());
+
+                                        match signature.as_str() {
+                                            "String" => {
+                                                unsafe { parameter_types.push(&mut libffi::low::types::pointer); }
+                                                let string = args.get(i as i32).to_string(scope).unwrap();
+
+                                                let string = HSTRING::from(string.to_rust_string_lossy(scope));
+
+
+                                                arguments.push(
+                                                    addr_of!(string) as *mut c_void
+                                                );
+
+                                                string_buf.push(string);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+
+                                  //  let mut result: *mut c_void = std::ptr::null_mut();
+
+
+                                    let mut result: MaybeUninit<IUnknown> = MaybeUninit::zeroed();
+
+
+
+                                    if !is_void {
+                                        unsafe { parameter_types.push(&mut libffi::low::types::pointer); }
+
+                                        arguments.push(&mut result.as_mut_ptr() as *mut _ as *mut c_void);
+                                     //   arguments.push(addr_of_mut!(result) as *mut _);
+                                    }
+
+
+                                    let interface = unsafe { IUnknown::from_raw(interface_ptr as *mut c_void) };
+
+                                    let mut vtable = interface.vtable();
+
+                                    let mut vtable: *mut *mut c_void = unsafe { std::mem::transmute(vtable)};
+
+                                    let func = unsafe {
+                                        *vtable.offset(index as isize)
+                                    };
+
+
+                                    let mut cif: libffi::low::ffi_cif = Default::default();
+
+                                    let prep_result = unsafe {
+                                        libffi::low::prep_cif(&mut cif,
+                                                              libffi::low::ffi_abi_FFI_DEFAULT_ABI,
+                                                              arguments.len(),
+                                                              &mut libffi::low::types::sint32,
+                                                              parameter_types.as_mut_ptr(),
+                                        )
+                                    };
+
+                                    let ret = unsafe {
+                                        libffi::low::call::<i32>(&mut cif, libffi::low::CodePtr::from_ptr(func), arguments.as_mut_ptr())
+                                    };
+
+                                    let ret = HRESULT(ret);
+
+
+                                    println!("ret {}", ret);
+
+                                }
+
+
+                            })
+                                .data(ext.into()).build(scope);
+
+
+                            let func = builder.unwrap();
+
+                            rv.set(func.into());
+                            return;
+                        }
+
+                    }
+                }
+            }
             DeclarationKind::Interface => {}
             DeclarationKind::GenericInterface => {}
             DeclarationKind::GenericInterfaceInstance => {}
@@ -632,12 +898,57 @@ fn handle_ns_meta_getter(scope: &mut v8::HandleScope,
             DeclarationKind::GenericDelegateInstance => {}
             DeclarationKind::Event => {}
             DeclarationKind::Property => {}
-            DeclarationKind::Method => {}
+            DeclarationKind::Method => {
+                println!("getter method {}", name);
+                let dec = lock.as_any().downcast_ref::<ClassDeclaration>();
+
+                if let Some(dec) = dec {
+                    println!("dec {}", dec.name());
+                    for method in dec.methods() {
+                        let mut name = method.overload_name();
+                        if name.is_empty() {
+                            name = method.name();
+                        }
+
+                        println!("method name {}", name);
+                        // let cached_item = store.get(scope, key.into());
+                        // if let Some(cache) = cached_item {
+                        //     if !cache.is_null_or_undefined() {
+                        //         rv.set(cache);
+                        //         return;
+                        //     }
+                        // }
+
+                        // let full_name = format!("{}.{}", dec.full_name(), name.as_str());
+                        // if let Some(dec) = MetadataReader::find_by_name(full_name.as_str()) {
+                        //     let declaration = Arc::clone(&dec);
+                        //     let lock = dec.read();
+                        //
+                        //     match lock.kind() {
+                        //         DeclarationKind::Class => {
+                        //             let ret: Local<v8::Value> = create_ns_ctor_object(lock.name(), declaration, scope).into();
+                        //             rv.set(ret.into());
+                        //         }
+                        //         _ => {
+                        //             let ret: Local<v8::Value> = create_ns_object(name.as_str(), declaration, scope).into();
+                        //             rv.set(ret.into());
+                        //         }
+                        //     }
+                        //
+                        //
+                        //     //  store.set(scope, key.into(), ret.into());
+                        //     return;
+                        // }
+                        //
+                        // rv.set_undefined();
+                        // return;
+                    }
+                }
+            }
             DeclarationKind::Parameter => {}
         }
         return;
     }
-
 
     rv.set(args.holder().into());
 }

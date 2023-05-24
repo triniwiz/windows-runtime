@@ -7,6 +7,42 @@
 #include <comutil.h>
 #include <iostream>
 
+rust::String GUIDToString(uint32_t Data1, uint16_t Data2, uint16_t Data3, rust::Slice<const uint8_t> Data4) {
+    GUID guid;
+    guid.Data1 = Data1;
+    guid.Data2 = Data2;
+    guid.Data3 = Data3;
+    std::memcpy(&guid.Data4, Data4.data(), 8);
+
+    wchar_t guidString[40];
+    StringFromGUID2(guid, guidString, sizeof(guidString) / sizeof(guidString[0]));
+
+    std::wstring buf(guidString);
+    auto data = (char16_t*)buf.c_str();
+    auto size = buf.size();
+    return rust::String(data, size);
+}
+
+void QueryInterface(size_t index, c_void* factory, uint32_t Data1, uint16_t Data2, uint16_t Data3, rust::Slice<const uint8_t> Data4,  c_void* activation_factory, c_void** func) {
+    Microsoft::WRL::ComPtr<IUnknown> classFactory(static_cast<IUnknown*>(factory));
+    Microsoft::WRL::ComPtr<IUnknown> activationFactory(static_cast<IUnknown*>(activation_factory));
+
+    GUID guid;
+    guid.Data1 = Data1;
+    guid.Data2 = Data2;
+    guid.Data3 = Data3;
+
+    std::memcpy(&guid.Data4, Data4.data(), 8);
+
+    classFactory->QueryInterface(guid, reinterpret_cast<void**>(activationFactory.GetAddressOf()));
+
+    void** vtable = *reinterpret_cast<void***>(activationFactory.Get());
+
+    void* fun = vtable[index];
+
+    *func = fun;
+}
+
 std::unique_ptr <GUID> GetGUID(const uint8_t *data) {
     GUID guid(*reinterpret_cast<const GUID *>(data));
 
