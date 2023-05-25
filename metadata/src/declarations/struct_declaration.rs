@@ -36,15 +36,15 @@ impl Declaration for StructDeclaration {
 }
 
 impl StructDeclaration {
-    pub fn new(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: CorTokenType) -> Self {
+    pub fn new(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> Self {
         Self {
             base: TypeDeclaration::new(
                 DeclarationKind::Struct,
-                metadata.clone(),
+                metadata,
                 token,
             ),
             fields: StructDeclaration::make_field_declarations(
-                metadata.clone(),
+                metadata,
                 token,
             ),
         }
@@ -59,19 +59,17 @@ impl StructDeclaration {
     }
 
     fn make_field_declarations(
-        metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
     ) -> Vec<StructFieldDeclaration> {
         let mut result = Vec::new();
 
-        if let Some(metadata) = Option::as_ref(&metadata) {
-            let meta = Arc::clone(metadata);
-            let lock = metadata.read();
+        if let Some(metadata) = metadata {
             let mut enumerator = std::ptr::null_mut();
             let mut count = 0;
             let mut tokens = [0_u32; 1024];
             let mut enumerator_ptr = &mut enumerator;
-            let result_inner = unsafe { lock.EnumFields(
+            let result_inner = unsafe { metadata.EnumFields(
                 enumerator_ptr,
                 token.0 as u32,
                 tokens.as_mut_ptr(),
@@ -83,13 +81,13 @@ impl StructDeclaration {
 
             assert!(count < tokens.len().saturating_sub(1) as u32);
 
-           unsafe { lock.CloseEnum(enumerator) };
+           unsafe { metadata.CloseEnum(enumerator) };
 
             result.reserve(count as usize);
 
             for i in 0..count as usize {
                 result.push(StructFieldDeclaration::new(
-                    Some(Arc::clone(&meta)),
+                    Some(metadata),
                     CorTokenType(tokens[i] as i32),
                 ))
             }

@@ -17,7 +17,7 @@ pub struct GenericInterfaceDeclaration {
 }
 
 impl GenericInterfaceDeclaration {
-    pub fn new(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: CorTokenType) -> Self {
+    pub fn new(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> Self {
         Self {
             base: InterfaceDeclaration::new_with_kind(
                 DeclarationKind::GenericInterface,

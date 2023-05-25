@@ -13,7 +13,7 @@ use crate::prelude::*;
 #[derive(Clone, Debug)]
 pub struct PropertyDeclaration {
     kind: DeclarationKind,
-    pub(crate) metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+    pub(crate) metadata: Option<IMetaDataImport2>,
     token: CorTokenType,
     full_name: String,
     getter: MethodDeclaration,
@@ -33,7 +33,6 @@ impl Declaration for PropertyDeclaration {
         let mut property_flags = 0_u32;
 
         if let Some(metadata) = self.metadata.as_ref() {
-            let metadata = metadata.read();
             let result = unsafe {
                 metadata.GetPropertyProps(
                     self.token.0 as u32,
@@ -79,15 +78,13 @@ impl Declaration for PropertyDeclaration {
 impl PropertyDeclaration {
 
     fn make_getter(
-        metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
     ) -> MethodDeclaration {
         let mut getter_token = 0_u32;
-        match Option::as_ref(&metadata) {
+        match metadata {
             None => {}
             Some(metadata) => {
-                let metadata = metadata.read();
-
                 let result = unsafe {
                     metadata.GetPropertyProps(
                         token.0 as u32,
@@ -117,13 +114,12 @@ impl PropertyDeclaration {
     }
 
     fn make_setter(
-        metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
     ) -> Option<MethodDeclaration> {
         let mut setter_token = 0_u32;
 
-        if let Some(metadata) = Option::as_ref(&metadata) {
-            let metadata = metadata.read();
+        if let Some(metadata) = metadata {
             let result = unsafe {
                 metadata.GetPropertyProps(
                     token.0 as u32,
@@ -154,7 +150,7 @@ impl PropertyDeclaration {
         return Some(MethodDeclaration::new(metadata, CorTokenType(setter_token as i32)));
     }
 
-    pub fn new(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: CorTokenType) -> Self {
+    pub fn new(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> Self {
         debug_assert!(metadata.is_some());
         debug_assert!(type_from_token(token) == mdtProperty.0);
         debug_assert!(token.0 != 0);
@@ -163,8 +159,7 @@ impl PropertyDeclaration {
 
         let mut full_name_data = [0_u16; MAX_IDENTIFIER_LENGTH + 1];
         let mut name_length = 0;
-        if let Some(metadata) = metadata.as_ref() {
-            let metadata = metadata.read();
+        if let Some(metadata) = metadata {
             let name = PCWSTR(full_name_data.as_mut_ptr());
             let result = unsafe {
                 metadata.GetPropertyProps(
@@ -195,7 +190,7 @@ impl PropertyDeclaration {
 
         Self {
             kind: DeclarationKind::Property,
-            metadata: metadata.clone(),
+            metadata: metadata.map(|f| f.clone()),
             token,
             getter: PropertyDeclaration::make_getter(
                 metadata.clone(),
@@ -214,7 +209,6 @@ impl PropertyDeclaration {
         let mut signature_count = 0;
 
         if let Some(metadata) = self.metadata.as_ref() {
-            let metadata = metadata.read();
             let result = unsafe {
                 metadata.GetPropertyProps(
                     self.token.0 as u32,

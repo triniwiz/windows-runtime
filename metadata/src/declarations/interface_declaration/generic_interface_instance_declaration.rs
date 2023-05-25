@@ -17,15 +17,15 @@ use crate::signature::Signature;
 #[derive(Clone, Debug)]
 pub struct GenericInterfaceInstanceDeclaration {
     base: InterfaceDeclaration,
-    closed_metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+    closed_metadata: Option<IMetaDataImport2>,
     closed_token: CorTokenType,
 }
 
 impl GenericInterfaceInstanceDeclaration {
     pub fn new(
-        open_metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        open_metadata: Option<&IMetaDataImport2>,
         open_token: CorTokenType,
-        closed_metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        closed_metadata: Option<&IMetaDataImport2>,
         closed_token: CorTokenType,
     ) -> Self {
         debug_assert!(closed_metadata.is_some());
@@ -37,8 +37,7 @@ impl GenericInterfaceInstanceDeclaration {
 
         let mut full_name = String::new();
 
-        if let Some(metadata) = closed_metadata.as_ref() {
-            let metadata = metadata.read();
+        if let Some(metadata) = closed_metadata {
 
             let mut signature = std::ptr::null_mut();//PCCOR_SIGNATURE::default();
             //let mut signature = [0_u8; MAX_IDENTIFIER_LENGTH];
@@ -57,7 +56,7 @@ impl GenericInterfaceInstanceDeclaration {
             if signature_size > 0 {
                 let mut signature = PCCOR_SIGNATURE::from_ptr(signature);
                // let signature = unsafe { std::slice::from_raw_parts(signature, signature_size as usize) };
-                full_name = Signature::to_string(&metadata, &signature);
+                full_name = Signature::to_string(metadata, &signature);
             }
         }
 
@@ -67,7 +66,7 @@ impl GenericInterfaceInstanceDeclaration {
                 open_metadata,
                 open_token,
             ),
-            closed_metadata,
+            closed_metadata: closed_metadata.map(|f| f.clone()),
             closed_token,
         }
     }

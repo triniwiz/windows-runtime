@@ -9,6 +9,7 @@ use crate::interop::{create_dispatcher_queue_controller_for_current_thread, shut
 use windows::{
     core::Result
 };
+use windows::Win32::System::Com::{CoInitialize, CoUninitialize};
 use metadata::declarations::declaration::Declaration;
 
 
@@ -90,10 +91,16 @@ fn run_js_app() {
  // console.log(method);
    console.log("\n");
    "#;
+    let _  = unsafe {
+        CoInitialize(None)
+    };
     let rt = nativescript::runtime_init(0 as _);
     let script = CString::new(script).unwrap();
     nativescript::runtime_runscript(rt, script.as_ptr());
     nativescript::runtime_deinit(rt);
+    let _ = unsafe {
+        CoUninitialize()
+    };
 }
 
 fn main() {

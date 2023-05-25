@@ -44,7 +44,7 @@ impl Declaration for EnumDeclaration {
 }
 
 impl EnumDeclaration {
-    pub fn new(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: CorTokenType) -> Self {
+    pub fn new(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> Self {
         Self {
             base: TypeDeclaration::new(DeclarationKind::Enum, metadata, token)
         }
@@ -146,7 +146,7 @@ impl EnumDeclaration {
                 let mut field = 0_u32;
                 let result = unsafe { metadata.EnumFields(&mut enumerator, self.base.token().0 as u32, &mut field, 1, 0 as _) };
                 assert!(result.is_ok());
-                enums.push(EnumMemberDeclaration::new(self.base.metadata.clone(), CorTokenType(field as i32)))
+                enums.push(EnumMemberDeclaration::new(self.base.metadata(), CorTokenType(field as i32)))
             }
             unsafe { metadata.CloseEnum(enumerator) };
         }

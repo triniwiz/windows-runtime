@@ -2,7 +2,6 @@ use std::any::Any;
 use std::borrow::Cow;
 
 use crate::prelude::*;
-use std::sync::{Arc};
 use parking_lot::RwLock;
 use windows::core::GUID;
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2, mdtTypeSpec};
@@ -17,25 +16,24 @@ use crate::signature::Signature;
 pub struct GenericDelegateInstanceDeclaration {
     base: DelegateDeclaration,
     closed_token: CorTokenType,
-    closed_metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+    closed_metadata: Option<IMetaDataImport2>,
     full_name: String,
 }
 
 impl GenericDelegateInstanceDeclaration {
     pub fn new(
-        open_metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        open_metadata: Option<&IMetaDataImport2>,
         open_token: CorTokenType,
-        closed_metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        closed_metadata: Option<&IMetaDataImport2>,
         closed_token: CorTokenType,
     ) -> Self {
         assert!(closed_metadata.is_some());
         assert_eq!(type_from_token(closed_token), mdtTypeSpec.0);
         assert_ne!(closed_token.0, 0);
 
-        let full_name = match Option::as_ref(&closed_metadata) {
+        let full_name = match closed_metadata {
             None => String::new(),
             Some(metadata) => {
-                let metadata = metadata.read();
                 let mut signature = PCCOR_SIGNATURE::default(); //std::ptr::null_mut();
                 //let mut sig = &mut signature;
                 let mut signature_size = 0;
@@ -47,8 +45,8 @@ impl GenericDelegateInstanceDeclaration {
                     )
                 };
                 assert!(result.is_ok());
-               // let signature = unsafe { std::slice::from_raw_parts(signature as *const u8, signature_size as usize) };
-                Signature::to_string(&*metadata, &signature)
+                // let signature = unsafe { std::slice::from_raw_parts(signature as *const u8, signature_size as usize) };
+                Signature::to_string(metadata, &signature)
             }
         };
 
@@ -59,7 +57,7 @@ impl GenericDelegateInstanceDeclaration {
                 open_token,
             ),
             closed_token,
-            closed_metadata,
+            closed_metadata: closed_metadata.map(|f| f.clone()),
             full_name,
         }
     }

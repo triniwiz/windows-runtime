@@ -1,5 +1,7 @@
 mod console;
 mod converter;
+mod value;
+mod interop;
 
 use std::any::Any;
 use std::ffi::{c_char, c_void, CString};
@@ -8,14 +10,14 @@ use std::ops::Deref;
 use std::ptr::{addr_of, addr_of_mut};
 use std::result;
 use std::sync::{Arc, Once};
+use libffi::high::arg;
 use libffi::low::ffi_type;
 use libffi::middle::Cif;
 use parking_lot::{RawRwLock, RwLock};
 use parking_lot::lock_api::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLockReadGuard, RwLockWriteGuard};
-use v8::{Local, Object};
+use v8::{Global, Local, Object};
 use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, IUnknown_Vtbl, ComInterface, PCWSTR, Type, IInspectable, Error};
-use windows::Data::Json::{IJsonValue, JsonValue};
-use windows::Foundation::GuidHelper;
+use windows::Foundation::{GuidHelper, IAsyncOperation};
 use windows::Win32::Foundation::CO_E_INIT_ONLY_SINGLE_THREADED;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, CLSIDFromProgID, CLSIDFromString, CoCreateInstance, CoGetClassObject, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED, CoInitialize, CoInitializeEx, CoUninitialize, DISPATCH_METHOD, DISPPARAMS, EXCEPINFO, IClassFactory, IDispatch, IDispatch_Vtbl, ITypeLib, VARIANT, VT_UI2};
 use windows::Win32::System::WinRT::{IActivationFactory, RoActivateInstance, RoGetActivationFactory};
@@ -38,6 +40,7 @@ use metadata::{guid_to_string, query_interface, signature};
 use metadata::declarations::method_declaration::MethodDeclaration;
 use metadata::signature::Signature;
 use metadata::value::{Value, Variant};
+use crate::value::MethodCall;
 
 pub struct Runtime {
     isolate: v8::OwnedIsolate,
@@ -173,8 +176,8 @@ fn create_ns_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, s
     let object_tmpl = tmpl.instance_template(scope);
     object_tmpl.set_named_property_handler(
         v8::NamedPropertyHandlerConfiguration::new()
-            .getter(handle_ns_meta_getter)
-            .setter(handle_ns_meta_setter)
+            .getter(handle_named_property_getter)
+            .setter(handle_named_property_setter)
     );
     object_tmpl.set_internal_field_count(2);
     let object = object_tmpl.new_instance(scope).unwrap();
@@ -198,8 +201,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, declaration: Arc<RwLock<dyn De
     let object_tmpl = tmpl.instance_template(scope);
     object_tmpl.set_named_property_handler(
         v8::NamedPropertyHandlerConfiguration::new()
-            .getter(handle_ns_meta_getter)
-            .setter(handle_ns_meta_setter)
+            .getter(handle_named_property_getter)
+            .setter(handle_named_property_setter)
     );
     object_tmpl.set_internal_field_count(2);
     let object = object_tmpl.new_instance(scope).unwrap();
@@ -257,8 +260,15 @@ fn create_ns_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration
                 let clazz_factory = clazz_factory.unwrap();
 
                 unsafe {
+                    let is_sealed = clazz.is_sealed();
                     for ctor in clazz.initializers() {
-                        let number_of_parameters = ctor.number_of_parameters();
+                        println!("ctor {}", clazz.is_sealed());
+
+                        let mut method = MethodCall::new(
+                            ctor, is_sealed, clazz_factory.clone(), true
+                        );
+
+                        /*let number_of_parameters = ctor.number_of_parameters();
 
                         let mut index = 0 as usize;
 
@@ -366,8 +376,11 @@ fn create_ns_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration
 
                         let ret = HRESULT(ret);
 
+                        */
+
+                        let (ret, result) = method.call(scope, &args);
                         if ret.is_ok() {
-                            let result = result.assume_init();
+                            let result = unsafe {IUnknown::from_raw(result)};
                             let ctor = Arc::clone(&dec.inner);
                             let instance = create_ns_ctor_instance_object(clazz.name(), ctor, Some(result), scope);
                             retval.set(instance);
@@ -511,8 +524,13 @@ fn create_ns_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration
         let object_tmpl = v8::ObjectTemplate::new(scope);
         object_tmpl.set_named_property_handler(
             v8::NamedPropertyHandlerConfiguration::new()
-                .getter(handle_ns_meta_getter)
-                .setter(handle_ns_meta_setter)
+                .getter(handle_named_property_getter)
+                .setter(handle_named_property_setter)
+        );
+        object_tmpl.set_indexed_property_handler(
+            v8::IndexedPropertyHandlerConfiguration::new()
+                .setter(handle_indexed_property_setter)
+                .getter(handle_indexed_property_getter)
         );
         object_tmpl.set_internal_field_count(2);
         let object = object_tmpl.new_instance(scope).unwrap();
@@ -523,6 +541,7 @@ fn create_ns_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration
         object.set_internal_field(1, object_store.into());
 
         retval.set(object.into());
+
     })
         .data(ext.into()).build(scope);
     tmpl.set_class_name(name);
@@ -557,7 +576,8 @@ fn init_meta(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, context
     }
 }
 
-fn handle_ns_meta_setter(scope: &mut v8::HandleScope,
+
+fn handle_named_property_setter(scope: &mut v8::HandleScope,
                          key: Local<v8::Name>,
                          value: Local<v8::Value>,
                          args: v8::PropertyCallbackArguments) {
@@ -631,7 +651,7 @@ fn handle_ns_meta_setter(scope: &mut v8::HandleScope,
     }
 }
 
-fn handle_ns_meta_getter(scope: &mut v8::HandleScope,
+fn handle_named_property_getter(scope: &mut v8::HandleScope,
                          key: v8::Local<v8::Name>,
                          args: v8::PropertyCallbackArguments,
                          mut rv: v8::ReturnValue) {
@@ -700,7 +720,6 @@ fn handle_ns_meta_getter(scope: &mut v8::HandleScope,
 
                             let ext = v8::External::new(scope, declaration as _);
 
-
                             let builder = v8::Function::builder(|scope: &mut v8::HandleScope,
                                                               args: v8::FunctionCallbackArguments,
                                                               mut retval: v8::ReturnValue| {
@@ -718,25 +737,27 @@ fn handle_ns_meta_getter(scope: &mut v8::HandleScope,
 
                                 let method = method.unwrap();
 
+                                let instance = dec.instance.clone().unwrap();
+
+                                let mut method = MethodCall::new(
+                                    method, method.is_sealed(), instance, false
+                                );
+
+                                let (ret, result ) = method.call(scope, &args);
+
+                                /*
                                 let mut index = 0_usize;
 
                                 if let Some(interface) = Metadata::find_declaring_interface_for_method(method, &mut index) {
-                                    let interface = interface.read();
-                                    println!("base {}", interface.base().name());
+                                    /*let interface = interface.read();
                                     let method_interface = interface.as_declaration().as_any().downcast_ref::<InterfaceDeclaration>();
                                     let method_interface = method_interface.unwrap();
                                     let iid = method_interface.id();
 
-                                    let metadata = method.metadata.as_ref();
-                                    let metadata = metadata.unwrap();
-                                    let metadata = metadata.read();
-
-                                    let return_type = method.return_type();
-                                    let is_void = Signature::to_string(&*metadata, &return_type) == "Void";
+                                    let is_void = method.is_void();
 
                                     let number_of_parameters = method.number_of_parameters();
                                     let number_of_abi_parameters = number_of_parameters + if is_void {1} else {2};
-
 
                                     index = index.saturating_add(6);
 
@@ -797,13 +818,12 @@ fn handle_ns_meta_getter(scope: &mut v8::HandleScope,
 
                                     let mut result: MaybeUninit<IUnknown> = MaybeUninit::zeroed();
 
-
-
                                     if !is_void {
                                         unsafe { parameter_types.push(&mut libffi::low::types::pointer); }
 
+                                       // arguments.push(addr_of_mut!(result) as *mut _);
+
                                         arguments.push(&mut result.as_mut_ptr() as *mut _ as *mut c_void);
-                                     //   arguments.push(addr_of_mut!(result) as *mut _);
                                     }
 
 
@@ -817,6 +837,7 @@ fn handle_ns_meta_getter(scope: &mut v8::HandleScope,
                                         *vtable.offset(index as isize)
                                     };
 
+                                    std::mem::forget(interface);
 
                                     let mut cif: libffi::low::ffi_cif = Default::default();
 
@@ -835,11 +856,16 @@ fn handle_ns_meta_getter(scope: &mut v8::HandleScope,
 
                                     let ret = HRESULT(ret);
 
+                                    */
+
 
                                     println!("ret {}", ret);
 
                                 }
 
+                                */
+
+                                println!("{} {:?}", ret, result);
 
                             })
                                 .data(ext.into()).build(scope);
@@ -954,6 +980,18 @@ fn handle_ns_meta_getter(scope: &mut v8::HandleScope,
 }
 
 
+fn handle_indexed_property_setter(_scope: &mut v8::HandleScope,
+                                index: u32,
+                                value: v8::Local<v8::Value>,
+                                args: v8::PropertyCallbackArguments){}
+
+
+fn handle_indexed_property_getter(scope: &mut v8::HandleScope,
+index: u32,
+args: v8::PropertyCallbackArguments,
+mut rv: v8::ReturnValue){}
+
+
 fn handle_ns_func(scope: &mut v8::HandleScope,
                   _args: v8::FunctionCallbackArguments,
                   mut _retval: v8::ReturnValue) {
@@ -978,10 +1016,11 @@ fn handle_meta(scope: &mut v8::HandleScope,
 impl Runtime {
     pub fn new(app_root: &str) -> Self {
         INIT.call_once(|| {
-            let _ = unsafe {
+           /* let _ = unsafe {
                 // CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)
                 CoInitialize(None)
             };
+            */
             let platform = v8::Platform::new(0, false).make_shared();
             v8::V8::initialize_platform(platform);
             v8::V8::initialize();
@@ -1030,6 +1069,7 @@ impl Runtime {
     }
 
     pub fn run_script(&mut self, script: &str) {
+        println!("run {}", script);
         let isolate = &mut self.isolate;
         let scope = &mut v8::HandleScope::new(isolate);
         let context = v8::Local::new(scope, &self.global_context);
@@ -1040,8 +1080,8 @@ impl Runtime {
     }
 
     pub fn dispose(&self) {
-        unsafe {
+       /* unsafe {
             CoUninitialize();
-        }
+        }*/
     }
 }

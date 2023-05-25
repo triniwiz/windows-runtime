@@ -1,5 +1,8 @@
+use std::ffi::CString;
+use windows::core::{HSTRING, PCSTR, PCWSTR};
 use windows::Win32::System::{Console};
 use windows::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
+use windows::Win32::System::Diagnostics::Debug::OutputDebugStringA;
 
 pub(crate) fn handle_console_log(scope: &mut v8::HandleScope, args: v8::FunctionCallbackArguments, _retval: v8::ReturnValue) {
     let mut value = String::new();
@@ -18,14 +21,28 @@ pub(crate) fn handle_console_log(scope: &mut v8::HandleScope, args: v8::Function
 
     let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
 
-    let result = unsafe {
-        Console::WriteConsoleA(handle.unwrap(), value.as_bytes(), None, None)
-    };
+    match handle {
+        Ok(handle) => {
+            let result = unsafe {
+                Console::WriteConsoleA(handle, value.as_bytes(), None, None)
+            };
 
-    // try using println
-    if !result.as_bool() {
-        println!("{value}");
+            // try using println
+            if !result.as_bool() {
+                println!("{value}");
+            }
+        }
+        Err(_) => {
+            let value = CString::new(value).unwrap();
+            unsafe {
+                OutputDebugStringA(
+                    PCSTR::from_raw(value.as_ptr() as _)
+                )
+            }
+        }
     }
+
+
 }
 
 pub(crate) fn handle_console_dir(scope: &mut v8::HandleScope, args: v8::FunctionCallbackArguments, _retval: v8::ReturnValue) {

@@ -19,7 +19,7 @@ impl Display for EnumMemberDeclaration {
 }
 
 impl EnumMemberDeclaration {
-    pub fn new(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: CorTokenType) -> Self {
+    pub fn new(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> Self {
         Self {
             base: FieldDeclaration::new(DeclarationKind::EnumMember, metadata, token)
         }

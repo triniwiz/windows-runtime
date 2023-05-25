@@ -13,19 +13,20 @@ use crate::prelude::*;
 #[derive(Clone, Debug)]
 pub struct MethodDeclaration {
     kind: DeclarationKind,
-    pub metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
-    pub token: CorTokenType,
+    metadata: Option<IMetaDataImport2>,
+    token: CorTokenType,
     parameters: Vec<ParameterDeclaration>,
     return_type: PCCOR_SIGNATURE,
     full_name: String,
     overload_name: String,
+    is_void: bool
 }
 
 const OVERLOAD_ATTRIBUTE: &str = "Windows.Foundation.Metadata.OverloadAttribute";
 const DEFAULT_OVERLOAD_ATTRIBUTE: &str = "Windows.Foundation.Metadata.DefaultOverloadAttribute";
 
 impl MethodDeclaration {
-    pub fn new(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: CorTokenType) -> Self {
+    pub fn new(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> Self {
         assert!(metadata.is_some());
         assert_eq!(type_from_token(token), mdtMethodDef.0);
         assert_ne!(token.0, 0);
@@ -38,12 +39,11 @@ impl MethodDeclaration {
         let mut return_type = PCCOR_SIGNATURE::default();
         let mut full_name = String::new();
         let mut overload_name = String::new();
+        let mut is_void = false;
         unsafe {
-            match Option::as_ref(&metadata) {
+            match metadata {
                 None => {}
                 Some(metadata) => {
-                    let meta = Arc::clone(&metadata);
-                    let metadata = metadata.read();
                     let result = unsafe {
                         metadata.GetMethodProps(
                             token.0 as u32,
@@ -106,7 +106,7 @@ impl MethodDeclaration {
                     for i in start_index..parameters_count as usize {
                         let sig_type = Signature::consume_type(&mut sig);
                         parameters.push(ParameterDeclaration::new(
-                            Some(Arc::clone(&meta)),
+                            Some(metadata),
                             CorTokenType(parameter_tokens[i] as i32),
                             sig_type,
                         ))
@@ -135,10 +135,12 @@ impl MethodDeclaration {
 
 
                     overload_name = get_unary_custom_attribute_string_value(
-                        &*metadata,
+                        &metadata,
                         token,
                         OVERLOAD_ATTRIBUTE,
                     );
+
+                    is_void = Signature::to_string(metadata, &return_type) == "Void";
 
                     // todo
                     //debug_assert!(signature_size == signature);
@@ -147,23 +149,34 @@ impl MethodDeclaration {
             }
         }
 
-
         Self {
             kind:DeclarationKind::Method,
-            metadata,
+            metadata: metadata.map(|f|f.clone()),
             token,
             parameters,
             return_type,
             full_name,
             overload_name,
+            is_void
         }
+    }
+
+    pub fn metadata(&self) -> Option<&IMetaDataImport2> {
+        self.metadata.as_ref()
+    }
+
+    pub fn token(&self) -> CorTokenType {
+        self.token
+    }
+
+    pub fn is_void(&self) -> bool {
+        self.is_void
     }
 
     pub fn is_initializer(&self) -> bool {
         let mut full_name_data = [0_u16; MAX_IDENTIFIER_LENGTH];
         let mut method_flags = 0;
         if let Some(metadata) = self.metadata.as_ref() {
-            let metadata = metadata.read();
             let result = unsafe {
                 metadata.GetMethodProps(
                     self.token.0 as u32,
@@ -189,7 +202,6 @@ impl MethodDeclaration {
     pub fn is_static(&self) -> bool {
         let mut method_flags = 0;
         if let Some(metadata) = self.metadata.as_ref() {
-            let metadata = metadata.read();
             let result = unsafe {
                 metadata.GetMethodProps(
                     self.token.0 as u32,
@@ -211,7 +223,6 @@ impl MethodDeclaration {
     pub fn is_sealed(&self) -> bool {
         let mut method_flags = 0;
         if let Some(metadata) = self.metadata.as_ref() {
-            let metadata = metadata.read();
             let result = unsafe {
                 metadata.GetMethodProps(
                     self.token.0 as u32,
@@ -246,7 +257,6 @@ impl MethodDeclaration {
         let data = HSTRING::from(DEFAULT_OVERLOAD_ATTRIBUTE);
         let data = PCWSTR(data.as_ptr());
         if let Some(metadata) = self.metadata.as_ref() {
-            let metadata = metadata.read();
             let get_attribute_result =
                 unsafe { metadata.GetCustomAttributeByName(self.token.0 as u32, data, 0 as _, 0 as _) };
             debug_assert!(get_attribute_result.is_ok());
@@ -272,7 +282,6 @@ impl Declaration for MethodDeclaration {
     fn is_exported(&self) -> bool {
         let mut method_flags = 0_u32;
         if let Some(metadata) = self.metadata.as_ref() {
-            let metadata = metadata.read();
             let result = unsafe {
                 metadata.GetMethodProps(
                     self.token.0 as u32,

@@ -282,15 +282,12 @@ impl Metadata {
         return true;
     }
 
-    pub fn declaring_interface_for_initializer(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, method_token: CorTokenType, out_index: &mut usize) -> Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>> {
+    pub fn declaring_interface_for_initializer(metadata: Option<&IMetaDataImport2>, method_token: CorTokenType, out_index: &mut usize) -> Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>> {
         // InterfaceDeclaration
-
-        let meta = metadata.clone();
 
         match metadata {
             None => None,
             Some(metadata) => {
-                let metadata = &*metadata.read();
 
                 let method_argument_count = Metadata::get_method_argument_count(metadata, method_token);
 
@@ -320,14 +317,11 @@ impl Metadata {
                             continue;
                         }
 
-                        //drop early to force unlock
-                        drop(metadata);
-
                         *out_index = i;
                         return Some(
                             Arc::new(
                                 RwLock::new(
-                                    InterfaceDeclaration::new(meta, CorTokenType(factory_token as i32))
+                                    InterfaceDeclaration::new(Some(metadata), CorTokenType(factory_token as i32))
                                 )
                             )
                         );
@@ -369,15 +363,12 @@ impl Metadata {
                             continue;
                         }
 
-                        //drop early to force unlock
-
-                        drop(metadata);
 
                         *out_index = i;
                         return Some(
                             Arc::new(
                                 RwLock::new(
-                                    InterfaceDeclaration::new(meta, CorTokenType(factory_token as i32))
+                                    InterfaceDeclaration::new(Some(metadata), CorTokenType(factory_token as i32))
                                 )
                             )
                         );
@@ -389,13 +380,10 @@ impl Metadata {
         }
     }
 
-    pub fn declaring_interface_for_static_method(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, method_token: CorTokenType, out_index: &mut usize) -> Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>> {
-        let meta = metadata.clone();
+    pub fn declaring_interface_for_static_method(metadata: Option<&IMetaDataImport2>, method_token: CorTokenType, out_index: &mut usize) -> Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>> {
         match metadata {
             None => None,
             Some(metadata) => {
-                let metadata = &*metadata.read();
-
                 let method_signature = Metadata::get_method_signature(
                     metadata, method_token,
                 );
@@ -460,7 +448,7 @@ impl Metadata {
                             continue;
                         }
                         *out_index = i;
-                        ret = Some(Arc::new(RwLock::new(InterfaceDeclaration::new(meta.clone(), CorTokenType(statics_token as i32)))));
+                        ret = Some(Arc::new(RwLock::new(InterfaceDeclaration::new(Some(metadata), CorTokenType(statics_token as i32)))));
                         break;
                     }
                 }
@@ -499,12 +487,11 @@ impl Metadata {
         return (method_token.0 as u32 - first_method) as usize;
     }
 
-    pub fn declaring_interface_for_instance_method(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, method_token: CorTokenType, out_index: &mut usize) -> Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>> {
+    pub fn declaring_interface_for_instance_method(metadata: Option<&IMetaDataImport2>, method_token: CorTokenType, out_index: &mut usize) -> Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>> {
         let meta = metadata.clone();
         match metadata {
             None => None,
             Some(metadata) => {
-                let metadata = &*metadata.read();
                 let class_token = Metadata::get_method_containing_class_token(
                     metadata, method_token,
                 );
@@ -575,7 +562,7 @@ impl Metadata {
                             ret = Some(
                                 Arc::new(
                                     RwLock::new(
-                                        InterfaceDeclaration::new(meta.clone(), CorTokenType(declaring_interface_token as i32))
+                                        InterfaceDeclaration::new(Some(metadata), CorTokenType(declaring_interface_token as i32))
                                     )
                                 )
                             );
@@ -648,11 +635,7 @@ impl Metadata {
                                             RwLock::new(
                                                 InterfaceDeclaration::new(
                                                     Some(
-                                                        Arc::new(
-                                                            RwLock::new(
-                                                                external_metadata
-                                                            )
-                                                        )
+                                                        &external_metadata
                                                     ), declaring_interface_token)
                                             )
                                         )
@@ -730,7 +713,7 @@ impl Metadata {
                                                 Arc::new(
                                                     RwLock::new(
                                                         GenericInterfaceInstanceDeclaration::new(
-                                                            meta.clone(), CorTokenType(open_generic_class_token as i32), meta.clone(), CorTokenType(parent_token as i32),
+                                                            Some(metadata), CorTokenType(open_generic_class_token as i32), Some(metadata), CorTokenType(parent_token as i32),
                                                         )
                                                     )
                                                 )
@@ -772,12 +755,8 @@ impl Metadata {
                                                 Arc::new(
                                                     RwLock::new(
                                                         GenericInterfaceInstanceDeclaration::new(Some(
-                                                            Arc::new(
-                                                                RwLock::new(
-                                                                    external_metadata
-                                                                )
-                                                            )
-                                                        ), external_class_token, meta.clone(), CorTokenType(parent_token as i32))
+                                                            &external_metadata
+                                                        ), external_class_token, Some(metadata), CorTokenType(parent_token as i32))
                                                     )
                                                 )
                                             );
@@ -806,20 +785,20 @@ impl Metadata {
         debug_assert!(
             *out_index == 0
         );
-        let method_token = method.token;
+        let method_token = method.token();
 
         if method.is_static() {
             return Metadata::declaring_interface_for_static_method(
-                method.metadata.clone(), method_token, out_index,
+                method.metadata(), method_token, out_index,
             );
         } else if method.is_initializer() {
             return Metadata::declaring_interface_for_initializer(
-                method.metadata.clone(), method_token, out_index,
+                method.metadata(), method_token, out_index,
             )
         }
 
         Metadata::declaring_interface_for_instance_method(
-            method.metadata.clone(), method_token, out_index,
+            method.metadata(), method_token, out_index,
         )
     }
 }

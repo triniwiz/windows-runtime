@@ -14,7 +14,7 @@ use crate::prelude::*;
 #[derive(Clone)]
 pub struct EventDeclaration {
     kind: DeclarationKind,
-    pub(crate) metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+    pub(crate) metadata: Option<IMetaDataImport2>,
     token: CorTokenType,
     // Arc ??
     type_: Option<Box<dyn DelegateDeclarationImpl>>,
@@ -36,12 +36,11 @@ impl Debug for EventDeclaration {
 
 impl EventDeclaration {
     pub fn make_add_method(
-        metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
     ) -> MethodDeclaration {
         let mut add_method_token = 0 as u32;
-        if let Some(metadata) = Option::as_ref(&metadata) {
-            let metadata = metadata.read();
+        if let Some(metadata) = metadata {
 
             let result = unsafe {
                 metadata.GetEventProps(
@@ -63,20 +62,19 @@ impl EventDeclaration {
             debug_assert!(result.is_ok());
         }
         MethodDeclaration::new(
-            Option::as_ref(&metadata).map(|v| Arc::clone(v)),
+            metadata,
             CorTokenType(add_method_token as i32),
         )
     }
 
     pub fn make_remove_method(
-        metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
     ) -> MethodDeclaration {
         let mut remove_method_token = 0_u32;
-        match Option::as_ref(&metadata) {
+        match metadata {
             None => {}
             Some(metadata) => {
-                let metadata = metadata.read();
                 let result = unsafe {
                     metadata.GetEventProps(
                         token.0 as u32,
@@ -99,20 +97,19 @@ impl EventDeclaration {
             }
         }
         MethodDeclaration::new(
-            Option::as_ref(&metadata).map(|v| Arc::clone(v)),
+            metadata,
             CorTokenType(remove_method_token as i32),
         )
     }
 
     pub fn make_type(
-        metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
     ) -> Option<Box<dyn DelegateDeclarationImpl>> {
         let mut delegate_token = 0 as u32;
-        match Option::as_ref(&metadata) {
+        match metadata {
             None => {}
             Some(metadata) => {
-                let metadata = metadata.read();
                 let result = unsafe {
                     metadata.GetEventProps(
                         token.0 as u32,
@@ -134,16 +131,15 @@ impl EventDeclaration {
             }
         }
         return DeclarationFactory::make_delegate_declaration(
-            Option::as_ref(&metadata).map(|v| Arc::clone(v)),
+            metadata,
             CorTokenType(delegate_token as i32),
         );
     }
 
-    pub fn new(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: CorTokenType) -> Self {
+    pub fn new(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> Self {
         let mut full_name = String::new();
 
-        if let Some(metadata) = metadata.as_ref() {
-            let metadata = metadata.read();
+        if let Some(metadata) = metadata {
 
             let mut name_data = [0_u16; MAX_IDENTIFIER_LENGTH];
             let mut name_data_length = 0;
@@ -177,18 +173,18 @@ impl EventDeclaration {
 
         Self {
             kind: DeclarationKind::Event,
-            metadata: metadata.clone(),
+            metadata: metadata.map(|f| f.clone()),
             token,
             type_: EventDeclaration::make_type(
-                Option::as_ref(&metadata).map(|v| Arc::clone(v)),
+                metadata,
                 token,
             ),
             add_method: EventDeclaration::make_add_method(
-                Option::as_ref(&metadata).map(|v| Arc::clone(v)),
+                metadata,
                 token,
             ),
             remove_method: EventDeclaration::make_remove_method(
-                Option::as_ref(&metadata).map(|v| Arc::clone(v)),
+                metadata,
                 token,
             ),
             full_name,
@@ -229,7 +225,6 @@ impl Declaration for EventDeclaration {
     fn is_exported(&self) -> bool {
         let mut flags = 0;
         if let Some(metadata) = self.metadata.as_ref() {
-            let metadata = metadata.read();
             let result = unsafe { metadata.GetEventProps(
                 self.token.0 as u32,
                 0 as _,

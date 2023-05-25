@@ -1,11 +1,13 @@
 use std::any::Any;
-use crate::prelude::*;
 use std::borrow::Cow;
-use std::sync::{Arc};
+use std::sync::Arc;
+
 use parking_lot::RwLock;
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMAGE_CEE_CS_CALLCONV_FIELD, IMetaDataImport2};
+
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::field_declaration::FieldDeclaration;
+use crate::prelude::*;
 
 #[derive(Clone, Debug)]
 pub struct StructFieldDeclaration {
@@ -38,7 +40,7 @@ impl StructFieldDeclaration {
     pub fn base(&self) -> &FieldDeclaration {
         &self.base
     }
-    pub fn new(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: CorTokenType) -> Self {
+    pub fn new(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> Self {
         Self {
             base: FieldDeclaration::new(DeclarationKind::StructField, metadata, token),
         }
@@ -48,27 +50,28 @@ impl StructFieldDeclaration {
         let mut signature = PCCOR_SIGNATURE::new();
         let mut signature_size = 0;
         match self.base.metadata() {
-            None => {},
+            None => {}
             Some(metadata) => {
-                let result = unsafe { metadata.GetFieldProps(
-                    self.base.token().0 as u32,
-                    0 as _,
-                    None,
-                    0 as _,
-                    0 as _,
-                    &mut signature.as_abi_mut(),
-                    &mut signature_size,
-                    0 as _,
-                    0 as _,
-                    0 as _,
-                )};
+                let result = unsafe {
+                    metadata.GetFieldProps(
+                        self.base.token().0 as u32,
+                        0 as _,
+                        None,
+                        0 as _,
+                        0 as _,
+                        &mut signature.as_abi_mut(),
+                        &mut signature_size,
+                        0 as _,
+                        0 as _,
+                        0 as _,
+                    )
+                };
 
                 assert!(result.is_ok());
 
                 let header = cor_sig_uncompress_data(&mut signature);
 
                 assert_eq!(header, IMAGE_CEE_CS_CALLCONV_FIELD.0 as u32);
-
             }
         }
 

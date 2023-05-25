@@ -10,6 +10,7 @@ use crate::declarations::method_declaration::MethodDeclaration;
 use crate::declarations::property_declaration::PropertyDeclaration;
 use crate::declarations::type_declaration::TypeDeclaration;
 use crate::prelude::*;
+
 pub mod generic_interface_declaration;
 pub mod generic_interface_instance_declaration;
 
@@ -19,13 +20,13 @@ pub struct InterfaceDeclaration {
 }
 
 impl InterfaceDeclaration {
-    pub fn new(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: CorTokenType) -> Self {
+    pub fn new(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> Self {
         Self::new_with_kind(DeclarationKind::Interface, metadata, token)
     }
 
     pub fn new_with_kind(
         kind: DeclarationKind,
-        metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
     ) -> Self {
         Self {
@@ -38,8 +39,7 @@ impl InterfaceDeclaration {
         match base.metadata.as_ref() {
             None => GUID::zeroed(),
             Some(metadata) => {
-                let metadata = metadata.read();
-                get_guid_attribute_value(Some(&*metadata), base.token())
+                get_guid_attribute_value(Some(metadata), base.token())
             }
         }
     }

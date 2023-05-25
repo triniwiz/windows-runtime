@@ -14,11 +14,11 @@ pub struct GenericDelegateDeclaration {
 }
 
 impl GenericDelegateDeclaration {
-    pub fn new(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: CorTokenType) -> Self {
+    pub fn new(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> Self {
         Self {
             base: DelegateDeclaration::new_overload(
                 DeclarationKind::GenericDelegate,
-                Option::as_ref(&metadata).map(|v| Arc::clone(v)),
+                metadata,
                 token,
             ),
         }

@@ -21,6 +21,5 @@ features = [
     "Win32_Foundation",
     "Win32_System_Ole",
     "Win32_System_Com",
-    "Data_Json",
-    "UI_Popups"
+    "Win32_System_Diagnostics_Debug"
 ]

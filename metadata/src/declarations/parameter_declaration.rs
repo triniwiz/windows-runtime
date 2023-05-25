@@ -10,7 +10,7 @@ use crate::declarations::type_declaration::TypeDeclaration;
 #[derive(Clone, Debug)]
 pub struct ParameterDeclaration {
     kind: DeclarationKind,
-    pub(crate) metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+    pub(crate) metadata: Option<IMetaDataImport2>,
     token: CorTokenType,
     parameter_type: PCCOR_SIGNATURE,
     full_name: String,
@@ -18,7 +18,7 @@ pub struct ParameterDeclaration {
 
 impl ParameterDeclaration {
     pub fn new(
-        metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
         sig_type: PCCOR_SIGNATURE,
     ) -> Self {
@@ -26,11 +26,10 @@ impl ParameterDeclaration {
         assert_eq!(type_from_token(token), mdtParamDef.0);
         assert_ne!(token.0, 0);
 
-        let full_name = match metadata.as_ref() {
+        let full_name = match metadata {
             None => String::new(),
             Some(metadata) => {
                 let mut length = 0;
-                let metadata = metadata.read();
 
                 let result = unsafe {
                     metadata.GetParamProps(
@@ -70,7 +69,7 @@ impl ParameterDeclaration {
 
         Self {
             kind:DeclarationKind::Parameter,
-            metadata,
+            metadata: metadata.map(|f| f.clone()),
             token,
             parameter_type: sig_type,
             full_name,
@@ -91,22 +90,8 @@ impl ParameterDeclaration {
         self.parameter_type
     }
 
-    pub fn metadata(&self) -> Option<MappedRwLockReadGuard<'_, IMetaDataImport2>> {
-        self.metadata.as_ref().map(|metadata| {
-            RwLockReadGuard::map(
-                metadata.read(),
-                |metadata| metadata,
-            )
-        })
-    }
-
-    pub fn metadata_mut(&self) -> Option<MappedRwLockWriteGuard<'_, IMetaDataImport2>> {
-        self.metadata.as_ref().map(|metadata| {
-            RwLockWriteGuard::map(
-                metadata.write(),
-                |metadata| metadata,
-            )
-        })
+    pub fn metadata(&self) -> Option<&IMetaDataImport2> {
+        self.metadata.as_ref()
     }
 }
 

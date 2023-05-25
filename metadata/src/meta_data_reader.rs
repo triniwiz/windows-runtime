@@ -113,38 +113,30 @@ impl MetadataReader {
             // let parent_name_string = String::from_utf16_lossy(&parent_name[0..size as usize]);
             // let parent_name_string = unsafe { CString::from_vec_with_nul_unchecked(parent_name_string.into_bytes())}.into_string().unwrap();
 
-            let metadata = unsafe {
-                Arc::new(
-                    RwLock::new(
-                        metadata
-                    )
-                )
-            };
-
 
             if parent_name_string == SYSTEM_ENUM {
                 return Some(
                     Arc::new(
-                        RwLock::new(EnumDeclaration::new(Some(metadata), CorTokenType(token as i32)))
+                        RwLock::new(EnumDeclaration::new(Some(&metadata), CorTokenType(token as i32)))
                     )
                 );
             } else if parent_name_string == SYSTEM_VALUETYPE {
                 return Some(
                     Arc::new(
-                        RwLock::new(StructDeclaration::new(Some(metadata), CorTokenType(token as i32)))
+                        RwLock::new(StructDeclaration::new(Some(&metadata), CorTokenType(token as i32)))
                     )
                 );
             } else if parent_name_string == SYSTEM_MULTICASTDELEGATE {
                 return if full_name.contains("`") {
                     Some(
                         Arc::new(
-                            RwLock::new(GenericDelegateDeclaration::new(Some(metadata), CorTokenType(token as i32)))
+                            RwLock::new(GenericDelegateDeclaration::new(Some(&metadata), CorTokenType(token as i32)))
                         )
                     )
                 } else {
                     Some(
                         Arc::new(
-                            RwLock::new(DelegateDeclaration::new(Some(metadata), CorTokenType(token as i32)))
+                            RwLock::new(DelegateDeclaration::new(Some(&metadata), CorTokenType(token as i32)))
                         )
                     )
                 };
@@ -153,7 +145,7 @@ impl MetadataReader {
 
             return Some(
                 Arc::new(
-                    RwLock::new(ClassDeclaration::new(Some(metadata), CorTokenType(token as i32)))
+                    RwLock::new(ClassDeclaration::new(Some(&metadata), CorTokenType(token as i32)))
                 )
             );
 
@@ -161,23 +153,16 @@ impl MetadataReader {
 
 
         if is_td_interface(flags as i32) {
-            let metadata = unsafe {
-                Arc::new(
-                    RwLock::new(
-                        metadata
-                    )
-                )
-            };
             return if full_name.contains("`") {
                 Some(
                     Arc::new(
-                        RwLock::new(GenericInterfaceDeclaration::new(Some(metadata), CorTokenType(token as i32)))
+                        RwLock::new(GenericInterfaceDeclaration::new(Some(&metadata), CorTokenType(token as i32)))
                     )
                 )
             } else {
                 Some(
                     Arc::new(
-                        RwLock::new(InterfaceDeclaration::new(Some(metadata), CorTokenType(token as i32)))
+                        RwLock::new(InterfaceDeclaration::new(Some(&metadata), CorTokenType(token as i32)))
                     )
                 )
             };

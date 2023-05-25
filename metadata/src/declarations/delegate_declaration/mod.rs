@@ -17,12 +17,11 @@ use crate::prelude::get_guid_attribute_value;
 const INVOKE_METHOD_NAME: &str = "Invoke";
 
 pub fn get_invoke_method_token(
-    metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+    metadata: Option<&IMetaDataImport2>,
     token: CorTokenType,
 ) -> CorTokenType {
     let mut invoke_method_token = 0;
-    if let Some(metadata) = Option::as_ref(&metadata) {
-        let metadata = metadata.read();
+    if let Some(metadata) = metadata {
         let name = HSTRING::from(INVOKE_METHOD_NAME);
         let result = unsafe {
             metadata.FindMethod(
@@ -46,8 +45,7 @@ pub trait DelegateDeclarationImpl: dyn_clone::DynClone {
         match self.base().metadata.as_ref() {
             None => GUID::zeroed(),
             Some(metadata) => {
-                let metadata = metadata.read();
-                get_guid_attribute_value(Some(&*metadata), self.base().token())
+                get_guid_attribute_value(Some(metadata), self.base().token())
             }
         }
     }
@@ -74,24 +72,24 @@ pub struct DelegateDeclaration {
 }
 
 impl<'a> DelegateDeclaration {
-    pub fn new(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: CorTokenType) -> Self {
+    pub fn new(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> Self {
         Self::new_overload(DeclarationKind::Delegate, metadata, token)
     }
 
     pub fn new_overload(
         kind: DeclarationKind,
-        metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
     ) -> Self {
         Self {
             base: TypeDeclaration::new(
                 kind,
-                Option::as_ref(&metadata).map(|v| Arc::clone(v)),
+                metadata,
                 token,
             ),
             invoke_method: MethodDeclaration::new(
-                metadata.clone(),
-                get_invoke_method_token(Option::as_ref(&metadata).map(|v| Arc::clone(v)), token),
+                metadata,
+                get_invoke_method_token(metadata, token),
             ),
         }
     }

@@ -33,20 +33,18 @@ impl Debug for BaseClassDeclaration {
 }
 
 impl BaseClassDeclaration {
-    pub fn metadata(&self) -> Option<MappedRwLockReadGuard<'_, IMetaDataImport2>> {
+    pub fn metadata(&self) -> Option<&IMetaDataImport2> {
         self.base.metadata()
     }
 
     pub fn make_implemented_interfaces_declarations(
-        metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
     ) -> Vec<Box<dyn BaseClassDeclarationImpl>> {
         let mut result = Vec::new();
-        match Option::as_ref(&metadata) {
+        match metadata {
             None => {}
             Some(metadata) => {
-                let meta = Arc::clone(metadata);
-                let metadata = metadata.read();
 
                 let mut enumerator = std::ptr::null_mut();
                 let mut count = 0;
@@ -80,7 +78,7 @@ impl BaseClassDeclaration {
                     };
                     debug_assert!(result_inner.is_ok());
                     if let Some(dec) = DeclarationFactory::make_interface_declaration(
-                        Some(Arc::clone(&meta)),
+                        Some(metadata),
                         CorTokenType(interface_token as i32),
                     )
                     {
@@ -93,15 +91,13 @@ impl BaseClassDeclaration {
     }
 
     pub fn make_method_declarations(
-        metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
     ) -> Vec<MethodDeclaration> {
         let mut result = Vec::new();
-        match Option::as_ref(&metadata) {
+        match metadata {
             None => {}
             Some(metadata) => {
-                let meta = Arc::clone(&metadata);
-                let metadata = metadata.read();
 
                 let mut enumerator = std::ptr::null_mut();
                 let enumerator_ptr = &mut enumerator;
@@ -124,7 +120,7 @@ impl BaseClassDeclaration {
                 result.reserve(count as usize);
                 for i in 0..count as usize {
                     let token = tokens[i];
-                    let method = MethodDeclaration::new(Some(Arc::clone(&meta)), CorTokenType(token as i32));
+                    let method = MethodDeclaration::new(Some(&metadata), CorTokenType(token as i32));
                     if !method.is_exported() {
                         continue;
                     }
@@ -137,15 +133,13 @@ impl BaseClassDeclaration {
     }
 
     pub fn make_property_declarations(
-        metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
     ) -> Vec<PropertyDeclaration> {
         let mut result = Vec::new();
-        match Option::as_ref(&metadata) {
+        match metadata {
             None => {}
             Some(metadata) => {
-                let meta = Arc::clone(&metadata);
-                let metadata = metadata.read();
 
                 let mut enumerator = std::ptr::null_mut();
                 let enumerator_ptr = &mut enumerator;
@@ -168,7 +162,7 @@ impl BaseClassDeclaration {
                 for i in 0.. count as usize {
                     let propertyToken = tokens[i];
                     let property =
-                        PropertyDeclaration::new(Some(Arc::clone(&meta)), CorTokenType(propertyToken as i32));
+                        PropertyDeclaration::new(Some(metadata), CorTokenType(propertyToken as i32));
                     if !property.is_exported() {
                         continue;
                     }
@@ -180,13 +174,11 @@ impl BaseClassDeclaration {
     }
 
     pub fn make_event_declarations(
-        metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
     ) -> Vec<EventDeclaration> {
         let mut result = Vec::new();
-        if let Some(metadata) = Option::as_ref(&metadata) {
-            let meta = Arc::clone(metadata);
-            let metadata = metadata.read();
+        if let Some(metadata) = metadata {
 
             let mut enumerator = std::ptr::null_mut();
             let enumerator_ptr = &mut enumerator;
@@ -204,12 +196,13 @@ impl BaseClassDeclaration {
             };
             debug_assert!(result_inner.is_ok());
             debug_assert!(count < (tokens.len().saturating_sub(1)) as u32);
+
             result.reserve(count as usize);
             unsafe { metadata.CloseEnum(enumerator) };
 
             for i in 0..count as usize {
                 let token = tokens[i];
-                let event = EventDeclaration::new(Some(Arc::clone(&meta)), CorTokenType(token as i32));
+                let event = EventDeclaration::new(Some(&metadata), CorTokenType(token as i32));
                 if !event.is_exported() {
                     continue;
                 }
@@ -222,7 +215,7 @@ impl BaseClassDeclaration {
 
     pub fn new(
         kind: DeclarationKind,
-        metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
     ) -> Self {
         Self {
@@ -244,7 +237,7 @@ impl BaseClassDeclaration {
                 token,
             ),
             methods: BaseClassDeclaration::make_method_declarations(
-                metadata.clone(),
+                metadata,
                 token,
             ),
         }
@@ -308,7 +301,6 @@ pub trait BaseClassDeclarationImpl {
     fn find_methods_with_name(&self, name: &str) -> Vec<MethodDeclaration> {
         debug_assert!(!name.is_empty());
         let mut method_tokens = [0_u32; 1024];
-        let mut meta = self.base().metadata.clone();
         if let Some(metadata) = self.base().metadata() {
             let mut enumerator = std::ptr::null_mut();
             let enumerator_ptr = &mut enumerator;
@@ -334,7 +326,7 @@ pub trait BaseClassDeclarationImpl {
         method_tokens
             .into_iter()
             .map(|method_token| {
-                MethodDeclaration::new(Option::as_ref(&meta).map(|v| Arc::clone(v)), CorTokenType(method_token as i32))
+                MethodDeclaration::new(self.base().metadata(), CorTokenType(method_token as i32))
             })
             .collect()
     }

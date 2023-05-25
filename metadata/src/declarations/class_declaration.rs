@@ -26,14 +26,13 @@ pub struct ClassDeclaration {
 
 impl ClassDeclaration {
     pub fn make_initializer_declarations(
-        metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
     ) -> Vec<MethodDeclaration> {
         let mut ret = Vec::new();
 
-        if let Some(metadata) = Option::as_ref(&metadata) {
-            let meta = Arc::clone(metadata);
-            let metadata = metadata.read();
+        if let Some(metadata) = metadata {
+
             let mut enumerator = std::ptr::null_mut();
             let enumerator_ptr = &mut enumerator;
             let mut count = 0;
@@ -81,7 +80,7 @@ impl ClassDeclaration {
                 }
 
                 ret.push(MethodDeclaration::new(
-                    Some(Arc::clone(&meta)),
+                    Some(&metadata),
                     CorTokenType(method_token as i32),
                 ));
             }
@@ -90,14 +89,12 @@ impl ClassDeclaration {
     }
 
     pub fn make_default_interface(
-        metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
     ) -> Option<Box<dyn BaseClassDeclarationImpl>> {
-        match Option::as_ref(&metadata) {
+        match metadata {
             None => {}
             Some(metadata) => {
-                let meta = Arc::clone(metadata);
-                let metadata = metadata.read();
 
                 let mut interface_impl_tokens = [0 as u32; 1024];
                 let mut interface_impl_count = 0;
@@ -141,7 +138,7 @@ impl ClassDeclaration {
                         };
                         debug_assert!(result.is_ok());
                         return DeclarationFactory::make_interface_declaration(
-                            Some(Arc::clone(&meta)),
+                            Some(metadata),
                             CorTokenType(interface_token as i32),
                         )
                     }
@@ -154,12 +151,10 @@ impl ClassDeclaration {
         None
     }
 
-    pub fn new(metadata: Option<Arc<RwLock<IMetaDataImport2>>>, token: CorTokenType) -> Self {
+    pub fn new(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> Self {
         let mut base_full_name = String::new();
 
-        if let Some(metadata) = metadata.as_ref() {
-            let metadata = metadata.read();
-
+        if let Some(metadata) = metadata {
             let mut parent_token = 0_u32;
 
 
@@ -173,7 +168,7 @@ impl ClassDeclaration {
                 )
             };
             debug_assert!(result.is_ok());
-            base_full_name = get_type_name(&*metadata, CorTokenType(parent_token as i32));
+            base_full_name = get_type_name(metadata, CorTokenType(parent_token as i32));
         }
 
         Self {

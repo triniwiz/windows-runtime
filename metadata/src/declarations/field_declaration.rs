@@ -11,7 +11,7 @@ use crate::prelude::*;
 #[derive(Clone, Debug)]
 pub struct FieldDeclaration {
     kind: DeclarationKind,
-    pub(crate) metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+    pub(crate) metadata: Option<IMetaDataImport2>,
     token: CorTokenType,
     fullname: String,
 }
@@ -47,16 +47,15 @@ impl Declaration for FieldDeclaration {
 impl FieldDeclaration {
     pub fn new(
         kind: DeclarationKind,
-        metadata: Option<Arc<RwLock<IMetaDataImport2>>>,
+        metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
     ) -> Self {
         assert!(metadata.is_some());
         assert_eq!(type_from_token(token), mdtFieldDef.0);
         assert_ne!(token.0, 0);
-        let fullname = match metadata.as_ref() {
+        let fullname = match metadata {
             None => "".to_string(),
             Some(metadata) => {
-                let metadata = metadata.read();
                 let mut full_name_data = [0_u16; MAX_IDENTIFIER_LENGTH];
                 let mut length = 0;
                 let result = unsafe {
@@ -84,7 +83,7 @@ impl FieldDeclaration {
 
         Self {
             kind,
-            metadata,
+            metadata: metadata.map(|f| f.clone()),
             token,
             fullname,
         }
@@ -98,21 +97,7 @@ impl FieldDeclaration {
         self.token
     }
 
-    pub fn metadata(&self) -> Option<MappedRwLockReadGuard<'_, IMetaDataImport2>> {
-        self.metadata.as_ref().map(|metadata| {
-            RwLockReadGuard::map(
-                metadata.read(),
-                |metadata| metadata,
-            )
-        })
-    }
-
-    pub fn metadata_mut(&self) -> Option<MappedRwLockWriteGuard<'_, IMetaDataImport2>> {
-        self.metadata.as_ref().map(|metadata| {
-            RwLockWriteGuard::map(
-                metadata.write(),
-                |metadata| metadata,
-            )
-        })
+    pub fn metadata(&self) -> Option<&IMetaDataImport2> {
+        self.metadata.as_ref()
     }
 }
