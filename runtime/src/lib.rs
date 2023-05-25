@@ -53,7 +53,7 @@ static INIT: Once = Once::new();
 #[derive(Clone)]
 struct DeclarationFFI {
     inner: Arc<RwLock<dyn Declaration>>,
-    pub(crate) instance: Option<IUnknown>
+    pub(crate) instance: Option<IUnknown>,
 }
 
 unsafe impl Sync for DeclarationFFI {}
@@ -100,10 +100,6 @@ fn init_global(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, conte
         scope, "global",
     ).unwrap().into();
     global.define_own_property(scope, value, global.into(), v8::READ_ONLY);
-    // let interop = Box::new(COMInterop::new());
-    // let interop = Box::into_raw(interop);
-    // let value = v8::External::new(scope, interop as *mut c_void);
-    // global.set_internal_field(0, value.into());
 }
 
 fn init_console(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, context: v8::Local<v8::Context>) {
@@ -193,17 +189,104 @@ fn create_ns_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, s
     ret.into()
 }
 
-fn create_ns_ctor_instance_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>,instance: Option<IUnknown>,scope: &mut v8::HandleScope<'a>) -> Local<'a, v8::Value> {
+fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, declaration: Arc<RwLock<dyn Declaration>>, instance: Option<IUnknown>, scope: &mut v8::HandleScope<'a>) -> Local<'a, v8::Value> {
     let scope = &mut v8::EscapableHandleScope::new(scope);
+
+    let class_name = v8::String::new(scope, name).unwrap();
+
     let name = v8::String::new(scope, name).unwrap();
     let tmpl = v8::FunctionTemplate::new(scope, handle_ns_func);
     tmpl.set_class_name(name);
+
+    let proto = tmpl.prototype_template(scope);
+
+
+    {
+
+        let lock = declaration.read();
+
+        let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
+
+
+        let to_string_func = v8::FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                                                                        args: v8::FunctionCallbackArguments,
+                                                                        mut retval: v8::ReturnValue| {
+            retval.set(args.data());
+    })
+        .data(class_name.into())
+        .build(scope);
+
+        let to_string = v8::String::new(scope, "toString").unwrap();
+        proto.set(to_string.into(), to_string_func.into());
+
+        println!("clazz {}", clazz.name());
+
+        for method in clazz.methods().iter() {
+            let name = v8::String::new(scope, method.name());
+            let is_static = method.is_static();
+
+            let declaration = DeclarationFFI::new_with_instance(
+                Arc::new(
+                    RwLock::new(
+                        method.clone()
+                    )
+                ),
+                if is_static { Some(factory.clone()) } else { instance.clone() },
+            );
+
+            let declaration = Box::into_raw(Box::new(declaration));
+
+
+            let ext = v8::External::new(scope, declaration as _);
+
+            let func = v8::FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                                                      args: v8::FunctionCallbackArguments,
+                                                      mut retval: v8::ReturnValue| {
+                let dec = unsafe { Local::<v8::External>::cast(args.data()) };
+
+                let dec = dec.value() as *mut DeclarationFFI;
+
+                let dec = unsafe { &*dec };
+
+                let lock = dec.read();
+
+                let kind = lock.kind();
+
+                println!("{} {}", kind, lock.name());
+
+                let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
+
+                let mut method = MethodCall::new(
+                    method, method.is_sealed(), dec.instance.clone().unwrap(), false,
+                );
+
+                let (ret, result) = method.call(scope, &args);
+
+                println!("{}", ret);
+            })
+                .data(ext.into())
+                .build(scope);
+
+            if is_static {
+                tmpl.set(name.unwrap().into(), func.into());
+            } else {
+                proto.set(name.unwrap().into(), func.into());
+            }
+        }
+
+        for property in clazz.properties().iter() {
+            println!("prop: {} {:?} {:?}", property.name(), property.setter(), property.getter());
+        }
+
+    }
+
+
     let object_tmpl = tmpl.instance_template(scope);
-    object_tmpl.set_named_property_handler(
-        v8::NamedPropertyHandlerConfiguration::new()
-            .getter(handle_named_property_getter)
-            .setter(handle_named_property_setter)
-    );
+    // object_tmpl.set_named_property_handler(
+    //     v8::NamedPropertyHandlerConfiguration::new()
+    //         .getter(handle_named_property_getter)
+    //         .setter(handle_named_property_setter)
+    // );
     object_tmpl.set_internal_field_count(2);
     let object = object_tmpl.new_instance(scope).unwrap();
     let declaration = Box::new(DeclarationFFI::new_with_instance(declaration, instance));
@@ -218,11 +301,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, declaration: Arc<RwLock<dyn De
     ret.into()
 }
 
-
 fn create_ns_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, scope: &mut v8::HandleScope<'a>) -> Local<'a, v8::Value> {
     let scope = &mut v8::EscapableHandleScope::new(scope);
-
-    println!("name {}", name);
 
     let name = v8::String::new(scope, name).unwrap();
 
@@ -265,7 +345,7 @@ fn create_ns_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration
                         println!("ctor {}", clazz.is_sealed());
 
                         let mut method = MethodCall::new(
-                            ctor, is_sealed, clazz_factory.clone(), true
+                            ctor, is_sealed, clazz_factory.clone(), true,
                         );
 
                         /*let number_of_parameters = ctor.number_of_parameters();
@@ -380,14 +460,15 @@ fn create_ns_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration
 
                         let (ret, result) = method.call(scope, &args);
                         if ret.is_ok() {
-                            let result = unsafe {IUnknown::from_raw(result)};
+                            let result = unsafe { IUnknown::from_raw(result) };
                             let ctor = Arc::clone(&dec.inner);
-                            let instance = create_ns_ctor_instance_object(clazz.name(), ctor, Some(result), scope);
+                            let instance = create_ns_ctor_instance_object(clazz.name(), clazz_factory, ctor, Some(result), scope);
                             retval.set(instance);
                             return;
                         } else {
                             let error = Error::from(ret);
-
+                            // let error = v8::Exception::
+                            //   scope.throw_exception()
 
                             println!("ret {:?} {:?}", ret.to_string(), result);
                         }
@@ -541,7 +622,6 @@ fn create_ns_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration
         object.set_internal_field(1, object_store.into());
 
         retval.set(object.into());
-
     })
         .data(ext.into()).build(scope);
     tmpl.set_class_name(name);
@@ -551,7 +631,6 @@ fn create_ns_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration
 
     ret.into()
 }
-
 
 fn init_meta(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, context: Local<v8::Context>) {
     let mut global = context.global(scope);
@@ -578,9 +657,9 @@ fn init_meta(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, context
 
 
 fn handle_named_property_setter(scope: &mut v8::HandleScope,
-                         key: Local<v8::Name>,
-                         value: Local<v8::Value>,
-                         args: v8::PropertyCallbackArguments) {
+                                key: Local<v8::Name>,
+                                value: Local<v8::Value>,
+                                args: v8::PropertyCallbackArguments) {
     let this = args.holder();
     let dec = this.get_internal_field(scope, 0).unwrap();
     let dec = unsafe { Local::<v8::External>::cast(dec) };
@@ -623,38 +702,38 @@ fn handle_named_property_setter(scope: &mut v8::HandleScope,
         DeclarationKind::Method => {
 
 
-           // let length = args.length();
+            // let length = args.length();
 
             println!("setter {}", name);
 
 
 
-           /* let json = windows::Data::Json::JsonObject::from_raw(result.into_raw());
+            /* let json = windows::Data::Json::JsonObject::from_raw(result.into_raw());
 
-            let runtime = JsonValue::CreateStringValue(&HSTRING::from("NativeScript")).unwrap();
-            json.SetNamedValue(&HSTRING::from("runtime"), &runtime);
+             let runtime = JsonValue::CreateStringValue(&HSTRING::from("NativeScript")).unwrap();
+             json.SetNamedValue(&HSTRING::from("runtime"), &runtime);
 
-            println!("runtime key: {:?}", json.GetNamedValue(&HSTRING::from("runtime")).unwrap().GetString().unwrap());
+             println!("runtime key: {:?}", json.GetNamedValue(&HSTRING::from("runtime")).unwrap().GetString().unwrap());
 
 
-            // todo
-            for method in clazz.methods() {
-                let param_count = method.number_of_parameters();
-                //  println!("count {param_count}");
-                if param_count == length as usize {
-                    println!("{:?}", method.parameters());
-                }
-            }
-            */
+             // todo
+             for method in clazz.methods() {
+                 let param_count = method.number_of_parameters();
+                 //  println!("count {param_count}");
+                 if param_count == length as usize {
+                     println!("{:?}", method.parameters());
+                 }
+             }
+             */
         }
         DeclarationKind::Parameter => {}
     }
 }
 
 fn handle_named_property_getter(scope: &mut v8::HandleScope,
-                         key: v8::Local<v8::Name>,
-                         args: v8::PropertyCallbackArguments,
-                         mut rv: v8::ReturnValue) {
+                                key: v8::Local<v8::Name>,
+                                args: v8::PropertyCallbackArguments,
+                                mut rv: v8::ReturnValue) {
     let this = args.this();
     let dec = this.get_internal_field(scope, 0).unwrap();
     let dec = unsafe { Local::<v8::External>::cast(dec) };
@@ -716,13 +795,13 @@ fn handle_named_property_getter(scope: &mut v8::HandleScope,
                         if method_name == name {
                             let mut declaration = Arc::new(RwLock::new(method.clone()));
 
-                            let declaration = Box::into_raw(Box::new(DeclarationFFI::new_with_instance(declaration, dec.instance.clone() )));
+                            let declaration = Box::into_raw(Box::new(DeclarationFFI::new_with_instance(declaration, dec.instance.clone())));
 
                             let ext = v8::External::new(scope, declaration as _);
 
                             let builder = v8::Function::builder(|scope: &mut v8::HandleScope,
-                                                              args: v8::FunctionCallbackArguments,
-                                                              mut retval: v8::ReturnValue| {
+                                                                 args: v8::FunctionCallbackArguments,
+                                                                 mut retval: v8::ReturnValue| {
                                 let length = args.length();
 
                                 let dec = unsafe { Local::<v8::External>::cast(args.data()) };
@@ -740,10 +819,10 @@ fn handle_named_property_getter(scope: &mut v8::HandleScope,
                                 let instance = dec.instance.clone().unwrap();
 
                                 let mut method = MethodCall::new(
-                                    method, method.is_sealed(), instance, false
+                                    method, method.is_sealed(), instance, false,
                                 );
 
-                                let (ret, result ) = method.call(scope, &args);
+                                let (ret, result) = method.call(scope, &args);
 
                                 /*
                                 let mut index = 0_usize;
@@ -864,9 +943,6 @@ fn handle_named_property_getter(scope: &mut v8::HandleScope,
                                 }
 
                                 */
-
-                                println!("{} {:?}", ret, result);
-
                             })
                                 .data(ext.into()).build(scope);
 
@@ -876,7 +952,6 @@ fn handle_named_property_getter(scope: &mut v8::HandleScope,
                             rv.set(func.into());
                             return;
                         }
-
                     }
                 }
             }
@@ -981,15 +1056,15 @@ fn handle_named_property_getter(scope: &mut v8::HandleScope,
 
 
 fn handle_indexed_property_setter(_scope: &mut v8::HandleScope,
-                                index: u32,
-                                value: v8::Local<v8::Value>,
-                                args: v8::PropertyCallbackArguments){}
+                                  index: u32,
+                                  value: v8::Local<v8::Value>,
+                                  args: v8::PropertyCallbackArguments) {}
 
 
 fn handle_indexed_property_getter(scope: &mut v8::HandleScope,
-index: u32,
-args: v8::PropertyCallbackArguments,
-mut rv: v8::ReturnValue){}
+                                  index: u32,
+                                  args: v8::PropertyCallbackArguments,
+                                  mut rv: v8::ReturnValue) {}
 
 
 fn handle_ns_func(scope: &mut v8::HandleScope,
@@ -1016,11 +1091,11 @@ fn handle_meta(scope: &mut v8::HandleScope,
 impl Runtime {
     pub fn new(app_root: &str) -> Self {
         INIT.call_once(|| {
-           /* let _ = unsafe {
-                // CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)
-                CoInitialize(None)
-            };
-            */
+            /* let _ = unsafe {
+                 // CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)
+                 CoInitialize(None)
+             };
+             */
             let platform = v8::Platform::new(0, false).make_shared();
             v8::V8::initialize_platform(platform);
             v8::V8::initialize();
@@ -1039,7 +1114,6 @@ impl Runtime {
             global.set_class_name(class_name);
 
             let mut global_template = v8::ObjectTemplate::new_from_template(scope, global);
-
             global_template.set_internal_field_count(1);
 
             {
@@ -1056,7 +1130,7 @@ impl Runtime {
                     init_global(scope, context);
                     init_console(scope, context);
                     init_meta(scope, context);
-                    global_context = v8::Global::new(scope, context);
+                    global_context = Global::new(scope, context);
                 }
             }
         }
@@ -1069,7 +1143,6 @@ impl Runtime {
     }
 
     pub fn run_script(&mut self, script: &str) {
-        println!("run {}", script);
         let isolate = &mut self.isolate;
         let scope = &mut v8::HandleScope::new(isolate);
         let context = v8::Local::new(scope, &self.global_context);
@@ -1080,8 +1153,8 @@ impl Runtime {
     }
 
     pub fn dispose(&self) {
-       /* unsafe {
-            CoUninitialize();
-        }*/
+        /* unsafe {
+             CoUninitialize();
+         }*/
     }
 }

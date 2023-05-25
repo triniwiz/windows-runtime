@@ -82,11 +82,13 @@ fn run_js_app() {
    // console.log('Default', Windows.UI.Popups.Placement.Default, Windows.UI.Popups.Placement.Default === 0);
    //  console.log('Right', Windows.UI.Popups.Placement.Right, Windows.UI.Popups.Placement.Right === 4);
    //   console.log('Bar', Windows.UI.Text.TabAlignment.Bar, Windows.UI.Text.TabAlignment.Bar == 4);
+  // const value = Windows.Data.Json.JsonValue.CreateBooleanValue(true);
+   //console.log('Windows.Data.Json.JsonValue', value);
     const dialog = new Windows.UI.Popups.MessageDialog("Hello, World!");
+   console.log(dialog);
     dialog.ShowAsync();
   // console.log('Windows.UI.Popups.MessageDialog', dialog);
  // const json = new Windows.Data.Json.JsonObject();
- // const value = Windows.Data.Json.JsonValue(true);
   //const method = new Windows.Web.Http.HttpMethod('GET');
  // console.log(method);
    console.log("\n");
