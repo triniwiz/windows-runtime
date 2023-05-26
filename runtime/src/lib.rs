@@ -15,7 +15,7 @@ use libffi::low::ffi_type;
 use libffi::middle::Cif;
 use parking_lot::{RawRwLock, RwLock};
 use parking_lot::lock_api::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLockReadGuard, RwLockWriteGuard};
-use v8::{Global, Local, Object};
+use v8::{FunctionTemplate, Global, Local, Object};
 use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, IUnknown_Vtbl, ComInterface, PCWSTR, Type, IInspectable, Error};
 use windows::Foundation::{GuidHelper, IAsyncOperation};
 use windows::Win32::Foundation::CO_E_INIT_ONLY_SINGLE_THREADED;
@@ -38,9 +38,12 @@ use metadata::meta_data_reader::MetadataReader;
 use metadata::prelude::{get_guid_attribute_value, get_string_value_from_blob, get_type_name, LOCALE_SYSTEM_DEFAULT};
 use metadata::{guid_to_string, query_interface, signature};
 use metadata::declarations::method_declaration::MethodDeclaration;
+use metadata::declarations::property_declaration::PropertyDeclaration;
+use metadata::declarations::struct_declaration::StructDeclaration;
+use metadata::declarations::struct_field_declaration::StructFieldDeclaration;
 use metadata::signature::Signature;
 use metadata::value::{Value, Variant};
-use crate::value::MethodCall;
+use crate::value::{MethodCall, PropertyCall};
 
 pub struct Runtime {
     isolate: v8::OwnedIsolate,
@@ -195,6 +198,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, declaration
     let class_name = v8::String::new(scope, name).unwrap();
 
     let name = v8::String::new(scope, name).unwrap();
+
     let tmpl = v8::FunctionTemplate::new(scope, handle_ns_func);
     tmpl.set_class_name(name);
 
@@ -202,82 +206,214 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, declaration
 
 
     {
-
         let lock = declaration.read();
 
-        let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
+        let kind = lock.kind();
+
+        match kind {
+            DeclarationKind::Class => {
+                let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
 
 
-        let to_string_func = v8::FunctionTemplate::builder(|scope: &mut v8::HandleScope,
-                                                                        args: v8::FunctionCallbackArguments,
-                                                                        mut retval: v8::ReturnValue| {
-            retval.set(args.data());
-    })
-        .data(class_name.into())
-        .build(scope);
+                let to_string_func = v8::FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                                                                    args: v8::FunctionCallbackArguments,
+                                                                    mut retval: v8::ReturnValue| {
+                    retval.set(args.data());
+                })
+                    .data(class_name.into())
+                    .build(scope);
 
-        let to_string = v8::String::new(scope, "toString").unwrap();
-        proto.set(to_string.into(), to_string_func.into());
+                let to_string = v8::String::new(scope, "toString").unwrap();
+                proto.set(to_string.into(), to_string_func.into());
 
-        println!("clazz {}", clazz.name());
+                for method in clazz.methods().iter() {
+                    let name = v8::String::new(scope, method.name());
+                    let is_static = method.is_static();
 
-        for method in clazz.methods().iter() {
-            let name = v8::String::new(scope, method.name());
-            let is_static = method.is_static();
+                    let declaration = DeclarationFFI::new_with_instance(
+                        Arc::new(
+                            RwLock::new(
+                                method.clone()
+                            )
+                        ),
+                        if is_static { Some(factory.clone()) } else { instance.clone() },
+                    );
 
-            let declaration = DeclarationFFI::new_with_instance(
-                Arc::new(
-                    RwLock::new(
-                        method.clone()
-                    )
-                ),
-                if is_static { Some(factory.clone()) } else { instance.clone() },
-            );
-
-            let declaration = Box::into_raw(Box::new(declaration));
+                    let declaration = Box::into_raw(Box::new(declaration));
 
 
-            let ext = v8::External::new(scope, declaration as _);
+                    let ext = v8::External::new(scope, declaration as _);
 
-            let func = v8::FunctionTemplate::builder(|scope: &mut v8::HandleScope,
-                                                      args: v8::FunctionCallbackArguments,
-                                                      mut retval: v8::ReturnValue| {
-                let dec = unsafe { Local::<v8::External>::cast(args.data()) };
+                    let func = v8::FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                                                              args: v8::FunctionCallbackArguments,
+                                                              mut retval: v8::ReturnValue| {
+                        let dec = unsafe { Local::<v8::External>::cast(args.data()) };
 
-                let dec = dec.value() as *mut DeclarationFFI;
+                        let dec = dec.value() as *mut DeclarationFFI;
 
-                let dec = unsafe { &*dec };
+                        let dec = unsafe { &*dec };
 
-                let lock = dec.read();
+                        let lock = dec.read();
 
-                let kind = lock.kind();
+                        let kind = lock.kind();
 
-                println!("{} {}", kind, lock.name());
+                        let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
 
-                let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
+                        let mut method = MethodCall::new(
+                            method, method.is_sealed(), dec.instance.clone().unwrap(), false,
+                        );
 
-                let mut method = MethodCall::new(
-                    method, method.is_sealed(), dec.instance.clone().unwrap(), false,
-                );
+                        let (ret, result) = method.call(scope, &args);
 
-                let (ret, result) = method.call(scope, &args);
+                        println!("ret {}", ret);
+                        if ret.is_err() {
+                            println!(">>> {}", ret.message().to_string())
+                        }else if !method.is_void() {
+                            match method.return_type() {
+                                "String" => {
+                                    if result.is_null() {
+                                        retval.set_empty_string();
+                                    }else {
+                                        let string = unsafe { PCWSTR::from_raw(std::mem::transmute(result)) };
+                                        let string = unsafe { string.to_hstring().unwrap()};
+                                        let string = string.to_string();
+                                        let string = v8::String::new(scope, string.as_str()).unwrap();
+                                        retval.set(string.into());
+                                    }
+                                }
+                                _ => {
+                                    retval.set_undefined();
+                                }
+                            }
+                        }else {
+                            retval.set_undefined();
+                        }
 
-                println!("{}", ret);
-            })
-                .data(ext.into())
-                .build(scope);
+                        // todo
+                    })
+                        .data(ext.into())
+                        .build(scope);
 
-            if is_static {
-                tmpl.set(name.unwrap().into(), func.into());
-            } else {
-                proto.set(name.unwrap().into(), func.into());
+                    if is_static {
+                        tmpl.set(name.unwrap().into(), func.into());
+                    } else {
+                        proto.set(name.unwrap().into(), func.into());
+                    }
+                }
+
+                for property in clazz.properties().iter() {
+                    let name = v8::String::new(scope, property.name());
+                    let is_static = property.is_static();
+
+                    let declaration = DeclarationFFI::new_with_instance(
+                        Arc::new(
+                            RwLock::new(
+                                property.clone()
+                            )
+                        ),
+                        if is_static { Some(factory.clone()) } else { instance.clone() },
+                    );
+
+
+                    let getter_declaration = declaration.clone();
+
+                    let getter_declaration = Box::into_raw(Box::new(getter_declaration));
+
+                    let getter_declaration_ext = v8::External::new(scope, getter_declaration as _);
+
+
+
+                    let getter = FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                                                                args: v8::FunctionCallbackArguments,
+                                                                mut retval: v8::ReturnValue|{
+
+                        let dec = unsafe { Local::<v8::External>::cast(args.data()) };
+
+                        let dec = dec.value() as *mut DeclarationFFI;
+
+                        let dec = unsafe { &*dec };
+
+                        let lock = dec.read();
+
+                        let kind = lock.kind();
+
+                        println!("property call {} {}", kind, lock.name());
+
+                        let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
+
+                        let mut method = PropertyCall::new(
+                            method, false, dec.instance.clone().unwrap(), false,
+                        );
+
+
+                        let (ret, result) = method.call(scope, &args);
+
+                        println!("ret {}", ret);
+                        if ret.is_err() {
+                            println!(">>> {}", ret.message().to_string())
+                        }else if !method.is_void() {
+                            match method.return_type() {
+                                "String" => {
+                                    if result.is_null() {
+                                        retval.set_empty_string();
+                                    }else {
+                                        let string = unsafe { PCWSTR::from_raw(std::mem::transmute(result)) };
+                                        let string = unsafe { string.to_hstring().unwrap()};
+                                        let string = string.to_string();
+                                        let string = v8::String::new(scope, string.as_str()).unwrap();
+                                        retval.set(string.into());
+                                    }
+                                }
+                                _ => {
+                                    retval.set_undefined();
+                                }
+                            }
+                        }else {
+                            retval.set_undefined();
+                        }
+                    })
+                        .data(getter_declaration_ext.into())
+                        .build(scope);
+
+
+                    let mut setter: Option<Local<FunctionTemplate>> = None;
+
+
+                    if property.setter().is_some() {
+                        let setter_declaration = declaration;
+
+                        let setter_declaration = Box::into_raw(Box::new(setter_declaration));
+
+                        let setter_declaration_ext = v8::External::new(scope, setter_declaration as _);
+
+
+                        setter = Some(FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                                                                 args: v8::FunctionCallbackArguments,
+                                                                 mut retval: v8::ReturnValue|{
+
+                        })
+                            .data(setter_declaration_ext.into())
+                            .build(scope));
+                    }
+
+
+
+
+
+
+                    if property.is_static() {
+                        // todo
+                    }else {
+                        let name = name.unwrap();
+                        proto.set_accessor_property(name.into(), Some(getter), setter, v8::READ_ONLY | v8::DONT_DELETE);
+                    }
+
+                }
+            },
+            _ => {
+
             }
         }
-
-        for property in clazz.properties().iter() {
-            println!("prop: {} {:?} {:?}", property.name(), property.setter(), property.getter());
-        }
-
     }
 
 
@@ -306,9 +442,9 @@ fn create_ns_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration
 
     let name = v8::String::new(scope, name).unwrap();
 
-    let declaration = Box::into_raw(Box::new(DeclarationFFI::new(declaration)));
+    let ext = Box::into_raw(Box::new(DeclarationFFI::new(Arc::clone(&declaration))));
 
-    let ext = v8::External::new(scope, declaration as _);
+    let ext = v8::External::new(scope, ext as _);
 
     let tmpl = v8::FunctionTemplate::builder(|scope: &mut v8::HandleScope,
                                               args: v8::FunctionCallbackArguments,
@@ -342,127 +478,16 @@ fn create_ns_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration
                 unsafe {
                     let is_sealed = clazz.is_sealed();
                     for ctor in clazz.initializers() {
-                        println!("ctor {}", clazz.is_sealed());
 
                         let mut method = MethodCall::new(
                             ctor, is_sealed, clazz_factory.clone(), true,
                         );
 
-                        /*let number_of_parameters = ctor.number_of_parameters();
-
-                        let mut index = 0 as usize;
-
-                        let iid = match Metadata::find_declaring_interface_for_method(ctor, &mut index) {
-                            None => {
-                                index = 0;
-                                IActivationFactory::IID
-                            }
-                            Some(interface) => {
-                                let ii_lock = interface.read();
-                                let ii = ii_lock.as_declaration().as_any().downcast_ref::<InterfaceDeclaration>();
-                                let ii = ii.unwrap();
-                                ii.id()
-                            }
-                        };
-
-                        index = index.saturating_add(6); // account for IInspectable vtable overhead
-
-                        let mut interface_ptr: *mut c_void = std::ptr::null_mut(); // IActivationFactory
-
-                        let vtable = clazz_factory.vtable();
-
-                        let interface_ptr_ptr = addr_of_mut!(interface_ptr);
-
-                        let result = ((*vtable).QueryInterface)(clazz_factory.as_raw(), &iid, interface_ptr_ptr as *mut *const c_void);
-
-                        assert!(result.is_ok());
-
-                        let is_composition = !clazz.is_sealed();
-
-                        let number_of_abi_parameters = number_of_parameters + if clazz.is_sealed() { 2 } else { 4 };
-
-                        let mut parameter_types: Vec<*mut ffi_type> = Vec::new();
-
-                        parameter_types.reserve(number_of_abi_parameters);
-
-                        unsafe { parameter_types.push(&mut libffi::low::types::pointer); }
-
-                        let mut arguments: Vec<*mut c_void> = Vec::new();
-
-                        arguments.reserve(number_of_abi_parameters);
-
-                        unsafe { arguments.push(interface_ptr) };
-
-                        let mut string_buf = Vec::new();
-
-                        for (i, parameter) in ctor.parameters().iter().enumerate() {
-                            let type_ = parameter.type_();
-                            let metadata = parameter.metadata().unwrap();
-
-                            let signature = Signature::to_string(&*metadata, &type_);
-                            match signature.as_str() {
-                                "String" => {
-                                    unsafe { parameter_types.push(&mut libffi::low::types::pointer); }
-                                    let string = args.get(i as i32).to_string(scope).unwrap();
-
-                                    let string = HSTRING::from(string.to_rust_string_lossy(scope));
-
-
-                                    arguments.push(
-                                        addr_of!(string) as *mut c_void
-                                    );
-
-                                    string_buf.push(string);
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        if is_composition {
-                            unsafe { parameter_types.push(&mut libffi::low::types::pointer); }
-                            unsafe { parameter_types.push(&mut libffi::low::types::pointer); }
-                        }
-
-                        unsafe { parameter_types.push(&mut libffi::low::types::pointer); }
-
-                        let mut result: MaybeUninit<IUnknown> = MaybeUninit::zeroed();
-
-                        arguments.push(&mut result.as_mut_ptr() as *mut _ as *mut c_void);
-
-                        let interface = unsafe { IUnknown::from_raw(interface_ptr as *mut c_void) };
-
-                        let mut vtable = interface.vtable();
-
-                        let mut vtable: *mut *mut c_void = std::mem::transmute(vtable);
-
-                        let func = unsafe {
-                            *vtable.offset(index as isize)
-                        };
-
-                        let mut cif: libffi::low::ffi_cif = Default::default();
-
-                        let prep_result = unsafe {
-                            libffi::low::prep_cif(&mut cif,
-                                                  libffi::low::ffi_abi_FFI_DEFAULT_ABI,
-                                                  arguments.len(),
-                                                  &mut libffi::low::types::sint32,
-                                                  parameter_types.as_mut_ptr(),
-                            )
-                        };
-
-                        let ret = unsafe {
-                            libffi::low::call::<i32>(&mut cif, libffi::low::CodePtr::from_ptr(func), arguments.as_mut_ptr())
-                        };
-
-                        let ret = HRESULT(ret);
-
-                        */
-
                         let (ret, result) = method.call(scope, &args);
                         if ret.is_ok() {
                             let result = unsafe { IUnknown::from_raw(result) };
-                            let ctor = Arc::clone(&dec.inner);
-                            let instance = create_ns_ctor_instance_object(clazz.name(), clazz_factory, ctor, Some(result), scope);
+                            //let ctor = Arc::clone(&dec.inner);
+                            let instance = create_ns_ctor_instance_object(clazz.name(), clazz_factory, dec.inner.clone(), Some(result), scope);
                             retval.set(instance);
                             return;
                         } else {
@@ -472,130 +497,6 @@ fn create_ns_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration
 
                             println!("ret {:?} {:?}", ret.to_string(), result);
                         }
-
-                        // let mut cif = libffi::middle::Cif::new(
-                        //     parameter_types,
-                        //     libffi::middle::Type::pointer(),
-                        // );
-
-
-                        // let af = unsafe { IActivationFactory::from_raw(interface_ptr as _)};
-
-                        // let vt = addr_of_mut!(interface_ptr);
-                        //
-                        // let func = unsafe {
-                        //     *(vt.offset(index as isize))
-                        // };
-
-                        // let a = unsafe { af.ActivateInstance().unwrap()};
-                        //
-                        //
-                        // let func =  a.as_raw();
-
-                        // let result: *mut c_void = unsafe {
-                        //     cif.call(
-                        //         libffi::middle::CodePtr::from_ptr(*func),
-                        //         arguments.as_slice(),
-                        //     )
-                        // };
-
-
-
-                        /*
-                           let class_id = HSTRING::from(clazz.full_name());
-
-                                //  let class_id = HSTRING::from(ii.full_name());
-
-                                println!("class_id {}", class_id);
-
-
-                                let result = unsafe { CoInitialize(None) };
-
-
-                                let ret = unsafe { RoGetActivationFactory::<IUnknown>(&class_id)};
-
-
-                                let instance: windows::core::Result<IDispatch> = unsafe { CoCreateInstance(&id, None, CLSCTX_INPROC_SERVER)};
-
-                                println!("instaaance {:?}", instance);
-
-                                let ret = ret.unwrap();
-
-                                let mut interface_ptr = std::ptr::null_mut() as *const c_void;
-
-                                let raw = ret.vtable();
-
-                                let result = unsafe { ((*raw).QueryInterface)(ret.as_raw(), &id, &mut interface_ptr)};
-
-                                let name = HSTRING::from(ii.full_name());
-
-                                let GUID_NULL = GUID::default();
-
-                                let mut dispid = 0_i32;
-                                let ds = unsafe { IDispatch::from_raw(interface_ptr as *mut c_void)};
-                                let result = unsafe {ds.GetIDsOfNames(
-                                    &GUID_NULL,
-                                    &PCWSTR(name.as_ptr()),
-                                    1,
-                                    LOCALE_SYSTEM_DEFAULT,
-                                    &mut dispid
-                                )};
-
-                                println!("name {} {} {:?} {:?} {}", ctor.name(), dispid, result, ctor.is_initializer(), ii.full_name());
-
-                                let val: Variant = Value::String("Hello".to_string()).into();
-                                let mut rgvarg = vec![val.as_abi()];
-
-
-                                let mut disparams = DISPPARAMS {
-                                    rgvarg: unsafe { rgvarg.as_mut_ptr() as *mut VARIANT},
-                                    rgdispidNamedArgs: std::ptr::null_mut(),
-                                    cArgs: 1,
-                                    cNamedArgs: 0,
-                                };
-
-
-                                let mut pvarresult = VARIANT::default();
-                                let mut excep = EXCEPINFO::default();
-                                let mut err = 0_u32;
-                                let result = unsafe {
-                                    ds.Invoke(
-                                        dispid,
-                                        &GUID_NULL,
-                                        LOCALE_SYSTEM_DEFAULT,
-                                        DISPATCH_METHOD,
-                                        &mut disparams,
-                                        Some(&mut pvarresult),
-                                        Some(&mut excep),
-                                        Some(&mut err)
-                                    )
-                                };
-
-                                // let instance: windows::core::Result<IDispatch> = unsafe { CoCreateInstance(&id, None, CLSCTX_INPROC_SERVER)};
-
-
-                                // println!("instance {:?} {:?}", instance, ret);
-                                //println!("result {:?} {:?}", result.is_ok(), interface_ptr);
-
-                                // TODO handling ctor
-
-                                let mut index = 0;
-                                if param_count == length as usize {
-
-                                    for param in ctor.parameters().iter() {
-                                        let type_ = param.type_();
-                                        let metadata = param.metadata();
-                                        if let Some(metadata) = metadata {
-                                            println!("{:?}", Signature::to_string(&*metadata, &type_));
-                                        }
-
-                                    }
-
-
-                                    break;
-                                }
-                            }
-                         */
                     }
                 }
             }
@@ -625,6 +526,115 @@ fn create_ns_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration
     })
         .data(ext.into()).build(scope);
     tmpl.set_class_name(name);
+
+
+    {
+        let lock = declaration.read();
+
+        let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
+
+        let clazz_name = HSTRING::from(clazz.full_name());
+
+        let clazz_factory = unsafe { RoGetActivationFactory::<IUnknown>(&clazz_name) };
+        let clazz_factory = clazz_factory.unwrap();
+
+        for method in clazz.methods().iter() {
+            let name = v8::String::new(scope, method.name());
+            let is_static = method.is_static();
+
+            if !is_static {
+                continue;
+            }
+
+            let declaration = DeclarationFFI::new_with_instance(
+                Arc::new(
+                    RwLock::new(
+                        method.clone()
+                    )
+                ),
+                Some(clazz_factory.clone()),
+            );
+
+            let declaration = Box::into_raw(Box::new(declaration));
+
+            let ext = v8::External::new(scope, declaration as _);
+
+            let func = v8::FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                                                      args: v8::FunctionCallbackArguments,
+                                                      mut retval: v8::ReturnValue| {
+
+                let dec = unsafe { Local::<v8::External>::cast(args.data()) };
+
+                let dec = dec.value() as *mut DeclarationFFI;
+
+                let dec = unsafe { &*dec };
+
+                let lock = dec.read();
+
+                let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
+
+                let return_type = method.return_type();
+
+                let signature = Signature::to_string(method.metadata().unwrap(), &return_type);
+
+                println!("ret type {}", signature);
+
+                let mut method = MethodCall::new(
+                    method, method.is_sealed(), dec.instance.clone().unwrap(), false,
+                );
+
+                let (ret, result) = method.call(scope, &args);
+
+                if ret.is_ok() {
+                    unsafe {
+                        match signature.as_str() {
+                            "Boolean" => {
+                                retval.set_bool(
+                                    *(result as *mut bool)
+                                )
+                            }
+                            _ => {
+
+                                let instance = IUnknown::from_raw(result);
+                                let declaration = method.declaration.clone().unwrap();
+
+                                let lock = declaration.read();
+
+                                let declaration: Arc<RwLock<dyn Declaration>>;
+                                match lock.base().kind() {
+                                    DeclarationKind::Interface =>{
+                                        let dec = lock.as_declaration().as_any().downcast_ref::<InterfaceDeclaration>();
+                                        declaration = Arc::new(
+                                            RwLock::new(dec.unwrap().clone())
+                                        )
+                                    }
+                                    DeclarationKind::Class =>{
+                                        let dec = lock.as_declaration().as_any().downcast_ref::<ClassDeclaration>();
+                                        declaration = Arc::new(
+                                            RwLock::new(dec.unwrap().clone())
+                                        )
+                                    }
+                                    _ => {
+                                        // todo
+                                        unimplemented!()
+                                    }
+                                }
+
+
+                                let ret: Local<v8::Value> = create_ns_ctor_instance_object(signature.as_str(), dec.instance.clone().unwrap(), declaration, Some(instance), scope).into();
+                                retval.set(ret.into());
+                            }
+                        }
+                    }
+                } else {}
+            })
+                .data(ext.into())
+                .build(scope);
+
+            tmpl.set(name.unwrap().into(), func.into());
+        }
+    }
+
 
     let func = tmpl.get_function(scope).unwrap();
     let ret = scope.escape(func);

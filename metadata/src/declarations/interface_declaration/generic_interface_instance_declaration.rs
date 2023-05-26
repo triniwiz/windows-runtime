@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::ptr::addr_of_mut;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use windows::core::GUID;
@@ -19,6 +20,7 @@ pub struct GenericInterfaceInstanceDeclaration {
     base: InterfaceDeclaration,
     closed_metadata: Option<IMetaDataImport2>,
     closed_token: CorTokenType,
+    full_name: String
 }
 
 impl GenericInterfaceInstanceDeclaration {
@@ -39,7 +41,7 @@ impl GenericInterfaceInstanceDeclaration {
 
         if let Some(metadata) = closed_metadata {
 
-            let mut signature = std::ptr::null_mut();//PCCOR_SIGNATURE::default();
+            let mut signature = PCCOR_SIGNATURE::default();
             //let mut signature = [0_u8; MAX_IDENTIFIER_LENGTH];
             //let signature_ptr = &mut signature;
             let mut signature_size = 0;
@@ -48,17 +50,18 @@ impl GenericInterfaceInstanceDeclaration {
             let result = unsafe {
                 metadata.GetTypeSpecFromToken(
                     closed_token.0 as u32,
-                    &mut signature,
+                    addr_of_mut!(signature.0),
                     &mut signature_size,
                 )
             };
             debug_assert!(result.is_ok());
             if signature_size > 0 {
-                let mut signature = PCCOR_SIGNATURE::from_ptr(signature);
+                //let mut signature = PCCOR_SIGNATURE::from_ptr(signature);
                // let signature = unsafe { std::slice::from_raw_parts(signature, signature_size as usize) };
                 full_name = Signature::to_string(metadata, &signature);
             }
         }
+
 
         Self {
             base: InterfaceDeclaration::new_with_kind(
@@ -68,6 +71,7 @@ impl GenericInterfaceInstanceDeclaration {
             ),
             closed_metadata: closed_metadata.map(|f| f.clone()),
             closed_token,
+            full_name
         }
     }
     pub fn id(&self) -> GUID {
@@ -119,7 +123,7 @@ impl Declaration for GenericInterfaceInstanceDeclaration {
     }
 
     fn full_name(&self) -> &str {
-        self.base.full_name()
+        self.full_name.as_str()
     }
 
     fn kind(&self) -> DeclarationKind {

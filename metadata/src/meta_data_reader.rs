@@ -108,7 +108,6 @@ impl MetadataReader {
             let parent_name_buf = &parent_name[0..size as usize];
             let parent_name_string = unsafe { PCWSTR::from_raw(parent_name_buf.as_ptr()).to_string().unwrap_or("".to_string())};
 
-            println!("{}", parent_name_string.as_str());
             // todo find a better way
             // let parent_name_string = String::from_utf16_lossy(&parent_name[0..size as usize]);
             // let parent_name_string = unsafe { CString::from_vec_with_nul_unchecked(parent_name_string.into_bytes())}.into_string().unwrap();

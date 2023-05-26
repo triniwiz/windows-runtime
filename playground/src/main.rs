@@ -9,7 +9,8 @@ use crate::interop::{create_dispatcher_queue_controller_for_current_thread, shut
 use windows::{
     core::Result
 };
-use windows::Win32::System::Com::{CoInitialize, CoUninitialize};
+use windows::Win32::Foundation::CO_E_INIT_ONLY_SINGLE_THREADED;
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitialize, CoInitializeEx, CoUninitialize};
 use metadata::declarations::declaration::Declaration;
 
 
@@ -82,19 +83,49 @@ fn run_js_app() {
    // console.log('Default', Windows.UI.Popups.Placement.Default, Windows.UI.Popups.Placement.Default === 0);
    //  console.log('Right', Windows.UI.Popups.Placement.Right, Windows.UI.Popups.Placement.Right === 4);
    //   console.log('Bar', Windows.UI.Text.TabAlignment.Bar, Windows.UI.Text.TabAlignment.Bar == 4);
-  // const value = Windows.Data.Json.JsonValue.CreateBooleanValue(true);
-   //console.log('Windows.Data.Json.JsonValue', value);
-    const dialog = new Windows.UI.Popups.MessageDialog("Hello, World!");
-   console.log(dialog);
-    dialog.ShowAsync();
+
+    // const map = new Windows.Foundation.Collections.StringMap();
+    // console.log(map);
+    // map.Insert("First", "Osei");
+    // map.Insert("Last", "Osei");
+    //
+    // console.log(map.Lookup("First"), map.Lookup("Last"));
+
+   // const value = Windows.Data.Json.JsonValue.CreateBooleanValue(true);
+   //
+   const json = new Windows.Data.Json.JsonObject();
+
+   console.log('keys',Object.keys(json), json.ValueType);
+
+    console.log("JsonObject String Size", json,json.Size());
+
+   console.log("JsonObject String", json,json.ToString());
+
+   //  const ret = json.GetNamedBoolean("isOsei");
+   //
+   //  console.log('ret', ret);
+   //
+   // json.SetNamedValue("isOsei", value);
+   //
+   // console.log(json.GetNamedBoolean("isOsei") === true);
+
+   //  const dialog = new Windows.UI.Popups.MessageDialog("Hello, World!");
+   // console.log(dialog);
+   //  dialog.ShowAsync();
   // console.log('Windows.UI.Popups.MessageDialog', dialog);
- // const json = new Windows.Data.Json.JsonObject();
-  //const method = new Windows.Web.Http.HttpMethod('GET');
- // console.log(method);
+
+  // const uri = new Windows.Foundation.Uri("http://www.bing.com");
+  //
+  //   uri.CombineUri("/home");
+  //
+  // console.log(uri.ToString());
+
+  const method = new Windows.Web.Http.HttpMethod('GET');
+  console.log(method);
    console.log("\n");
    "#;
     let _  = unsafe {
-        CoInitialize(None)
+        CoInitializeEx(None, COINIT_MULTITHREADED)
     };
     let rt = nativescript::runtime_init(0 as _);
     let script = CString::new(script).unwrap();

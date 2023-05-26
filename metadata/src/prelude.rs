@@ -74,6 +74,10 @@ pub fn TokenFromRid(rid: u32, tktype: u32) -> u32 {
 }
 
 pub fn cor_sig_uncompress_element_type(p_data: &mut PCCOR_SIGNATURE) -> CorElementType {
+    if p_data.is_empty() {
+        // todo ve
+        return CorElementType::default()
+    }
     let p_data = &mut p_data.0;
     let data = unsafe { **p_data };
     unsafe { *p_data = p_data.offset(1) };
@@ -225,8 +229,7 @@ pub fn get_unary_custom_attribute_string_value(
     assert!(!attribute_name.is_empty());
 
     let mut data = std::ptr::null_mut() as *const c_void;
-    let name = OsString::from_str(attribute_name).unwrap();
-    let name: Vec<u16> = name.encode_wide().collect();
+    let name = HSTRING::from(attribute_name);
     let name = PCWSTR(name.as_ptr());
     let mut size = 0_u32;
     let result =

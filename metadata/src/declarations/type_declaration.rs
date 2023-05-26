@@ -107,24 +107,14 @@ impl TypeDeclaration {
         };
 
         let mut name = fullname.clone();
-        let back_tick_index = name.find('`');
-        if let Some(index) = back_tick_index {
-            name = name
-                .chars()
-                .take(0)
-                .chain(name.chars().skip(index + 1))
-                .collect()
+
+        if let Some(backtick_index) = name.rfind('`') {
+            name.truncate(backtick_index);
         }
 
-        let dot_index = name.find('.');
-        if let Some(index) = dot_index {
-            name = name
-                .chars()
-                .take(0)
-                .chain(name.chars().skip(index + 1))
-                .collect()
+        if let Some(dot_index) = name.rfind('.') {
+            name = name[(dot_index + 1)..].to_owned();
         }
-
 
         Self {
             kind,

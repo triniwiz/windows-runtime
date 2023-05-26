@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::borrow::Cow;
+use std::ptr::addr_of_mut;
 
 use crate::prelude::*;
 use parking_lot::RwLock;
@@ -34,18 +35,16 @@ impl GenericDelegateInstanceDeclaration {
         let full_name = match closed_metadata {
             None => String::new(),
             Some(metadata) => {
-                let mut signature = PCCOR_SIGNATURE::default(); //std::ptr::null_mut();
-                //let mut sig = &mut signature;
+                let mut signature = PCCOR_SIGNATURE::default();
                 let mut signature_size = 0;
                 let result = unsafe {
                     metadata.GetTypeSpecFromToken(
                         closed_token.0 as u32,
-                        &mut signature.as_abi_mut(),
+                        addr_of_mut!(signature.0),
                         &mut signature_size,
                     )
                 };
                 assert!(result.is_ok());
-                // let signature = unsafe { std::slice::from_raw_parts(signature as *const u8, signature_size as usize) };
                 Signature::to_string(metadata, &signature)
             }
         };

@@ -121,16 +121,12 @@ impl Signature {
 
                 let generic_arguments_count = cor_sig_uncompress_data(&mut signature);
 
-
-              //  signature = unsafe { PCCOR_SIGNATURE::from_ptr((signature.0 as *mut u8).offset(1)) };
-
-
                 for i in 0..generic_arguments_count {
                     let mut sig_type = Signature::consume_type(&mut signature);
                     let data = Signature::to_string(metadata, &mut sig_type);
 
                     result += data.as_ref();
-                    if i == generic_arguments_count - 1 {
+                    if i != generic_arguments_count.saturating_sub(1) {
                         result += ", ";
                     }
                 }

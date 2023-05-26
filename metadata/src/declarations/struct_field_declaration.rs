@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::borrow::Cow;
+use std::ptr::addr_of_mut;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -59,7 +60,7 @@ impl StructFieldDeclaration {
                         None,
                         0 as _,
                         0 as _,
-                        &mut signature.as_abi_mut(),
+                        addr_of_mut!(signature.0),
                         &mut signature_size,
                         0 as _,
                         0 as _,

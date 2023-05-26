@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::ffi::{c_void};
+use std::ptr::addr_of_mut;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use windows::Win32::System::WinRT::Metadata::COR_ENUM_FIELD_NAME_W;
@@ -94,7 +95,7 @@ impl EnumDeclaration {
                     metadata.GetFieldProps(
                         type_field,
                         0 as _, None, 0 as _, 0 as _,
-                        &mut signature.as_abi_mut(),
+                        addr_of_mut!(signature.0),
                         &mut signature_size,
                         0 as _,
                         0 as _,

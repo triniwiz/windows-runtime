@@ -1,5 +1,6 @@
 use std::hint::black_box;
 use std::mem::MaybeUninit;
+use std::ptr::addr_of_mut;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, ELEMENT_TYPE_CLASS, ELEMENT_TYPE_GENERICINST, IMetaDataImport2, mdtTypeDef, mdtTypeRef, mdtTypeSpec};
@@ -40,7 +41,7 @@ impl DeclarationFactory {
 
                     let result = unsafe {
                         metadata.GetTypeSpecFromToken(
-                            token.0 as u32, &mut signature.as_abi_mut(), &mut signature_size,
+                            token.0 as u32, addr_of_mut!(signature.0), &mut signature_size,
                         )
                     };
                     debug_assert!(

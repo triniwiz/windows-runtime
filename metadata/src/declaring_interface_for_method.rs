@@ -1,9 +1,10 @@
 use std::ffi::{c_void, OsString};
 use std::mem::MaybeUninit;
 use std::os::windows::prelude::OsStrExt;
+use std::ptr::addr_of_mut;
 use std::sync::Arc;
 use parking_lot::RwLock;
-use windows::core::PCWSTR;
+use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, ELEMENT_TYPE_CLASS, ELEMENT_TYPE_GENERICINST, ELEMENT_TYPE_VOID, IMetaDataImport2, mdtMemberRef, mdtMethodDef, mdtTypeDef, mdtTypeRef, mdtTypeSpec};
 use crate::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use crate::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
@@ -200,8 +201,7 @@ impl Metadata {
             &signature
         );
 
-        let type_name = OsString::from(type_name);
-        let type_name = type_name.encode_wide().collect::<Vec<u16>>();
+        let type_name = HSTRING::from(type_name);
         let type_name = PCWSTR(type_name.as_ptr());
 
         let mut type_token = 0_u32;
@@ -469,7 +469,7 @@ impl Metadata {
 
         let result = unsafe {
             metadata.EnumMethods(
-                &mut methods_enumerator,
+                addr_of_mut!(methods_enumerator),
                 class_token.0 as u32,
                 &mut first_method,
                 1,
@@ -556,6 +556,11 @@ impl Metadata {
                             debug_assert!(
                                 result.is_ok()
                             );
+
+                            let t = Metadata::find_method_index(
+                                metadata, CorTokenType(declaring_interface_token as i32), CorTokenType(method_decl_token as i32),
+                            );
+
                             *out_index = Metadata::find_method_index(
                                 metadata, CorTokenType(declaring_interface_token as i32), CorTokenType(method_decl_token as i32),
                             );
@@ -603,7 +608,7 @@ impl Metadata {
                                             method_decl_token, 0 as _,
                                             Some(declaring_method_name.as_mut_slice()),
                                             &mut declaring_method_name_length,
-                                            &mut signature,
+                                            addr_of_mut!(signature),
                                             &mut signature_size,
                                         )
                                     };
@@ -613,7 +618,7 @@ impl Metadata {
                                     let mut declaring_method = 0_u32;
 
                                     let declaring_method_name = String::from_utf16_lossy(&declaring_method_name[..declaring_method_name_length as usize]);
-                                    let declaring_method_name = OsString::from(declaring_method_name).encode_wide().collect::<Vec<u16>>();
+                                    let declaring_method_name = HSTRING::from(declaring_method_name);
                                     let declaring_method_name = PCWSTR(declaring_method_name.as_ptr());
                                     let result = unsafe {
                                         external_metadata.FindMethod(
@@ -630,6 +635,7 @@ impl Metadata {
                                     *out_index = Metadata::find_method_index(
                                         &mut external_metadata, declaring_interface_token, CorTokenType(declaring_method as i32),
                                     );
+
                                     ret = Some(
                                         Arc::new(
                                             RwLock::new(
@@ -667,7 +673,7 @@ impl Metadata {
                                             0 as _,
                                             Some(declaring_method_name.as_mut_slice()),
                                             &mut declaring_method_name_size,
-                                            &mut signature,
+                                            addr_of_mut!(signature),
                                             &mut signature_size,
                                         )
                                     };
@@ -677,7 +683,7 @@ impl Metadata {
                                     );
 
                                     let declaring_method_name = String::from_utf16_lossy(&declaring_method_name[..declaring_method_name_size as usize]);
-                                    let declaring_method_name = OsString::from(declaring_method_name).encode_wide().collect::<Vec<u16>>();
+                                    let declaring_method_name = HSTRING::from(declaring_method_name);
                                     let declaring_method_name = PCWSTR(declaring_method_name.as_ptr());
 
                                     let mut type_spec_signature = PCCOR_SIGNATURE(type_spec_signature);
