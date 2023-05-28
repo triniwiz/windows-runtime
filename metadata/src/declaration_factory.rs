@@ -118,20 +118,18 @@ impl DeclarationFactory {
                     ))
                 }
                 mdtTypeSpec => {
-                    let mut signature = std::ptr::null_mut();//[0_u8; MAX_IDENTIFIER_LENGTH];
+                    let mut signature = PCCOR_SIGNATURE::default();
                     let mut signature_size = 0;
                     let result = unsafe {
                         metadata.GetTypeSpecFromToken(
                             token.0 as u32,
-                            &mut signature,
+                            addr_of_mut!(signature.0),
                             &mut signature_size,
                         )
                     };
                     debug_assert!(
                         result.is_ok()
                     );
-
-                    let mut signature = PCCOR_SIGNATURE::from_ptr(signature);
 
                     let type1 = cor_sig_uncompress_element_type(&mut signature);
 

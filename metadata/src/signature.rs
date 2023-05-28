@@ -66,7 +66,7 @@ impl Signature {
         }
     }
 
-    pub fn to_string(metadata: &IMetaDataImport2, signature: &PCCOR_SIGNATURE) -> String {
+    fn get_string(metadata: Option<&IMetaDataImport2>, signature: &PCCOR_SIGNATURE) -> String {
         let mut signature = signature.clone();
 
         let element_type = cor_sig_uncompress_element_type(&mut signature);
@@ -87,8 +87,11 @@ impl Signature {
             ELEMENT_TYPE_R8 => "Double".to_string(),
             ELEMENT_TYPE_STRING => "String".to_string(),
             ELEMENT_TYPE_VALUETYPE => {
+                assert!(metadata.is_some());
+
                 let token = cor_sig_uncompress_token(&mut signature);
-                let class_name = get_type_name(metadata, CorTokenType(token as i32));
+
+                let class_name = get_type_name(metadata.unwrap(), CorTokenType(token as i32));
 
                 if class_name.eq("System.Guid") {
                     Guid.to_string()
@@ -97,12 +100,14 @@ impl Signature {
                 }
             }
             ELEMENT_TYPE_CLASS => {
+                assert!(metadata.is_some());
+
                 let token = cor_sig_uncompress_token(&mut signature);
-                get_type_name(metadata, CorTokenType(token as i32))
+                get_type_name(metadata.unwrap(), CorTokenType(token as i32))
             }
             ELEMENT_TYPE_OBJECT => "Object".to_string(),
             ELEMENT_TYPE_SZARRAY => {
-                let result = Signature::to_string(metadata, &mut signature);
+                let result = Signature::get_string(metadata, &mut signature);
                 format!("{}[]", result)
             }
             ELEMENT_TYPE_VAR => {
@@ -111,11 +116,14 @@ impl Signature {
             }
             ELEMENT_TYPE_GENERICINST => {
                 let generic_type = cor_sig_uncompress_element_type(&mut signature);
+
                 assert_eq!(generic_type, ELEMENT_TYPE_CLASS);
+
+                assert!(metadata.is_some());
 
                 let token = cor_sig_uncompress_token(&mut signature);
 
-                let mut result = get_type_name(metadata, CorTokenType(token as i32));
+                let mut result = get_type_name(metadata.unwrap(), CorTokenType(token as i32));
 
                 result += "<";
 
@@ -123,7 +131,7 @@ impl Signature {
 
                 for i in 0..generic_arguments_count {
                     let mut sig_type = Signature::consume_type(&mut signature);
-                    let data = Signature::to_string(metadata, &mut sig_type);
+                    let data = Signature::get_string(metadata, &mut sig_type);
 
                     result += data.as_ref();
                     if i != generic_arguments_count.saturating_sub(1) {
@@ -137,12 +145,27 @@ impl Signature {
             }
             ELEMENT_TYPE_BYREF => {
                 let mut result = "ByRef ".to_string();
-                result += Signature::to_string(metadata, &mut signature).as_ref();
+                result += Signature::get_string(metadata, &mut signature).as_ref();
                 result
             }
             _ => {
                 unreachable!()
             }
         };
+    }
+
+    pub fn to_string(metadata: &IMetaDataImport2, signature: &PCCOR_SIGNATURE) -> String {
+        Signature::get_string(Some(metadata), signature)
+    }
+
+    pub fn as_string(signature: &PCCOR_SIGNATURE) -> String {
+        Signature::get_string(None, signature)
+    }
+
+    pub fn get_signature_element_type(signature: &PCCOR_SIGNATURE) -> CorElementType {
+        let mut signature = signature.clone();
+
+         cor_sig_uncompress_element_type(&mut signature)
+
     }
 }

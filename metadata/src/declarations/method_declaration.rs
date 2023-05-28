@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::ptr::addr_of_mut;
 use std::sync::{Arc};
 use parking_lot::RwLock;
 use windows::core::{HSTRING, PCWSTR, PWSTR};
@@ -51,7 +52,7 @@ impl MethodDeclaration {
                             None,
                             0 as _,
                             0 as _,
-                            &mut signature,
+                            addr_of_mut!(signature),
                             &mut signature_size,
                             0 as _,
                             0 as _,
@@ -78,13 +79,12 @@ impl MethodDeclaration {
                     return_type = Signature::consume_type(&mut sig);
 
                     let mut parameter_enumerator = std::ptr::null_mut();
-                    let enumerator = &mut parameter_enumerator;
                     // todo
                     let mut parameters_count = 0_u32;
                     let mut parameter_tokens = [0; 1024];
 
                     let result = metadata.EnumParams(
-                        enumerator,
+                        addr_of_mut!(parameter_enumerator),
                         token.0 as u32,
                         parameter_tokens.as_mut_ptr(),
                         parameter_tokens.len() as u32,

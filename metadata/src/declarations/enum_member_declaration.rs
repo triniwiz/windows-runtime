@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::fmt::{Display, Formatter};
+use std::ptr::addr_of_mut;
 use std::sync::Arc;
 use parking_lot::{RwLock};
 use windows::Win32::System::WinRT::Metadata::{CorElementType, CorTokenType, IMetaDataImport2};
@@ -43,7 +44,7 @@ impl EnumMemberDeclaration {
                         0 as _,
                         0 as _,
                         &mut value_type,
-                        &mut value,
+                        addr_of_mut!(value),
                         0 as _,
                     )
                 };

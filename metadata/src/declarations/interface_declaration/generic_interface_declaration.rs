@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::ptr::addr_of_mut;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use windows::core::GUID;
@@ -30,13 +31,12 @@ impl GenericInterfaceDeclaration {
     pub fn number_of_generic_parameters(&self) -> usize {
         let mut count = 0_u32;
         let mut enumerator = std::ptr::null_mut();
-        let enumerator_ptr = &mut enumerator;
         let base = self.base();
         match base.metadata() {
             None => {}
             Some(metadata) => {
                 let result =
-                    unsafe { metadata.EnumGenericParams(enumerator_ptr, base.token().0 as u32, 0 as _, 0 as _, 0 as _) };
+                    unsafe { metadata.EnumGenericParams(addr_of_mut!(enumerator), base.token().0 as u32, 0 as _, 0 as _, 0 as _) };
                 debug_assert!(result.is_ok());
                 let result = unsafe { metadata.CountEnum(enumerator, &mut count) };
                 debug_assert!(result.is_ok());

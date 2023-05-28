@@ -91,15 +91,57 @@ fn run_js_app() {
     //
     // console.log(map.Lookup("First"), map.Lookup("Last"));
 
-   // const value = Windows.Data.Json.JsonValue.CreateBooleanValue(true);
-   //
-   const json = new Windows.Data.Json.JsonObject();
+/*    const boolean = Windows.Data.Json.JsonValue.CreateBooleanValue(true);
 
-   console.log('keys',Object.keys(json), json.ValueType);
+    const number = Windows.Data.Json.JsonValue.CreateNumberValue(100);
 
-    console.log("JsonObject String Size", json,json.Size());
+    let string;
 
-   console.log("JsonObject String", json,json.ToString());
+    try{
+    string = Windows.Data.Json.JsonValue.CreateStringValue("Hey");
+    }catch(error){
+    console.log("Fails as the string is not a json string: ", error);
+    }
+
+    string = Windows.Data.Json.JsonValue.CreateStringValue(JSON.stringify({greet: "Hey"}));
+
+
+    console.log("ValueType",string.ValueType);
+
+    console.log(boolean.GetBoolean());
+
+    console.log(number.GetNumber());
+
+    console.log(string.GetString());
+    */
+
+    // const uri = new Windows.Foundation.Uri("http://www.bing.com");
+    //
+    //  uri.AbsoluteUri();
+
+   //const json = new Windows.Data.Json.JsonObject();
+
+   //console.log(json);
+
+   const a = new Windows.Foundation.Point({X: 1,Y: 2});
+
+   const b = new Windows.Foundation.Point({X: 3,Y: 4});
+
+   console.log(a.toString());
+
+    console.log(a.X, a.Y, b.X,b.Y);
+
+   const rect = new Windows.Foundation.Rect({ X: 100, Y:200, Width: 300, Height: 400});
+
+   console.log(rect.X, rect.Y, rect.Width, rect.Height);
+
+   rect.X += 500;
+
+   console.log(rect.X, rect.Y, rect.Width, rect.Height);
+
+  // console.log("JsonObject String", json,json.ToString());
+
+   //console.log("JsonObject String Size", json,json.Size);
 
    //  const ret = json.GetNamedBoolean("isOsei");
    //
@@ -120,11 +162,11 @@ fn run_js_app() {
   //
   // console.log(uri.ToString());
 
-  const method = new Windows.Web.Http.HttpMethod('GET');
-  console.log(method);
+  // const method = new Windows.Web.Http.HttpMethod('GET');
+  // console.log(method);
    console.log("\n");
    "#;
-    let _  = unsafe {
+    let _ = unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED)
     };
     let rt = nativescript::runtime_init(0 as _);

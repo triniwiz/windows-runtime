@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::ptr::addr_of_mut;
 use crate::prelude::*;
 use std::sync::{Arc};
 use parking_lot::RwLock;
@@ -68,9 +69,8 @@ impl StructDeclaration {
             let mut enumerator = std::ptr::null_mut();
             let mut count = 0;
             let mut tokens = [0_u32; 1024];
-            let mut enumerator_ptr = &mut enumerator;
             let result_inner = unsafe { metadata.EnumFields(
-                enumerator_ptr,
+                addr_of_mut!(enumerator),
                 token.0 as u32,
                 tokens.as_mut_ptr(),
                 tokens.len() as u32,

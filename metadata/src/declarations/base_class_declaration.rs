@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::fmt::{Debug, Formatter, Pointer};
+use std::ptr::addr_of_mut;
 use std::sync::Arc;
 use parking_lot::{MappedRwLockReadGuard, RwLock};
 use windows::core::{HSTRING, PCWSTR};
@@ -45,14 +46,13 @@ impl BaseClassDeclaration {
         match metadata {
             None => {}
             Some(metadata) => {
-
                 let mut enumerator = std::ptr::null_mut();
                 let mut count = 0;
                 let mut tokens = [0_u32; 1024];
 
                 let result_inner = unsafe {
                     metadata.EnumInterfaceImpls(
-                        &mut enumerator,
+                        addr_of_mut!(enumerator),
                         token.0 as u32,
                         tokens.as_mut_ptr(),
                         tokens.len() as u32,
@@ -98,14 +98,12 @@ impl BaseClassDeclaration {
         match metadata {
             None => {}
             Some(metadata) => {
-
                 let mut enumerator = std::ptr::null_mut();
-                let enumerator_ptr = &mut enumerator;
                 let mut count = 0;
                 let mut tokens = [0_u32; 1024];
                 let result_inner = unsafe {
                     metadata.EnumMethods(
-                        enumerator_ptr,
+                        addr_of_mut!(enumerator),
                         token.0 as u32,
                         tokens.as_mut_ptr(),
                         tokens.len() as u32,
@@ -142,12 +140,11 @@ impl BaseClassDeclaration {
             Some(metadata) => {
 
                 let mut enumerator = std::ptr::null_mut();
-                let enumerator_ptr = &mut enumerator;
                 let mut count = 0;
                 let mut tokens = [0 as u32; 1024];
                 let result_inner = unsafe {
                     metadata.EnumProperties(
-                        enumerator_ptr,
+                        addr_of_mut!(enumerator),
                         token.0 as u32,
                         tokens.as_mut_ptr(),
                         tokens.len() as u32,
@@ -160,12 +157,13 @@ impl BaseClassDeclaration {
                 result.reserve(count as usize);
 
                 for i in 0.. count as usize {
-                    let propertyToken = tokens[i];
+                    let property_token = tokens[i];
                     let property =
-                        PropertyDeclaration::new(Some(metadata), CorTokenType(propertyToken as i32));
+                        PropertyDeclaration::new(Some(metadata), CorTokenType(property_token as i32));
                     if !property.is_exported() {
                         continue;
                     }
+
                     result.push(property);
                 }
             }
@@ -181,13 +179,12 @@ impl BaseClassDeclaration {
         if let Some(metadata) = metadata {
 
             let mut enumerator = std::ptr::null_mut();
-            let enumerator_ptr = &mut enumerator;
             let mut count = 0;
             let mut tokens = [0_u32; 1024];
 
             let result_inner = unsafe {
                 metadata.EnumEvents(
-                    enumerator_ptr,
+                    addr_of_mut!(enumerator),
                     token.0 as u32,
                     tokens.as_mut_ptr(),
                     tokens.len() as u32,
@@ -218,7 +215,7 @@ impl BaseClassDeclaration {
         metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
     ) -> Self {
-        Self {
+          Self {
             base: TypeDeclaration::new(
                 kind,
                 metadata.clone(),
@@ -303,7 +300,6 @@ pub trait BaseClassDeclarationImpl {
         let mut method_tokens = [0_u32; 1024];
         if let Some(metadata) = self.base().metadata() {
             let mut enumerator = std::ptr::null_mut();
-            let enumerator_ptr = &mut enumerator;
 
             let mut methods_count = 0;
             let name = HSTRING::from(name);
@@ -311,7 +307,7 @@ pub trait BaseClassDeclarationImpl {
             let base = self.base();
             let result = unsafe {
                 metadata.EnumMethodsWithName(
-                    enumerator_ptr,
+                    addr_of_mut!(enumerator),
                     base.token().0 as u32,
                     name,
                     method_tokens.as_mut_ptr(),

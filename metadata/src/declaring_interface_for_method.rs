@@ -89,7 +89,7 @@ impl Metadata {
                         None,
                         0 as _,
                         0 as _,
-                        &mut signature,
+                        addr_of_mut!(signature),
                         &mut signature_size,
                         0 as _,
                         0 as _,
@@ -136,7 +136,7 @@ impl Metadata {
 
         let result = unsafe {
             metadata.EnumCustomAttributes(
-                &mut attributes_enumerator,
+                addr_of_mut!(attributes_enumerator),
                 token.0 as u32,
                 0 as _,
                 attributes.as_mut_ptr(),
@@ -186,7 +186,7 @@ impl Metadata {
                 token.0 as u32,
                 0 as _,
                 0 as _,
-                &mut attribute_value,
+                addr_of_mut!(attribute_value),
                 &mut attribute_value_size,
             )
         };
@@ -226,7 +226,7 @@ impl Metadata {
 
         let result = unsafe {
             metadata.EnumMethods(
-                &mut methods_enumerator,
+                addr_of_mut!(methods_enumerator),
                 token.0 as u32,
                 methods.as_mut_ptr(),
                 methods.len() as u32,
@@ -419,7 +419,7 @@ impl Metadata {
                                 None,
                                 0 as _,
                                 0 as _,
-                                &mut static_signature,
+                                addr_of_mut!(static_signature),
                                 &mut static_signature_size,
                                 0 as _,
                                 0 as _,
@@ -433,14 +433,14 @@ impl Metadata {
                         let a = unsafe {
                             std::slice::from_raw_parts(
                                 static_signature.offset(1),
-                                static_signature_size as usize,
+                                static_signature_size as usize -1,
                             )
                         };
 
                         let b = unsafe {
                             std::slice::from_raw_parts(
                                 method_signature.0,
-                                static_signature_size as usize,
+                                static_signature_size as usize - 1,
                             )
                         };
 
@@ -505,7 +505,7 @@ impl Metadata {
 
                 let result = unsafe {
                     metadata.EnumMethodImpls(
-                        &mut method_impls_enumerator,
+                        addr_of_mut!(method_impls_enumerator),
                         class_token,
                         method_body_tokens.as_mut_ptr(),
                         method_decl_tokens.as_mut_ptr(),
@@ -653,7 +653,7 @@ impl Metadata {
 
                                     let result = unsafe {
                                         metadata.GetTypeSpecFromToken(
-                                            parent_token, &mut type_spec_signature, &mut type_spec_signature_size,
+                                            parent_token, addr_of_mut!(type_spec_signature), &mut type_spec_signature_size,
                                         )
                                     };
 

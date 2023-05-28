@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::ptr::addr_of_mut;
 use std::sync::{Arc};
 use parking_lot::RwLock;
 use windows::core::{HSTRING, PCWSTR};
@@ -34,13 +35,12 @@ impl ClassDeclaration {
         if let Some(metadata) = metadata {
 
             let mut enumerator = std::ptr::null_mut();
-            let enumerator_ptr = &mut enumerator;
             let mut count = 0;
             let mut tokens = [0_u32; 1024];
 
             let result = unsafe {
                 metadata.EnumMembersWithName(
-                    enumerator_ptr,
+                    addr_of_mut!(enumerator),
                     token.0 as u32,
                     COR_CTOR_METHOD_NAME_W,
                     tokens.as_mut_ptr(),
@@ -99,10 +99,9 @@ impl ClassDeclaration {
                 let mut interface_impl_tokens = [0 as u32; 1024];
                 let mut interface_impl_count = 0;
                 let mut interface_enumerator = std::ptr::null_mut();
-                let interface_enumerator_ptr = &mut interface_enumerator;
                 let result = unsafe {
                     metadata.EnumInterfaceImpls(
-                        interface_enumerator_ptr,
+                        addr_of_mut!(interface_enumerator),
                         token.0 as u32,
                         interface_impl_tokens.as_mut_ptr(),
                         interface_impl_tokens.len() as u32,

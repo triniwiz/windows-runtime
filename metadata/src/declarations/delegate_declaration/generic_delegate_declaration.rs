@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::ptr::addr_of_mut;
 use crate::prelude::*;
 use std::sync::{Arc};
 use parking_lot::RwLock;
@@ -29,9 +30,8 @@ impl GenericDelegateDeclaration {
 
         if let Some(metadata) = self.base.base.metadata() {
             let mut enumerator = std::ptr::null_mut();
-            let enumerator_ptr = &mut enumerator;
             let result = unsafe { metadata.EnumGenericParams(
-                enumerator_ptr,
+                addr_of_mut!(enumerator),
                 self.base.base.token().0 as u32,
                 0 as _,
                 0,

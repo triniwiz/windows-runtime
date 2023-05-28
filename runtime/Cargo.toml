@@ -6,15 +6,20 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+libloading = "0.8.0"
+anyhow = "1.0.71"
 libffi = "3.2.0"
 v8 = "0.71.0"
 tokio = { version = "1.27.0", features = ["full"] }
 chrono = "0.4.24"
 metadata = { path = "../metadata" }
 parking_lot = "0.12.1"
+libc = "0.2.144"
+windows-sys = "0.48.0"
 [dependencies.windows]
 version = "0.48.0"
 features = [
+    "Foundation",
     "Win32_System",
     "Win32_System_WindowsProgramming",
     "Win32_System_Console",
@@ -23,5 +28,6 @@ features = [
     "Win32_System_Com",
     "Win32_System_Diagnostics_Debug",
     "UI_Popups",
-    "Data_Json"
+    "Data_Json",
+    "Foundation_Collections"
 ]

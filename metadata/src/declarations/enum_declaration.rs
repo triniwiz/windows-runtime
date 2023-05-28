@@ -57,7 +57,7 @@ impl EnumDeclaration {
         if let Some(metadata) = self.base.metadata() {
             let mut enumerator = std::ptr::null_mut() as *mut c_void;
 
-            let result = unsafe { metadata.EnumFields(&mut enumerator as *mut *mut c_void, self.base.token().0 as u32, 0 as _, 0, 0 as _) };
+            let result = unsafe { metadata.EnumFields(addr_of_mut!(enumerator), self.base.token().0 as u32, 0 as _, 0, 0 as _) };
             ;
 
             assert!(result.is_ok());
@@ -133,7 +133,7 @@ impl EnumDeclaration {
         if let Some(metadata) = self.base.metadata() {
             let mut enumerator = std::ptr::null_mut();
             let mut size = 0_u32;
-            let result = unsafe { metadata.EnumFields(&mut enumerator, self.base.token().0 as u32, 0 as _, 0, 0 as _) };
+            let result = unsafe { metadata.EnumFields(addr_of_mut!(enumerator), self.base.token().0 as u32, 0 as _, 0, 0 as _) };
             assert!(result.is_ok());
             // offset by 1 to remove the __value enum
             let result = unsafe { metadata.ResetEnum(enumerator, 1) };

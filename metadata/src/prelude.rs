@@ -185,7 +185,7 @@ pub fn get_guid_attribute_value(metadata: Option<&IMetaDataImport2>, token: CorT
                 metadata.GetCustomAttributeByName(
                     token.0 as u32,
                     name,
-                    std::mem::transmute(&mut data),
+                    addr_of_mut!(data) as *const *const c_void,
                     &mut size,
                 )
             };
@@ -233,7 +233,7 @@ pub fn get_unary_custom_attribute_string_value(
     let name = PCWSTR(name.as_ptr());
     let mut size = 0_u32;
     let result =
-        unsafe { metadata.GetCustomAttributeByName(token.0 as u32, name, &data as *const *const c_void, &mut size) };
+        unsafe { metadata.GetCustomAttributeByName(token.0 as u32, name, addr_of_mut!(data) as *const *const c_void, &mut size) };
     debug_assert!(result.is_ok());
 
     if result.is_err() {

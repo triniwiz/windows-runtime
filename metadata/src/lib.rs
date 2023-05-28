@@ -3,8 +3,9 @@ use std::ffi::{c_void, OsString};
 use std::fmt::{Debug, Formatter};
 use std::os::windows::ffi::EncodeWide;
 use std::os::windows::prelude::OsStrExt;
+use std::ptr::{addr_of, addr_of_mut};
 use cxx::UniquePtr;
-use windows::core::{GUID, HSTRING, IUnknown, PCWSTR, Type};
+use windows::core::{GUID, HSTRING, Interface, IUnknown, PCWSTR, Type};
 use windows::Win32::System::Com::{CLSIDFromProgID, CLSIDFromString};
 use windows::Win32::System::WinRT::Metadata::{CorElementType, CorTokenType, IMetaDataImport2, MDTypeRefToDef};
 use crate::prelude::PCCOR_SIGNATURE;
@@ -25,11 +26,16 @@ mod ffi {
     unsafe extern "C++" {
         include!("metadata/src/bindings.h");
 
-        type HSTRING;
-
         type GUID;
 
         type c_void;
+
+        type IUnknown;
+
+
+        pub unsafe fn PrintVtableNames(iface: *mut IUnknown);
+
+        pub unsafe fn GetMethod(iface: *mut IUnknown, index: usize, method: *mut *mut c_void);
 
         pub unsafe fn GetGUID(data: *const u8) -> UniquePtr<GUID>;
 
@@ -59,6 +65,17 @@ impl Debug for ffi::GUID {
                 .field("Data4", &ffi::GetData4(self))
                 .finish()
         }
+    }
+}
+
+pub fn print_vtable_names(iface: &IUnknown){
+    unsafe {
+        ffi::PrintVtableNames(std::mem::transmute_copy(iface))
+    }
+}
+pub fn get_method(iface: &IUnknown, index: usize, method: *mut *mut c_void) {
+    unsafe {
+        ffi::GetMethod(std::mem::transmute_copy(iface), index, std::mem::transmute(method))
     }
 }
 
