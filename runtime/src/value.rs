@@ -26,15 +26,12 @@ use std::sync::Arc;
 use libffi::middle::{Arg, Cif};
 use v8::FunctionCallbackArguments;
 use windows::core::{ComInterface, IInspectable, IUnknown, Interface, IntoParam, Type, GUID, HRESULT, HSTRING, IUnknown_Vtbl, IInspectable_Vtbl};
-use windows::Data::Json::{IJsonObject_Vtbl, IJsonValue, JsonObject, JsonValue};
 use windows::Win32::System::Com::IDispatch;
 use windows::Win32::System::WinRT::IActivationFactory;
 use windows::Win32::System::WinRT::Metadata::{CorElementType, ELEMENT_TYPE_CLASS};
 use metadata::{get_method, print_vtable_names};
-
-use anyhow::Error;
+use crate::error::*;
 use chrono::Local;
-use windows::Foundation::{IStringable, IStringable_Vtbl};
 
 pub(crate) const MAX_SAFE_INTEGER: isize = 9007199254740991;
 pub(crate) const MIN_SAFE_INTEGER: isize = -9007199254740991;
@@ -62,50 +59,6 @@ pub enum NativeType {
     String
 }
 
-/// A simple error type that lets the creator specify both the error message and
-/// the error class name. This type is private; externally it only ever appears
-/// wrapped in an `anyhow::Error`. To retrieve the error class name from a wrapped
-/// `CustomError`, use the function `get_custom_error_class()`.
-#[derive(Debug)]
-struct CustomError {
-    class: &'static str,
-    message: Cow<'static, str>,
-}
-
-impl Display for CustomError {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for CustomError {}
-
-/// If this error was crated with `custom_error()`, return the specified error
-/// class name. In all other cases this function returns `None`.
-pub fn get_custom_error_class(error: &Error) -> Option<&'static str> {
-    error.downcast_ref::<CustomError>().map(|e| e.class)
-}
-
-pub type AnyError = anyhow::Error;
-
-pub fn custom_error(
-    class: &'static str,
-    message: impl Into<Cow<'static, str>>,
-) -> Error {
-    CustomError {
-        class,
-        message: message.into(),
-    }
-        .into()
-}
-
-pub fn generic_error(message: impl Into<Cow<'static, str>>) -> Error {
-    custom_error("Error", message)
-}
-
-pub fn type_error(message: impl Into<Cow<'static, str>>) -> Error {
-    custom_error("TypeError", message)
-}
 
 impl NativeType {
     pub fn size(&self) -> usize {
@@ -600,9 +553,20 @@ pub fn ffi_parse_f64_arg(
 
 #[inline]
 pub fn ffi_parse_pointer_arg(
-    _scope: &mut v8::HandleScope,
+    scope: &mut v8::HandleScope,
     arg: v8::Local<v8::Value>,
 ) -> std::result::Result<NativeValue, AnyError> {
+    if arg.is_object() {
+        let arg = arg.to_object(scope).unwrap();
+        let dec = arg.get_internal_field(scope, 0).unwrap();
+        let dec = unsafe { v8::Local::<v8::External>::cast(dec) };
+        let dec = dec.value() as *mut DeclarationFFI;
+        let dec = unsafe { &*dec };
+        return Ok(NativeValue {pointer: dec.instance.as_ref()
+            .map(|instance| unsafe {mem::transmute_copy(instance)})
+            .unwrap_or(std::ptr::null_mut())
+        })
+    }
     let pointer = if let Ok(value) = v8::Local::<v8::External>::try_from(arg) {
         value.value()
     } else if arg.is_null() {
@@ -712,8 +676,10 @@ pub fn ffi_parse_function_arg(
             "Invalid FFI function type, expected null, or External",
         ));
     };
+
     Ok(NativeValue { pointer })
 }
+
 
 
 #[inline]
@@ -739,27 +705,23 @@ pub unsafe fn set_ret_val(value:*mut c_void, scope: &mut v8::HandleScope, mut rv
             );
         }
         NativeType::U16 => {
-            let ret: &u16 = mem::transmute(value as *const u16);
             rv.set_uint32(
-                *ret as u32
+                value as u32
             );
         }
         NativeType::I16 => {
-            let ret: &i16 = mem::transmute(value as *const i16);
             rv.set_int32(
-                *ret as i32
+                value as i32
             );
         }
         NativeType::U32 => {
-            let ret: &u32 = mem::transmute(value as *const u32);
             rv.set_uint32(
-                *ret
+                value as u32
             );
         }
         NativeType::I32 => {
-            let ret: &i32 = mem::transmute(value as *const i32);
             rv.set_int32(
-                *ret
+                value as i32
             );
         }
         NativeType::U64 => {
@@ -815,10 +777,11 @@ pub unsafe fn set_ret_val(value:*mut c_void, scope: &mut v8::HandleScope, mut rv
 
             // enum value ??
             if size == 1 {
-
                 let result = value as *const _ as i8;
 
                 rv.set_int32(result as i32);
+            }else {
+
             }
 
         }
@@ -831,801 +794,6 @@ pub unsafe fn set_ret_val(value:*mut c_void, scope: &mut v8::HandleScope, mut rv
             let string = v8::String::new(scope, string.as_str()).unwrap();
             rv.set(string.into());
         }
-    }
-}
-
-
-pub struct MethodCall {
-    index: usize,
-    number_of_parameters: usize,
-    number_of_abi_parameters: usize,
-    is_initializer: bool,
-    is_sealed: bool,
-    is_void: bool,
-    iid: GUID,
-    interface: IUnknown,
-    cif: Cif,
-    parameter_types: Vec<NativeType>,
-    parameters: Vec<ParameterDeclaration>,
-    return_type: String,
-    pub(crate) declaration: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>>,
-}
-
-impl MethodCall {
-    pub fn is_void(&self) -> bool {
-        self.is_void
-    }
-
-    pub fn return_type(&self) -> &str {
-        self.return_type.as_str()
-    }
-
-    pub fn new(
-        method: &MethodDeclaration,
-        is_sealed: bool,
-        interface: IUnknown,
-        is_initializer: bool,
-    ) -> Self {
-        let signature = method.return_type();
-
-        let return_type = Signature::to_string(method.metadata().unwrap(), &signature);
-
-        let number_of_parameters = method.number_of_parameters();
-
-        let mut index = 0 as usize;
-
-        let mut declaration: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>> = None;
-
-        let iid = match Metadata::find_declaring_interface_for_method(method, &mut index) {
-            None => {
-                index = 0;
-                IActivationFactory::IID
-            }
-            Some(interface) => {
-                let iid;
-                {
-                    let ii_lock = interface.read();
-
-                    let kind = ii_lock.base().kind();
-
-                    match kind {
-                        DeclarationKind::GenericInterfaceInstance => {
-                            let ii = ii_lock
-                                .as_declaration()
-                                .as_any()
-                                .downcast_ref::<GenericInterfaceInstanceDeclaration>();
-                            let ii = ii.unwrap();
-                            iid = ii.id();
-                        }
-                        _ => {
-                            let ii = ii_lock
-                                .as_declaration()
-                                .as_any()
-                                .downcast_ref::<InterfaceDeclaration>();
-                            let ii = ii.unwrap();
-                            iid = ii.id();
-                        }
-                    }
-                }
-                declaration = Some(interface);
-                iid
-            }
-        };
-
-        index = index.saturating_add(6); // account for IInspectable vtable overhead
-
-        // let mut interface_ptr: *mut c_void = std::ptr::null_mut(); // IActivationFactory
-
-        let vtable = interface.vtable();
-
-        let mut interface_ptr: *mut c_void = std::ptr::null_mut();
-
-        let result = unsafe {
-            ((*vtable).QueryInterface)(
-                interface.as_raw(),
-                &iid,
-                &mut interface_ptr as *mut _ as *mut *const c_void,
-            )
-        };
-
-        assert!(result.is_ok());
-        assert!(!interface_ptr.is_null());
-
-        let is_composition = !is_sealed;
-
-        let is_void = method.is_void();
-
-        let other_params: usize = if is_initializer {
-            if is_sealed {
-                2
-            } else {
-                4
-            }
-        } else {
-            if is_void {
-                1
-            } else {
-                2
-            }
-        };
-
-        let number_of_abi_parameters = number_of_parameters + other_params;
-
-        let mut parameter_types: Vec<NativeType> = Vec::new();
-
-        parameter_types.reserve(number_of_abi_parameters);
-
-        unsafe {
-            parameter_types.push(NativeType::Pointer);
-        }
-
-        for parameter in method.parameters().iter() {
-            let type_ = parameter.type_();
-            let metadata = parameter.metadata().unwrap();
-
-            let signature = Signature::to_string(metadata, &type_);
-
-            match signature.as_str() {
-                "Void" => unsafe {
-                    parameter_types.push(NativeType::Void);
-                },
-                "String" => unsafe {
-                    parameter_types.push(NativeType::Pointer);
-                },
-                "Boolean" => unsafe {
-                    parameter_types.push(NativeType::Bool);
-                },
-                "UInt8" => unsafe {
-                    parameter_types.push(NativeType::U8);
-                },
-                "UInt16" => unsafe {
-                    parameter_types.push(NativeType::U16);
-                },
-                "UInt32" => unsafe {
-                    parameter_types.push(NativeType::U32);
-                },
-                "UInt64" => unsafe {
-                    parameter_types.push(NativeType::U64);
-                },
-                "Int8" => unsafe {
-                    parameter_types.push(NativeType::I8);
-                },
-                "Int16" => unsafe {
-                    parameter_types.push(NativeType::I16);
-                },
-                "Int32" => unsafe {
-                    parameter_types.push(NativeType::I32);
-                },
-                "Int64" => unsafe {
-                    parameter_types.push(NativeType::I64);
-                },
-                "Single" => unsafe {
-                    parameter_types.push(NativeType::F32);
-                },
-                "Double" => unsafe {
-                    parameter_types.push(NativeType::F64);
-                },
-                _ => {
-                    // objects
-                    unsafe {
-                        parameter_types.push(NativeType::Pointer);
-                    }
-                }
-            }
-        }
-
-        if is_initializer {
-            if is_composition {
-                unsafe {
-                    parameter_types.push(NativeType::Pointer);
-                }
-                unsafe {
-                    parameter_types.push(NativeType::Pointer);
-                }
-            }
-            unsafe {
-                parameter_types.push(NativeType::Pointer);
-            }
-        } else {
-            if !is_void {
-                parameter_types.push(NativeType::Pointer);
-            }
-        }
-
-        let params =
-            parameter_types
-                .clone()
-                .into_iter()
-                .map(libffi::middle::Type::try_from)
-                .collect::<std::result::Result<Vec<libffi::middle::Type>, AnyError>>();
-
-        assert!(params.is_ok());
-
-        let mut cif = Cif::new(
-            params.unwrap(),
-            libffi::middle::Type::i32(),
-        );
-
-         let interface = unsafe { IUnknown::from_raw(interface_ptr as *mut c_void) };
-
-        Self {
-            cif,
-            index,
-            number_of_parameters,
-            number_of_abi_parameters,
-            is_initializer,
-            is_sealed,
-            is_void: method.is_void(),
-            iid,
-            interface,
-            parameter_types,
-            parameters: method.parameters().to_vec(),
-            declaration,
-            return_type,
-        }
-    }
-
-    pub fn call(
-        &mut self,
-        scope: &mut v8::HandleScope,
-        args: &FunctionCallbackArguments,
-    ) -> (HRESULT, *mut c_void) {
-
-        let number_of_abi_parameters = self.number_of_abi_parameters;
-
-        let mut arguments: Vec<NativeValue> = Vec::new();
-
-        arguments.reserve(number_of_abi_parameters);
-
-        unsafe { arguments.push(NativeValue { pointer: mem::transmute_copy(&self.interface) }) };
-
-        for (i, parameter) in self.parameters.iter().enumerate() {
-            let type_ = parameter.type_();
-            let metadata = parameter.metadata().unwrap();
-
-            let signature = Signature::to_string(metadata, &type_);
-
-            let value = args.get(i as i32);
-
-            let native_type = NativeType::try_from(signature.as_str());
-
-            // todo error
-            assert!(native_type.is_ok());
-
-            let native_type = native_type.unwrap();
-
-            let value = match native_type {
-                NativeType::Void => {
-                    // todo
-                    unreachable!()
-                }
-                NativeType::Bool => {
-                    ffi_parse_bool_arg(value)
-                }
-                NativeType::U8 => {
-                    ffi_parse_u8_arg(value)
-                }
-                NativeType::I8 => {
-                    ffi_parse_i8_arg(value)
-                }
-                NativeType::U16 => {
-                    ffi_parse_u16_arg(value)
-                }
-                NativeType::I16 => {
-                    ffi_parse_i16_arg(value)
-                }
-                NativeType::U32 => {
-                    ffi_parse_u32_arg(value)
-                }
-                NativeType::I32 => {
-                    ffi_parse_i32_arg(value)
-                }
-                NativeType::U64 => {
-                    ffi_parse_u64_arg(scope, value)
-                }
-                NativeType::I64 => {
-                    ffi_parse_i16_arg(value)
-                }
-                NativeType::USize => {
-                    ffi_parse_usize_arg(scope, value)
-                }
-                NativeType::ISize => {
-                    ffi_parse_isize_arg(scope, value)
-                }
-                NativeType::F32 => {
-                    ffi_parse_f32_arg(value)
-                }
-                NativeType::F64 => {
-                    ffi_parse_f64_arg(value)
-                }
-                NativeType::Pointer => {
-                    ffi_parse_pointer_arg(scope, value)
-                }
-                NativeType::Buffer => {
-                    ffi_parse_buffer_arg(scope, value)
-                }
-                NativeType::Function => {
-                    ffi_parse_function_arg(scope, value)
-                }
-                NativeType::Struct(_) => {
-                    ffi_parse_struct_arg(scope, value)
-                }
-                NativeType::String => {
-                    ffi_parse_string_arg(scope, value)
-                }
-            };
-
-            // todo error
-            assert!(value.is_ok());
-
-            let value = value.unwrap();
-
-            arguments.push(value);
-        }
-
-        let mut result: *mut c_void = std::ptr::null_mut();
-
-
-        if self.is_initializer {
-            unsafe { arguments.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void }) };
-        } else {
-            if !self.is_void {
-                arguments.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
-            }
-        }
-
-        let mut func = std::ptr::null_mut();
-
-        get_method(&self.interface, self.index, addr_of_mut!(func));
-
-        // let mut vtable = self.interface.vtable();
-        //
-        // let vtable: *mut *mut c_void = unsafe {mem::transmute(vtable)};
-        //
-        // let func = unsafe { *vtable.offset((self.index) as isize) };
-
-        let call_args: Vec<Arg> = arguments
-            .iter()
-            .enumerate()
-            // SAFETY: Creating a `Arg` from a `NativeValue` is pretty safe.
-            .map(|(i, v)| {
-                println!("{}", i);
-                unsafe { v.as_arg(self.parameter_types.get(i).unwrap()) }
-            })
-            .collect();
-
-
-        // let prep_result = unsafe {
-        //     prep_cif(
-        //         &mut cif,
-        //         ffi_abi_FFI_DEFAULT_ABI,
-        //         parameter_types.len(),
-        //         &mut types::sint32,
-        //         parameter_types.as_mut_ptr(),
-        //     )
-        // };
-
-        //assert!(prep_result.is_ok());
-
-        // todo handle prep_cif error
-
-        /*let ret = unsafe {
-            call::<i32>(
-                &mut self.cif,
-                CodePtr::from_ptr(func),
-                call_args.as_mut_ptr(),
-            )
-        };
-        */
-
-        let ret = unsafe {
-            self.cif.call(
-                CodePtr::from_ptr(func),
-                &call_args,
-            )
-        };
-
-
-        (HRESULT(ret), result)
-    }
-}
-
-pub struct PropertyCall {
-    index: usize,
-    number_of_parameters: usize,
-    number_of_abi_parameters: usize,
-    is_initializer: bool,
-    is_sealed: bool,
-    is_void: bool,
-    is_setter: bool,
-    iid: GUID,
-    cif: Cif,
-    parent_interface: IUnknown,
-    interface: IUnknown,
-    parameter_types: Vec<NativeType>,
-    parameters: Vec<ParameterDeclaration>,
-    return_type: String,
-    pub(crate) declaration: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>>,
-}
-
-impl PropertyCall {
-    pub fn is_void(&self) -> bool {
-        self.is_void
-    }
-
-    pub fn return_type(&self) -> &str {
-        self.return_type.as_str()
-    }
-
-    pub fn new(
-        property: &PropertyDeclaration,
-        is_setter: bool,
-        interface: IUnknown,
-        is_initializer: bool,
-    ) -> Self {
-        let method = if is_setter {
-            property.setter().unwrap()
-        } else {
-            property.getter()
-        };
-
-        let number_of_parameters = method.number_of_parameters();
-
-        let mut index = 0 as usize;
-
-        let mut declaration: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>> = None;
-
-        let iid = match Metadata::find_declaring_interface_for_method(method, &mut index) {
-            None => {
-                index = 0;
-                IActivationFactory::IID
-            }
-            Some(interface) => {
-                let iid;
-                {
-                    let ii_lock = interface.read();
-
-                    let kind = ii_lock.base().kind();
-
-                    match kind {
-                        DeclarationKind::GenericInterfaceInstance => {
-                            let ii = ii_lock
-                                .as_declaration()
-                                .as_any()
-                                .downcast_ref::<GenericInterfaceInstanceDeclaration>();
-                            let ii = ii.unwrap();
-                            iid = ii.id();
-                        }
-                        _ => {
-                            let ii = ii_lock
-                                .as_declaration()
-                                .as_any()
-                                .downcast_ref::<InterfaceDeclaration>();
-                            let ii = ii.unwrap();
-                            iid = ii.id();
-                        }
-                    }
-                }
-                declaration = Some(interface);
-                iid
-            }
-        };
-
-        index = index.saturating_add(6); // account for IInspectable vtable overhead
-
-        let mut interface_ptr: *const c_void = std::ptr::null_mut(); // IActivationFactory
-
-        let vtable = interface.vtable();
-
-        let mut interface_ptr: *mut c_void = std::ptr::null_mut();
-
-        let result = unsafe {
-            ((*vtable).QueryInterface)(
-                interface.as_raw(),
-                &iid,
-                &mut interface_ptr as *mut _ as *mut *const c_void
-            )
-        };
-
-        assert!(result.is_ok());
-        assert!(!interface_ptr.is_null());
-
-        let is_sealed = method.is_sealed();
-
-        let is_composition = !is_sealed;
-
-        let is_void = method.is_void();
-
-        let signature = method.return_type();
-
-        let return_type = Signature::to_string(method.metadata().unwrap(), &signature);
-
-
-        let other_params: usize = if is_initializer {
-            if is_sealed {
-                2
-            } else {
-                4
-            }
-        } else {
-            if is_void {
-                1
-            } else {
-                2
-            }
-        };
-
-        let number_of_abi_parameters = number_of_parameters + other_params;
-
-        let mut parameter_types: Vec<NativeType> = Vec::new();
-
-        parameter_types.reserve(number_of_abi_parameters);
-
-        unsafe {
-            parameter_types.push(NativeType::Pointer);
-        }
-
-        for parameter in method.parameters().iter() {
-            let type_ = parameter.type_();
-            let metadata = parameter.metadata().unwrap();
-
-            let signature = Signature::to_string(metadata, &type_);
-
-            match signature.as_str() {
-                "Void" => unsafe {
-                    parameter_types.push(NativeType::Void);
-                },
-                "String" => unsafe {
-                    parameter_types.push(NativeType::Pointer);
-                },
-                "Boolean" => unsafe {
-                    parameter_types.push(NativeType::Bool);
-                },
-                "UInt8" => unsafe {
-                    parameter_types.push(NativeType::U8);
-                },
-                "UInt16" => unsafe {
-                    parameter_types.push(NativeType::U16);
-                },
-                "UInt32" => unsafe {
-                    parameter_types.push(NativeType::U32);
-                },
-                "UInt64" => unsafe {
-                    parameter_types.push(NativeType::U64);
-                },
-                "Int8" => unsafe {
-                    parameter_types.push(NativeType::I8);
-                },
-                "Int16" => unsafe {
-                    parameter_types.push(NativeType::I16);
-                },
-                "Int32" => unsafe {
-                    parameter_types.push(NativeType::I32);
-                },
-                "Int64" => unsafe {
-                    parameter_types.push(NativeType::I64);
-                },
-                "Single" => unsafe {
-                    parameter_types.push(NativeType::F32);
-                },
-                "Double" => unsafe {
-                    parameter_types.push(NativeType::F64);
-                },
-                _ => {
-                    // objects
-                    unsafe {
-                        parameter_types.push(NativeType::Pointer);
-                    }
-                }
-            }
-        }
-
-        if is_initializer {
-            if is_composition {
-                unsafe {
-                    parameter_types.push(NativeType::Pointer);
-                }
-                unsafe {
-                    parameter_types.push(NativeType::Pointer);
-                }
-            }
-
-            unsafe {
-                parameter_types.push(NativeType::Pointer);
-            }
-        } else {
-            if !is_void {
-                parameter_types.push(NativeType::Pointer);
-            }
-        }
-
-
-        let params =
-            parameter_types
-                .clone()
-                .into_iter()
-                .map(libffi::middle::Type::try_from)
-                .collect::<std::result::Result<Vec<libffi::middle::Type>, AnyError>>();
-
-        assert!(params.is_ok());
-
-        let mut cif = Cif::new(
-            params.unwrap(),
-            libffi::middle::Type::i32(),
-        );
-
-        let parent_interface = interface.clone();
-
-        let interface = unsafe { IUnknown::from_raw(interface_ptr as *mut c_void) };
-
-
-        Self {
-            index,
-            number_of_parameters,
-            number_of_abi_parameters,
-            is_initializer,
-            is_sealed,
-            is_void: method.is_void(),
-            iid,
-            cif,
-            parent_interface,
-            interface,
-            parameter_types,
-            parameters: method.parameters().to_vec(),
-            declaration,
-            return_type,
-            is_setter,
-        }
-    }
-
-    pub fn call(
-        &mut self,
-        scope: &mut v8::HandleScope,
-        args: &FunctionCallbackArguments,
-    ) -> (HRESULT, *mut c_void) {
-        let number_of_abi_parameters = self.number_of_abi_parameters;
-
-        let mut arguments: Vec<NativeValue> = Vec::new();
-
-        arguments.reserve(number_of_abi_parameters);
-
-        unsafe { arguments.push(NativeValue { pointer: mem::transmute_copy(&self.interface) }) };
-
-        for (i, parameter) in self.parameters.iter().enumerate() {
-            let type_ = parameter.type_();
-            let metadata = parameter.metadata().unwrap();
-
-            let signature = Signature::to_string(metadata, &type_);
-
-            let value: v8::Local<v8::Value> = args.holder().into();
-
-            let native_type = NativeType::try_from(signature.as_str());
-
-            // todo error
-            assert!(native_type.is_ok());
-
-            let native_type = native_type.unwrap();
-
-            let value = match native_type {
-                NativeType::Void => {
-                    // todo
-                    unreachable!()
-                }
-                NativeType::Bool => {
-                    ffi_parse_bool_arg(value)
-                }
-                NativeType::U8 => {
-                    ffi_parse_u8_arg(value)
-                }
-                NativeType::I8 => {
-                    ffi_parse_i8_arg(value)
-                }
-                NativeType::U16 => {
-                    ffi_parse_u16_arg(value)
-                }
-                NativeType::I16 => {
-                    ffi_parse_i16_arg(value)
-                }
-                NativeType::U32 => {
-                    ffi_parse_u32_arg(value)
-                }
-                NativeType::I32 => {
-                    ffi_parse_i32_arg(value)
-                }
-                NativeType::U64 => {
-                    ffi_parse_u64_arg(scope, value)
-                }
-                NativeType::I64 => {
-                    ffi_parse_i16_arg(value)
-                }
-                NativeType::USize => {
-                    ffi_parse_usize_arg(scope, value)
-                }
-                NativeType::ISize => {
-                    ffi_parse_isize_arg(scope, value)
-                }
-                NativeType::F32 => {
-                    ffi_parse_f32_arg(value)
-                }
-                NativeType::F64 => {
-                    ffi_parse_f64_arg(value)
-                }
-                NativeType::Pointer => {
-                    ffi_parse_pointer_arg(scope, value)
-                }
-                NativeType::Buffer => {
-                    ffi_parse_buffer_arg(scope, value)
-                }
-                NativeType::Function => {
-                    ffi_parse_function_arg(scope, value)
-                }
-                NativeType::Struct(_) => {
-                    ffi_parse_struct_arg(scope, value)
-                }
-                NativeType::String => {
-                    ffi_parse_string_arg(scope, value)
-                }
-            };
-
-            // todo error
-            assert!(value.is_ok());
-
-            let value = value.unwrap();
-
-            arguments.push(value);
-
-        }
-
-        let mut result: *mut c_void = std::ptr::null_mut();
-
-
-        if self.is_initializer {
-            // arguments.push(result_ptr as *mut c_void);
-        } else {
-            if !self.is_void {
-                arguments.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
-            }
-        }
-
-        // let mut vtable = raw;
-
-        //let mut vtable: *mut *mut *mut c_void = unsafe { mem::transmute(vtable) };
-
-        let mut func = std::ptr::null_mut();
-
-        get_method(&self.interface, self.index, addr_of_mut!(func));
-
-
-        // let func = unsafe {
-        //     vtable.offset(self.index as isize)
-        // };
-
-        // let ret = unsafe {
-        //     call::<i32>(
-        //         &mut self.cif,
-        //         CodePtr::from_ptr(func),
-        //         arguments.as_mut_ptr(),
-        //     )
-        // };
-
-        let call_args: Vec<Arg> = arguments
-            .iter()
-            .enumerate()
-            // SAFETY: Creating a `Arg` from a `NativeValue` is pretty safe.
-            .map(|(i, v)| {
-                println!("{}", i);
-                unsafe { v.as_arg(self.parameter_types.get(i).unwrap()) }
-            })
-            .collect();
-
-        let ret = unsafe {
-            self.cif.call(
-                CodePtr::from_ptr(func),
-                &call_args,
-            )
-        };
-
-        (HRESULT(ret), result)
     }
 }
     

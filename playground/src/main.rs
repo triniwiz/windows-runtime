@@ -1,7 +1,7 @@
 mod interop;
 
 use std::ffi::CString;
-use windows::Win32::System::WinRT::{RO_INIT_SINGLETHREADED, RoInitialize};
+use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RO_INIT_SINGLETHREADED, RoInitialize};
 use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, MSG, TranslateMessage};
 use metadata::meta_data_reader::MetadataReader;
 use crate::interop::{create_dispatcher_queue_controller_for_current_thread, shutdown_dispatcher_queue_controller_and_exit};
@@ -15,7 +15,7 @@ use metadata::declarations::declaration::Declaration;
 
 
 fn run() -> Result<()> {
-    unsafe { RoInitialize(RO_INIT_SINGLETHREADED)? };
+    unsafe { RoInitialize(RO_INIT_MULTITHREADED)? };
     let controller = create_dispatcher_queue_controller_for_current_thread()?;
 
     // MetadataReader::find_by_name("Windows.UI.Popups.MessageDialog");
@@ -84,7 +84,33 @@ fn run_js_app() {
    //  console.log('Right', Windows.UI.Popups.Placement.Right, Windows.UI.Popups.Placement.Right === 4);
    //   console.log('Bar', Windows.UI.Text.TabAlignment.Bar, Windows.UI.Text.TabAlignment.Bar == 4);
 
-     const map = new Windows.Foundation.Collections.StringMap();
+
+    const feed = new Windows.Foundation.Uri("https://blogs.windows.com/feed");
+
+    const client = new Windows.Web.Syndication.SyndicationClient();
+    client.BypassCacheOnRetrieve = true;
+
+    client.SetRequestHeader(
+        "User-Agent",
+        "Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.2; WOW64; Trident/6.0)"
+    );
+
+   console.log('Timeout', client.Timeout);
+
+   client.Timeout = 1000;
+
+
+
+   console.log('Timeout', client.Timeout);
+
+    const currentFeed = client.RetrieveFeedAsync(feed);
+
+    console.log("feed",currentFeed.toString());
+
+
+    console.log(currentFeed.GetResults());
+
+    /* const map = new Windows.Foundation.Collections.StringMap();
 
      const first = map.Insert("First", "Osei");
 
@@ -131,7 +157,11 @@ fn run_js_app() {
 
    console.log(json.ToString());
 
+   */
+
 /*
+
+
    const a = new Windows.Foundation.Point({X: 1,Y: 2});
 
    const b = new Windows.Foundation.Point({X: 3,Y: 4});

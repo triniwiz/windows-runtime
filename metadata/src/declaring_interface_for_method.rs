@@ -488,7 +488,6 @@ impl Metadata {
     }
 
     pub fn declaring_interface_for_instance_method(metadata: Option<&IMetaDataImport2>, method_token: CorTokenType, out_index: &mut usize) -> Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>> {
-        let meta = metadata.clone();
         match metadata {
             None => None,
             Some(metadata) => {

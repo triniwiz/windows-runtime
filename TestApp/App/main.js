@@ -10,6 +10,12 @@
 //console.log("\n");
 //console.log("Hello\n");
 
+const currentWindow = Windows.UI.Xaml.Window.Current;
+const rootView = currentWindow.Content;
+currentWindow.Close();
+
+/*
 const dialog = new Windows.UI.Popups.MessageDialog("Hello, World!", "From NativeScript");
 dialog.ShowAsync();
 
+*/

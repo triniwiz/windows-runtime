@@ -49,17 +49,15 @@ namespace TestApp
 
         Int64 runtime;
 
+        string entry;
         public App()
         {
 
             AttachConsole(ATTACH_PARENT_PROCESS);
 
-            string entry = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "App\\main.js");
-            runtime = runtime_init(AppContext.BaseDirectory);
+            entry = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "App\\main.js");
 
-       
 
-     //   runtime_runscript(runtime, File.ReadAllText(Path.GetFullPath(entry)));
             this.InitializeComponent();
             this.Suspending += OnSuspending;
         }
@@ -72,6 +70,10 @@ namespace TestApp
         protected override void OnLaunched(LaunchActivatedEventArgs e)
         {
             Frame rootFrame = Window.Current.Content as Frame;
+
+
+            runtime = runtime_init(AppContext.BaseDirectory);
+            runtime_runscript(runtime, File.ReadAllText(Path.GetFullPath(entry)));
 
             // Do not repeat app initialization when the Window already has content,
             // just ensure that the window is active
@@ -103,12 +105,6 @@ namespace TestApp
                 // Ensure the current window is active
                 Window.Current.Activate();
             }
-
-            string entry = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "App\\main.js");
-
-
-              runtime_runscript(runtime, File.ReadAllText(Path.GetFullPath(entry)));
-
         }
 
         /// <summary>

@@ -2,6 +2,9 @@ mod console;
 mod converter;
 mod value;
 mod interop;
+mod method_call;
+mod property_call;
+mod error;
 
 use std::any::Any;
 use std::ffi::{c_char, c_void, CString};
@@ -17,7 +20,6 @@ use parking_lot::{RawRwLock, RwLock};
 use parking_lot::lock_api::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLockReadGuard, RwLockWriteGuard};
 use v8::{FunctionTemplate, Global, Local, Object};
 use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, IUnknown_Vtbl, ComInterface, PCWSTR, Type, IInspectable, Error};
-use windows::Data::Json::JsonObject;
 use windows::Foundation::{GuidHelper, IAsyncOperation};
 use windows::Win32::Foundation::CO_E_INIT_ONLY_SINGLE_THREADED;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, CLSIDFromProgID, CLSIDFromString, CoCreateInstance, CoGetClassObject, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED, CoInitialize, CoInitializeEx, CoUninitialize, DISPATCH_METHOD, DISPPARAMS, EXCEPINFO, IClassFactory, IDispatch, IDispatch_Vtbl, ITypeLib, VARIANT, VT_UI2};
@@ -39,13 +41,14 @@ use metadata::declaring_interface_for_method::Metadata;
 use metadata::meta_data_reader::MetadataReader;
 use metadata::prelude::{get_guid_attribute_value, get_string_value_from_blob, get_type_name, LOCALE_SYSTEM_DEFAULT};
 use metadata::{guid_to_string, query_interface, signature};
+use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
 use metadata::declarations::method_declaration::MethodDeclaration;
 use metadata::declarations::property_declaration::PropertyDeclaration;
 use metadata::declarations::struct_declaration::StructDeclaration;
 use metadata::declarations::struct_field_declaration::StructFieldDeclaration;
 use metadata::signature::Signature;
 use metadata::value::{Value, Variant};
-use crate::value::{AnyError, ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, MAX_SAFE_INTEGER, MethodCall, MIN_SAFE_INTEGER, NativeType, NativeValue, PropertyCall, set_ret_val};
+use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, MAX_SAFE_INTEGER, MIN_SAFE_INTEGER, NativeType, NativeValue, set_ret_val};
 
 pub struct Runtime {
     isolate: v8::OwnedIsolate,
@@ -95,6 +98,30 @@ impl Deref for DeclarationFFI {
     fn deref(&self) -> &Self::Target {
         self.inner.deref()
     }
+}
+
+
+use regex::Regex;
+use crate::method_call::MethodCall;
+use crate::property_call::PropertyCall;
+
+fn get_generic_return_types(name: &str) -> Vec<&str> {
+    /* let re_total_types = Regex::new(r"`(\d+)").unwrap();
+     let total_types = if let Some(captures) = re_total_types.captures(string) {
+         captures.get(1).unwrap().as_str().parse::<usize>().unwrap()
+     } else {
+         0
+     };
+
+     */
+
+    // Extracting the type names
+    let re_type_names = Regex::new(r"<(.*?)>").unwrap();
+    return if let Some(captures) = re_type_names.captures(name) {
+        captures.get(1).unwrap().as_str().split(", ").collect::<Vec<_>>()
+    } else {
+        vec![]
+    };
 }
 
 fn handle_global(scope: &mut v8::HandleScope,
@@ -179,6 +206,7 @@ fn create_ns_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, s
     let object_tmpl = tmpl.instance_template(scope);
     object_tmpl.set_named_property_handler(
         v8::NamedPropertyHandlerConfiguration::new()
+            .query(handle_named_property_query)
             .getter(handle_named_property_getter)
             .setter(handle_named_property_setter)
     );
@@ -196,24 +224,23 @@ fn create_ns_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, s
     ret.into()
 }
 
-fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Option<Arc<RwLock<dyn Declaration>>>, declaration: Arc<RwLock<dyn Declaration>>, instance: Option<IUnknown>, scope: &mut v8::HandleScope<'a>) -> Local<'a, v8::Value> {
+fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, parent: Option<Arc<RwLock<dyn Declaration>>>, declaration: Arc<RwLock<dyn Declaration>>, instance: Option<IUnknown>, scope: &mut v8::HandleScope<'a>) -> Local<'a, v8::Value> {
     let scope = &mut v8::EscapableHandleScope::new(scope);
 
     let class_name = v8::String::new(scope, name).unwrap();
 
-    let name = v8::String::new(scope, name).unwrap();
-
     let tmpl = FunctionTemplate::new(scope, handle_ns_func);
 
-    tmpl.set_class_name(name);
+    tmpl.set_class_name(class_name);
 
     let proto = tmpl.prototype_template(scope);
-
 
     {
         let lock = declaration.read();
 
         let kind = lock.kind();
+
+        println!("name {} : kind {}", name, kind);
 
         match kind {
             DeclarationKind::Class => {
@@ -229,6 +256,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                     .build(scope);
 
                 let to_string = v8::String::new(scope, "toString").unwrap();
+
                 proto.set(to_string.into(), to_string_func.into());
 
                 for method in clazz.methods().iter() {
@@ -243,7 +271,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                             )
                         ),
                         if is_static {
-                            Some(factory.clone())
+                            factory.clone()
                         } else {
                             instance.clone()
                         },
@@ -276,9 +304,33 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                         if ret.is_err() {
                             println!(">>> {}", ret.message().to_string())
                         } else if !method.is_void() {
-                            match NativeType::try_from(method.return_type()) {
+                            let return_sig = method.return_type();
+                            match NativeType::try_from(return_sig) {
                                 Ok(return_type) => {
-                                    unsafe { set_ret_val(result, scope, retval, return_type);}
+                                    if return_sig.contains(".") {
+                                        let instance = unsafe { IUnknown::from_raw(result) };
+
+                                        if return_sig.contains('`') {
+                                            let mut name = return_sig.to_string();
+
+                                            if let Some(backtick_index) = name.rfind('<') {
+                                                name.truncate(backtick_index);
+                                            }
+
+                                            // use the generic name
+                                            let declaration = MetadataReader::find_by_name(name.as_str()).unwrap();
+
+                                            let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig, None, dec.parent.clone(), declaration, Some(instance), scope).into();
+
+                                            retval.set(ret.into());
+
+                                            return;
+                                        }
+                                        let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig, None, dec.parent.clone(), dec.inner.clone(), Some(instance), scope).into();
+                                        retval.set(ret.into());
+                                        return;
+                                    }
+                                    unsafe { set_ret_val(result, scope, retval, return_type); }
                                 }
                                 Err(_) => {}
                             }
@@ -292,9 +344,9 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                         .build(scope);
 
                     if is_static {
-                        tmpl.set(name.unwrap().into(), func.into());
+                        tmpl.set_with_attr(name.unwrap().into(), func.into(), v8::DONT_DELETE);
                     } else {
-                        proto.set(name.unwrap().into(), func.into());
+                        proto.set_with_attr(name.unwrap().into(), func.into(), v8::DONT_DELETE);
                     }
                 }
 
@@ -308,7 +360,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                                 property.clone()
                             )
                         ),
-                        if is_static { Some(factory.clone()) } else { instance.clone() },
+                        if is_static { factory.clone() } else { instance.clone() },
                     );
 
 
@@ -330,8 +382,6 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
 
                         let lock = dec.read();
 
-                        let kind = lock.kind();
-
                         let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
 
                         let mut method = PropertyCall::new(
@@ -345,7 +395,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                         } else if !method.is_void() {
                             match NativeType::try_from(method.return_type()) {
                                 Ok(return_type) => {
-                                    unsafe { set_ret_val(result, scope, retval, return_type);}
+                                    unsafe { set_ret_val(result, scope, retval, return_type); }
                                 }
                                 Err(_) => {}
                             }
@@ -380,7 +430,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                         // todo
                     } else {
                         let name = name.unwrap();
-                        proto.set_accessor_property(name.into(), Some(getter), setter, v8::READ_ONLY | v8::DONT_DELETE);
+                        proto.set_accessor_property(name.into(), Some(getter), setter, v8::NONE);
                     }
                 }
             }
@@ -417,7 +467,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                                             method.clone()
                                         )
                                     ),
-                                    if is_static { Some(factory.clone()) } else { instance.clone() },
+                                    if is_static { factory.clone() } else { instance.clone() },
                                 );
 
                                 let declaration = Box::into_raw(Box::new(declaration));
@@ -448,7 +498,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                                     } else if !method.is_void() {
                                         match NativeType::try_from(method.return_type()) {
                                             Ok(return_type) => {
-                                                unsafe { set_ret_val(result, scope, retval, return_type);}
+                                                unsafe { set_ret_val(result, scope, retval, return_type); }
                                             }
                                             Err(_) => {}
                                         }
@@ -479,7 +529,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                                             property.clone()
                                         )
                                     ),
-                                    if is_static { Some(factory.clone()) } else { instance.clone() },
+                                    if is_static { factory.clone() } else { instance.clone() },
                                 );
 
 
@@ -516,7 +566,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                                     } else if !method.is_void() {
                                         match NativeType::try_from(method.return_type()) {
                                             Ok(return_type) => {
-                                                unsafe { set_ret_val(result, scope, retval, return_type);}
+                                                unsafe { set_ret_val(result, scope, retval, return_type); }
                                             }
                                             Err(_) => {}
                                         }
@@ -568,7 +618,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                                             method.clone()
                                         )
                                     ),
-                                    if is_static { Some(factory.clone()) } else { instance.clone() },
+                                    if is_static { factory.clone() } else { instance.clone() },
                                 );
 
                                 let declaration = Box::into_raw(Box::new(declaration));
@@ -599,7 +649,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                                     } else if !method.is_void() {
                                         match NativeType::try_from(method.return_type()) {
                                             Ok(return_type) => {
-                                                unsafe { set_ret_val(result, scope, retval, return_type);}
+                                                unsafe { set_ret_val(result, scope, retval, return_type); }
                                             }
                                             Err(_) => {}
                                         }
@@ -630,7 +680,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                                             property.clone()
                                         )
                                     ),
-                                    if is_static { Some(factory.clone()) } else { instance.clone() },
+                                    if is_static { factory.clone() } else { instance.clone() },
                                 );
 
 
@@ -668,7 +718,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                                     } else if !method.is_void() {
                                         match NativeType::try_from(method.return_type()) {
                                             Ok(return_type) => {
-                                                unsafe { set_ret_val(result, scope, retval, return_type);}
+                                                unsafe { set_ret_val(result, scope, retval, return_type); }
                                             }
                                             Err(_) => {}
                                         }
@@ -727,7 +777,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                                 method.clone()
                             )
                         ),
-                        if is_static { Some(factory.clone()) } else { instance.clone() },
+                        if is_static { factory.clone() } else { instance.clone() },
                     );
 
                     let declaration = Box::into_raw(Box::new(declaration));
@@ -758,7 +808,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                         } else if !method.is_void() {
                             match NativeType::try_from(method.return_type()) {
                                 Ok(return_type) => {
-                                    unsafe { set_ret_val(result, scope, retval, return_type);}
+                                    unsafe { set_ret_val(result, scope, retval, return_type); }
                                 }
                                 Err(_) => {}
                             }
@@ -789,7 +839,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                                 property.clone()
                             )
                         ),
-                        if is_static { Some(factory.clone()) } else { instance.clone() },
+                        if is_static { factory.clone() } else { instance.clone() },
                     );
 
 
@@ -827,7 +877,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                         } else if !method.is_void() {
                             match NativeType::try_from(method.return_type()) {
                                 Ok(return_type) => {
-                                    unsafe { set_ret_val(result, scope, retval, return_type);}
+                                    unsafe { set_ret_val(result, scope, retval, return_type); }
                                 }
                                 Err(_) => {}
                             }
@@ -866,21 +916,142 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                     }
                 }
             }
+            DeclarationKind::GenericInterface => {
+                let clazz = lock.as_any().downcast_ref::<GenericInterfaceDeclaration>().unwrap();
+
+                let return_types = get_generic_return_types(name);
+
+                println!("return_types {:?}", return_types.as_slice());
+
+                for method in clazz.methods() {
+                    let signature = method.return_type();
+
+                    let return_type = Signature::to_string(method.metadata().unwrap(), &signature);
+
+                    let return_type_index = usize::from_str_radix(&*return_type.as_str().replace("Var!", ""), 10).unwrap();
+
+                    let return_type = return_types.get(return_type_index).unwrap();
+
+                    let name = v8::String::new(scope, method.name());
+
+                    let is_static = method.is_static();
+
+                    let parent = Arc::clone(&declaration);
+
+                    let mut declaration = DeclarationFFI::new_with_instance(
+                        Arc::new(
+                            RwLock::new(
+                                method.clone()
+                            )
+                        ),
+                        if is_static {
+                            factory.clone()
+                        } else {
+                            instance.clone()
+                        },
+                    );
+
+                    declaration.parent = Some(parent);
+
+                    let declaration = Box::into_raw(Box::new(declaration));
+
+                    let return_type = v8::String::new(scope, return_type).unwrap();
+
+                    let ext = v8::External::new(scope, declaration as _);
+
+                    let data = v8::Array::new_with_elements(scope, &[ext.into(), return_type.into()]);
+
+                    let func = FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                                                          args: v8::FunctionCallbackArguments,
+                                                          mut retval: v8::ReturnValue| {
+
+                        let data = v8::Local::<v8::Array>::try_from(args.data()).unwrap();
+
+                        let return_type = data.get_index(scope, 1).unwrap().to_rust_string_lossy(scope);
+
+                        let dec = unsafe { Local::<v8::External>::cast(data.get_index(scope, 0).unwrap()) };
+
+                        let dec = dec.value() as *mut DeclarationFFI;
+
+                        let dec = unsafe { &*dec };
+
+                        let lock = dec.read();
+
+                        let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
+
+                        let parent = dec.parent.as_ref().unwrap();
+                        let parent = parent.read();
+                        let parent = parent.as_any().downcast_ref::<GenericInterfaceDeclaration>().unwrap();
+
+                        let mut method = MethodCall::new_with_return_type(
+                            method, method.is_sealed(), dec.instance.clone().unwrap(), false, return_type, Some(parent.id())
+                        );
+
+
+                        let (ret, result) = method.call(scope, &args);
+
+                        if ret.is_err() {
+                            println!(">>> {}", ret.message().to_string())
+                        } else if !method.is_void() {
+                            let return_sig = method.return_type();
+                            match NativeType::try_from(return_sig) {
+                                Ok(return_type) => {
+                                    if return_sig.contains(".") {
+                                        let instance = unsafe { IUnknown::from_raw(result) };
+
+                                        if return_sig.contains('`') {
+                                            let mut name = return_sig.to_string();
+
+                                            if let Some(backtick_index) = name.rfind('<') {
+                                                name.truncate(backtick_index);
+                                            }
+
+                                            // use the generic name
+                                            let declaration = MetadataReader::find_by_name(name.as_str()).unwrap();
+
+                                            let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig, None, dec.parent.clone(), declaration, Some(instance), scope).into();
+                                            retval.set(ret.into());
+
+                                            return;
+                                        }
+                                        let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig, None, dec.parent.clone(), dec.inner.clone(), Some(instance), scope).into();
+                                        retval.set(ret.into());
+                                        return;
+                                    }
+                                    unsafe { set_ret_val(result, scope, retval, return_type); }
+                                }
+                                Err(_) => {}
+                            }
+                        } else {
+                            retval.set_undefined();
+                        }
+
+                        // todo
+                    })
+                        .data(data.into())
+                        .build(scope);
+
+                    if is_static {
+                        tmpl.set_with_attr(name.unwrap().into(), func.into(), v8::DONT_DELETE);
+                    } else {
+                        proto.set_with_attr(name.unwrap().into(), func.into(), v8::DONT_DELETE);
+                    }
+
+                }
+            }
             _ => {}
         }
     }
 
-
     let object_tmpl = tmpl.instance_template(scope);
 
-    object_tmpl.set_internal_field_count(2);
+    object_tmpl.set_internal_field_count(1);
+
     let object = object_tmpl.new_instance(scope).unwrap();
+
     let declaration = Box::new(DeclarationFFI::new_with_instance(declaration, instance));
     let ext = v8::External::new(scope, Box::into_raw(declaration) as _);
     object.set_internal_field(0, ext.into());
-
-    let object_store = v8::Map::new(scope);
-    object.set_internal_field(1, object_store.into());
 
     let ret = scope.escape(object);
 
@@ -962,7 +1133,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
                             let result = IUnknown::from_raw(ret);
 
-                            let instance = create_ns_ctor_instance_object(clazz.name(), clazz_factory, None, dec.inner.clone(), Some(result), scope);
+                            let instance = create_ns_ctor_instance_object(clazz.name(), Some(clazz_factory), None, dec.inner.clone(), Some(result), scope);
                             retval.set(instance);
 
                             return;
@@ -982,6 +1153,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
         let object_tmpl = v8::ObjectTemplate::new(scope);
         object_tmpl.set_named_property_handler(
             v8::NamedPropertyHandlerConfiguration::new()
+                .query(handle_named_property_query)
                 .getter(handle_named_property_getter)
                 .setter(handle_named_property_setter)
         );
@@ -1108,7 +1280,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                                 }
 
 
-                                let ret: Local<v8::Value> = create_ns_ctor_instance_object(signature.as_str(), dec.instance.clone().unwrap(), dec.parent.clone(), declaration, Some(instance), scope).into();
+                                let ret: Local<v8::Value> = create_ns_ctor_instance_object(signature.as_str(), dec.instance.clone(), dec.parent.clone(), declaration, Some(instance), scope).into();
                                 retval.set(ret.into());
                             }
                         }
@@ -1126,7 +1298,6 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
             tmpl.set(name.unwrap().into(), func.into());
         }
     }
-
 
     let func = tmpl.get_function(scope).unwrap();
     let ret = scope.escape(func);
@@ -1272,7 +1443,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                     struct_size = struct_size + item.size();
                     libffi::middle::Type::try_from(item)
                 })
-                .collect::<Result<Vec<libffi::middle::Type>, AnyError>>();
+                .collect::<Result<Vec<libffi::middle::Type>, crate::error::AnyError>>();
 
         assert!(params.is_ok());
 
@@ -1714,6 +1885,15 @@ fn handle_named_property_setter(scope: &mut v8::HandleScope,
         }
         DeclarationKind::Parameter => {}
     }
+}
+
+
+fn handle_named_property_query(_scope: &mut v8::HandleScope,
+                               _key: v8::Local<v8::Name>,
+                               _args: v8::PropertyCallbackArguments,
+                               mut rv: v8::ReturnValue) {
+    // NONE
+    rv.set_int32(0);
 }
 
 fn handle_named_property_getter(scope: &mut v8::HandleScope,

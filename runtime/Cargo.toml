@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-libloading = "0.8.0"
+regex = "1.8.3"
 anyhow = "1.0.71"
 libffi = "3.2.0"
 v8 = "0.71.0"
@@ -26,8 +26,5 @@ features = [
     "Win32_Foundation",
     "Win32_System_Ole",
     "Win32_System_Com",
-    "Win32_System_Diagnostics_Debug",
-    "UI_Popups",
-    "Data_Json",
-    "Foundation_Collections"
+    "Win32_System_Diagnostics_Debug"
 ]

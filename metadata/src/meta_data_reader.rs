@@ -68,6 +68,7 @@ impl MetadataReader {
 
         let mut flags = 0;
         let mut parent_token = 0;
+
         {
             let result = unsafe {
                 metadata.GetTypeDefProps(

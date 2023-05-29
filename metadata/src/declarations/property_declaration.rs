@@ -1,9 +1,10 @@
 use std::any::Any;
 use std::ffi::OsString;
+use std::ptr::addr_of_mut;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMAGE_CEE_CS_CALLCONV_GENERICINST, IMetaDataImport2, mdtMethodDef, mdtProperty};
+use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMAGE_CEE_CS_CALLCONV_GENERICINST, IMAGE_CEE_CS_CALLCONV_HASTHIS, IMetaDataImport2, mdtMethodDef, mdtProperty};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::field_declaration::FieldDeclaration;
 use crate::declarations::method_declaration::MethodDeclaration;
@@ -76,7 +77,6 @@ impl Declaration for PropertyDeclaration {
 }
 
 impl PropertyDeclaration {
-
     fn make_getter(
         metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
@@ -205,7 +205,7 @@ impl PropertyDeclaration {
     }
 
     pub fn is_static(&self) -> bool {
-        let mut signature = [0_u8; MAX_IDENTIFIER_LENGTH];
+        let mut signature = PCCOR_SIGNATURE::default();
         let mut signature_count = 0;
 
         if let Some(metadata) = self.metadata.as_ref() {
@@ -217,7 +217,7 @@ impl PropertyDeclaration {
                     0 as _,
                     0 as _,
                     0 as _,
-                    signature.as_mut_ptr() as _,
+                    addr_of_mut!(signature.0),
                     &mut signature_count,
                     0 as _,
                     0 as _,
@@ -235,7 +235,9 @@ impl PropertyDeclaration {
             debug_assert!(signature_count > 0);
         }
 
-        (signature[0] as i32 & IMAGE_CEE_CS_CALLCONV_GENERICINST.0) == 0
+        let signature = unsafe { std::slice::from_raw_parts(signature.0, signature_count as usize) };
+
+        (signature[0] as i32 & IMAGE_CEE_CS_CALLCONV_HASTHIS.0) == 0
     }
 
     pub fn is_sealed(&self) -> bool {
