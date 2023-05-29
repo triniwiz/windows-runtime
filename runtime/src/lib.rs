@@ -45,7 +45,7 @@ use metadata::declarations::struct_declaration::StructDeclaration;
 use metadata::declarations::struct_field_declaration::StructFieldDeclaration;
 use metadata::signature::Signature;
 use metadata::value::{Value, Variant};
-use crate::value::{AnyError, ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, MAX_SAFE_INTEGER, MethodCall, MIN_SAFE_INTEGER, NativeType, NativeValue, PropertyCall};
+use crate::value::{AnyError, ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, MAX_SAFE_INTEGER, MethodCall, MIN_SAFE_INTEGER, NativeType, NativeValue, PropertyCall, set_ret_val};
 
 pub struct Runtime {
     isolate: v8::OwnedIsolate,
@@ -204,6 +204,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
     let name = v8::String::new(scope, name).unwrap();
 
     let tmpl = FunctionTemplate::new(scope, handle_ns_func);
+
     tmpl.set_class_name(name);
 
     let proto = tmpl.prototype_template(scope);
@@ -241,7 +242,11 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                                 method.clone()
                             )
                         ),
-                        if is_static { Some(factory.clone()) } else { instance.clone() },
+                        if is_static {
+                            Some(factory.clone())
+                        } else {
+                            instance.clone()
+                        },
                     );
 
                     let declaration = Box::into_raw(Box::new(declaration));
@@ -249,9 +254,9 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
 
                     let ext = v8::External::new(scope, declaration as _);
 
-                    let func = v8::FunctionTemplate::builder(|scope: &mut v8::HandleScope,
-                                                              args: v8::FunctionCallbackArguments,
-                                                              mut retval: v8::ReturnValue| {
+                    let func = FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                                                          args: v8::FunctionCallbackArguments,
+                                                          mut retval: v8::ReturnValue| {
                         let dec = unsafe { Local::<v8::External>::cast(args.data()) };
 
                         let dec = dec.value() as *mut DeclarationFFI;
@@ -266,28 +271,16 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                             method, method.is_sealed(), dec.instance.clone().unwrap(), false,
                         );
 
-
                         let (ret, result) = method.call(scope, &args);
 
-                        println!("HERE ret {} {}", ret, method.is_void());
                         if ret.is_err() {
                             println!(">>> {}", ret.message().to_string())
                         } else if !method.is_void() {
-                            match method.return_type() {
-                                "String" => {
-                                    if result.is_null() {
-                                        retval.set_empty_string();
-                                    } else {
-                                        let string = unsafe { PCWSTR::from_raw(std::mem::transmute(result)) };
-                                        let string = unsafe { string.to_hstring().unwrap() };
-                                        let string = string.to_string();
-                                        let string = v8::String::new(scope, string.as_str()).unwrap();
-                                        retval.set(string.into());
-                                    }
+                            match NativeType::try_from(method.return_type()) {
+                                Ok(return_type) => {
+                                    unsafe { set_ret_val(result, scope, retval, return_type);}
                                 }
-                                _ => {
-                                    retval.set_undefined();
-                                }
+                                Err(_) => {}
                             }
                         } else {
                             retval.set_undefined();
@@ -339,36 +332,22 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
 
                         let kind = lock.kind();
 
-                        println!("property call {} {}", kind, lock.name());
-
                         let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
 
                         let mut method = PropertyCall::new(
                             method, false, dec.instance.clone().unwrap(), false,
                         );
 
-
                         let (ret, result) = method.call(scope, &args);
 
-                        println!("ret {}", ret);
                         if ret.is_err() {
                             println!(">>> {}", ret.message().to_string())
                         } else if !method.is_void() {
-                            match method.return_type() {
-                                "String" => {
-                                    if result.is_null() {
-                                        retval.set_empty_string();
-                                    } else {
-                                        let string = unsafe { PCWSTR::from_raw(std::mem::transmute(result)) };
-                                        let string = unsafe { string.to_hstring().unwrap() };
-                                        let string = string.to_string();
-                                        let string = v8::String::new(scope, string.as_str()).unwrap();
-                                        retval.set(string.into());
-                                    }
+                            match NativeType::try_from(method.return_type()) {
+                                Ok(return_type) => {
+                                    unsafe { set_ret_val(result, scope, retval, return_type);}
                                 }
-                                _ => {
-                                    retval.set_undefined();
-                                }
+                                Err(_) => {}
                             }
                         } else {
                             retval.set_undefined();
@@ -432,8 +411,6 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                                 let name = v8::String::new(scope, method.name());
                                 let is_static = method.is_static();
 
-                                println!("method {}", method.name());
-
                                 let declaration = DeclarationFFI::new_with_instance(
                                     Arc::new(
                                         RwLock::new(
@@ -466,25 +443,14 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
 
                                     let (ret, result) = method.call(scope, &args);
 
-                                    println!("HERE ret {} {}", ret, method.is_void());
                                     if ret.is_err() {
                                         println!(">>> {}", ret.message().to_string())
                                     } else if !method.is_void() {
-                                        match method.return_type() {
-                                            "String" => {
-                                                if result.is_null() {
-                                                    retval.set_empty_string();
-                                                } else {
-                                                    let string = unsafe { PCWSTR::from_raw(std::mem::transmute(result)) };
-                                                    let string = unsafe { string.to_hstring().unwrap() };
-                                                    let string = string.to_string();
-                                                    let string = v8::String::new(scope, string.as_str()).unwrap();
-                                                    retval.set(string.into());
-                                                }
+                                        match NativeType::try_from(method.return_type()) {
+                                            Ok(return_type) => {
+                                                unsafe { set_ret_val(result, scope, retval, return_type);}
                                             }
-                                            _ => {
-                                                retval.set_undefined();
-                                            }
+                                            Err(_) => {}
                                         }
                                     } else {
                                         retval.set_undefined();
@@ -536,8 +502,6 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
 
                                     let kind = lock.kind();
 
-                                    println!("property call {} {}", kind, lock.name());
-
                                     let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
 
                                     let mut method = PropertyCall::new(
@@ -550,25 +514,11 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                                     if ret.is_err() {
                                         println!(">>> {}", ret.message().to_string())
                                     } else if !method.is_void() {
-                                        let return_type = method.return_type();
-                                        match return_type {
-                                            "String" => {
-                                                if result.is_null() {
-                                                    retval.set_empty_string();
-                                                } else {
-                                                    let string = unsafe { PCWSTR::from_raw(std::mem::transmute(result)) };
-                                                    let string = unsafe { string.to_hstring().unwrap() };
-                                                    let string = string.to_string();
-                                                    let string = v8::String::new(scope, string.as_str()).unwrap();
-                                                    retval.set(string.into());
-                                                }
+                                        match NativeType::try_from(method.return_type()) {
+                                            Ok(return_type) => {
+                                                unsafe { set_ret_val(result, scope, retval, return_type);}
                                             }
-                                            _ => {
-                                                let mut buf = result as *mut i32;
-
-                                                unsafe { println!("{:?}", buf) };
-                                                retval.set_undefined();
-                                            }
+                                            Err(_) => {}
                                         }
                                     } else {
                                         retval.set_undefined();
@@ -612,8 +562,6 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                                 let name = v8::String::new(scope, method.name());
                                 let is_static = method.is_static();
 
-                                println!("method {}", method.name());
-
                                 let declaration = DeclarationFFI::new_with_instance(
                                     Arc::new(
                                         RwLock::new(
@@ -646,25 +594,14 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
 
                                     let (ret, result) = method.call(scope, &args);
 
-                                    println!("HERE ret {} {}", ret, method.is_void());
                                     if ret.is_err() {
                                         println!(">>> {}", ret.message().to_string())
                                     } else if !method.is_void() {
-                                        match method.return_type() {
-                                            "String" => {
-                                                if result.is_null() {
-                                                    retval.set_empty_string();
-                                                } else {
-                                                    let string = unsafe { PCWSTR::from_raw(std::mem::transmute(result)) };
-                                                    let string = unsafe { string.to_hstring().unwrap() };
-                                                    let string = string.to_string();
-                                                    let string = v8::String::new(scope, string.as_str()).unwrap();
-                                                    retval.set(string.into());
-                                                }
+                                        match NativeType::try_from(method.return_type()) {
+                                            Ok(return_type) => {
+                                                unsafe { set_ret_val(result, scope, retval, return_type);}
                                             }
-                                            _ => {
-                                                retval.set_undefined();
-                                            }
+                                            Err(_) => {}
                                         }
                                     } else {
                                         retval.set_undefined();
@@ -717,8 +654,6 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
 
                                     let kind = lock.kind();
 
-                                    println!("property call {} {}", kind, lock.name());
-
                                     let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
 
                                     let mut method = PropertyCall::new(
@@ -728,25 +663,14 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
 
                                     let (ret, result) = method.call(scope, &args);
 
-                                    println!("ret {}", ret);
                                     if ret.is_err() {
                                         println!(">>> {}", ret.message().to_string())
                                     } else if !method.is_void() {
-                                        match method.return_type() {
-                                            "String" => {
-                                                if result.is_null() {
-                                                    retval.set_empty_string();
-                                                } else {
-                                                    let string = unsafe { PCWSTR::from_raw(std::mem::transmute(result)) };
-                                                    let string = unsafe { string.to_hstring().unwrap() };
-                                                    let string = string.to_string();
-                                                    let string = v8::String::new(scope, string.as_str()).unwrap();
-                                                    retval.set(string.into());
-                                                }
+                                        match NativeType::try_from(method.return_type()) {
+                                            Ok(return_type) => {
+                                                unsafe { set_ret_val(result, scope, retval, return_type);}
                                             }
-                                            _ => {
-                                                retval.set_undefined();
-                                            }
+                                            Err(_) => {}
                                         }
                                     } else {
                                         retval.set_undefined();
@@ -797,8 +721,6 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
                     let name = v8::String::new(scope, method.name());
                     let is_static = method.is_static();
 
-                    println!("method {}", method.name());
-
                     let declaration = DeclarationFFI::new_with_instance(
                         Arc::new(
                             RwLock::new(
@@ -831,25 +753,14 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
 
                         let (ret, result) = method.call(scope, &args);
 
-                        println!("HERE ret {} {}", ret, method.is_void());
                         if ret.is_err() {
                             println!(">>> {}", ret.message().to_string())
                         } else if !method.is_void() {
-                            match method.return_type() {
-                                "String" => {
-                                    if result.is_null() {
-                                        retval.set_empty_string();
-                                    } else {
-                                        let string = unsafe { PCWSTR::from_raw(std::mem::transmute(result)) };
-                                        let string = unsafe { string.to_hstring().unwrap() };
-                                        let string = string.to_string();
-                                        let string = v8::String::new(scope, string.as_str()).unwrap();
-                                        retval.set(string.into());
-                                    }
+                            match NativeType::try_from(method.return_type()) {
+                                Ok(return_type) => {
+                                    unsafe { set_ret_val(result, scope, retval, return_type);}
                                 }
-                                _ => {
-                                    retval.set_undefined();
-                                }
+                                Err(_) => {}
                             }
                         } else {
                             retval.set_undefined();
@@ -902,8 +813,6 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
 
                         let kind = lock.kind();
 
-                        println!("property call {} {}", kind, lock.name());
-
                         let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
 
                         let mut method = PropertyCall::new(
@@ -913,25 +822,14 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: IUnknown, parent: Opt
 
                         let (ret, result) = method.call(scope, &args);
 
-                        println!("ret {}", ret);
                         if ret.is_err() {
                             println!(">>> {}", ret.message().to_string())
                         } else if !method.is_void() {
-                            match method.return_type() {
-                                "String" => {
-                                    if result.is_null() {
-                                        retval.set_empty_string();
-                                    } else {
-                                        let string = unsafe { PCWSTR::from_raw(std::mem::transmute(result)) };
-                                        let string = unsafe { string.to_hstring().unwrap() };
-                                        let string = string.to_string();
-                                        let string = v8::String::new(scope, string.as_str()).unwrap();
-                                        retval.set(string.into());
-                                    }
+                            match NativeType::try_from(method.return_type()) {
+                                Ok(return_type) => {
+                                    unsafe { set_ret_val(result, scope, retval, return_type);}
                                 }
-                                _ => {
-                                    retval.set_undefined();
-                                }
+                                Err(_) => {}
                             }
                         } else {
                             retval.set_undefined();
@@ -995,8 +893,8 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
     let name = v8::String::new(scope, name).unwrap();
 
     let mut ext = DeclarationFFI::new(Arc::clone(&declaration));
-    ext.parent = parent;
 
+    ext.parent = parent;
 
     let ext = Box::into_raw(Box::new(ext));
 
@@ -1034,11 +932,16 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                 unsafe {
                     let is_sealed = clazz.is_sealed();
                     for ctor in clazz.initializers() {
+                        let number_of_parameters = ctor.number_of_parameters();
+                        if number_of_parameters != length as usize {
+                            continue;
+                        }
                         let mut method = MethodCall::new(
                             ctor, is_sealed, clazz_factory.clone(), true,
                         );
 
                         let (ret, result) = method.call(scope, &args);
+
                         if ret.is_ok() {
                             let result = unsafe { IUnknown::from_raw(result) };
 
@@ -1049,15 +952,15 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                             let res = unsafe {
                                 ((*vtable).QueryInterface)(
                                     result.as_raw(),
-                                    &IInspectable::IID,
-                                    &mut ret as *mut _ as *mut *const c_void,
+                                    &IUnknown::IID,
+                                    std::mem::transmute(&mut ret),
                                 )
                             };
 
                             assert!(res.is_ok());
                             assert!(!ret.is_null());
 
-                            let result = unsafe { IUnknown::from_raw(ret) };
+                            let result = IUnknown::from_raw(ret);
 
                             let instance = create_ns_ctor_instance_object(clazz.name(), clazz_factory, None, dec.inner.clone(), Some(result), scope);
                             retval.set(instance);
@@ -1072,9 +975,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                     }
                 }
             }
-            DeclarationKind::Struct => {
-                let clazz = lock.as_any().downcast_ref::<StructDeclaration>().unwrap();
-            }
+            DeclarationKind::Struct => {}
             _ => {}
         }
 
@@ -1156,7 +1057,6 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
                 let signature = Signature::to_string(method.metadata().unwrap(), &return_type);
 
-                println!("ret type {}", signature);
 
                 let mut method = MethodCall::new(
                     method, method.is_sealed(), dec.instance.clone().unwrap(), false,
@@ -1164,7 +1064,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
                 let (ret, result) = method.call(scope, &args);
 
-                println!("ret {}", signature.as_str());
+
                 if ret.is_ok() {
                     unsafe {
                         match signature.as_str() {
@@ -1233,7 +1133,6 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
     ret.into()
 }
-
 
 fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, scope: &mut v8::HandleScope<'a>) -> Local<'a, v8::Value> {
     let scope = &mut v8::EscapableHandleScope::new(scope);
@@ -1344,6 +1243,9 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                         NativeType::Struct(_) => {
                             ffi_parse_struct_arg(scope, field)
                         }
+                        NativeType::String => {
+                            ffi_parse_string_arg(scope, field)
+                        }
                     };
                     match value {
                         Ok(value) => {
@@ -1445,7 +1347,6 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
             for field in struct_dec.fields() {
                 if field.name() == key.as_str() {
                     if let Some((buffer, types)) = instance {
-
                         let mut current_field_position = 0;
                         for field_type in types.iter() {
                             let size = field_type.size();
@@ -1531,7 +1432,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
 
                                             let ret: f32 = if cfg!(target_endian = "big") {
                                                 f32::from_be_bytes(<[u8; 4]>::try_from(slice).unwrap())
-                                            }else {
+                                            } else {
                                                 f32::from_le_bytes(<[u8; 4]>::try_from(slice).unwrap())
                                             };
 
@@ -1549,6 +1450,9 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                                         NativeType::Buffer => {}
                                         NativeType::Function => {}
                                         NativeType::Struct(_) => {}
+                                        NativeType::String => {
+                                            // TODO
+                                        }
                                     }
                                 }
                             }
@@ -1556,7 +1460,6 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                             current_field_position = current_field_position + 1;
 
                             offset = offset + size as isize;
-
                         }
                     }
                     break;
@@ -1577,7 +1480,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
 
             let dec = dec.value() as *mut DeclarationFFI;
 
-            let instance = unsafe { (&mut *dec).struct_instance.as_mut()};
+            let instance = unsafe { (&mut *dec).struct_instance.as_mut() };
 
             let mut dec = unsafe { &mut *dec };
 
@@ -1591,7 +1494,6 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
             for field in struct_dec.fields() {
                 if field.name() == key.as_str() {
                     if let Some((buffer, types)) = instance {
-
                         let field = value;
 
                         let mut current_field_position = 0;
@@ -1599,8 +1501,6 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                             let size = field_type.size();
 
                             if position == current_field_position {
-
-
                                 let value = match field_type {
                                     NativeType::Void => {
                                         // todo
@@ -1657,6 +1557,9 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                                     NativeType::Struct(_) => {
                                         ffi_parse_struct_arg(scope, field)
                                     }
+                                    NativeType::String => {
+                                        ffi_parse_string_arg(scope, field)
+                                    }
                                 };
                                 match value {
                                     Ok(value) => {
@@ -1669,8 +1572,6 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                                             let slice = std::slice::from_raw_parts_mut(buffer, size);
 
                                             std::ptr::copy(value, slice.as_mut_ptr(), size);
-
-
                                         }
                                     }
                                     Err(err) => {
@@ -1685,15 +1586,12 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                             current_field_position = current_field_position + 1;
 
                             offset = offset + size as isize;
-
                         }
-
                     }
                     break;
                 }
                 position = position + 1;
             }
-
         };
 
         object_tmpl.set_named_property_handler(
@@ -1719,7 +1617,6 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
 
     ret.into()
 }
-
 
 fn init_meta(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, context: Local<v8::Context>) {
     let mut global = context.global(scope);
@@ -1982,7 +1879,6 @@ fn handle_named_property_getter(scope: &mut v8::HandleScope,
                 let dec = lock.as_any().downcast_ref::<ClassDeclaration>();
 
                 if let Some(dec) = dec {
-                    println!("dec {}", dec.name());
                     for method in dec.methods() {
                         let mut name = method.overload_name();
                         if name.is_empty() {

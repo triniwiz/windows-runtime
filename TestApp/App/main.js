@@ -10,6 +10,6 @@
 //console.log("\n");
 //console.log("Hello\n");
 
-const dialog = new Windows.UI.Popups.MessageDialog("Hello, World!");
+const dialog = new Windows.UI.Popups.MessageDialog("Hello, World!", "From NativeScript");
 dialog.ShowAsync();
 

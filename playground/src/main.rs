@@ -78,20 +78,27 @@ fn run_js_app() {
     let script = r#"
    console.log('Hello From NativeScript running in a Windows CLI App\n');
    console.log(performance.now() + '\n');
-   console.dir(global + '\n');
+  // console.dir(global + '\n');
    //console.log(Windows.UI.Xaml);
    // console.log('Default', Windows.UI.Popups.Placement.Default, Windows.UI.Popups.Placement.Default === 0);
    //  console.log('Right', Windows.UI.Popups.Placement.Right, Windows.UI.Popups.Placement.Right === 4);
    //   console.log('Bar', Windows.UI.Text.TabAlignment.Bar, Windows.UI.Text.TabAlignment.Bar == 4);
 
-    // const map = new Windows.Foundation.Collections.StringMap();
-    // console.log(map);
-    // map.Insert("First", "Osei");
-    // map.Insert("Last", "Osei");
-    //
-    // console.log(map.Lookup("First"), map.Lookup("Last"));
+     const map = new Windows.Foundation.Collections.StringMap();
 
-/*    const boolean = Windows.Data.Json.JsonValue.CreateBooleanValue(true);
+     const first = map.Insert("First", "Osei");
+
+     const last = map.Insert("Last", "Fortune");
+
+     console.log("First did insert", first);
+
+     console.log("Last did insert", last);
+
+     console.log("Updated",map.Insert("First", "Osei"));
+
+      console.log(map.Lookup("First") === "Osei", map.Lookup("Last") === "Fortune");
+
+    const boolean = Windows.Data.Json.JsonValue.CreateBooleanValue(true);
 
     const number = Windows.Data.Json.JsonValue.CreateNumberValue(100);
 
@@ -105,33 +112,37 @@ fn run_js_app() {
 
     string = Windows.Data.Json.JsonValue.CreateStringValue(JSON.stringify({greet: "Hey"}));
 
+    console.log("ValueType",string.ValueType, boolean.ValueType);
 
-    console.log("ValueType",string.ValueType);
+    console.log("GetBoolean",boolean.GetBoolean());
 
-    console.log(boolean.GetBoolean());
+    console.log("GetNumber",number.GetNumber());
 
-    console.log(number.GetNumber());
+    console.log("GetString",string.GetString());
 
-    console.log(string.GetString());
-    */
 
-    // const uri = new Windows.Foundation.Uri("http://www.bing.com");
-    //
-    //  uri.AbsoluteUri();
+    // const method = new Windows.Web.Http.HttpMethod('GET');
 
-   //const json = new Windows.Data.Json.JsonObject();
+    const uri = new Windows.Foundation.Uri("http://www.bing.com/");
 
-   //console.log(json);
+    console.log('AbsoluteUri',uri.AbsoluteUri, uri.AbsoluteUri === "http://www.bing.com/");
 
+  const json = new Windows.Data.Json.JsonObject();
+
+   console.log(json.ToString());
+
+/*
    const a = new Windows.Foundation.Point({X: 1,Y: 2});
 
    const b = new Windows.Foundation.Point({X: 3,Y: 4});
 
-   console.log(a.toString());
+   console.log(a.toString(), b.toString());
 
-    console.log(a.X, a.Y, b.X,b.Y);
+   console.log(a.X, a.Y, b.X,b.Y);
 
    const rect = new Windows.Foundation.Rect({ X: 100, Y:200, Width: 300, Height: 400});
+
+   console.log(rect.toString());
 
    console.log(rect.X, rect.Y, rect.Width, rect.Height);
 
@@ -139,7 +150,9 @@ fn run_js_app() {
 
    console.log(rect.X, rect.Y, rect.Width, rect.Height);
 
-  // console.log("JsonObject String", json,json.ToString());
+   */
+
+//  console.log("JsonObject String", json,json.ToString());
 
    //console.log("JsonObject String Size", json,json.Size);
 

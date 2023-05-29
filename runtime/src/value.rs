@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::ffi::c_void;
 use std::fmt::{Display, Formatter};
 use std::{fmt, mem};
-use std::mem::MaybeUninit;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::os::raw::c_ushort;
 use std::ptr::{addr_of, addr_of_mut};
 
@@ -26,13 +26,15 @@ use std::sync::Arc;
 use libffi::middle::{Arg, Cif};
 use v8::FunctionCallbackArguments;
 use windows::core::{ComInterface, IInspectable, IUnknown, Interface, IntoParam, Type, GUID, HRESULT, HSTRING, IUnknown_Vtbl, IInspectable_Vtbl};
-use windows::Data::Json::{IJsonValue, JsonValue};
+use windows::Data::Json::{IJsonObject_Vtbl, IJsonValue, JsonObject, JsonValue};
 use windows::Win32::System::Com::IDispatch;
 use windows::Win32::System::WinRT::IActivationFactory;
 use windows::Win32::System::WinRT::Metadata::{CorElementType, ELEMENT_TYPE_CLASS};
 use metadata::{get_method, print_vtable_names};
 
 use anyhow::Error;
+use chrono::Local;
+use windows::Foundation::{IStringable, IStringable_Vtbl};
 
 pub(crate) const MAX_SAFE_INTEGER: isize = 9007199254740991;
 pub(crate) const MIN_SAFE_INTEGER: isize = -9007199254740991;
@@ -57,6 +59,7 @@ pub enum NativeType {
     Buffer,
     Function,
     Struct(Box<[NativeType]>),
+    String
 }
 
 /// A simple error type that lets the creator specify both the error message and
@@ -106,65 +109,67 @@ pub fn type_error(message: impl Into<Cow<'static, str>>) -> Error {
 
 impl NativeType {
     pub fn size(&self) -> usize {
-        unsafe { match self {
-            NativeType::Void => {
-                types::void.size
-            }
-            NativeType::Bool | NativeType::U8 => {
-                types::uint8.size
-            }
-            NativeType::I8 => {
-                types::sint8.size
-            }
-            NativeType::U16 => {
-                types::uint16.size
-            }
-            NativeType::I16 => {
-                types::sint16.size
-            }
-            NativeType::U32 => {
-                types::uint32.size
-            }
-            NativeType::I32 => {
-                types::sint32.size
-            }
-            NativeType::U64 => {
-                types::uint64.size
-            }
-            NativeType::I64 => {
-                types::sint64.size
-            }
-            NativeType::USize => {
-                let usize_type = *(libffi::middle::Type::usize().as_raw_ptr());
-                usize_type.size
-            }
-            NativeType::ISize => {
-                let isize_type = *(libffi::middle::Type::isize().as_raw_ptr());
-                isize_type.size
-            }
-            NativeType::F32 => {
-                types::float.size
-            }
-            NativeType::F64 => {
-                types::double.size
-            }
-            NativeType::Pointer => {
-                types::pointer.size
-            }
-            NativeType::Buffer => {
-                types::pointer.size
-            }
-            NativeType::Function => {
-                types::pointer.size
-            }
-            NativeType::Struct(ref value) => {
-                let mut size = 0_usize;
-                for native_type in value.iter() {
-                    size = size + 1 + native_type.size();
+        unsafe {
+            match self {
+                NativeType::Void => {
+                    types::void.size
                 }
-                size
+                NativeType::Bool | NativeType::U8 => {
+                    types::uint8.size
+                }
+                NativeType::I8 => {
+                    types::sint8.size
+                }
+                NativeType::U16 => {
+                    types::uint16.size
+                }
+                NativeType::I16 => {
+                    types::sint16.size
+                }
+                NativeType::U32 => {
+                    types::uint32.size
+                }
+                NativeType::I32 => {
+                    types::sint32.size
+                }
+                NativeType::U64 => {
+                    types::uint64.size
+                }
+                NativeType::I64 => {
+                    types::sint64.size
+                }
+                NativeType::USize => {
+                    let usize_type = *(libffi::middle::Type::usize().as_raw_ptr());
+                    usize_type.size
+                }
+                NativeType::ISize => {
+                    let isize_type = *(libffi::middle::Type::isize().as_raw_ptr());
+                    isize_type.size
+                }
+                NativeType::F32 => {
+                    types::float.size
+                }
+                NativeType::F64 => {
+                    types::double.size
+                }
+                NativeType::Pointer | NativeType::String => {
+                    types::pointer.size
+                }
+                NativeType::Buffer => {
+                    types::pointer.size
+                }
+                NativeType::Function => {
+                    types::pointer.size
+                }
+                NativeType::Struct(ref value) => {
+                    let mut size = 0_usize;
+                    for native_type in value.iter() {
+                        size = size + 1 + native_type.size();
+                    }
+                    size
+                }
             }
-        } }
+        }
     }
 }
 
@@ -186,7 +191,7 @@ impl TryFrom<NativeType> for libffi::middle::Type {
             NativeType::ISize => libffi::middle::Type::isize(),
             NativeType::F32 => libffi::middle::Type::f32(),
             NativeType::F64 => libffi::middle::Type::f64(),
-            NativeType::Pointer | NativeType::Buffer | NativeType::Function => {
+            NativeType::Pointer | NativeType::Buffer | NativeType::Function | NativeType::String => {
                 libffi::middle::Type::pointer()
             }
             NativeType::Struct(fields) => {
@@ -214,7 +219,7 @@ impl TryFrom<&str> for NativeType {
         Ok(match native_type {
             "Void" => NativeType::Void,
             "Uint8" => NativeType::U8,
-            "Bool" => NativeType::Bool,
+            "Boolean" => NativeType::Bool,
             "Int8" => NativeType::I8,
             "UInt16" => NativeType::U16,
             "Int16" => NativeType::I16,
@@ -226,6 +231,7 @@ impl TryFrom<&str> for NativeType {
             "ISize" => NativeType::ISize,
             "Single" => NativeType::F32,
             "Double" => NativeType::F64,
+            "String" | "Char16" => NativeType::String,
             _ => {
                 return Err(type_error("Unsupported type"));
             }
@@ -250,9 +256,11 @@ pub union NativeValue {
     pub f32_value: f32,
     pub f64_value: f64,
     pub pointer: *mut c_void,
+    pub string: ManuallyDrop<HSTRING>
 }
 
 impl NativeValue {
+
     pub unsafe fn as_arg(&self, native_type: &NativeType) -> Arg {
         match native_type {
             NativeType::Void => unreachable!(),
@@ -273,9 +281,12 @@ impl NativeValue {
                 Arg::new(&self.pointer)
             }
             NativeType::Struct(_) => Arg::new(&*self.pointer),
+            NativeType::String => {
+                let addr = &*self.string;
+                Arg::new::<*mut c_void>(mem::transmute(addr))
+            }
         }
     }
-
 
     // SAFETY: native_type must correspond to the type of value represented by the union field
     #[inline]
@@ -284,7 +295,7 @@ impl NativeValue {
         scope: &mut v8::HandleScope<'a>,
         native_type: NativeType,
     ) -> v8::Local<v8::Value> {
-       let value = match native_type {
+        let value = match native_type {
             NativeType::Void => {
                 let local_value: v8::Local<v8::Value> = v8::undefined(scope).into();
                 local_value
@@ -387,19 +398,36 @@ impl NativeValue {
                 let local_value: v8::Local<v8::Value> = v8::null(scope).into();
                 local_value
             }
+            NativeType::String => {
+                let local_value: v8::Local<v8::Value> =
+                    v8::String::new_from_two_byte(scope, self.string.as_wide(), v8::NewStringType::Normal).unwrap().into();
+                local_value
+            }
         };
 
         let mut scope = v8::EscapableHandleScope::new(scope);
 
         scope.escape(value)
-
     }
-
 }
 
 
 // SAFETY: unsafe trait must have unsafe implementation
 unsafe impl Send for NativeValue {}
+
+
+#[inline]
+pub fn ffi_parse_string_arg(
+    scope: &mut v8::HandleScope,
+    arg: v8::Local<v8::Value>,
+) -> std::result::Result<NativeValue, AnyError> {
+    let string_value = v8::Local::<v8::String>::try_from(arg)
+        .map_err(|_| type_error("Invalid FFI String type, expected String"))?;
+
+    let string = string_value.to_rust_string_lossy(scope);
+
+    Ok(NativeValue { string: ManuallyDrop::new(HSTRING::from(string)) })
+}
 
 
 #[inline]
@@ -688,6 +716,125 @@ pub fn ffi_parse_function_arg(
 }
 
 
+#[inline]
+pub unsafe fn set_ret_val(value:*mut c_void, scope: &mut v8::HandleScope, mut rv: v8::ReturnValue, native_type: NativeType){
+    match native_type {
+        NativeType::Void => {
+            unimplemented!()
+        }
+        NativeType::Bool => {
+            // just check if null :D
+            rv.set_bool(!value.is_null());
+        }
+        NativeType::U8 => {
+            let ret: &u8 = mem::transmute(value as *const u8);
+            rv.set_uint32(
+                *ret as u32
+            );
+        }
+        NativeType::I8 => {
+            let ret: &i8 = mem::transmute(value as *const i8);
+            rv.set_int32(
+                *ret as i32
+            );
+        }
+        NativeType::U16 => {
+            let ret: &u16 = mem::transmute(value as *const u16);
+            rv.set_uint32(
+                *ret as u32
+            );
+        }
+        NativeType::I16 => {
+            let ret: &i16 = mem::transmute(value as *const i16);
+            rv.set_int32(
+                *ret as i32
+            );
+        }
+        NativeType::U32 => {
+            let ret: &u32 = mem::transmute(value as *const u32);
+            rv.set_uint32(
+                *ret
+            );
+        }
+        NativeType::I32 => {
+            let ret: &i32 = mem::transmute(value as *const i32);
+            rv.set_int32(
+                *ret
+            );
+        }
+        NativeType::U64 => {
+            let ret: u64 = *mem::transmute::<*const u64, &u64>(value as *const u64);
+
+            let local_value: v8::Local<v8::Value> =
+                if ret > MAX_SAFE_INTEGER as u64 {
+                    v8::BigInt::new_from_u64(scope, ret).into()
+                } else {
+                    v8::Number::new(scope, ret as f64).into()
+                };
+
+            rv.set(local_value);
+        }
+        NativeType::I64 => {
+            let ret: i64 = *mem::transmute::<*const i64, &i64>(value as *const i64);
+            let local_value: v8::Local<v8::Value> =
+                if ret > MAX_SAFE_INTEGER as i64 || ret < MIN_SAFE_INTEGER as i64
+                {
+                    v8::BigInt::new_from_i64(scope, ret).into()
+                } else {
+                    v8::Number::new(scope, ret as f64).into()
+                };
+            rv.set(local_value);
+        }
+        NativeType::USize => {}
+        NativeType::ISize => {}
+        NativeType::F32 => {
+            let slice = unsafe {std::slice::from_raw_parts(value as *const u8, 4)};
+            let ret: f32 = if cfg!(target_endian = "big") {
+                f32::from_be_bytes(<[u8; 4]>::try_from(slice).unwrap())
+            } else {
+                f32::from_le_bytes(<[u8; 4]>::try_from(slice).unwrap())
+            };
+
+            rv.set(
+                v8::Number::new(scope, ret as f64).into()
+            );
+        }
+        NativeType::F64 => {
+            let slice = unsafe {std::slice::from_raw_parts((&value) as *const _ as *const u8, 8)};
+
+            let ret: f64 = if cfg!(target_endian = "big") {
+                f64::from_be_bytes(<[u8; 8]>::try_from(slice).unwrap())
+            } else {
+                f64::from_le_bytes(<[u8; 8]>::try_from(slice).unwrap())
+            };
+            rv.set_double(ret);
+        }
+        NativeType::Pointer => {
+            // trying something
+            let size = mem::size_of_val(&*value);
+
+            // enum value ??
+            if size == 1 {
+
+                let result = value as *const _ as i8;
+
+                rv.set_int32(result as i32);
+            }
+
+        }
+        NativeType::Buffer => {}
+        NativeType::Function => {}
+        NativeType::Struct(_) => {}
+        NativeType::String => {
+            let string: HSTRING = unsafe { mem::transmute(value) };
+            let string = string.to_string();
+            let string = v8::String::new(scope, string.as_str()).unwrap();
+            rv.set(string.into());
+        }
+    }
+}
+
+
 pub struct MethodCall {
     index: usize,
     number_of_parameters: usize,
@@ -718,7 +865,11 @@ impl MethodCall {
         is_sealed: bool,
         interface: IUnknown,
         is_initializer: bool,
-    ) -> MethodCall {
+    ) -> Self {
+        let signature = method.return_type();
+
+        let return_type = Signature::to_string(method.metadata().unwrap(), &signature);
+
         let number_of_parameters = method.number_of_parameters();
 
         let mut index = 0 as usize;
@@ -763,11 +914,7 @@ impl MethodCall {
 
         index = index.saturating_add(6); // account for IInspectable vtable overhead
 
-        //  index = index.saturating_add(mem::size_of::<windows::core::IInspectable_Vtbl>());
-
         // let mut interface_ptr: *mut c_void = std::ptr::null_mut(); // IActivationFactory
-
-        let ii = unsafe { IInspectable::from_raw(interface.clone().into_raw()) };
 
         let vtable = interface.vtable();
 
@@ -881,9 +1028,7 @@ impl MethodCall {
             }
         } else {
             if !is_void {
-                unsafe {
-                    parameter_types.push(NativeType::Pointer);
-                }
+                parameter_types.push(NativeType::Pointer);
             }
         }
 
@@ -901,10 +1046,8 @@ impl MethodCall {
             libffi::middle::Type::i32(),
         );
 
-        // let interface = unsafe { IUnknown::from_raw(interface_ptr as *mut c_void) };
+         let interface = unsafe { IUnknown::from_raw(interface_ptr as *mut c_void) };
 
-        let signature = method.return_type();
-        let return_type = Signature::to_string(method.metadata().unwrap(), &signature);
         Self {
             cif,
             index,
@@ -927,15 +1070,14 @@ impl MethodCall {
         scope: &mut v8::HandleScope,
         args: &FunctionCallbackArguments,
     ) -> (HRESULT, *mut c_void) {
+
         let number_of_abi_parameters = self.number_of_abi_parameters;
 
         let mut arguments: Vec<NativeValue> = Vec::new();
 
         arguments.reserve(number_of_abi_parameters);
 
-        unsafe { arguments.push(NativeValue { pointer: self.interface.as_raw() }) };
-
-        let mut string_buf: Vec<HSTRING> = Vec::new();
+        unsafe { arguments.push(NativeValue { pointer: mem::transmute_copy(&self.interface) }) };
 
         for (i, parameter) in self.parameters.iter().enumerate() {
             let type_ = parameter.type_();
@@ -943,162 +1085,94 @@ impl MethodCall {
 
             let signature = Signature::to_string(metadata, &type_);
 
-            println!("sig {}", signature.as_str());
+            let value = args.get(i as i32);
 
-            let string = args.get(i as i32).to_string(scope).unwrap();
+            let native_type = NativeType::try_from(signature.as_str());
 
-            let string = string.to_rust_string_lossy(scope);
+            // todo error
+            assert!(native_type.is_ok());
 
-            let mut string = HSTRING::from(string);
+            let native_type = native_type.unwrap();
 
-            arguments.push(NativeValue { pointer: string.as_ptr() as *mut _ });
-
-            string_buf.push(string);
-
-
-            /*
-            match signature.as_str() {
-                "String" => {
-                    let string = args.get(i as i32).to_string(scope).unwrap();
-
-                    let string = HSTRING::from(string.to_rust_string_lossy(scope));
-
-                    arguments.push(NativeValue {pointer: addr_of!(string) as *mut c_void});
-
-                    string_buf.push(string);
+            let value = match native_type {
+                NativeType::Void => {
+                    // todo
+                    unreachable!()
                 }
-                "Boolean" => {
-                    let value = args.get(i as i32).boolean_value(scope);
-                    // arguments.push(
-                    //     addr_of!(value) as *mut c_void
-                    // )
-
-                    arguments.push(unsafe { mem::transmute(&value) })
+                NativeType::Bool => {
+                    ffi_parse_bool_arg(value)
                 }
-                "UInt8" => {
-                    let value = args.get(i as i32).uint32_value(scope).unwrap() as u8;
-
-                    arguments.push(unsafe { mem::transmute(&value) })
+                NativeType::U8 => {
+                    ffi_parse_u8_arg(value)
                 }
-                "UInt16" => {
-                    let value = args.get(i as i32).uint32_value(scope).unwrap() as u16;
-
-                    arguments.push(unsafe { mem::transmute(&value) })
+                NativeType::I8 => {
+                    ffi_parse_i8_arg(value)
                 }
-                "UInt32" => {
-                    let value = args.get(i as i32).uint32_value(scope).unwrap();
-
-                    arguments.push(unsafe { mem::transmute(&value) })
+                NativeType::U16 => {
+                    ffi_parse_u16_arg(value)
                 }
-                "UInt64" => {
-                    let value = args.get(i as i32);
-                    if value.is_big_int() {
-                        let value = value.to_big_int(scope).unwrap().u64_value();
-
-                        arguments.push(unsafe { mem::transmute(&value.0) })
-                    } else {
-                        let value = args.get(i as i32).uint32_value(scope).unwrap() as u64;
-
-                        arguments.push(unsafe { mem::transmute(&value) })
-                    }
+                NativeType::I16 => {
+                    ffi_parse_i16_arg(value)
                 }
-                "Int8" => {
-                    let value = args.get(i as i32).int32_value(scope).unwrap() as i8;
-
-                    arguments.push(unsafe { mem::transmute(&value) })
+                NativeType::U32 => {
+                    ffi_parse_u32_arg(value)
                 }
-                "Int16" => {
-                    let value = args.get(i as i32).int32_value(scope).unwrap() as i16;
-
-                    arguments.push(unsafe { mem::transmute(&value) })
+                NativeType::I32 => {
+                    ffi_parse_i32_arg(value)
                 }
-                "Int32" => {
-                    let value = args.get(i as i32).int32_value(scope).unwrap();
-
-                    arguments.push(unsafe { mem::transmute(&value) })
+                NativeType::U64 => {
+                    ffi_parse_u64_arg(scope, value)
                 }
-                "Int64" => {
-                    let value = args.get(i as i32);
-                    if value.is_big_int() {
-                        let value = value.to_big_int(scope).unwrap().i64_value();
-
-                        arguments.push(unsafe { mem::transmute(&value.0) })
-                    } else {
-                        let value = args.get(i as i32).int32_value(scope).unwrap() as i64;
-
-                        arguments.push(unsafe { mem::transmute(&value) })
-                    }
+                NativeType::I64 => {
+                    ffi_parse_i16_arg(value)
                 }
-                "Single" => {
-                    let value = args.get(i as i32).number_value(scope).unwrap() as f32;
-
-                    arguments.push(unsafe { mem::transmute(&value) })
+                NativeType::USize => {
+                    ffi_parse_usize_arg(scope, value)
                 }
-                "Double" => {
-                    let value = args.get(i as i32).number_value(scope).unwrap();
-
-                    arguments.push(unsafe { mem::transmute(&value) })
+                NativeType::ISize => {
+                    ffi_parse_isize_arg(scope, value)
                 }
-                _ => {
-                    let value = args.get(i as i32);
-
-                    if value.is_object() {
-                        let value = value.to_object(scope).unwrap();
-
-                        let dec = value.get_internal_field(scope, 0).unwrap();
-
-                        let dec = unsafe { v8::Local::<v8::External>::cast(dec) };
-
-                        let dec = dec.value() as *mut DeclarationFFI;
-
-                        let dec = unsafe { &*dec };
-
-                        let instance = dec.instance.clone();
-                        match instance {
-                            None => {
-                                arguments.push(std::ptr::null_mut());
-                            }
-                            Some(mut instance) => {
-                                unsafe {
-                                    arguments
-                                        .push(&mut instance.into_raw() as *mut _ as *mut c_void)
-                                };
-                            }
-                        }
-                    }
+                NativeType::F32 => {
+                    ffi_parse_f32_arg(value)
                 }
-            }
+                NativeType::F64 => {
+                    ffi_parse_f64_arg(value)
+                }
+                NativeType::Pointer => {
+                    ffi_parse_pointer_arg(scope, value)
+                }
+                NativeType::Buffer => {
+                    ffi_parse_buffer_arg(scope, value)
+                }
+                NativeType::Function => {
+                    ffi_parse_function_arg(scope, value)
+                }
+                NativeType::Struct(_) => {
+                    ffi_parse_struct_arg(scope, value)
+                }
+                NativeType::String => {
+                    ffi_parse_string_arg(scope, value)
+                }
+            };
 
+            // todo error
+            assert!(value.is_ok());
 
-            */
+            let value = value.unwrap();
+
+            arguments.push(value);
         }
 
         let mut result: *mut c_void = std::ptr::null_mut();
 
-        let result_ptr: *mut *mut *mut c_void = &mut addr_of_mut!(result);
 
         if self.is_initializer {
-            // result_ptr as *mut c_void
-            unsafe { arguments.push(NativeValue { pointer: addr_of_mut!(result) as *mut _ as *mut c_void }) };
+            unsafe { arguments.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void }) };
         } else {
             if !self.is_void {
-                match self.return_type.as_str() {
-                    "Boolean" | "String" => {
-                        // arguments.push(&mut result as *mut _ as *mut c_void);
-                        // arguments.push(&mut result as *mut _ as *mut c_void);
-                        arguments.push(NativeValue { pointer: result });
-                    }
-                    _ => {
-                        // arguments.push(&mut result as *mut _ as *mut c_void);
-                        //arguments.push(result_ptr as *mut c_void);
-
-                        arguments.push(NativeValue { pointer: result });
-                    }
-                }
+                arguments.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
             }
         }
-
-        // print_vtable_names(&self.interface);
 
         let mut func = std::ptr::null_mut();
 
@@ -1114,7 +1188,10 @@ impl MethodCall {
             .iter()
             .enumerate()
             // SAFETY: Creating a `Arg` from a `NativeValue` is pretty safe.
-            .map(|(i, v)| unsafe { v.as_arg(self.parameter_types.get(i).unwrap()) })
+            .map(|(i, v)| {
+                println!("{}", i);
+                unsafe { v.as_arg(self.parameter_types.get(i).unwrap()) }
+            })
             .collect();
 
 
@@ -1148,6 +1225,7 @@ impl MethodCall {
             )
         };
 
+
         (HRESULT(ret), result)
     }
 }
@@ -1161,10 +1239,10 @@ pub struct PropertyCall {
     is_void: bool,
     is_setter: bool,
     iid: GUID,
-    cif: ffi_cif,
+    cif: Cif,
     parent_interface: IUnknown,
     interface: IUnknown,
-    parameter_types: Vec<*mut ffi_type>,
+    parameter_types: Vec<NativeType>,
     parameters: Vec<ParameterDeclaration>,
     return_type: String,
     pub(crate) declaration: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>>,
@@ -1239,17 +1317,18 @@ impl PropertyCall {
 
         let vtable = interface.vtable();
 
-        // let interface_ptr_ptr = addr_of_mut!(interface_ptr);
+        let mut interface_ptr: *mut c_void = std::ptr::null_mut();
 
         let result = unsafe {
             ((*vtable).QueryInterface)(
                 interface.as_raw(),
                 &iid,
-                mem::transmute(&mut interface_ptr),
+                &mut interface_ptr as *mut _ as *mut *const c_void
             )
         };
 
         assert!(result.is_ok());
+        assert!(!interface_ptr.is_null());
 
         let is_sealed = method.is_sealed();
 
@@ -1278,12 +1357,12 @@ impl PropertyCall {
 
         let number_of_abi_parameters = number_of_parameters + other_params;
 
-        let mut parameter_types: Vec<*mut ffi_type> = Vec::new();
+        let mut parameter_types: Vec<NativeType> = Vec::new();
 
         parameter_types.reserve(number_of_abi_parameters);
 
         unsafe {
-            parameter_types.push(&mut types::pointer);
+            parameter_types.push(NativeType::Pointer);
         }
 
         for parameter in method.parameters().iter() {
@@ -1293,16 +1372,49 @@ impl PropertyCall {
             let signature = Signature::to_string(metadata, &type_);
 
             match signature.as_str() {
+                "Void" => unsafe {
+                    parameter_types.push(NativeType::Void);
+                },
                 "String" => unsafe {
-                    parameter_types.push(&mut types::pointer);
+                    parameter_types.push(NativeType::Pointer);
                 },
                 "Boolean" => unsafe {
-                    parameter_types.push(&mut types::uint8);
+                    parameter_types.push(NativeType::Bool);
+                },
+                "UInt8" => unsafe {
+                    parameter_types.push(NativeType::U8);
+                },
+                "UInt16" => unsafe {
+                    parameter_types.push(NativeType::U16);
+                },
+                "UInt32" => unsafe {
+                    parameter_types.push(NativeType::U32);
+                },
+                "UInt64" => unsafe {
+                    parameter_types.push(NativeType::U64);
+                },
+                "Int8" => unsafe {
+                    parameter_types.push(NativeType::I8);
+                },
+                "Int16" => unsafe {
+                    parameter_types.push(NativeType::I16);
+                },
+                "Int32" => unsafe {
+                    parameter_types.push(NativeType::I32);
+                },
+                "Int64" => unsafe {
+                    parameter_types.push(NativeType::I64);
+                },
+                "Single" => unsafe {
+                    parameter_types.push(NativeType::F32);
+                },
+                "Double" => unsafe {
+                    parameter_types.push(NativeType::F64);
                 },
                 _ => {
                     // objects
                     unsafe {
-                        parameter_types.push(&mut types::pointer);
+                        parameter_types.push(NativeType::Pointer);
                     }
                 }
             }
@@ -1311,60 +1423,41 @@ impl PropertyCall {
         if is_initializer {
             if is_composition {
                 unsafe {
-                    parameter_types.push(&mut types::pointer);
+                    parameter_types.push(NativeType::Pointer);
                 }
                 unsafe {
-                    parameter_types.push(&mut types::pointer);
+                    parameter_types.push(NativeType::Pointer);
                 }
             }
 
             unsafe {
-                parameter_types.push(&mut types::pointer);
+                parameter_types.push(NativeType::Pointer);
             }
         } else {
             if !is_void {
-                if return_type.as_str() == "UInt32" {
-                    unsafe {
-                        parameter_types.push(&mut types::sint32);
-                    }
-                } else if return_type.as_str() == "Boolean" {
-                    unsafe {
-                        parameter_types.push(&mut types::uint8);
-                    }
-                } else if return_type.as_str() == "String" {
-                    unsafe {
-                        parameter_types.push(&mut types::pointer);
-                    }
-                } else if return_type.as_str() == "Object" {
-                    unsafe {
-                        parameter_types.push(&mut types::pointer);
-                    }
-                } else {
-                    unsafe {
-                        parameter_types.push(&mut types::pointer);
-                    }
-                }
+                parameter_types.push(NativeType::Pointer);
             }
         }
 
+
+        let params =
+            parameter_types
+                .clone()
+                .into_iter()
+                .map(libffi::middle::Type::try_from)
+                .collect::<std::result::Result<Vec<libffi::middle::Type>, AnyError>>();
+
+        assert!(params.is_ok());
+
+        let mut cif = Cif::new(
+            params.unwrap(),
+            libffi::middle::Type::i32(),
+        );
+
         let parent_interface = interface.clone();
+
         let interface = unsafe { IUnknown::from_raw(interface_ptr as *mut c_void) };
 
-        let mut cif: ffi_cif = Default::default();
-
-        let prep_result = unsafe {
-            prep_cif(
-                &mut cif,
-                ffi_abi_FFI_DEFAULT_ABI,
-                parameter_types.len(),
-                &mut types::sint32,
-                parameter_types.as_mut_ptr(),
-            )
-        };
-
-        assert!(prep_result.is_ok());
-
-        // todo handle prep_cif error
 
         Self {
             index,
@@ -1388,17 +1481,15 @@ impl PropertyCall {
     pub fn call(
         &mut self,
         scope: &mut v8::HandleScope,
-        args: &v8::FunctionCallbackArguments,
+        args: &FunctionCallbackArguments,
     ) -> (HRESULT, *mut c_void) {
         let number_of_abi_parameters = self.number_of_abi_parameters;
 
-        let mut arguments: Vec<*mut c_void> = Vec::new();
+        let mut arguments: Vec<NativeValue> = Vec::new();
 
         arguments.reserve(number_of_abi_parameters);
 
-        unsafe { arguments.push(self.interface.as_raw()) };
-
-        let mut string_buf: Vec<HSTRING> = Vec::new();
+        unsafe { arguments.push(NativeValue { pointer: mem::transmute_copy(&self.interface) }) };
 
         for (i, parameter) in self.parameters.iter().enumerate() {
             let type_ = parameter.type_();
@@ -1406,78 +1497,93 @@ impl PropertyCall {
 
             let signature = Signature::to_string(metadata, &type_);
 
-            match signature.as_str() {
-                "String" => {
-                    let string = args.holder().to_string(scope).unwrap();
+            let value: v8::Local<v8::Value> = args.holder().into();
 
-                    let string = HSTRING::from(string.to_rust_string_lossy(scope));
+            let native_type = NativeType::try_from(signature.as_str());
 
-                    arguments.push(addr_of!(string) as *mut c_void);
+            // todo error
+            assert!(native_type.is_ok());
 
-                    string_buf.push(string);
+            let native_type = native_type.unwrap();
+
+            let value = match native_type {
+                NativeType::Void => {
+                    // todo
+                    unreachable!()
                 }
-                "Boolean" => {
-                    let value = args.holder().boolean_value(scope);
-                    // arguments.push(
-                    //     addr_of!(value) as *mut c_void
-                    // )
-
-                    arguments.push(unsafe { mem::transmute(&value) })
+                NativeType::Bool => {
+                    ffi_parse_bool_arg(value)
                 }
-                _ => {
-                    let value = args.holder();
-
-                    if value.is_object() {
-                        let value = value.to_object(scope).unwrap();
-
-                        let dec = value.get_internal_field(scope, 0).unwrap();
-
-                        let dec = unsafe { v8::Local::<v8::External>::cast(dec) };
-
-                        let dec = dec.value() as *mut DeclarationFFI;
-
-                        let dec = unsafe { &*dec };
-
-                        let instance = dec.instance.clone();
-                        match instance {
-                            None => {
-                                arguments.push(std::ptr::null_mut());
-                            }
-                            Some(mut instance) => {
-                                unsafe {
-                                    arguments
-                                        .push(&mut instance.into_raw() as *mut _ as *mut c_void)
-                                };
-                            }
-                        }
-                    }
+                NativeType::U8 => {
+                    ffi_parse_u8_arg(value)
                 }
-            }
+                NativeType::I8 => {
+                    ffi_parse_i8_arg(value)
+                }
+                NativeType::U16 => {
+                    ffi_parse_u16_arg(value)
+                }
+                NativeType::I16 => {
+                    ffi_parse_i16_arg(value)
+                }
+                NativeType::U32 => {
+                    ffi_parse_u32_arg(value)
+                }
+                NativeType::I32 => {
+                    ffi_parse_i32_arg(value)
+                }
+                NativeType::U64 => {
+                    ffi_parse_u64_arg(scope, value)
+                }
+                NativeType::I64 => {
+                    ffi_parse_i16_arg(value)
+                }
+                NativeType::USize => {
+                    ffi_parse_usize_arg(scope, value)
+                }
+                NativeType::ISize => {
+                    ffi_parse_isize_arg(scope, value)
+                }
+                NativeType::F32 => {
+                    ffi_parse_f32_arg(value)
+                }
+                NativeType::F64 => {
+                    ffi_parse_f64_arg(value)
+                }
+                NativeType::Pointer => {
+                    ffi_parse_pointer_arg(scope, value)
+                }
+                NativeType::Buffer => {
+                    ffi_parse_buffer_arg(scope, value)
+                }
+                NativeType::Function => {
+                    ffi_parse_function_arg(scope, value)
+                }
+                NativeType::Struct(_) => {
+                    ffi_parse_struct_arg(scope, value)
+                }
+                NativeType::String => {
+                    ffi_parse_string_arg(scope, value)
+                }
+            };
+
+            // todo error
+            assert!(value.is_ok());
+
+            let value = value.unwrap();
+
+            arguments.push(value);
+
         }
 
         let mut result: *mut c_void = std::ptr::null_mut();
 
 
-        //let result_ptr: *mut *mut *mut c_void = &mut addr_of_mut!(result);
-
         if self.is_initializer {
             // arguments.push(result_ptr as *mut c_void);
         } else {
             if !self.is_void {
-                println!("ret {}", self.return_type.as_str());
-
-                match self.return_type.as_str() {
-                    "Boolean" | "String" | "UInt32" => {
-                        // unsafe { arguments.push(mem::transmute(&mut result))};
-                        //  arguments.push(addr_of_mut!(result) as *mut _ as *mut c_void);
-                        //unsafe { arguments.push(mem::transmute(a.as_mut_ptr())); }
-
-                        unsafe { arguments.push(std::mem::transmute(&&result)) };
-                    }
-                    _ => {
-                        //  arguments.push(result_ptr as *mut c_void);
-                    }
-                }
+                arguments.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
             }
         }
 
@@ -1489,17 +1595,33 @@ impl PropertyCall {
 
         get_method(&self.interface, self.index, addr_of_mut!(func));
 
-        println!("asdas {:?}", func);
 
         // let func = unsafe {
         //     vtable.offset(self.index as isize)
         // };
 
+        // let ret = unsafe {
+        //     call::<i32>(
+        //         &mut self.cif,
+        //         CodePtr::from_ptr(func),
+        //         arguments.as_mut_ptr(),
+        //     )
+        // };
+
+        let call_args: Vec<Arg> = arguments
+            .iter()
+            .enumerate()
+            // SAFETY: Creating a `Arg` from a `NativeValue` is pretty safe.
+            .map(|(i, v)| {
+                println!("{}", i);
+                unsafe { v.as_arg(self.parameter_types.get(i).unwrap()) }
+            })
+            .collect();
+
         let ret = unsafe {
-            call::<i32>(
-                &mut self.cif,
+            self.cif.call(
                 CodePtr::from_ptr(func),
-                arguments.as_mut_ptr(),
+                &call_args,
             )
         };
 
