@@ -3,39 +3,37 @@ use std::ptr::addr_of_mut;
 use std::sync::Arc;
 use libffi::middle::*;
 use parking_lot::RwLock;
-use windows::core::{ComInterface, GUID, HRESULT, Interface, IUnknown};
+use windows::core::{ComInterface, GUID, HRESULT, IInspectable, Interface, IUnknown};
 use windows::Win32::System::WinRT::IActivationFactory;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
-use metadata::declarations::declaration::DeclarationKind;
+use metadata::declarations::declaration::{Declaration, DeclarationKind};
+use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
 use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
 use metadata::declarations::interface_declaration::InterfaceDeclaration;
+use metadata::declarations::method_declaration::MethodDeclaration;
 use metadata::declarations::parameter_declaration::ParameterDeclaration;
-use metadata::declarations::property_declaration::PropertyDeclaration;
 use metadata::declaring_interface_for_method::Metadata;
 use metadata::get_method;
 use metadata::signature::Signature;
 use crate::error::AnyError;
 use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue};
 
-pub struct PropertyCall {
+pub struct GenericMethodCall {
     index: usize,
     number_of_parameters: usize,
     number_of_abi_parameters: usize,
     is_initializer: bool,
     is_sealed: bool,
     is_void: bool,
-    is_setter: bool,
     iid: GUID,
-    cif: Cif,
-    parent_interface: IUnknown,
     interface: IUnknown,
+    cif: Cif,
     parameter_types: Vec<NativeType>,
     parameters: Vec<ParameterDeclaration>,
-    return_type: String,
-    pub(crate) declaration: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>>,
+    return_type: String
 }
 
-impl PropertyCall {
+impl GenericMethodCall {
     pub fn is_void(&self) -> bool {
         self.is_void
     }
@@ -45,62 +43,22 @@ impl PropertyCall {
     }
 
     pub fn new(
-        property: &PropertyDeclaration,
-        is_setter: bool,
+        class: &GenericInterfaceDeclaration,
+        method: &MethodDeclaration,
+        is_sealed: bool,
         interface: IUnknown,
         is_initializer: bool,
+        return_type: String,
     ) -> Self {
-        let method = if is_setter {
-            property.setter().unwrap()
-        } else {
-            property.getter()
-        };
-
         let number_of_parameters = method.number_of_parameters();
 
-        let mut index = 0 as usize;
+        let mut index = Metadata::find_method_index(method.metadata().unwrap(), class.base().token(),method.token());
 
-        let mut declaration: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>> = None;
-
-        let iid = match Metadata::find_declaring_interface_for_method(method, &mut index) {
-            None => {
-                index = 0;
-                IActivationFactory::IID
-            }
-            Some(interface) => {
-                let iid;
-                {
-                    let ii_lock = interface.read();
-
-                    let kind = ii_lock.base().kind();
-
-                    match kind {
-                        DeclarationKind::GenericInterfaceInstance => {
-                            let ii = ii_lock
-                                .as_declaration()
-                                .as_any()
-                                .downcast_ref::<GenericInterfaceInstanceDeclaration>();
-                            let ii = ii.unwrap();
-                            iid = ii.id();
-                        }
-                        _ => {
-                            let ii = ii_lock
-                                .as_declaration()
-                                .as_any()
-                                .downcast_ref::<InterfaceDeclaration>();
-                            let ii = ii.unwrap();
-                            iid = ii.id();
-                        }
-                    }
-                }
-                declaration = Some(interface);
-                iid
-            }
-        };
+        let iid = class.id();
 
         index = index.saturating_add(6); // account for IInspectable vtable overhead
 
-        let mut interface_ptr: *const c_void = std::ptr::null_mut(); // IActivationFactory
+        let mut interface_ptr: *mut c_void = std::ptr::null_mut(); // IActivationFactory
 
         let vtable = interface.vtable();
 
@@ -114,19 +72,12 @@ impl PropertyCall {
             )
         };
 
-        assert!(result.is_ok());
-        assert!(!interface_ptr.is_null());
-
-        let is_sealed = method.is_sealed();
+        // assert!(result.is_ok());
+        // assert!(!interface_ptr.is_null());
 
         let is_composition = !is_sealed;
 
         let is_void = method.is_void();
-
-        let signature = method.return_type();
-
-        let return_type = Signature::to_string(method.metadata().unwrap(), &signature);
-
 
         let other_params: usize = if is_initializer {
             if is_sealed {
@@ -216,7 +167,6 @@ impl PropertyCall {
                     parameter_types.push(NativeType::Pointer);
                 }
             }
-
             unsafe {
                 parameter_types.push(NativeType::Pointer);
             }
@@ -225,7 +175,6 @@ impl PropertyCall {
                 parameter_types.push(NativeType::Pointer);
             }
         }
-
 
         let params =
             parameter_types
@@ -241,12 +190,10 @@ impl PropertyCall {
             Type::i32(),
         );
 
-        let parent_interface = interface.clone();
-
-        let interface = unsafe { IUnknown::from_raw(interface_ptr as *mut c_void) };
-
+       // let interface = unsafe { IUnknown::from_raw(interface_ptr as *mut c_void) };
 
         Self {
+            cif,
             index,
             number_of_parameters,
             number_of_abi_parameters,
@@ -254,14 +201,10 @@ impl PropertyCall {
             is_sealed,
             is_void: method.is_void(),
             iid,
-            cif,
-            parent_interface,
             interface,
             parameter_types,
             parameters: method.parameters().to_vec(),
-            declaration,
             return_type,
-            is_setter,
         }
     }
 
@@ -284,7 +227,7 @@ impl PropertyCall {
 
             let signature = Signature::to_string(metadata, &type_);
 
-            let value: v8::Local<v8::Value> = args.holder().into();
+            let value = args.get(i as i32);
 
             let native_type = NativeType::try_from(signature.as_str());
 
@@ -347,7 +290,6 @@ impl PropertyCall {
                     ffi_parse_function_arg(scope, value)
                 }
                 NativeType::Struct(_) => {
-                    // todo
                     ffi_parse_struct_arg(scope, value)
                 }
                 NativeType::String => {
@@ -367,22 +309,32 @@ impl PropertyCall {
 
 
         if self.is_initializer {
-            // arguments.push(result_ptr as *mut c_void);
+            unsafe { arguments.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void }) };
         } else {
             if !self.is_void {
                 arguments.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
             }
         }
 
-        // let mut func = std::ptr::null_mut();
-        //
+        //let mut func = std::ptr::null_mut();
+
         // get_method(&self.interface, self.index, addr_of_mut!(func));
 
+        /*
         let mut vtable = self.interface.vtable();
 
-        let vtable: *mut *mut c_void = unsafe {std::mem::transmute(vtable)};
+        let vtable: *mut *mut c_void = unsafe { std::mem::transmute(vtable) };
 
         let func = unsafe { *vtable.offset((self.index) as isize) };
+
+        */
+
+        let mut func = std::ptr::null_mut();
+
+        get_method(&self.interface, self.index, addr_of_mut!(func));
+
+        println!("func {:?}", func);
+
 
         let call_args: Vec<Arg> = arguments
             .iter()
@@ -392,6 +344,7 @@ impl PropertyCall {
                 unsafe { v.as_arg(self.parameter_types.get(i).unwrap()) }
             })
             .collect();
+
 
         let ret = unsafe {
             self.cif.call(

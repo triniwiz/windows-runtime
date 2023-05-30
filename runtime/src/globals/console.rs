@@ -6,6 +6,32 @@ use windows::Win32::System::{Console};
 use windows::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringA;
 
+pub fn init_console(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, context: v8::Local<v8::Context>) {
+    let console = v8::Object::new(scope);
+    let log = v8::Function::new(scope, handle_console_log).unwrap();
+    let dir = v8::Function::new(scope, handle_console_dir).unwrap();
+
+    let name = v8::String::new(scope, "log").unwrap().into();
+    console.set(
+        scope,
+        name,
+        log.into(),
+    );
+
+    let name = v8::String::new(scope, "dir").unwrap().into();
+    console.set(
+        scope,
+        name,
+        dir.into(),
+    );
+
+    let mut global = context.global(scope);
+    let value = v8::String::new(
+        scope, "console",
+    ).unwrap().into();
+    global.define_own_property(scope, value, console.into(), v8::READ_ONLY);
+}
+
 fn handle_item_log(scope: &mut v8::HandleScope, item: v8::Local<v8::Value>, output: &mut String, is_last: bool){
 
     if item.is_array() {

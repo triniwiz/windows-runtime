@@ -104,7 +104,7 @@ impl Metadata {
                         0 as _,
                         None,
                         0 as _,
-                        &mut signature,
+                        addr_of_mut!(signature),
                         &mut signature_size,
                     )
                 };
@@ -125,7 +125,6 @@ impl Metadata {
         let mut signature = Metadata::get_method_signature(metadata, token);
         Metadata::get_signature_argument_count(metadata, &mut signature)
     }
-
 
     pub fn get_custom_attributes_with_name(metadata: &IMetaDataImport2, token: CorTokenType, attribute_name: &str) -> Vec<u32> {
         // mdCustomAttribute
@@ -218,7 +217,6 @@ impl Metadata {
         type_token
     }
 
-
     pub fn get_class_methods(metadata: &IMetaDataImport2, token: CorTokenType) -> Vec<u32> {
         let mut methods = [0_u32; 1024];
         let mut methods_count = 0;
@@ -245,7 +243,6 @@ impl Metadata {
 
         methods[..methods_count as usize].to_vec()
     }
-
 
     pub fn has_method_first_type_argument(metadata: &IMetaDataImport2, token: CorTokenType) -> bool {
         let mut signature = Metadata::get_method_signature(
@@ -495,14 +492,15 @@ impl Metadata {
                     metadata, method_token,
                 );
                 debug_assert!(
-                    CorTokenType(type_from_token(CorTokenType(class_token as i32))) == mdtTypeDef
+                    type_from_token(CorTokenType(class_token as i32)) == mdtTypeDef.0
                 );
+
                 let mut method_body_tokens = [0_u32; 1024];
                 let mut method_decl_tokens = [0_u32; 1024];
                 let mut method_impls_count = 0;
                 let mut method_impls_enumerator = std::ptr::null_mut();
 
-                let result = unsafe {
+                let mut result = unsafe {
                     metadata.EnumMethodImpls(
                         addr_of_mut!(method_impls_enumerator),
                         class_token,
@@ -512,6 +510,9 @@ impl Metadata {
                         &mut method_impls_count,
                     )
                 };
+
+                println!("{}",method_impls_count);
+
                 debug_assert!(
                     result.is_ok()
                 );
@@ -556,10 +557,6 @@ impl Metadata {
                                 result.is_ok()
                             );
 
-                            let t = Metadata::find_method_index(
-                                metadata, CorTokenType(declaring_interface_token as i32), CorTokenType(method_decl_token as i32),
-                            );
-
                             *out_index = Metadata::find_method_index(
                                 metadata, CorTokenType(declaring_interface_token as i32), CorTokenType(method_decl_token as i32),
                             );
@@ -589,14 +586,14 @@ impl Metadata {
                                     let mut declaring_interface_token = CorTokenType::default();
                                     let is_resolved = unsafe {
                                         resolve_type_ref(
-                                            Some(metadata), CorTokenType(parent_token as i32), &mut *external_metadata.as_mut_ptr(), &mut declaring_interface_token,
+                                            Some(metadata), CorTokenType(parent_token as i32), std::mem::transmute(external_metadata.as_mut_ptr()),&mut declaring_interface_token,
                                         )
                                     };
                                     debug_assert!(
                                         is_resolved
                                     );
 
-                                    let mut external_metadata = unsafe { external_metadata.assume_init() };
+                                    let mut external_metadata: IMetaDataImport2 = unsafe { external_metadata.assume_init() };
 
                                     let mut declaring_method_name = [0_u16; MAX_IDENTIFIER_LENGTH];
                                     let mut declaring_method_name_length = 0_u32;
@@ -659,7 +656,6 @@ impl Metadata {
                                     debug_assert!(
                                         result.is_ok()
                                     );
-
 
                                     let mut declaring_method_name = [0_u16; MAX_IDENTIFIER_LENGTH];
                                     let mut declaring_method_name_size = 0_u32;
@@ -730,14 +726,14 @@ impl Metadata {
 
                                             let is_resolved = unsafe {
                                                 resolve_type_ref(
-                                                    Some(metadata), CorTokenType(open_generic_class_token as i32), &mut *external_metadata.as_mut_ptr(), &mut external_class_token,
+                                                    Some(metadata), CorTokenType(open_generic_class_token as i32), std::mem::transmute(external_metadata.as_mut_ptr()), &mut external_class_token,
                                                 )
                                             };
                                             debug_assert!(
                                                 is_resolved
                                             );
 
-                                            let mut external_metadata = unsafe { external_metadata.assume_init() };
+                                            let mut external_metadata: IMetaDataImport2 = unsafe { external_metadata.assume_init() };
 
                                             let mut declaring_method = 0_u32;
 
@@ -796,7 +792,9 @@ impl Metadata {
             return Metadata::declaring_interface_for_static_method(
                 method.metadata(), method_token, out_index,
             );
-        } else if method.is_initializer() {
+        }
+
+        if method.is_initializer() {
             return Metadata::declaring_interface_for_initializer(
                 method.metadata(), method_token, out_index,
             )

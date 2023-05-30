@@ -1,12 +1,15 @@
-mod console;
 mod converter;
 mod value;
 mod interop;
 mod method_call;
 mod property_call;
 mod error;
+mod structure;
+mod globals;
+mod generic_method_call;
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CString};
 use std::mem::MaybeUninit;
 use std::ops::Deref;
@@ -16,11 +19,11 @@ use std::sync::{Arc, Once};
 use libffi::high::arg;
 use libffi::low::{CodePtr, ffi_type};
 use libffi::middle::Cif;
-use parking_lot::{RawRwLock, RwLock};
+use parking_lot::{Mutex, RawRwLock, RwLock};
 use parking_lot::lock_api::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLockReadGuard, RwLockWriteGuard};
-use v8::{FunctionTemplate, Global, Local, Object};
+use v8::{FunctionTemplate, Global, Local, Number, Object};
 use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, IUnknown_Vtbl, ComInterface, PCWSTR, Type, IInspectable, Error};
-use windows::Foundation::{GuidHelper, IAsyncOperation};
+use windows::Foundation::{AsyncStatus, GuidHelper, IAsyncInfo, IAsyncOperation};
 use windows::Win32::Foundation::CO_E_INIT_ONLY_SINGLE_THREADED;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, CLSIDFromProgID, CLSIDFromString, CoCreateInstance, CoGetClassObject, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED, CoInitialize, CoInitializeEx, CoUninitialize, DISPATCH_METHOD, DISPPARAMS, EXCEPINFO, IClassFactory, IDispatch, IDispatch_Vtbl, ITypeLib, VARIANT, VT_UI2};
 use windows::Win32::System::WinRT::{IActivationFactory, RoActivateInstance, RoGetActivationFactory};
@@ -50,13 +53,59 @@ use metadata::signature::Signature;
 use metadata::value::{Value, Variant};
 use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, MAX_SAFE_INTEGER, MIN_SAFE_INTEGER, NativeType, NativeValue, set_ret_val};
 
+
+thread_local!(static ISOLATE: RefCell<Option<&'static mut v8::Isolate>> = RefCell::new(None));
+
 pub struct Runtime {
     isolate: v8::OwnedIsolate,
     global_context: v8::Global<v8::Context>,
     app_root: String,
+    pub(crate) runtime: Arc<RwLock<runtime::Runtime>>,
 }
 
 static INIT: Once = Once::new();
+
+struct IUnknownSafeInner(IUnknown);
+
+unsafe impl Send for IUnknownSafeInner {}
+
+struct IUnknownSafe {
+    inner: Mutex<IUnknownSafeInner>
+}
+
+impl IUnknownSafe {
+    pub fn new(value: IUnknown) -> Self {
+        Self {
+            inner: Mutex::new(IUnknownSafeInner(value))
+        }
+    }
+}
+
+
+struct FFIPromiseInner {
+    promise: NonNull<v8::PromiseResolver>,
+    context: NonNull<v8::Context>
+}
+
+unsafe impl Send for FFIPromiseInner {}
+
+
+struct FFIPromise(Arc<RwLock<FFIPromiseInner>>);
+
+impl FFIPromise {
+    pub fn new(
+        context: NonNull<v8::Context>,
+        promise: NonNull<v8::PromiseResolver>
+    ) -> Self {
+        Self { 0: Arc::new(RwLock::new(FFIPromiseInner {
+            context,
+            promise
+        })) }
+    }
+}
+
+
+unsafe impl Send for FFIPromise {}
 
 #[derive(Clone)]
 struct DeclarationFFI {
@@ -102,6 +151,10 @@ impl Deref for DeclarationFFI {
 
 
 use regex::Regex;
+use tokio::io::AsyncReadExt;
+use tokio::runtime;
+use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
+use crate::generic_method_call::GenericMethodCall;
 use crate::method_call::MethodCall;
 use crate::property_call::PropertyCall;
 
@@ -124,6 +177,27 @@ fn get_generic_return_types(name: &str) -> Vec<&str> {
     };
 }
 
+pub fn is_async(interface: &IUnknown) -> bool {
+    let vtable = interface.vtable();
+
+    let mut interface_ptr: *mut c_void = std::ptr::null_mut();
+
+    let _ = unsafe {
+        ((*vtable).QueryInterface)(
+            interface.as_raw(),
+            &IAsyncInfo::IID,
+            &mut interface_ptr as *mut _ as *mut *const c_void,
+        )
+    };
+
+    if !interface_ptr.is_null() {
+        let _ = unsafe { IUnknown::from_raw(interface_ptr) };
+        return true;
+    }
+
+    false
+}
+
 fn handle_global(scope: &mut v8::HandleScope,
                  args: v8::FunctionCallbackArguments,
                  mut _retval: v8::ReturnValue) {}
@@ -136,32 +210,6 @@ fn init_global(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, conte
     global.define_own_property(scope, value, global.into(), v8::READ_ONLY);
 }
 
-fn init_console(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, context: v8::Local<v8::Context>) {
-    let console = v8::Object::new(scope);
-    let log = v8::Function::new(scope, console::handle_console_log).unwrap();
-    let dir = v8::Function::new(scope, console::handle_console_dir).unwrap();
-
-    let name = v8::String::new(scope, "log").unwrap().into();
-    console.set(
-        scope,
-        name,
-        log.into(),
-    );
-
-    let name = v8::String::new(scope, "dir").unwrap().into();
-    console.set(
-        scope,
-        name,
-        dir.into(),
-    );
-
-    let mut global = context.global(scope);
-    let value = v8::String::new(
-        scope, "console",
-    ).unwrap().into();
-    global.define_own_property(scope, value, console.into(), v8::READ_ONLY);
-}
-
 fn handle_time(scope: &mut v8::HandleScope,
                _args: v8::FunctionCallbackArguments,
                mut retval: v8::ReturnValue) {
@@ -170,32 +218,10 @@ fn handle_time(scope: &mut v8::HandleScope,
 }
 
 fn init_time(scope: &mut v8::HandleScope<()>, global: &mut v8::Local<v8::ObjectTemplate>) {
-    let time = v8::FunctionTemplate::new(scope, handle_time);
+    let time = FunctionTemplate::new(scope, handle_time);
     global.set(
         v8::String::new(scope, "time").unwrap().into(), time.into(),
     );
-}
-
-fn init_performance(scope: &mut v8::HandleScope<()>, global: &mut v8::Local<v8::ObjectTemplate>) {
-    let performance = v8::ObjectTemplate::new(scope);
-    let now = v8::FunctionTemplate::new(scope, handle_now);
-    performance.set(
-        v8::String::new(scope, "now").unwrap().into(),
-        now.into(),
-    );
-    global.set(
-        v8::String::new(scope, "performance").unwrap().into(),
-        performance.into(),
-    );
-}
-
-fn handle_now(scope: &mut v8::HandleScope,
-              _args: v8::FunctionCallbackArguments,
-              mut retval: v8::ReturnValue) {
-    let now = chrono::Utc::now();
-    retval.set_double(
-        now.timestamp_nanos() as f64
-    )
 }
 
 fn create_ns_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, scope: &mut v8::HandleScope<'a>) -> Local<'a, v8::Value> {
@@ -282,9 +308,15 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                     let ext = v8::External::new(scope, declaration as _);
 
-                    let func = FunctionTemplate::builder(|scope: &mut v8::HandleScope,
-                                                          args: v8::FunctionCallbackArguments,
-                                                          mut retval: v8::ReturnValue| {
+
+                    extern "C" fn callback(callback: *const v8::FunctionCallbackInfo) {
+                        let info = unsafe { &*callback };
+
+                        let scope = unsafe { &mut v8::CallbackScope::new(info) };
+                        let args = unsafe {v8::FunctionCallbackArguments::from_function_callback_info(info)};
+                        let mut retval = v8::ReturnValue::from_function_callback_info(info);
+
+
                         let dec = unsafe { Local::<v8::External>::cast(args.data()) };
 
                         let dec = dec.value() as *mut DeclarationFFI;
@@ -295,6 +327,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                         let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
 
+                        let nam = method.name();
                         let mut method = MethodCall::new(
                             method, method.is_sealed(), dec.instance.clone().unwrap(), false,
                         );
@@ -304,8 +337,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         if ret.is_err() {
                             println!(">>> {}", ret.message().to_string())
                         } else if !method.is_void() {
-                            let return_sig = method.return_type();
-                            match NativeType::try_from(return_sig) {
+                            let return_sig = method.return_type().to_string();
+                            match NativeType::try_from(return_sig.as_str()) {
                                 Ok(return_type) => {
                                     if return_sig.contains(".") {
                                         let instance = unsafe { IUnknown::from_raw(result) };
@@ -317,16 +350,136 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                                 name.truncate(backtick_index);
                                             }
 
+
                                             // use the generic name
                                             let declaration = MetadataReader::find_by_name(name.as_str()).unwrap();
 
-                                            let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig, None, dec.parent.clone(), declaration, Some(instance), scope).into();
 
-                                            retval.set(ret.into());
+                                            // todo async
 
-                                            return;
+                                            // check if async
+
+                                            let is_async = is_async(&instance);
+
+                                            if is_async {
+
+                                                let promise = v8::PromiseResolver::new(scope).unwrap();
+
+                                                retval.set(promise.get_promise(scope).into());
+
+                                                let promise: Global<v8::PromiseResolver> = Global::new(scope, promise);
+
+                                                let current_context = scope.get_current_context();
+                                                let context = v8::Global::new(scope, current_context).into_raw();
+
+                                                let callback = FFIPromise::new(context, promise.into_raw());
+
+                                                let runtime = scope.get_slot::<Arc<RwLock<runtime::Runtime>>>();
+
+                                                let runtime = runtime.unwrap();
+
+                                                let runtime = runtime.read();
+
+                                                //  let instance = IUnknownSafe::new(instance);
+
+                                                let declaration = DeclarationFFI::new_with_instance(
+                                                    declaration,
+                                                    Some(instance)
+                                                );
+
+                                                // let declaration = Box::into_raw(Box::new(declaration));
+
+
+                                                runtime.spawn( async {
+                                                    let callback = callback;
+                                                    let callback = callback.0.read();
+
+                                                    let promise: NonNull<v8::PromiseResolver> = callback.promise;
+                                                    let context: NonNull<v8::Context> = callback.context;
+
+                                                    let context = unsafe { std::mem::transmute::<
+                                                        NonNull<v8::Context>,
+                                                        v8::Local<v8::Context>,
+                                                    >(context)};
+
+                                                    let mut cb_scope = unsafe { v8::CallbackScope::new(context)};
+                                                    let scope = &mut v8::HandleScope::new(&mut cb_scope);
+                                                    let promise = unsafe {std::mem::transmute::<
+                                                        NonNull<v8::PromiseResolver>,
+                                                        v8::Local<v8::PromiseResolver>,
+                                                    >(promise)};
+
+
+                                                    let declaration = declaration;
+
+                                                    let instance = declaration.instance.unwrap();
+
+                                                    let declaration = declaration.inner;
+
+                                                    // let instance = instance.inner.lock().0.clone();;
+                                                    let info =  unsafe { IAsyncInfo::from_raw(instance.clone().into_raw())};
+
+                                                    let mut current_status = AsyncStatus::Started;
+
+                                                    let mut is_running = info.Status()
+                                                        .map(|status| {
+                                                            current_status = status;
+                                                            status == AsyncStatus::Started
+                                                        })
+                                                        .unwrap_or_else(|e| {
+                                                            let message = e.message().to_string();
+                                                            let message = v8::String::new(scope, message.as_str()).unwrap();
+                                                            let error = v8::Exception::error(scope, message.into());
+                                                            promise.reject(scope, error.into());
+                                                            false
+                                                        });
+
+                                                    let return_sig = return_sig;
+
+                                                    let ret = create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope);
+
+                                                    let mut did = false;
+                                                    while is_running {
+                                                        match info.Status() {
+                                                            Ok(done) => {
+                                                                match done {
+                                                                    AsyncStatus::Completed =>{
+                                                                        is_running = false;
+                                                                        println!("Completed");
+                                                                    }
+                                                                    AsyncStatus::Error => {
+                                                                        is_running = false;
+                                                                        println!("Error");
+                                                                    }
+                                                                    AsyncStatus::Canceled => {
+                                                                        is_running = false;
+                                                                        println!("Canceled");
+                                                                    }
+                                                                    AsyncStatus::Started =>{
+                                                                        if !did {
+                                                                            promise.resolve(scope, ret.into());
+                                                                            did = true;
+                                                                        }
+                                                                    }
+                                                                    _ =>{}
+                                                                }
+                                                            }
+                                                            Err(error) => {
+                                                                println!("error {}", error.message())
+                                                            }
+                                                        }
+                                                    }
+
+                                                    // IAsyncInfo
+
+                                                    //
+
+                                                });
+
+                                                return;
+                                            }
                                         }
-                                        let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig, None, dec.parent.clone(), dec.inner.clone(), Some(instance), scope).into();
+                                        let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, dec.parent.clone(), dec.inner.clone(), Some(instance), scope).into();
                                         retval.set(ret.into());
                                         return;
                                     }
@@ -339,7 +492,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         }
 
                         // todo
-                    })
+
+                    }
+
+                    let func = FunctionTemplate::builder_raw(callback)
                         .data(ext.into())
                         .build(scope);
 
@@ -936,8 +1092,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                     let is_static = method.is_static();
 
-                    let parent = Arc::clone(&declaration);
-
+                    let parent = declaration.clone();
                     let mut declaration = DeclarationFFI::new_with_instance(
                         Arc::new(
                             RwLock::new(
@@ -950,7 +1105,6 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             instance.clone()
                         },
                     );
-
                     declaration.parent = Some(parent);
 
                     let declaration = Box::into_raw(Box::new(declaration));
@@ -964,7 +1118,6 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     let func = FunctionTemplate::builder(|scope: &mut v8::HandleScope,
                                                           args: v8::FunctionCallbackArguments,
                                                           mut retval: v8::ReturnValue| {
-
                         let data = v8::Local::<v8::Array>::try_from(args.data()).unwrap();
 
                         let return_type = data.get_index(scope, 1).unwrap().to_rust_string_lossy(scope);
@@ -983,10 +1136,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let parent = parent.read();
                         let parent = parent.as_any().downcast_ref::<GenericInterfaceDeclaration>().unwrap();
 
-                        let mut method = MethodCall::new_with_return_type(
-                            method, method.is_sealed(), dec.instance.clone().unwrap(), false, return_type, Some(parent.id())
-                        );
 
+                        let mut method = GenericMethodCall::new(
+                            parent, method, method.is_sealed(), dec.instance.clone().unwrap(), false, return_type,
+                        );
 
                         let (ret, result) = method.call(scope, &args);
 
@@ -997,7 +1150,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             match NativeType::try_from(return_sig) {
                                 Ok(return_type) => {
                                     if return_sig.contains(".") {
-                                        let instance = unsafe { IUnknown::from_raw(result) };
+                                        let instance = unsafe { IUnknown::from_raw(*(result as *mut *mut c_void)) };
 
                                         if return_sig.contains('`') {
                                             let mut name = return_sig.to_string();
@@ -1008,6 +1161,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                                             // use the generic name
                                             let declaration = MetadataReader::find_by_name(name.as_str()).unwrap();
+
 
                                             let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig, None, dec.parent.clone(), declaration, Some(instance), scope).into();
                                             retval.set(ret.into());
@@ -1026,6 +1180,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             retval.set_undefined();
                         }
 
+
                         // todo
                     })
                         .data(data.into())
@@ -1036,7 +1191,6 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     } else {
                         proto.set_with_attr(name.unwrap().into(), func.into(), v8::DONT_DELETE);
                     }
-
                 }
             }
             _ => {}
@@ -1443,7 +1597,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                     struct_size = struct_size + item.size();
                     libffi::middle::Type::try_from(item)
                 })
-                .collect::<Result<Vec<libffi::middle::Type>, crate::error::AnyError>>();
+                .collect::<Result<Vec<libffi::middle::Type>, error::AnyError>>();
 
         assert!(params.is_ok());
 
@@ -1812,7 +1966,6 @@ fn init_meta(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, context
     }
 }
 
-
 fn handle_named_property_setter(scope: &mut v8::HandleScope,
                                 key: Local<v8::Name>,
                                 value: Local<v8::Value>,
@@ -2127,21 +2280,6 @@ fn handle_ns_func(scope: &mut v8::HandleScope,
     // scope.throw_exception(v8::Exception::error(scope, v8::String::new("")))
 }
 
-fn handle_meta(scope: &mut v8::HandleScope,
-               args: v8::FunctionCallbackArguments,
-               mut retval: v8::ReturnValue) {
-    // let isolate = scope.get_isolate_mut();
-    // let class_name = args.get(0).to_rust_string_lossy(scope);
-    // let global = scope.get_current_context().global(scope);
-    // match global.get_internal_field(scope, 0) {
-    //     None => {}
-    //     Some(value) => {
-    //         let interop: v8::External = value.try_into().unwrap();
-    //         let interop = interop.value() as *mut COMInterop;
-    //     }
-    // }
-}
-
 impl Runtime {
     pub fn new(app_root: &str) -> Self {
         INIT.call_once(|| {
@@ -2173,7 +2311,7 @@ impl Runtime {
             {
                 let template = &mut global_template;
 
-                init_performance(scope, template);
+                globals::performance::init_performance(scope, template);
 
                 init_time(scope, template);
 
@@ -2182,33 +2320,52 @@ impl Runtime {
                     let scope = &mut v8::ContextScope::new(scope, context);
 
                     init_global(scope, context);
-                    init_console(scope, context);
+                    globals::console::init_console(scope, context);
                     init_meta(scope, context);
                     global_context = Global::new(scope, context);
                 }
             }
         }
 
+        let runtime = runtime::Builder::new_current_thread()
+            .enable_all()
+            .build().unwrap();
+
+        let runtime = Arc::new(RwLock::new(runtime));
+
+        isolate.set_slot(Arc::clone(&runtime));
+
+        ISOLATE.with(|slot| slot.replace(Some(unsafe { std::mem::transmute(&mut*isolate) })));
+
+
+        std::mem::forget(&isolate);
         Self {
             isolate,
             global_context,
             app_root: app_root.to_string(),
+            runtime,
         }
     }
 
     pub fn run_script(&mut self, script: &str) {
-        let isolate = &mut self.isolate;
-        let scope = &mut v8::HandleScope::new(isolate);
-        let context = v8::Local::new(scope, &self.global_context);
-        let scope = &mut v8::ContextScope::new(scope, context);
-        let code = v8::String::new(scope, script).unwrap();
-        let script = v8::Script::compile(scope, code, None).unwrap();
-        let _ = script.run(scope);
+        let runtime = self.runtime.read();
+        runtime.block_on(async {
+            let isolate = &mut self.isolate;
+            let scope = &mut v8::HandleScope::new(isolate);
+            let context = v8::Local::new(scope, &self.global_context);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let code = v8::String::new(scope, script).unwrap();
+            let script = v8::Script::compile(scope, code, None).unwrap();
+            let _ = script.run(scope);
+            tokio::task::yield_now().await
+        });
     }
 
     pub fn dispose(&self) {
         /* unsafe {
              CoUninitialize();
          }*/
+
+        ISOLATE.with(|slot| slot.replace(None));
     }
 }

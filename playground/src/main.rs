@@ -105,10 +105,23 @@ fn run_js_app() {
 
     const currentFeed = client.RetrieveFeedAsync(feed);
 
-    console.log("feed",currentFeed.toString());
+    //console.log("feed",currentFeed.toString());
 
 
-    console.log(currentFeed.GetResults());
+    currentFeed.then(feed =>{
+    let start = Date.now();
+    let total = 0;
+    while(total <= 500){
+    total = Date.now() - start;
+    }
+
+    const result = feed.GetResults();
+
+     console.log(result.Items);
+    })
+    .catch(error => {
+    console.log(error);
+    });
 
     /* const map = new Windows.Foundation.Collections.StringMap();
 

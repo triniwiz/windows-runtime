@@ -41,27 +41,17 @@ impl MethodCall {
         self.return_type.as_str()
     }
 
-    pub fn new( method: &MethodDeclaration,
-                is_sealed: bool,
-                interface: IUnknown,
-                is_initializer: bool) -> Self {
+    pub fn new(
+        method: &MethodDeclaration,
+        is_sealed: bool,
+        interface: IUnknown,
+        is_initializer: bool
+    ) -> Self {
+
         let signature = method.return_type();
 
         let return_type = Signature::to_string(method.metadata().unwrap(), &signature);
 
-        Self::new_with_return_type(
-            method, is_sealed, interface, is_initializer, return_type, None
-        )
-    }
-
-    pub fn new_with_return_type(
-        method: &MethodDeclaration,
-        is_sealed: bool,
-        interface: IUnknown,
-        is_initializer: bool,
-        return_type: String,
-        iid: Option<GUID> // use for generic
-    ) -> Self {
 
         let number_of_parameters = method.number_of_parameters();
 
@@ -69,8 +59,7 @@ impl MethodCall {
 
         let mut declaration: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>> = None;
 
-
-        let iid = iid.unwrap_or(match Metadata::find_declaring_interface_for_method(method, &mut index) {
+        let iid = match Metadata::find_declaring_interface_for_method(method, &mut index) {
             None => {
                 index = 0;
                 IActivationFactory::IID
@@ -104,7 +93,7 @@ impl MethodCall {
                 declaration = Some(interface);
                 iid
             }
-        });
+        };
 
         index = index.saturating_add(6); // account for IInspectable vtable overhead
 
@@ -231,13 +220,13 @@ impl MethodCall {
                 .clone()
                 .into_iter()
                 .map(libffi::middle::Type::try_from)
-                .collect::<std::result::Result<Vec<libffi::middle::Type>, AnyError>>();
+                .collect::<std::result::Result<Vec<Type>, AnyError>>();
 
         assert!(params.is_ok());
 
         let mut cif = Cif::new(
             params.unwrap(),
-            libffi::middle::Type::i32(),
+            Type::i32(),
         );
 
         let interface = unsafe { IUnknown::from_raw(interface_ptr as *mut c_void) };

@@ -22,9 +22,9 @@ impl DeclarationFactory {
                 mdtTypeRef => {
                     let mut external_metadata = MaybeUninit::uninit();
                     let mut external_delegate_token = CorTokenType::default();
-                    let is_resolved = unsafe { resolve_type_ref(Some(metadata), token, &mut *external_metadata.as_mut_ptr(), &mut external_delegate_token) };
+                    let is_resolved = unsafe { resolve_type_ref(Some(metadata), token, std::mem::transmute(external_metadata.as_mut_ptr()), &mut external_delegate_token) };
                     debug_assert!(is_resolved);
-                    let external_metadata = unsafe { external_metadata.assume_init() };
+                    let external_metadata: IMetaDataImport2 = unsafe { external_metadata.assume_init() };
                     // todo
                     Some(
                         Box::new(
@@ -69,7 +69,7 @@ impl DeclarationFactory {
 
                             let is_resolved = unsafe {
                                 resolve_type_ref(
-                                    Some(metadata), CorTokenType(open_generic_delegate_token as i32), &mut *external_metadata.as_mut_ptr(), &mut external_delegate_token,
+                                    Some(metadata), CorTokenType(open_generic_delegate_token as i32), std::mem::transmute(external_metadata.as_mut_ptr()), &mut external_delegate_token,
                                 )
                             };
 
@@ -77,7 +77,7 @@ impl DeclarationFactory {
 
                             // todo
 
-                            let external_metadata = unsafe {external_metadata.assume_init()};
+                            let external_metadata: IMetaDataImport2 = unsafe {external_metadata.assume_init()};
 
                             Box::new(GenericDelegateInstanceDeclaration::new(Some(&external_metadata), external_delegate_token, Some(metadata), token))
                         }
@@ -105,11 +105,11 @@ impl DeclarationFactory {
                     let mut external_metadata: MaybeUninit<IMetaDataImport2> = MaybeUninit::zeroed();
                     let mut external_interface_token = CorTokenType::default();//mdtTypeDef;
 
-                    let is_resolved = unsafe { resolve_type_ref(Some(&*metadata), token, &mut *external_metadata.as_mut_ptr(), &mut external_interface_token) };
+                    let is_resolved = unsafe { resolve_type_ref(Some(&*metadata), token, std::mem::transmute(external_metadata.as_mut_ptr()), &mut external_interface_token) };
 
                     debug_assert!(is_resolved);
 
-                    let external_metadata = if is_resolved {
+                    let external_metadata: Option<IMetaDataImport2> = if is_resolved {
                         unsafe { Some(external_metadata.assume_init()) }
                     } else { None };
 
@@ -158,7 +158,7 @@ impl DeclarationFactory {
 
                                 let is_resolved = unsafe {
                                     resolve_type_ref(
-                                        Some(&*metadata), open_generic_delegate_token, &mut *external_metadata.as_mut_ptr(), &mut external_delegate_token,
+                                        Some(&*metadata), open_generic_delegate_token, std::mem::transmute(external_metadata.as_mut_ptr()), &mut external_delegate_token,
                                     )
                                 };
 
@@ -166,7 +166,7 @@ impl DeclarationFactory {
                                     is_resolved
                                 );
 
-                                let external_metadata = if is_resolved {
+                                let external_metadata: Option<IMetaDataImport2> = if is_resolved {
                                     unsafe { Some(external_metadata.assume_init()) }
                                 } else { None };
 
