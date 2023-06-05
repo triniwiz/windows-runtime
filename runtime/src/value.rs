@@ -23,6 +23,7 @@ use metadata::prelude::cor_sig_uncompress_element_type;
 use metadata::signature::Signature;
 use parking_lot::RwLock;
 use std::sync::Arc;
+use byteorder::ByteOrder;
 use libffi::middle::{Arg, Cif};
 use v8::FunctionCallbackArguments;
 use windows::core::{ComInterface, IInspectable, IUnknown, Interface, IntoParam, Type, GUID, HRESULT, HSTRING, IUnknown_Vtbl, IInspectable_Vtbl};
@@ -752,9 +753,9 @@ pub unsafe fn set_ret_val(value:*mut c_void, scope: &mut v8::HandleScope, mut rv
         NativeType::F32 => {
             let slice = unsafe {std::slice::from_raw_parts(value as *const u8, 4)};
             let ret: f32 = if cfg!(target_endian = "big") {
-                f32::from_be_bytes(<[u8; 4]>::try_from(slice).unwrap())
+                byteorder::BigEndian::read_f32(slice)
             } else {
-                f32::from_le_bytes(<[u8; 4]>::try_from(slice).unwrap())
+                byteorder::LittleEndian::read_f32(slice)
             };
 
             rv.set(
@@ -765,9 +766,9 @@ pub unsafe fn set_ret_val(value:*mut c_void, scope: &mut v8::HandleScope, mut rv
             let slice = unsafe {std::slice::from_raw_parts((&value) as *const _ as *const u8, 8)};
 
             let ret: f64 = if cfg!(target_endian = "big") {
-                f64::from_be_bytes(<[u8; 8]>::try_from(slice).unwrap())
+                byteorder::BigEndian::read_f64(slice)
             } else {
-                f64::from_le_bytes(<[u8; 8]>::try_from(slice).unwrap())
+                byteorder::LittleEndian::read_f64(slice)
             };
             rv.set_double(ret);
         }

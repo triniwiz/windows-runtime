@@ -29,7 +29,7 @@ pub fn init_console(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, 
     let value = v8::String::new(
         scope, "console",
     ).unwrap().into();
-    global.define_own_property(scope, value, console.into(), v8::READ_ONLY);
+    global.define_own_property(scope, value, console.into(), v8::PropertyAttribute::READ_ONLY);
 }
 
 fn handle_item_log(scope: &mut v8::HandleScope, item: v8::Local<v8::Value>, output: &mut String, is_last: bool){

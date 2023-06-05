@@ -350,6 +350,14 @@ impl MethodCall {
 
 
         if self.is_initializer {
+
+            if !self.is_sealed {
+                // TODO: handle inheritance
+                let mut ptr: *mut c_void = std::ptr::null_mut();
+                unsafe { arguments.push(NativeValue { pointer: &mut ptr as *mut _ as *mut c_void }) };
+                unsafe { arguments.push(NativeValue { pointer: &mut ptr as *mut _ as *mut c_void }) };
+            }
+
             unsafe { arguments.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void }) };
         } else {
             if !self.is_void {
@@ -384,6 +392,9 @@ impl MethodCall {
             )
         };
 
+        println!("ret {}", ret);
+
+        println!("{}", HRESULT(ret).message());
 
         (HRESULT(ret), result)
     }

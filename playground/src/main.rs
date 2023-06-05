@@ -78,12 +78,31 @@ fn run_js_app() {
     let script = r#"
    console.log('Hello From NativeScript running in a Windows CLI App\n');
    console.log(performance.now() + '\n');
+
+   console.log(Object.keys(Windows));
+
+/* todo
+   const json = new Windows.Data.Json.JsonObject.extends({
+    ToString: function(){
+    return "Osei";
+    }
+   });
+
+   */
+
+
+   console.log(">>");
+   //const btn = new Windows.UI.Xaml.Controls.Button();
+
+   //console.log("btn", btn.Width);
+
   // console.dir(global + '\n');
    //console.log(Windows.UI.Xaml);
    // console.log('Default', Windows.UI.Popups.Placement.Default, Windows.UI.Popups.Placement.Default === 0);
    //  console.log('Right', Windows.UI.Popups.Placement.Right, Windows.UI.Popups.Placement.Right === 4);
    //   console.log('Bar', Windows.UI.Text.TabAlignment.Bar, Windows.UI.Text.TabAlignment.Bar == 4);
 
+/*
 
     const feed = new Windows.Foundation.Uri("https://blogs.windows.com/feed");
 
@@ -122,6 +141,8 @@ fn run_js_app() {
     .catch(error => {
     console.log(error);
     });
+
+    */
 
     /* const map = new Windows.Foundation.Collections.StringMap();
 
