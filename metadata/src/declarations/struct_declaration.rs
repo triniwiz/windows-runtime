@@ -1,0 +1,98 @@
+use std::any::Any;
+use std::ptr::addr_of_mut;
+use crate::prelude::*;
+use std::sync::{Arc};
+use parking_lot::RwLock;
+use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
+use crate::declarations::declaration::{Declaration, DeclarationKind};
+use crate::declarations::struct_field_declaration::StructFieldDeclaration;
+use crate::declarations::type_declaration::TypeDeclaration;
+
+#[derive(Clone, Debug)]
+pub struct StructDeclaration {
+    base: TypeDeclaration,
+    fields: Vec<StructFieldDeclaration>,
+}
+
+impl Declaration for StructDeclaration {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        self.base.name()
+    }
+
+    fn full_name(&self) -> &str {
+        self.base.full_name()
+    }
+
+    fn kind(&self) -> DeclarationKind {
+        self.base.kind()
+    }
+}
+
+impl StructDeclaration {
+    pub fn new(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> Self {
+        Self {
+            base: TypeDeclaration::new(
+                DeclarationKind::Struct,
+                metadata,
+                token,
+            ),
+            fields: StructDeclaration::make_field_declarations(
+                metadata,
+                token,
+            ),
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        self.fields.len()
+    }
+
+    pub fn fields(&self) -> &[StructFieldDeclaration] {
+        self.fields.as_slice()
+    }
+
+    fn make_field_declarations(
+        metadata: Option<&IMetaDataImport2>,
+        token: CorTokenType,
+    ) -> Vec<StructFieldDeclaration> {
+        let mut result = Vec::new();
+
+        if let Some(metadata) = metadata {
+            let mut enumerator = std::ptr::null_mut();
+            let mut count = 0;
+            let mut tokens = [0_u32; 1024];
+            let result_inner = unsafe { metadata.EnumFields(
+                addr_of_mut!(enumerator),
+                token.0 as u32,
+                tokens.as_mut_ptr(),
+                tokens.len() as u32,
+                &mut count,
+            )};
+            assert!(result_inner.is_ok());
+
+
+            assert!(count < tokens.len().saturating_sub(1) as u32);
+
+           unsafe { metadata.CloseEnum(enumerator) };
+
+            result.reserve(count as usize);
+
+            for i in 0..count as usize {
+                result.push(StructFieldDeclaration::new(
+                    Some(metadata),
+                    CorTokenType(tokens[i] as i32),
+                ))
+            }
+        }
+
+        return result;
+    }
+}
