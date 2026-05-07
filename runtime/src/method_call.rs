@@ -1,9 +1,8 @@
 use std::ffi::c_void;
-use std::ptr::addr_of_mut;
 use std::sync::Arc;
 use libffi::middle::*;
 use parking_lot::RwLock;
-use windows::core::{ComInterface, GUID, HRESULT, Interface, IUnknown};
+use windows::core::{GUID, HRESULT, Interface, IUnknown};
 use windows::Win32::System::WinRT::IActivationFactory;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use metadata::declarations::declaration::DeclarationKind;
@@ -26,10 +25,41 @@ pub struct MethodCall {
     iid: GUID,
     interface: IUnknown,
     cif: Cif,
+    func: *mut c_void,
     parameter_types: Vec<NativeType>,
+    parse_parameter_types: Vec<NativeType>,
     parameters: Vec<ParameterDeclaration>,
     return_type: String,
     pub(crate) declaration: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>>,
+    /// Scratch buffer used when a WinRT method returns a value type (e.g. GUID, Rect)
+    /// that is larger than, or cannot be safely aliased through, a single pointer slot.
+    return_value_buf: [u8; 128],
+}
+
+#[inline]
+fn ffi_native_type_from_signature(signature: &str) -> NativeType {
+    match signature {
+        "Void" => NativeType::Void,
+        "String" => NativeType::Pointer,
+        "Boolean" => NativeType::Bool,
+        "UInt8" => NativeType::U8,
+        "UInt16" => NativeType::U16,
+        "UInt32" => NativeType::U32,
+        "UInt64" => NativeType::U64,
+        "Int8" => NativeType::I8,
+        "Int16" => NativeType::I16,
+        "Int32" => NativeType::I32,
+        "Int64" => NativeType::I64,
+        "Single" => NativeType::F32,
+        "Double" => NativeType::F64,
+        _ => NativeType::Pointer,
+    }
+}
+
+#[inline]
+fn call_failure() -> HRESULT {
+    // E_FAIL
+    HRESULT(0x8000_4005u32 as i32)
 }
 
 impl MethodCall {
@@ -107,7 +137,7 @@ impl MethodCall {
             ((*vtable).QueryInterface)(
                 interface.as_raw(),
                 &iid,
-                &mut interface_ptr as *mut _ as *mut *const c_void,
+                &mut interface_ptr as *mut _ as *mut *mut c_void,
             )
         };
 
@@ -134,13 +164,9 @@ impl MethodCall {
 
         let number_of_abi_parameters = number_of_parameters + other_params;
 
-        let mut parameter_types: Vec<NativeType> = Vec::new();
-
-        parameter_types.reserve(number_of_abi_parameters);
-
-        unsafe {
-            parameter_types.push(NativeType::Pointer);
-        }
+        let mut parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_abi_parameters);
+        let mut parse_parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters);
+        parameter_types.push(NativeType::Pointer);
 
         for parameter in method.parameters().iter() {
             let type_ = parameter.type_();
@@ -148,67 +174,18 @@ impl MethodCall {
 
             let signature = Signature::to_string(metadata, &type_);
 
-            match signature.as_str() {
-                "Void" => unsafe {
-                    parameter_types.push(NativeType::Void);
-                },
-                "String" => unsafe {
-                    parameter_types.push(NativeType::Pointer);
-                },
-                "Boolean" => unsafe {
-                    parameter_types.push(NativeType::Bool);
-                },
-                "UInt8" => unsafe {
-                    parameter_types.push(NativeType::U8);
-                },
-                "UInt16" => unsafe {
-                    parameter_types.push(NativeType::U16);
-                },
-                "UInt32" => unsafe {
-                    parameter_types.push(NativeType::U32);
-                },
-                "UInt64" => unsafe {
-                    parameter_types.push(NativeType::U64);
-                },
-                "Int8" => unsafe {
-                    parameter_types.push(NativeType::I8);
-                },
-                "Int16" => unsafe {
-                    parameter_types.push(NativeType::I16);
-                },
-                "Int32" => unsafe {
-                    parameter_types.push(NativeType::I32);
-                },
-                "Int64" => unsafe {
-                    parameter_types.push(NativeType::I64);
-                },
-                "Single" => unsafe {
-                    parameter_types.push(NativeType::F32);
-                },
-                "Double" => unsafe {
-                    parameter_types.push(NativeType::F64);
-                },
-                _ => {
-                    // objects
-                    unsafe {
-                        parameter_types.push(NativeType::Pointer);
-                    }
-                }
-            }
+            let parse_native_type = NativeType::try_from(signature.as_str());
+            assert!(parse_native_type.is_ok());
+            parse_parameter_types.push(parse_native_type.unwrap());
+            parameter_types.push(ffi_native_type_from_signature(signature.as_str()));
         }
 
         if is_initializer {
             if is_composition {
-                unsafe {
-                    parameter_types.push(NativeType::Pointer);
-                }
-                unsafe {
-                    parameter_types.push(NativeType::Pointer);
-                }
-            }
-            unsafe {
+                parameter_types.push(NativeType::Pointer);
                 parameter_types.push(NativeType::Pointer);
             }
+            parameter_types.push(NativeType::Pointer);
         } else {
             if !is_void {
                 parameter_types.push(NativeType::Pointer);
@@ -217,22 +194,25 @@ impl MethodCall {
 
         let params =
             parameter_types
-                .clone()
-                .into_iter()
+                .iter()
+                .cloned()
                 .map(libffi::middle::Type::try_from)
                 .collect::<std::result::Result<Vec<Type>, AnyError>>();
 
         assert!(params.is_ok());
 
-        let mut cif = Cif::new(
+        let cif = Cif::new(
             params.unwrap(),
             Type::i32(),
         );
 
         let interface = unsafe { IUnknown::from_raw(interface_ptr as *mut c_void) };
+        let vtable: *mut *mut c_void = unsafe { std::mem::transmute(interface.vtable()) };
+        let func = unsafe { *vtable.offset(index as isize) };
 
         Self {
             cif,
+            func,
             index,
             number_of_parameters,
             number_of_abi_parameters,
@@ -242,45 +222,42 @@ impl MethodCall {
             iid,
             interface,
             parameter_types,
+            parse_parameter_types,
             parameters: method.parameters().to_vec(),
             declaration,
             return_type,
+            return_value_buf: [0u8; 128],
         }
+    }
+
+    /// Returns true when the return type is a WinRT value-struct (GUID, Rect, Point, …)
+    /// that is NOT a COM reference type.  These must be written into a caller-allocated
+    /// buffer rather than into a pointer-sized slot.
+    fn is_value_type_return(&self) -> bool {
+        matches!(
+            self.return_type.as_str(),
+            "Guid" | "Rect" | "Matrix3x2" | "Matrix4x4"
+        )
     }
 
     pub fn call(
         &mut self,
-        scope: &mut v8::HandleScope,
+        scope: &mut v8::PinScope<'_, '_>,
         args: &v8::FunctionCallbackArguments,
     ) -> (HRESULT, *mut c_void) {
 
         let number_of_abi_parameters = self.number_of_abi_parameters;
 
-        let mut arguments: Vec<NativeValue> = Vec::new();
-
-        arguments.reserve(number_of_abi_parameters);
+        let mut arguments: Vec<NativeValue> = Vec::with_capacity(number_of_abi_parameters);
 
         unsafe { arguments.push(NativeValue { pointer: std::mem::transmute_copy(&self.interface) }) };
 
-        for (i, parameter) in self.parameters.iter().enumerate() {
-            let type_ = parameter.type_();
-            let metadata = parameter.metadata().unwrap();
-
-            let signature = Signature::to_string(metadata, &type_);
-
+        for (i, native_type) in self.parse_parameter_types.iter().enumerate() {
             let value = args.get(i as i32);
 
-            let native_type = NativeType::try_from(signature.as_str());
-
-            // todo error
-            assert!(native_type.is_ok());
-
-            let native_type = native_type.unwrap();
-
-            let value = match native_type {
+            let value = match *native_type {
                 NativeType::Void => {
-                    // todo
-                    unreachable!()
+                    return (call_failure(), std::ptr::null_mut())
                 }
                 NativeType::Bool => {
                     ffi_parse_bool_arg(value)
@@ -338,30 +315,47 @@ impl MethodCall {
                 }
             };
 
-            // todo error
-            assert!(value.is_ok());
-
-            let value = value.unwrap();
+            let value = match value {
+                Ok(value) => value,
+                Err(_) => return (call_failure(), std::ptr::null_mut()),
+            };
 
             arguments.push(value);
         }
 
         let mut result: *mut c_void = std::ptr::null_mut();
+        let mut composition_outer: *mut c_void = std::ptr::null_mut();
+        let mut composition_inner: *mut c_void = std::ptr::null_mut();
 
 
         if self.is_initializer {
 
             if !self.is_sealed {
-                // TODO: handle inheritance
-                let mut ptr: *mut c_void = std::ptr::null_mut();
-                unsafe { arguments.push(NativeValue { pointer: &mut ptr as *mut _ as *mut c_void }) };
-                unsafe { arguments.push(NativeValue { pointer: &mut ptr as *mut _ as *mut c_void }) };
+                // WinRT composition constructors receive separate outer/inner pointers.
+                unsafe {
+                    arguments.push(NativeValue {
+                        pointer: &mut composition_outer as *mut _ as *mut c_void,
+                    })
+                };
+                unsafe {
+                    arguments.push(NativeValue {
+                        pointer: &mut composition_inner as *mut _ as *mut c_void,
+                    })
+                };
             }
 
             unsafe { arguments.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void }) };
         } else {
             if !self.is_void {
-                arguments.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
+                if self.is_value_type_return() {
+                    // Value structs (GUID=16B, Rect=16B, …) are written directly into the
+                    // out-param location — not through a pointer-to-pointer.  Use the
+                    // pre-allocated scratch buffer so we don't overflow a pointer-sized slot.
+                    let buf_ptr = self.return_value_buf.as_mut_ptr() as *mut c_void;
+                    arguments.push(NativeValue { pointer: buf_ptr });
+                } else {
+                    arguments.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
+                }
             }
         }
 
@@ -369,32 +363,35 @@ impl MethodCall {
 
        // get_method(&self.interface, self.index, addr_of_mut!(func));
 
-         let mut vtable = self.interface.vtable();
-
-         let vtable: *mut *mut c_void = unsafe {std::mem::transmute(vtable)};
-
-         let func = unsafe { *vtable.offset((self.index) as isize) };
-
-        let call_args: Vec<Arg> = arguments
-            .iter()
-            .enumerate()
-            // SAFETY: Creating a `Arg` from a `NativeValue` is pretty safe.
-            .map(|(i, v)| {
-                unsafe { v.as_arg(self.parameter_types.get(i).unwrap()) }
-            })
-            .collect();
+        let mut call_args: Vec<Arg> = Vec::with_capacity(arguments.len());
+        for (i, v) in arguments.iter().enumerate() {
+            // SAFETY: Creating a `Arg` from a `NativeValue` is safe when the parallel type vector matches.
+            let Some(native_type) = self.parameter_types.get(i) else {
+                return (call_failure(), std::ptr::null_mut());
+            };
+            call_args.push(unsafe { v.as_arg(native_type) });
+        }
 
 
         let ret = unsafe {
             self.cif.call(
-                CodePtr::from_ptr(func),
+                CodePtr::from_ptr(self.func),
                 &call_args,
             )
         };
 
-        println!("ret {}", ret);
+        if self.is_initializer && !self.is_sealed && result.is_null() {
+            if !composition_inner.is_null() {
+                result = composition_inner;
+            } else if !composition_outer.is_null() {
+                result = composition_outer;
+            }
+        }
 
-        println!("{}", HRESULT(ret).message());
+        if !self.is_initializer && !self.is_void && self.is_value_type_return() {
+            // Point result at the scratch buffer so the caller can read the bytes.
+            result = self.return_value_buf.as_mut_ptr() as *mut c_void;
+        }
 
         (HRESULT(ret), result)
     }

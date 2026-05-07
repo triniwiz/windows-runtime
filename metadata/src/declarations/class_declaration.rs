@@ -145,8 +145,6 @@ impl ClassDeclaration {
             }
         }
 
-        // todo
-        unreachable!();
         None
     }
 

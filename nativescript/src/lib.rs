@@ -1,5 +1,18 @@
 use std::ffi::{c_char, CStr};
+use std::sync::Once;
 use runtime::Runtime;
+
+static CTRL_C_INIT: Once = Once::new();
+
+#[no_mangle]
+pub extern fn runtime_install_ctrlc_handler(exit_code: i32) {
+    CTRL_C_INIT.call_once(move || {
+        let _ = ctrlc::set_handler(move || {
+            println!("Ctrl+C received, shutting down runtime...");
+            std::process::exit(exit_code);
+        });
+    });
+}
 
 #[no_mangle]
 pub extern fn runtime_init(app_root: *const c_char) -> i64 {

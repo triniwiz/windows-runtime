@@ -51,7 +51,7 @@ impl EnumMemberDeclaration {
 
                 assert!(result.is_ok());
 
-                match CorElementType(value_type as i32) {
+                match CorElementType(value_type as u8) {
                     windows::Win32::System::WinRT::Metadata::ELEMENT_TYPE_I4 => {
                         let value: &mut i32 = unsafe {std::mem::transmute(value)};
                         Value::Int32(*value)

@@ -6,7 +6,6 @@ use windows::Win32::System::WinRT::Metadata::{tdAbstract, tdAnsiClass, tdAutoCla
 use std::os::windows::prelude::*;
 use std::ptr::{addr_of, addr_of_mut, NonNull};
 use std::str::FromStr;
-use windows::w;
 use crate::signature::Signature;
 
 pub const LOCALE_SYSTEM_DEFAULT: u32 = 0x0800;
@@ -81,7 +80,7 @@ pub fn cor_sig_uncompress_element_type(p_data: &mut PCCOR_SIGNATURE) -> CorEleme
     let p_data = &mut p_data.0;
     let data = unsafe { **p_data };
     unsafe { *p_data = p_data.offset(1) };
-    CorElementType(data as i32)
+    CorElementType(data)
 }
 
 pub fn str_from_u8_nul_utf8(utf8_src: &[u8]) -> Result<&str, std::str::Utf8Error> {
@@ -275,7 +274,7 @@ pub fn resolve_type_ref(
                 )
             };
             debug_assert!(result.is_ok());
-            let mut string = HSTRING::from_wide(&data[..length.saturating_sub(1) as usize]).unwrap_or_default();
+            let mut string = HSTRING::from_wide(&data[..length.saturating_sub(1) as usize]);
 
             let dispenser: MaybeUninit<IMetaDataDispenserEx> = MaybeUninit::zeroed();
             let mut value = external_token.0 as u32;//0_u32;

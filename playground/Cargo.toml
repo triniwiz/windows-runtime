@@ -3,28 +3,18 @@ name = "playground"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[profile.dev]
-debug = true
-
-
 [dependencies]
-metadata = {path = "../metadata"}
-nativescript = {path = "../nativescript"}
+metadata = { path = "../metadata" }
+nativescript = { path = "../nativescript" }
 
 [dependencies.windows]
-version = "0.48.0"
+version = "0.62"
 features = [
+    "Foundation",
     "Foundation_Collections",
     "Foundation_Numerics",
-    "Graphics",
     "System",
-    "UI_Composition_Desktop",
     "Win32_Foundation",
-    "Win32_Graphics_Gdi",
-    "Win32_System_LibraryLoader",
     "Win32_System_WinRT",
-    "Win32_System_WinRT_Composition",
-    "Win32_UI_WindowsAndMessaging"
+    "Win32_UI_WindowsAndMessaging",
 ]

@@ -2,7 +2,7 @@ use std::ffi::{c_void, OsString};
 use std::mem::MaybeUninit;
 use std::os::windows::prelude::OsStringExt;
 use std::ptr::addr_of_mut;
-use windows::core::{GUID, HRESULT, HSTRING, IntoParam, PCWSTR};
+use windows::core::{GUID, HRESULT, HSTRING, PCWSTR, Ref};
 use windows::Win32::System::WinRT::Metadata::{IRoMetaDataLocator, IRoMetaDataLocator_Impl, IRoSimpleMetaDataBuilder, RoGetParameterizedTypeInstanceIID, RoParseTypeName};
 use windows::Win32::System::WinRT::WindowsGetStringRawBuffer;
 use crate::declarations::class_declaration::ClassDeclaration;
@@ -24,7 +24,7 @@ pub struct GenericInstanceIdBuilder {}
 pub struct IRoMetaDataLocatorImpl;
 
 impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
-    fn Locate(&self, nameelement: &PCWSTR, metadatadestination: Option<&IRoSimpleMetaDataBuilder>) -> windows::core::Result<()> {
+    fn Locate(&self, nameelement: &PCWSTR, metadatadestination: Ref<'_, IRoSimpleMetaDataBuilder>) -> windows::core::Result<()> {
         let name = OsString::from_wide(unsafe { nameelement.as_wide() });
         let name = name.to_string_lossy();
 
@@ -52,7 +52,7 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                         let full_name = HSTRING::from(default_interface.full_name());
                         let full_name = PCWSTR::from_raw(full_name.as_ptr());
 
-                        if let Some(builder) = metadatadestination {
+                        if let Ok(builder) = metadatadestination.ok() {
                             let result = unsafe {
                                 builder.SetRuntimeClassSimpleDefault(
                                     name,
@@ -73,7 +73,7 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                             .unwrap();
                         let interface_declaration_id = interface_declaration.id();
 
-                        if let Some(builder) = metadatadestination {
+                        if let Ok(builder) = metadatadestination.ok() {
                             let result = unsafe {
                                 builder.SetWinRtInterface(
                                     interface_declaration_id
@@ -90,16 +90,13 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                             .downcast_ref::<GenericInterfaceDeclaration>()
                             .unwrap();
 
-                        match metadatadestination {
-                            None => {}
-                            Some(builder) => {
-                                return unsafe {
-                                    builder.SetParameterizedInterface(
-                                        generic_interface_declaration.id(),
-                                        generic_interface_declaration.number_of_generic_parameters() as u32,
-                                    )
-                                };
-                            }
+                        if let Ok(builder) = metadatadestination.ok() {
+                            return unsafe {
+                                builder.SetParameterizedInterface(
+                                    generic_interface_declaration.id(),
+                                    generic_interface_declaration.number_of_generic_parameters() as u32,
+                                )
+                            };
                         }
                         return Ok(());
                     }
@@ -115,7 +112,7 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                         let signature = Signature::as_string(&type_);
                         let signature = HSTRING::from(signature);
 
-                        if let Some(builder) = metadatadestination {
+                        if let Ok(builder) = metadatadestination.ok() {
                             let full_name = PCWSTR(full_name.as_ptr());
                             let signature = PCWSTR(signature.as_ptr());
                             let result = unsafe {
@@ -134,7 +131,7 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                         let mut struct_declaration =
                             declaration.as_any().downcast_ref::<StructDeclaration>().unwrap();
 
-                        if let Some(builder) = metadatadestination {
+                        if let Ok(builder) = metadatadestination.ok() {
                             let mut field_names = Vec::new();
                             for field in struct_declaration.fields().iter() {
                                 let field_type = field.type_();
@@ -173,7 +170,7 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                             .downcast_ref::<DelegateDeclaration>()
                             .unwrap();
 
-                        if let Some(builder) = metadatadestination {
+                        if let Ok(builder) = metadatadestination.ok() {
                             let result = unsafe {
                                 builder.SetDelegate(
                                     delegate_declaration.id()
@@ -192,7 +189,7 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                             .unwrap();
 
 
-                        if let Some(builder) = metadatadestination {
+                        if let Ok(builder) = metadatadestination.ok() {
                             let result = unsafe {
                                 builder.SetParameterizedDelegate(
                                     generic_delegate_declaration.id(),

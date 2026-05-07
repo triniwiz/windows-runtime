@@ -1,0 +1,13 @@
+[package]
+name = "typings-generator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+metadata = { path = "../metadata" }
+parking_lot = "0.12"
+regex = "1.10"
+
+[dependencies.windows]
+version = "0.62"
+features = ["Win32_System_WinRT_Metadata"]

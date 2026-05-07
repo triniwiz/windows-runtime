@@ -1,15 +1,16 @@
-console.log("Hello From NativeScript running in a Windows CLI App\n");
-console.log(performance.now() + '\n');
-console.dir(global + '\n');
-//console.dir(Windows.UI.Popups.Placement);
-//console.log('Default', Windows.UI.Popups.Placement.Default, Windows.UI.Popups.Placement.Default === 0);
-//console.log('Right', Windows.UI.Popups.Placement.Right, Windows.UI.Popups.Placement.Right === 4);
-//const json = new Windows.Data.Json.JsonObject();
-//const method = new Windows.Web.Http.HttpMethod('GET');
-//console.log(method);
-console.log("\n");
+function dump(name, value) {
+	const proto = Object.getPrototypeOf(value);
+	const parentProto = proto ? Object.getPrototypeOf(proto) : null;
+	console.log(name + " own:", Object.getOwnPropertyNames(value).sort().join(", "));
+	console.log(name + " proto:", Object.getOwnPropertyNames(proto).sort().join(", "));
+	console.log(name + " proto2:", parentProto ? Object.getOwnPropertyNames(parentProto).sort().join(", ") : "<none>");
+	console.log(name + " children:", typeof value.Children, value.Children);
+	console.log(name + " items:", typeof value.Items, value.Items);
+	console.log(name + " orientation:", typeof value.Orientation, value.Orientation);
+	console.log(name + " spacing:", typeof value.Spacing, value.Spacing);
+	console.log(name + " probe:", typeof value.__probe__, value.__probe__);
+}
 
-
-const dialog = new Windows.UI.Popups.MessageDialog("Hello, World!");
-dialog.ShowAsync();
-
+dump("StackPanel", new Windows.UI.Xaml.Controls.StackPanel());
+dump("ListView", new Windows.UI.Xaml.Controls.ListView());
+dump("ComboBox", new Windows.UI.Xaml.Controls.ComboBox());

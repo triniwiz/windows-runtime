@@ -1,9 +1,8 @@
 use std::ffi::c_void;
-use std::ptr::addr_of_mut;
 use std::sync::Arc;
 use libffi::middle::*;
 use parking_lot::RwLock;
-use windows::core::{ComInterface, GUID, HRESULT, Interface, IUnknown};
+use windows::core::{GUID, HRESULT, Interface, IUnknown};
 use windows::Win32::System::WinRT::IActivationFactory;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use metadata::declarations::declaration::DeclarationKind;
@@ -12,7 +11,6 @@ use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::declarations::parameter_declaration::ParameterDeclaration;
 use metadata::declarations::property_declaration::PropertyDeclaration;
 use metadata::declaring_interface_for_method::Metadata;
-use metadata::get_method;
 use metadata::signature::Signature;
 use crate::error::AnyError;
 use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue};
@@ -27,12 +25,40 @@ pub struct PropertyCall {
     is_setter: bool,
     iid: GUID,
     cif: Cif,
+    func: *mut c_void,
     parent_interface: IUnknown,
     interface: IUnknown,
     parameter_types: Vec<NativeType>,
+    parse_parameter_types: Vec<NativeType>,
     parameters: Vec<ParameterDeclaration>,
     return_type: String,
     pub(crate) declaration: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>>,
+}
+
+#[inline]
+fn ffi_native_type_from_signature(signature: &str) -> NativeType {
+    match signature {
+        "Void" => NativeType::Void,
+        "String" => NativeType::Pointer,
+        "Boolean" => NativeType::Bool,
+        "UInt8" => NativeType::U8,
+        "UInt16" => NativeType::U16,
+        "UInt32" => NativeType::U32,
+        "UInt64" => NativeType::U64,
+        "Int8" => NativeType::I8,
+        "Int16" => NativeType::I16,
+        "Int32" => NativeType::I32,
+        "Int64" => NativeType::I64,
+        "Single" => NativeType::F32,
+        "Double" => NativeType::F64,
+        _ => NativeType::Pointer,
+    }
+}
+
+#[inline]
+fn call_failure() -> HRESULT {
+    // E_FAIL
+    HRESULT(0x8000_4005u32 as i32)
 }
 
 impl PropertyCall {
@@ -110,7 +136,7 @@ impl PropertyCall {
             ((*vtable).QueryInterface)(
                 interface.as_raw(),
                 &iid,
-                &mut interface_ptr as *mut _ as *mut *const c_void,
+                &mut interface_ptr as *mut _ as *mut *mut c_void,
             )
         };
 
@@ -144,13 +170,9 @@ impl PropertyCall {
 
         let number_of_abi_parameters = number_of_parameters + other_params;
 
-        let mut parameter_types: Vec<NativeType> = Vec::new();
-
-        parameter_types.reserve(number_of_abi_parameters);
-
-        unsafe {
-            parameter_types.push(NativeType::Pointer);
-        }
+        let mut parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_abi_parameters);
+        let mut parse_parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters);
+        parameter_types.push(NativeType::Pointer);
 
         for parameter in method.parameters().iter() {
             let type_ = parameter.type_();
@@ -158,68 +180,19 @@ impl PropertyCall {
 
             let signature = Signature::to_string(metadata, &type_);
 
-            match signature.as_str() {
-                "Void" => unsafe {
-                    parameter_types.push(NativeType::Void);
-                },
-                "String" => unsafe {
-                    parameter_types.push(NativeType::Pointer);
-                },
-                "Boolean" => unsafe {
-                    parameter_types.push(NativeType::Bool);
-                },
-                "UInt8" => unsafe {
-                    parameter_types.push(NativeType::U8);
-                },
-                "UInt16" => unsafe {
-                    parameter_types.push(NativeType::U16);
-                },
-                "UInt32" => unsafe {
-                    parameter_types.push(NativeType::U32);
-                },
-                "UInt64" => unsafe {
-                    parameter_types.push(NativeType::U64);
-                },
-                "Int8" => unsafe {
-                    parameter_types.push(NativeType::I8);
-                },
-                "Int16" => unsafe {
-                    parameter_types.push(NativeType::I16);
-                },
-                "Int32" => unsafe {
-                    parameter_types.push(NativeType::I32);
-                },
-                "Int64" => unsafe {
-                    parameter_types.push(NativeType::I64);
-                },
-                "Single" => unsafe {
-                    parameter_types.push(NativeType::F32);
-                },
-                "Double" => unsafe {
-                    parameter_types.push(NativeType::F64);
-                },
-                _ => {
-                    // objects
-                    unsafe {
-                        parameter_types.push(NativeType::Pointer);
-                    }
-                }
-            }
+            let parse_native_type = NativeType::try_from(signature.as_str());
+            assert!(parse_native_type.is_ok());
+            parse_parameter_types.push(parse_native_type.unwrap());
+            parameter_types.push(ffi_native_type_from_signature(signature.as_str()));
         }
 
         if is_initializer {
             if is_composition {
-                unsafe {
-                    parameter_types.push(NativeType::Pointer);
-                }
-                unsafe {
-                    parameter_types.push(NativeType::Pointer);
-                }
-            }
-
-            unsafe {
+                parameter_types.push(NativeType::Pointer);
                 parameter_types.push(NativeType::Pointer);
             }
+
+            parameter_types.push(NativeType::Pointer);
         } else {
             if !is_void {
                 parameter_types.push(NativeType::Pointer);
@@ -229,14 +202,14 @@ impl PropertyCall {
 
         let params =
             parameter_types
-                .clone()
-                .into_iter()
+                .iter()
+                .cloned()
                 .map(libffi::middle::Type::try_from)
                 .collect::<std::result::Result<Vec<Type>, AnyError>>();
 
         assert!(params.is_ok());
 
-        let mut cif = Cif::new(
+        let cif = Cif::new(
             params.unwrap(),
             Type::i32(),
         );
@@ -244,6 +217,8 @@ impl PropertyCall {
         let parent_interface = interface.clone();
 
         let interface = unsafe { IUnknown::from_raw(interface_ptr as *mut c_void) };
+        let vtable: *mut *mut c_void = unsafe { std::mem::transmute(interface.vtable()) };
+        let func = unsafe { *vtable.offset(index as isize) };
 
 
         Self {
@@ -255,9 +230,11 @@ impl PropertyCall {
             is_void: method.is_void(),
             iid,
             cif,
+            func,
             parent_interface,
             interface,
             parameter_types,
+            parse_parameter_types,
             parameters: method.parameters().to_vec(),
             declaration,
             return_type,
@@ -267,36 +244,36 @@ impl PropertyCall {
 
     pub fn call(
         &mut self,
-        scope: &mut v8::HandleScope,
+        scope: &mut v8::PinScope<'_, '_>,
         args: &v8::FunctionCallbackArguments,
+    ) -> (HRESULT, *mut c_void) {
+        let mut values = Vec::with_capacity(self.parse_parameter_types.len());
+        for index in 0..self.parse_parameter_types.len() {
+            values.push(args.get(index as i32));
+        }
+
+        self.call_with_values(scope, &values)
+    }
+
+    pub fn call_with_values(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
+        values: &[v8::Local<v8::Value>],
     ) -> (HRESULT, *mut c_void) {
         let number_of_abi_parameters = self.number_of_abi_parameters;
 
-        let mut arguments: Vec<NativeValue> = Vec::new();
-
-        arguments.reserve(number_of_abi_parameters);
+        let mut arguments: Vec<NativeValue> = Vec::with_capacity(number_of_abi_parameters);
 
         unsafe { arguments.push(NativeValue { pointer: std::mem::transmute_copy(&self.interface) }) };
 
-        for (i, parameter) in self.parameters.iter().enumerate() {
-            let type_ = parameter.type_();
-            let metadata = parameter.metadata().unwrap();
+        for (i, native_type) in self.parse_parameter_types.iter().enumerate() {
+            let Some(value) = values.get(i).copied() else {
+                return (call_failure(), std::ptr::null_mut());
+            };
 
-            let signature = Signature::to_string(metadata, &type_);
-
-            let value: v8::Local<v8::Value> = args.holder().into();
-
-            let native_type = NativeType::try_from(signature.as_str());
-
-            // todo error
-            assert!(native_type.is_ok());
-
-            let native_type = native_type.unwrap();
-
-            let value = match native_type {
+            let value = match *native_type {
                 NativeType::Void => {
-                    // todo
-                    unreachable!()
+                    return (call_failure(), std::ptr::null_mut())
                 }
                 NativeType::Bool => {
                     ffi_parse_bool_arg(value)
@@ -355,10 +332,10 @@ impl PropertyCall {
                 }
             };
 
-            // todo error
-            assert!(value.is_ok());
-
-            let value = value.unwrap();
+            let value = match value {
+                Ok(value) => value,
+                Err(_) => return (call_failure(), std::ptr::null_mut()),
+            };
 
             arguments.push(value);
         }
@@ -378,24 +355,18 @@ impl PropertyCall {
         //
         // get_method(&self.interface, self.index, addr_of_mut!(func));
 
-        let mut vtable = self.interface.vtable();
-
-        let vtable: *mut *mut c_void = unsafe {std::mem::transmute(vtable)};
-
-        let func = unsafe { *vtable.offset((self.index) as isize) };
-
-        let call_args: Vec<Arg> = arguments
-            .iter()
-            .enumerate()
-            // SAFETY: Creating a `Arg` from a `NativeValue` is pretty safe.
-            .map(|(i, v)| {
-                unsafe { v.as_arg(self.parameter_types.get(i).unwrap()) }
-            })
-            .collect();
+        let mut call_args: Vec<Arg> = Vec::with_capacity(arguments.len());
+        for (i, v) in arguments.iter().enumerate() {
+            // SAFETY: Creating a `Arg` from a `NativeValue` is safe when the parallel type vector matches.
+            let Some(native_type) = self.parameter_types.get(i) else {
+                return (call_failure(), std::ptr::null_mut());
+            };
+            call_args.push(unsafe { v.as_arg(native_type) });
+        }
 
         let ret = unsafe {
             self.cif.call(
-                CodePtr::from_ptr(func),
+                CodePtr::from_ptr(self.func),
                 &call_args,
             )
         };

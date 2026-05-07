@@ -10,28 +10,35 @@ mod generic_method_call;
 mod helpers;
 mod class;
 mod name_space;
+mod proxy_manifest_loader;
 
 use std::any::Any;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CString};
+use std::fs;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::ptr::{addr_of, addr_of_mut, NonNull};
+use std::process::Command;
 use std::result;
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Once, OnceLock};
+use std::time::{Duration, Instant};
 use libffi::high::arg;
 use libffi::low::{CodePtr, ffi_type};
 use libffi::middle::Cif;
 use parking_lot::{Mutex, RawRwLock, RwLock};
 use parking_lot::lock_api::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLockReadGuard, RwLockWriteGuard};
 use v8::{FunctionTemplate, Global, Local, Number, Object};
-use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, IUnknown_Vtbl, ComInterface, PCWSTR, Type, IInspectable, Error};
-use windows::Foundation::{AsyncStatus, GuidHelper, IAsyncInfo, IAsyncOperation};
-use windows::Win32::Foundation::CO_E_INIT_ONLY_SINGLE_THREADED;
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, CLSIDFromProgID, CLSIDFromString, CoCreateInstance, CoGetClassObject, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED, CoInitialize, CoInitializeEx, CoUninitialize, DISPATCH_METHOD, DISPPARAMS, EXCEPINFO, IClassFactory, IDispatch, IDispatch_Vtbl, ITypeLib, VARIANT, VT_UI2};
+use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, IUnknown_Vtbl, PCWSTR, IInspectable, Error};
+use windows::Foundation::GuidHelper;
+use windows::Win32::System::Com::{IDispatch, IDispatch_Vtbl};
+use windows::Win32::System::Console::GetConsoleWindow;
 use windows::Win32::System::WinRT::{IActivationFactory, RoActivateInstance, RoGetActivationFactory};
 use windows::Win32::System::WinRT::Metadata::ELEMENT_TYPE_CHAR;
-use windows::Win32::UI::WindowsAndMessaging::LB_GETLOCALE;
+use windows::Win32::UI::Shell::IInitializeWithWindow;
+use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PeekMessageW, PM_REMOVE, TranslateMessage};
 use metadata::declarations::base_class_declaration::{BaseClassDeclaration, BaseClassDeclarationImpl};
 use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration;
@@ -39,6 +46,10 @@ use metadata::declarations::declaration::{
     DeclarationKind,
     Declaration,
 };
+use metadata::declarations::delegate_declaration::DelegateDeclaration;
+use metadata::declarations::delegate_declaration::DelegateDeclarationImpl;
+use metadata::declarations::delegate_declaration::generic_delegate_declaration::GenericDelegateDeclaration;
+use metadata::declarations::delegate_declaration::generic_delegate_instance_declaration::GenericDelegateInstanceDeclaration;
 use metadata::declarations::enum_declaration::EnumDeclaration;
 use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::declarations::namespace_declaration::NamespaceDeclaration;
@@ -54,7 +65,9 @@ use metadata::declarations::struct_declaration::StructDeclaration;
 use metadata::declarations::struct_field_declaration::StructFieldDeclaration;
 use metadata::signature::Signature;
 use metadata::value::{Value, Variant};
-use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, MAX_SAFE_INTEGER, MIN_SAFE_INTEGER, NativeType, NativeValue, set_ret_val};
+use runtime_binding_gen::{RuntimeExtensionMetadata, RuntimeExtensionRegistry, RuntimeMethodMetadata, RuntimeParameterMetadata, RuntimePropertyMetadata};
+use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, MAX_SAFE_INTEGER, MIN_SAFE_INTEGER, NativeType, NativeValue, set_ret_val};
+use crate::proxy_manifest_loader::SbgManifestLoader;
 
 thread_local!(static ISOLATE: RefCell<Option<&'static mut v8::Isolate>> = RefCell::new(None));
 
@@ -62,51 +75,290 @@ pub struct Runtime {
     isolate: v8::OwnedIsolate,
     global_context: v8::Global<v8::Context>,
     app_root: String,
-    pub(crate) runtime: Arc<RwLock<runtime::Runtime>>,
 }
 
 static INIT: Once = Once::new();
+static PROXY_MANIFESTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
-struct IUnknownSafeInner(IUnknown);
-
-unsafe impl Send for IUnknownSafeInner {}
-
-struct IUnknownSafe {
-    inner: Mutex<IUnknownSafeInner>,
+fn proxy_manifests() -> &'static Mutex<Vec<String>> {
+    PROXY_MANIFESTS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-impl IUnknownSafe {
-    pub fn new(value: IUnknown) -> Self {
-        Self {
-            inner: Mutex::new(IUnknownSafeInner(value))
+fn default_sbg_manifest_path() -> PathBuf {
+    if let Ok(explicit) = std::env::var("SBG_MANIFEST_PATH") {
+        return PathBuf::from(explicit);
+    }
+    if let Ok(out_dir) = std::env::var("SBG_OUTPUT_DIR") {
+        return PathBuf::from(out_dir).join("sbg-manifest.json");
+    }
+    PathBuf::from("sbg_output").join("sbg-manifest.json")
+}
+
+fn preload_sbg_manifest() {
+    let manifest_path = default_sbg_manifest_path();
+    if !manifest_path.exists() {
+        return;
+    }
+
+    let mut loader = SbgManifestLoader::new();
+    if loader.load_manifest_file(&manifest_path).is_ok() {
+        if let Ok(content) = fs::read_to_string(&manifest_path) {
+            let mut manifests = proxy_manifests().lock();
+            if manifests.iter().all(|item| item != &content) {
+                manifests.push(content);
+            }
         }
     }
 }
 
-struct FFIPromiseInner {
-    promise: NonNull<v8::PromiseResolver>,
-    context: NonNull<v8::Context>,
+fn split_type_name(type_name: &str) -> (Option<String>, String) {
+    match type_name.rsplit_once('.') {
+        Some((namespace, class_name)) => (Some(namespace.to_string()), class_name.to_string()),
+        None => (None, type_name.to_string()),
+    }
 }
 
-unsafe impl Send for FFIPromiseInner {}
+fn extend_class_methods(class_declaration: &ClassDeclaration, methods: &mut Vec<MethodDeclaration>, seen: &mut HashSet<String>) {
+    for method in class_declaration.methods() {
+        let mut method_name = method.overload_name().to_string();
+        if method_name.is_empty() {
+            method_name = method.name().to_string();
+        }
 
-struct FFIPromise(Arc<RwLock<FFIPromiseInner>>);
+        if seen.insert(method_name) {
+            methods.push(method.clone());
+        }
+    }
 
-impl FFIPromise {
-    pub fn new(
-        context: NonNull<v8::Context>,
-        promise: NonNull<v8::PromiseResolver>,
-    ) -> Self {
-        Self {
-            0: Arc::new(RwLock::new(FFIPromiseInner {
-                context,
-                promise,
-            }))
+    if let Some(default_interface) = class_declaration.default_interface() {
+        for method in default_interface.methods() {
+            let mut method_name = method.overload_name().to_string();
+            if method_name.is_empty() {
+                method_name = method.name().to_string();
+            }
+
+            if seen.insert(method_name) {
+                methods.push(method.clone());
+            }
+        }
+    }
+
+    for interface in class_declaration.implemented_interfaces() {
+        for method in interface.methods() {
+            let mut method_name = method.overload_name().to_string();
+            if method_name.is_empty() {
+                method_name = method.name().to_string();
+            }
+
+            if seen.insert(method_name) {
+                methods.push(method.clone());
+            }
+        }
+    }
+
+    if !class_declaration.base_full_name().is_empty() {
+        if let Some(base_declaration) = MetadataReader::find_by_name(class_declaration.base_full_name()) {
+            let base_lock = base_declaration.read();
+            if let Some(base_class) = base_lock.as_any().downcast_ref::<ClassDeclaration>() {
+                extend_class_methods(base_class, methods, seen);
+            }
         }
     }
 }
 
-unsafe impl Send for FFIPromise {}
+fn extend_class_properties(class_declaration: &ClassDeclaration, properties: &mut Vec<PropertyDeclaration>, seen: &mut HashSet<String>) {
+    for property in class_declaration.properties() {
+        if seen.insert(property.name().to_string()) {
+            properties.push(property.clone());
+        }
+    }
+
+    if let Some(default_interface) = class_declaration.default_interface() {
+        for property in default_interface.properties() {
+            if seen.insert(property.name().to_string()) {
+                properties.push(property.clone());
+            }
+        }
+    }
+
+    for interface in class_declaration.implemented_interfaces() {
+        for property in interface.properties() {
+            if seen.insert(property.name().to_string()) {
+                properties.push(property.clone());
+            }
+        }
+    }
+
+    if !class_declaration.base_full_name().is_empty() {
+        if let Some(base_declaration) = MetadataReader::find_by_name(class_declaration.base_full_name()) {
+            let base_lock = base_declaration.read();
+            if let Some(base_class) = base_lock.as_any().downcast_ref::<ClassDeclaration>() {
+                extend_class_properties(base_class, properties, seen);
+            }
+        }
+    }
+}
+
+fn collect_class_methods(class_declaration: &ClassDeclaration) -> Vec<MethodDeclaration> {
+    let mut methods = Vec::new();
+    let mut seen = HashSet::new();
+    extend_class_methods(class_declaration, &mut methods, &mut seen);
+    methods
+}
+
+fn collect_class_properties(class_declaration: &ClassDeclaration) -> Vec<PropertyDeclaration> {
+    let mut properties = Vec::new();
+    let mut seen = HashSet::new();
+    extend_class_properties(class_declaration, &mut properties, &mut seen);
+    properties
+}
+
+fn class_has_member_named(class_declaration: &ClassDeclaration, name: &str) -> bool {
+    collect_class_methods(class_declaration)
+        .iter()
+        .any(|method| {
+            let overload_name = method.overload_name();
+            (!overload_name.is_empty() && overload_name == name) || method.name() == name
+        })
+        || collect_class_properties(class_declaration)
+            .iter()
+            .any(|property| property.name() == name)
+}
+
+fn runtime_method_metadata_from_method(method: &MethodDeclaration) -> RuntimeMethodMetadata {
+    let return_type = Signature::to_string(method.metadata().unwrap(), &method.return_type());
+    let parameters = method
+        .parameters()
+        .iter()
+        .enumerate()
+        .map(|(index, parameter)| {
+            let type_name = parameter
+                .metadata()
+                .map(|metadata| Signature::to_string(metadata, &parameter.type_()))
+                .unwrap_or_else(|| "Object".to_string());
+            let name = if parameter.name().is_empty() {
+                format!("arg{}", index)
+            } else {
+                parameter.name().to_string()
+            };
+            RuntimeParameterMetadata { name, type_name }
+        })
+        .collect::<Vec<_>>();
+
+    RuntimeMethodMetadata {
+        name: method.name().to_string(),
+        return_type,
+        parameters,
+    }
+}
+
+fn runtime_property_metadata_from_property(property: &PropertyDeclaration) -> RuntimePropertyMetadata {
+    let prop_type = Signature::to_string(
+        property.getter().metadata().unwrap(),
+        &property.getter().return_type(),
+    );
+
+    RuntimePropertyMetadata {
+        name: property.name().to_string(),
+        prop_type,
+        readable: true,
+        writable: property.setter().is_some(),
+    }
+}
+
+fn base_declaration_descriptor(
+    full_name: String,
+    namespace: Option<String>,
+    class_name: String,
+    declaration: &dyn BaseClassDeclarationImpl,
+) -> serde_json::Value {
+    let methods = declaration
+        .methods()
+        .iter()
+        .filter(|method| method.is_exported())
+        .map(runtime_method_metadata_from_method)
+        .collect::<Vec<_>>();
+    let properties = declaration
+        .properties()
+        .iter()
+        .filter(|property| property.is_exported())
+        .map(runtime_property_metadata_from_property)
+        .collect::<Vec<_>>();
+    let interfaces = declaration
+        .implemented_interfaces()
+        .iter()
+        .map(|interface| interface.full_name().to_string())
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "typeName": full_name,
+        "className": class_name,
+        "namespace": namespace,
+        "methods": methods,
+        "properties": properties,
+        "interfaces": interfaces,
+    })
+}
+
+fn build_runtime_type_descriptor(type_name: &str) -> Option<serde_json::Value> {
+    let declaration = MetadataReader::find_by_name(type_name)?;
+    let lock = declaration.read();
+    let full_name = lock.full_name().to_string();
+    let (namespace, class_name) = split_type_name(full_name.as_str());
+
+    match lock.kind() {
+        DeclarationKind::Class => {
+            let class = lock.as_any().downcast_ref::<ClassDeclaration>()?;
+            Some(base_declaration_descriptor(full_name, namespace, class_name, class))
+        }
+        DeclarationKind::Interface => lock
+            .as_any()
+            .downcast_ref::<InterfaceDeclaration>()
+            .map(|interface| base_declaration_descriptor(full_name, namespace, class_name, interface)),
+        DeclarationKind::GenericInterface => lock
+            .as_any()
+            .downcast_ref::<GenericInterfaceDeclaration>()
+            .map(|interface| base_declaration_descriptor(full_name, namespace, class_name, interface)),
+        DeclarationKind::GenericInterfaceInstance => lock
+            .as_any()
+            .downcast_ref::<GenericInterfaceInstanceDeclaration>()
+            .map(|interface| base_declaration_descriptor(full_name, namespace, class_name, interface)),
+        _ => None,
+    }
+}
+
+fn handle_describe_winrt_type(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 1 {
+        throw_js_error(scope, "__nsDescribeWinRTType(typeName) expects 1 argument");
+        return;
+    }
+
+    let Some(type_name) = value_to_string(scope, args.get(0)) else {
+        throw_js_error(scope, "Unable to convert typeName argument to string");
+        return;
+    };
+
+    let Some(descriptor) = build_runtime_type_descriptor(type_name.as_str()) else {
+        retval.set_null();
+        return;
+    };
+
+    match serde_json::to_string(&descriptor) {
+        Ok(json) => {
+            if let Some(value) = v8::String::new(scope, json.as_str()) {
+                retval.set(value.into());
+            } else {
+                retval.set_null();
+            }
+        }
+        Err(error) => throw_js_error(scope, format!("Failed to serialize WinRT descriptor: {error}").as_str()),
+    }
+}
+
 
 #[derive(Clone)]
 struct DeclarationFFI {
@@ -151,8 +403,6 @@ impl Deref for DeclarationFFI {
 }
 
 use regex::Regex;
-use tokio::io::AsyncReadExt;
-use tokio::runtime;
 use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
 use crate::generic_method_call::GenericMethodCall;
 use crate::method_call::MethodCall;
@@ -166,8 +416,1683 @@ fn init_global(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, conte
     global.define_own_property(scope, value, global.into(), v8::PropertyAttribute::READ_ONLY);
 }
 
-fn create_ns_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, scope: &mut v8::HandleScope<'a>) -> Local<'a, v8::Value> {
-    let scope = &mut v8::EscapableHandleScope::new(scope);
+fn throw_js_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
+    if let Some(msg) = v8::String::new(scope, message) {
+        let err = v8::Exception::error(scope, msg.into());
+        scope.throw_exception(err);
+    }
+}
+
+fn try_get_async_status(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<v8::Value>,
+) -> Result<i32, String> {
+    if !value.is_object() {
+        return Err("Expected a wrapped WinRT async object".to_string());
+    }
+
+    let object = value
+        .to_object(scope)
+        .ok_or_else(|| "Expected a wrapped WinRT async object".to_string())?;
+    let status_key = v8::String::new(scope, "Status")
+        .ok_or_else(|| "Unable to allocate V8 string for async status lookup".to_string())?;
+    let status = object
+        .get(scope, status_key.into())
+        .ok_or_else(|| "Async object does not expose Status".to_string())?;
+
+    if let Ok(value) = v8::Local::<v8::Int32>::try_from(status) {
+        return Ok(value.value());
+    }
+
+    if let Ok(value) = v8::Local::<v8::Uint32>::try_from(status) {
+        return Ok(value.value() as i32);
+    }
+
+    if let Ok(value) = v8::Local::<v8::Number>::try_from(status) {
+        return Ok(value.value() as i32);
+    }
+
+    if let Some(value) = status.integer_value(scope) {
+        return Ok(value as i32);
+    }
+
+    if let Some(value) = status.number_value(scope) {
+        if value.is_finite() {
+            return Ok(value as i32);
+        }
+    }
+
+    if let Some(value) = status.to_string(scope) {
+        let status_text = value.to_rust_string_lossy(scope).to_ascii_lowercase();
+        return match status_text.as_str() {
+            "started" => Ok(0),
+            "completed" => Ok(1),
+            "canceled" | "cancelled" => Ok(2),
+            "error" => Ok(3),
+            _ => Err(format!("Async Status is not a recognized value: {status_text}")),
+        };
+    }
+
+    Err("Async Status is not a numeric value".to_string())
+}
+
+fn handle_host_wait_for_async(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 1 {
+        throw_js_error(scope, "__nsHostWaitForAsync expects a WinRT async object");
+        return;
+    }
+
+    let op_value = args.get(0);
+    let timeout_ms = if args.length() >= 2 {
+        let timeout = args.get(1);
+        if let Some(value) = timeout.integer_value(scope) {
+            if value >= 0 { value as u64 } else { 0 }
+        } else if let Some(value) = timeout.number_value(scope) {
+            if value.is_finite() && value >= 0.0 {
+                value as u64
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    let deadline = if timeout_ms == 0 {
+        None
+    } else {
+        Some(Instant::now() + Duration::from_millis(timeout_ms))
+    };
+
+    let mut message = MSG::default();
+    loop {
+        if let Some(deadline) = deadline {
+            if Instant::now() >= deadline {
+                throw_js_error(
+                    scope,
+                    format!("Timed out waiting for WinRT async operation after {timeout_ms}ms").as_str(),
+                );
+                return;
+            }
+        }
+
+        match try_get_async_status(scope, op_value) {
+            Ok(0) => {
+                while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.into() {
+                    unsafe {
+                        TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+                std::thread::yield_now();
+            }
+            Ok(_) => {
+                retval.set(op_value);
+                return;
+            }
+            Err(message) => {
+                throw_js_error(scope, message.as_str());
+                return;
+            }
+        }
+    }
+}
+
+fn try_extract_pointer_from_value(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<v8::Value>,
+) -> Option<*mut c_void> {
+    if value.is_null_or_undefined() {
+        return Some(std::ptr::null_mut());
+    }
+
+    if let Ok(external) = v8::Local::<v8::External>::try_from(value) {
+        return Some(external.value());
+    }
+
+    if !value.is_object() {
+        return None;
+    }
+
+    let object = value.to_object(scope)?;
+
+    if let Some(handle_key) = v8::String::new(scope, "handle") {
+        if let Some(handle) = object.get(scope, handle_key.into()) {
+            if let Ok(external) = v8::Local::<v8::External>::try_from(handle) {
+                return Some(external.value());
+            }
+            if handle.is_null_or_undefined() {
+                return Some(std::ptr::null_mut());
+            }
+        }
+    }
+
+    None
+}
+
+fn handle_pointer_key(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 1 {
+        throw_js_error(scope, "__nsPointerKey expects a pointer-like value");
+        return;
+    }
+
+    let pointer = match try_extract_pointer_from_value(scope, args.get(0)) {
+        Some(pointer) => pointer,
+        None => {
+            throw_js_error(scope, "Unable to extract native pointer from value");
+            return;
+        }
+    };
+
+    let key = format!("0x{:x}", pointer as usize);
+    if let Some(value) = v8::String::new(scope, key.as_str()) {
+        retval.set(value.into());
+    } else {
+        retval.set_undefined();
+    }
+}
+
+fn handle_buffer_to_pointer(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 1 {
+        throw_js_error(scope, "__nsBufferToPointer expects an ArrayBuffer or ArrayBufferView");
+        return;
+    }
+
+    let value = args.get(0);
+
+    let pointer = if let Ok(array_buffer) = v8::Local::<v8::ArrayBuffer>::try_from(value) {
+        match array_buffer.data() {
+            Some(data) => data.as_ptr(),
+            None => std::ptr::null_mut(),
+        }
+    } else if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(value) {
+        let byte_offset = view.byte_offset();
+        let Some(buffer) = view.buffer(scope) else {
+            throw_js_error(scope, "ArrayBufferView does not expose a backing buffer");
+            return;
+        };
+        match buffer.data() {
+            Some(data) => unsafe { data.as_ptr().add(byte_offset) },
+            None => std::ptr::null_mut(),
+        }
+    } else if value.is_null_or_undefined() {
+        std::ptr::null_mut()
+    } else {
+        throw_js_error(scope, "__nsBufferToPointer expects an ArrayBuffer or ArrayBufferView");
+        return;
+    };
+
+    if pointer.is_null() {
+        retval.set_null();
+    } else {
+        let external = v8::External::new(scope, pointer);
+        retval.set(external.into());
+    }
+}
+
+fn value_to_string(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> Option<String> {
+    let value = value.to_string(scope)?;
+    Some(value.to_rust_string_lossy(scope))
+}
+
+fn handle_proxy_write_text_file(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 2 {
+        throw_js_error(scope, "__nsProxyWriteTextFile(path, content) expects 2 arguments");
+        return;
+    }
+
+    let Some(path) = value_to_string(scope, args.get(0)) else {
+        throw_js_error(scope, "Unable to convert path argument to string");
+        return;
+    };
+    let Some(content) = value_to_string(scope, args.get(1)) else {
+        throw_js_error(scope, "Unable to convert content argument to string");
+        return;
+    };
+
+    let path_buf = PathBuf::from(path);
+    if let Some(parent) = path_buf.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                throw_js_error(scope, format!("Failed to create directory: {err}").as_str());
+                return;
+            }
+        }
+    }
+
+    if let Err(err) = fs::write(&path_buf, content) {
+        throw_js_error(scope, format!("Failed to write file: {err}").as_str());
+        return;
+    }
+
+    retval.set_bool(true);
+}
+
+fn handle_proxy_compile_project(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 1 {
+        throw_js_error(scope, "__nsProxyCompileProject(csprojPath[, configuration]) expects at least 1 argument");
+        return;
+    }
+
+    let Some(project_path) = value_to_string(scope, args.get(0)) else {
+        throw_js_error(scope, "Unable to convert csprojPath argument to string");
+        return;
+    };
+
+    let configuration = if args.length() >= 2 {
+        value_to_string(scope, args.get(1)).unwrap_or_else(|| "Debug".to_string())
+    } else {
+        "Debug".to_string()
+    };
+
+    let output = match Command::new("dotnet")
+        .arg("build")
+        .arg(project_path.as_str())
+        .arg("-c")
+        .arg(configuration.as_str())
+        .arg("-v")
+        .arg("minimal")
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            throw_js_error(scope, format!("Failed to execute dotnet build: {err}").as_str());
+            return;
+        }
+    };
+
+    let result = v8::Object::new(scope);
+    let success = output.status.success();
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if let Some(key) = v8::String::new(scope, "success") {
+        result.set(scope, key.into(), v8::Boolean::new(scope, success).into());
+    }
+    if let Some(key) = v8::String::new(scope, "exitCode") {
+        result.set(scope, key.into(), v8::Integer::new(scope, exit_code).into());
+    }
+    if let Some(key) = v8::String::new(scope, "stdout") {
+        if let Some(value) = v8::String::new(scope, stdout.as_str()) {
+            result.set(scope, key.into(), value.into());
+        }
+    }
+    if let Some(key) = v8::String::new(scope, "stderr") {
+        if let Some(value) = v8::String::new(scope, stderr.as_str()) {
+            result.set(scope, key.into(), value.into());
+        }
+    }
+
+    retval.set(result.into());
+}
+
+fn handle_proxy_register_manifest(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 1 {
+        throw_js_error(scope, "__nsProxyRegisterManifest(manifestJson) expects 1 argument");
+        return;
+    }
+
+    let Some(manifest) = value_to_string(scope, args.get(0)) else {
+        throw_js_error(scope, "Unable to convert manifest argument to string");
+        return;
+    };
+
+    let mut manifests = proxy_manifests().lock();
+    manifests.push(manifest);
+    let index = manifests.len() as i32 - 1;
+    retval.set(v8::Integer::new(scope, index).into());
+}
+
+fn default_auto_capture_path() -> PathBuf {
+    if let Ok(explicit) = std::env::var("NSWINRT_AUTO_METADATA_PATH") {
+        return PathBuf::from(explicit);
+    }
+    if let Ok(out_dir) = std::env::var("SBG_OUTPUT_DIR") {
+        return PathBuf::from(out_dir).join("sbg_metadata.json");
+    }
+    PathBuf::from("sbg_output").join("sbg_metadata.json")
+}
+
+fn handle_proxy_auto_capture(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 1 {
+        throw_js_error(scope, "__nsProxyAutoCapture(metadataJson) expects 1 argument");
+        return;
+    }
+
+    let Some(metadata_json) = value_to_string(scope, args.get(0)) else {
+        throw_js_error(scope, "Unable to convert metadata argument to string");
+        return;
+    };
+
+    let path_buf = default_auto_capture_path();
+    if let Some(parent) = path_buf.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                throw_js_error(scope, format!("Failed to create metadata directory: {err}").as_str());
+                return;
+            }
+        }
+    }
+
+    let normalized = match serde_json::from_str::<Vec<RuntimeExtensionMetadata>>(metadata_json.as_str()) {
+        Ok(extensions) => {
+            let mut registry = RuntimeExtensionRegistry::new();
+            for extension in extensions.iter().cloned() {
+                registry.register(extension);
+            }
+            match serde_json::to_string_pretty(&extensions) {
+                Ok(json) => json,
+                Err(err) => {
+                    throw_js_error(scope, format!("Failed to normalize captured metadata: {err}").as_str());
+                    return;
+                }
+            }
+        }
+        Err(_) => metadata_json,
+    };
+
+    if let Err(err) = fs::write(&path_buf, normalized) {
+        throw_js_error(scope, format!("Failed to write captured metadata: {err}").as_str());
+        return;
+    }
+
+    if let Some(path) = path_buf.to_str() {
+        if let Some(path_value) = v8::String::new(scope, path) {
+            retval.set(path_value.into());
+            return;
+        }
+    }
+    retval.set_bool(true);
+}
+
+fn handle_read_text_file(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 1 {
+        throw_js_error(scope, "__nsReadTextFile(path) expects 1 argument");
+        return;
+    }
+
+    let Some(path) = value_to_string(scope, args.get(0)) else {
+        throw_js_error(scope, "Unable to convert path argument to string");
+        return;
+    };
+
+    match fs::read_to_string(Path::new(path.as_str())) {
+        Ok(content) => {
+            if let Some(value) = v8::String::new(scope, content.as_str()) {
+                retval.set(value.into());
+            } else {
+                retval.set_null();
+            }
+        }
+        Err(err) => throw_js_error(scope, format!("Failed to read module file: {err}").as_str()),
+    }
+}
+
+fn normalize_js_path(path: &str) -> PathBuf {
+    if let Some(raw) = path.strip_prefix("file:///") {
+        return PathBuf::from(raw.replace('/', "\\"));
+    }
+    if let Some(raw) = path.strip_prefix("file://") {
+        return PathBuf::from(raw.replace('/', "\\"));
+    }
+    PathBuf::from(path)
+}
+
+fn try_resolve_with_known_extensions(mut candidate: PathBuf) -> PathBuf {
+    if candidate.exists() {
+        return candidate;
+    }
+
+    if candidate.extension().is_none() {
+        for ext in ["js", "mjs", "cjs"] {
+            let with_ext = candidate.with_extension(ext);
+            if with_ext.exists() {
+                return with_ext;
+            }
+        }
+    }
+
+    if candidate.is_dir() {
+        for index_file in ["index.js", "index.mjs", "index.cjs"] {
+            let with_index = candidate.join(index_file);
+            if with_index.exists() {
+                return with_index;
+            }
+        }
+    }
+
+    candidate
+}
+
+fn handle_resolve_module_path(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 1 {
+        throw_js_error(scope, "__nsResolveModulePath(specifier[, parentPath, appRoot]) expects at least 1 argument");
+        return;
+    }
+
+    let Some(specifier) = value_to_string(scope, args.get(0)) else {
+        throw_js_error(scope, "Unable to convert module specifier to string");
+        return;
+    };
+
+    let parent_path = if args.length() >= 2 {
+        value_to_string(scope, args.get(1))
+    } else {
+        None
+    };
+
+    let app_root = if args.length() >= 3 {
+        value_to_string(scope, args.get(2)).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let mut candidate = if specifier.starts_with("./") || specifier.starts_with("../") {
+        let parent = parent_path
+            .map(|value| normalize_js_path(value.as_str()))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let base = if parent.is_file() {
+            parent.parent().map(Path::to_path_buf).unwrap_or(parent)
+        } else {
+            parent
+        };
+        base.join(specifier)
+    } else {
+        let direct = normalize_js_path(specifier.as_str());
+        if direct.is_absolute() {
+            direct
+        } else {
+            let app_base = if app_root.is_empty() {
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+            } else {
+                PathBuf::from(app_root).join("App")
+            };
+            app_base.join(direct)
+        }
+    };
+
+    candidate = try_resolve_with_known_extensions(candidate);
+    let resolved = candidate.canonicalize().unwrap_or(candidate);
+
+    if let Some(value) = resolved.to_str().and_then(|path| v8::String::new(scope, path)) {
+        retval.set(value.into());
+    } else {
+        retval.set_null();
+    }
+}
+
+fn handle_proxy_list_manifests(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let manifests = proxy_manifests().lock();
+    let array = v8::Array::new(scope, manifests.len() as i32);
+    for (i, entry) in manifests.iter().enumerate() {
+        if let Some(value) = v8::String::new(scope, entry.as_str()) {
+            array.set_index(scope, i as u32, value.into());
+        }
+    }
+    retval.set(array.into());
+}
+
+fn init_async_helpers(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, app_root: &str) {
+    let global = scope.get_current_context().global(scope);
+    if let Some(wait_name) = v8::String::new(scope, "__nsHostWaitForAsync") {
+        if let Some(wait_fn) = v8::Function::new(scope, handle_host_wait_for_async) {
+            global.define_own_property(scope, wait_name.into(), wait_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    if let Some(pointer_key_name) = v8::String::new(scope, "__nsPointerKey") {
+        if let Some(pointer_key_fn) = v8::Function::new(scope, handle_pointer_key) {
+            global.define_own_property(scope, pointer_key_name.into(), pointer_key_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    if let Some(buffer_to_pointer_name) = v8::String::new(scope, "__nsBufferToPointer") {
+        if let Some(buffer_to_pointer_fn) = v8::Function::new(scope, handle_buffer_to_pointer) {
+            global.define_own_property(scope, buffer_to_pointer_name.into(), buffer_to_pointer_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    if let Some(write_text_name) = v8::String::new(scope, "__nsProxyWriteTextFile") {
+        if let Some(write_text_fn) = v8::Function::new(scope, handle_proxy_write_text_file) {
+            global.define_own_property(scope, write_text_name.into(), write_text_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    if let Some(compile_name) = v8::String::new(scope, "__nsProxyCompileProject") {
+        if let Some(compile_fn) = v8::Function::new(scope, handle_proxy_compile_project) {
+            global.define_own_property(scope, compile_name.into(), compile_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    if let Some(register_name) = v8::String::new(scope, "__nsProxyRegisterManifest") {
+        if let Some(register_fn) = v8::Function::new(scope, handle_proxy_register_manifest) {
+            global.define_own_property(scope, register_name.into(), register_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    if let Some(list_name) = v8::String::new(scope, "__nsProxyListManifests") {
+        if let Some(list_fn) = v8::Function::new(scope, handle_proxy_list_manifests) {
+            global.define_own_property(scope, list_name.into(), list_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    if let Some(capture_name) = v8::String::new(scope, "__nsProxyAutoCapture") {
+        if let Some(capture_fn) = v8::Function::new(scope, handle_proxy_auto_capture) {
+            global.define_own_property(scope, capture_name.into(), capture_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    if let Some(read_file_name) = v8::String::new(scope, "__nsReadTextFile") {
+        if let Some(read_file_fn) = v8::Function::new(scope, handle_read_text_file) {
+            global.define_own_property(scope, read_file_name.into(), read_file_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    if let Some(resolve_module_name) = v8::String::new(scope, "__nsResolveModulePath") {
+        if let Some(resolve_module_fn) = v8::Function::new(scope, handle_resolve_module_path) {
+            global.define_own_property(scope, resolve_module_name.into(), resolve_module_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    if let Some(app_root_name) = v8::String::new(scope, "__nsAppRoot") {
+        if let Some(app_root_value) = v8::String::new(scope, app_root) {
+            global.define_own_property(scope, app_root_name.into(), app_root_value.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    if let Some(describe_name) = v8::String::new(scope, "__nsDescribeWinRTType") {
+        if let Some(describe_fn) = v8::Function::new(scope, handle_describe_winrt_type) {
+            global.define_own_property(scope, describe_name.into(), describe_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+        let helper_source = r#"
+        (function () {
+            var defaultTimeoutMs = 0;
+            var statusEnum =
+                (globalThis.Windows &&
+                    globalThis.Windows.Foundation &&
+                    globalThis.Windows.Foundation.AsyncStatus) ||
+                { Started: 0, Completed: 1, Canceled: 2, Error: 3 };
+
+            function normalizeTimeoutMs(options) {
+                if (typeof options === 'number' && Number.isFinite(options) && options >= 0) {
+                    return Math.floor(options);
+                }
+
+                if (options && typeof options === 'object') {
+                    if (typeof options.timeoutMs === 'number' && Number.isFinite(options.timeoutMs) && options.timeoutMs >= 0) {
+                        return Math.floor(options.timeoutMs);
+                    }
+                }
+
+                return defaultTimeoutMs;
+            }
+
+            function normalizeStatus(status) {
+                if (status == null) {
+                    return Number.NaN;
+                }
+                if (typeof status === 'number') {
+                    return status;
+                }
+                if (typeof status === 'string') {
+                    var lower = status.toLowerCase();
+                    if (lower === 'started') return 0;
+                    if (lower === 'completed') return 1;
+                    if (lower === 'canceled' || lower === 'cancelled') return 2;
+                    if (lower === 'error') return 3;
+                }
+                if (typeof status.valueOf === 'function') {
+                    var value = status.valueOf();
+                    if (typeof value === 'number') {
+                        return value;
+                    }
+                    if (typeof value === 'string') {
+                        return normalizeStatus(value);
+                    }
+                }
+                var coerced = Number(status);
+                return Number.isNaN(coerced) ? Number.NaN : coerced;
+            }
+
+            function setDefaultTimeoutMs(timeoutMs) {
+                if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs < 0) {
+                    throw new Error('NSWinRT.setDefaultTimeoutMs(timeoutMs) expects a finite number >= 0');
+                }
+                defaultTimeoutMs = Math.floor(timeoutMs);
+                return defaultTimeoutMs;
+            }
+
+            function wait(op, options) {
+                if (typeof globalThis.__nsHostWaitForAsync === 'function') {
+                    globalThis.__nsHostWaitForAsync(op, normalizeTimeoutMs(options));
+                }
+                return op;
+            }
+
+            function getStatus(op) {
+                return normalizeStatus(op && op.Status);
+            }
+
+            function getResults(op) {
+                if (op && typeof op.GetResults === 'function') {
+                    return op.GetResults();
+                }
+                return undefined;
+            }
+
+            function toPromise(op, options) {
+                if (op == null) {
+                    return Promise.resolve(op);
+                }
+
+                // Match NativeScript runtime style: native objects are returned as-is.
+                // Promise conversion is opt-in via this helper.
+                if (typeof op.then === 'function') {
+                    return op;
+                }
+
+                return new Promise(function (resolve, reject) {
+                    function settleFromStatus(overrideStatus) {
+                        try {
+                            var status = normalizeStatus(
+                                overrideStatus !== undefined ? overrideStatus : (op && op.Status)
+                            );
+
+                            if (status === statusEnum.Completed || status === 1) {
+                                resolve(getResults(op));
+                                return;
+                            }
+                            if (status === statusEnum.Canceled || status === 2) {
+                                reject(new Error('WinRT async operation was canceled'));
+                                return;
+                            }
+                            if (status === statusEnum.Error || status === 3) {
+                                reject((op && op.ErrorCode) || new Error('WinRT async operation failed'));
+                                return;
+                            }
+
+                            reject(
+                                new Error('WinRT async operation is still pending and no completion callback was attached')
+                            );
+                        } catch (err) {
+                            reject(err);
+                        }
+                    }
+
+                    try {
+                        if (op && 'Completed' in op) {
+                            op.Completed = function (asyncInfo, asyncStatus) {
+                                settleFromStatus(asyncStatus);
+                            };
+                            return;
+                        }
+                    } catch (_) {
+                        // Fall through and attempt status-based settlement.
+                    }
+
+                    try {
+                        wait(op, options);
+                        settleFromStatus();
+                    } catch (err) {
+                        reject(err);
+                    }
+                });
+            }
+
+            function onCompleted(op, callback, options) {
+                if (typeof callback !== 'function') {
+                    throw new Error('NSWinRT.onCompleted(op, callback[, options]) expects callback to be a function');
+                }
+
+                try {
+                    if (op && 'Completed' in op) {
+                        op.Completed = function (asyncInfo, asyncStatus) {
+                            callback(asyncInfo || op, normalizeStatus(asyncStatus));
+                        };
+                        return op;
+                    }
+                } catch (_) {
+                    // Fall through to polling fallback.
+                }
+
+                Promise.resolve().then(function () {
+                    wait(op, options);
+                    callback(op, getStatus(op));
+                });
+
+                return op;
+            }
+
+            globalThis.__nsWinRTToPromise = toPromise;
+            globalThis.NSWinRT = globalThis.NSWinRT || {};
+            globalThis.NSWinRT.toPromise = toPromise;
+            globalThis.NSWinRT.wait = wait;
+            globalThis.NSWinRT.getStatus = getStatus;
+            globalThis.NSWinRT.getResults = getResults;
+            globalThis.NSWinRT.onCompleted = onCompleted;
+            globalThis.NSWinRT.setDefaultTimeoutMs = setDefaultTimeoutMs;
+
+            function Pointer(handle) {
+                this.handle = handle == null ? null : handle;
+            }
+
+            Pointer.prototype.isNull = function () {
+                return this.handle == null;
+            };
+
+            Pointer.prototype.unwrap = function () {
+                return this.handle;
+            };
+
+            Pointer.prototype.toString = function () {
+                return this.isNull() ? '[Pointer null]' : '[Pointer external]';
+            };
+
+            function asPointer(value) {
+                return value instanceof Pointer ? value : new Pointer(value);
+            }
+
+            function handleOf(value) {
+                return value instanceof Pointer ? value.handle : value;
+            }
+
+            function asBufferSource(value) {
+                if (value == null) {
+                    return value;
+                }
+
+                if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+                    return value;
+                }
+
+                throw new Error('NSWinRT.interop.asBufferSource(value) expects ArrayBuffer or ArrayBufferView');
+            }
+
+            function asUint8View(value) {
+                var source = asBufferSource(value);
+                if (source == null) {
+                    return new Uint8Array(0);
+                }
+
+                if (source instanceof ArrayBuffer) {
+                    return new Uint8Array(source);
+                }
+
+                return new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+            }
+
+            function asDataView(value) {
+                var source = asBufferSource(value);
+                if (source == null) {
+                    return new DataView(new ArrayBuffer(0));
+                }
+
+                if (source instanceof ArrayBuffer) {
+                    return new DataView(source);
+                }
+
+                return new DataView(source.buffer, source.byteOffset, source.byteLength);
+            }
+
+            // WinRT DateTime stores 100ns ticks since 1601-01-01T00:00:00Z.
+            var winRtUnixEpochOffsetTicks = 116444736000000000n;
+
+            function toWinRTDateTimeTicks(input) {
+                var ms;
+                if (input instanceof Date) {
+                    ms = input.getTime();
+                } else if (typeof input === 'number') {
+                    ms = input;
+                } else {
+                    throw new Error('NSWinRT.interop.toWinRTDateTimeTicks expects Date or millisecond timestamp');
+                }
+
+                if (!Number.isFinite(ms)) {
+                    throw new Error('Invalid Date/time value for WinRT conversion');
+                }
+
+                return BigInt(Math.trunc(ms)) * 10000n + winRtUnixEpochOffsetTicks;
+            }
+
+            function fromWinRTDateTimeTicks(value) {
+                if (value == null) {
+                    return new Date(Number.NaN);
+                }
+
+                var ticks = typeof value === 'bigint' ? value : BigInt(Math.trunc(Number(value)));
+                var unixTicks = ticks - winRtUnixEpochOffsetTicks;
+                var ms = Number(unixTicks / 10000n);
+                return new Date(ms);
+            }
+
+            var pointerBufferRegistry = new Map();
+
+            function pointerKey(value) {
+                if (typeof globalThis.__nsPointerKey !== 'function') {
+                    return null;
+                }
+                return globalThis.__nsPointerKey(value);
+            }
+
+            function pointerFromBuffer(value) {
+                var source = asBufferSource(value);
+                if (source == null || typeof globalThis.__nsBufferToPointer !== 'function') {
+                    return null;
+                }
+                return globalThis.__nsBufferToPointer(source);
+            }
+
+            function trackBufferSource(value) {
+                var source = asBufferSource(value);
+                if (source == null) {
+                    return null;
+                }
+
+                var pointer = pointerFromBuffer(source);
+                var key = pointerKey(pointer);
+                if (key != null) {
+                    pointerBufferRegistry.set(String(key), source);
+                }
+                return pointer;
+            }
+
+            function resolveTrackedBuffer(pointerLike) {
+                var key = pointerKey(pointerLike);
+                if (key == null) {
+                    return undefined;
+                }
+                return pointerBufferRegistry.get(String(key));
+            }
+
+            globalThis.NSWinRT.interop = {
+                Pointer: Pointer,
+                pointer: asPointer,
+                isPointer: function (value) {
+                    return value instanceof Pointer;
+                },
+                handleOf: handleOf,
+                asBufferSource: asBufferSource,
+                asUint8View: asUint8View,
+                asDataView: asDataView,
+                toWinRTDateTimeTicks: toWinRTDateTimeTicks,
+                fromWinRTDateTimeTicks: fromWinRTDateTimeTicks,
+                pointerKey: pointerKey,
+                pointerFromBuffer: pointerFromBuffer,
+                trackBufferSource: trackBufferSource,
+                resolveTrackedBuffer: resolveTrackedBuffer,
+                byteLengthOf: function (value) {
+                    var buffer = asBufferSource(value);
+                    if (buffer == null) {
+                        return 0;
+                    }
+                    return typeof buffer.byteLength === 'number' ? buffer.byteLength : 0;
+                },
+                byteOffsetOf: function (value) {
+                    if (ArrayBuffer.isView(value)) {
+                        return value.byteOffset;
+                    }
+                    return 0;
+                },
+                readU8: function (value, offset) {
+                    return asDataView(value).getUint8(offset >>> 0);
+                },
+                writeU8: function (value, offset, input) {
+                    asDataView(value).setUint8(offset >>> 0, input >>> 0);
+                    return value;
+                },
+                readI32: function (value, offset, littleEndian) {
+                    return asDataView(value).getInt32(offset >>> 0, littleEndian !== false);
+                },
+                writeI32: function (value, offset, input, littleEndian) {
+                    asDataView(value).setInt32(offset >>> 0, input | 0, littleEndian !== false);
+                    return value;
+                },
+                readF32: function (value, offset, littleEndian) {
+                    return asDataView(value).getFloat32(offset >>> 0, littleEndian !== false);
+                },
+                writeF32: function (value, offset, input, littleEndian) {
+                    asDataView(value).setFloat32(offset >>> 0, +input, littleEndian !== false);
+                    return value;
+                },
+                readF64: function (value, offset, littleEndian) {
+                    return asDataView(value).getFloat64(offset >>> 0, littleEndian !== false);
+                },
+                writeF64: function (value, offset, input, littleEndian) {
+                    asDataView(value).setFloat64(offset >>> 0, +input, littleEndian !== false);
+                    return value;
+                },
+            };
+
+            var proxyExtensions = [];
+            var proxyInstances = new Map();
+            var nextProxyId = 1;
+
+            function ctorName(ctor) {
+                return (ctor && (ctor.__typeName__ || ctor.name)) || 'Object';
+            }
+
+            var typeDescriptorCache = Object.create(null);
+
+            function describeWinRTType(typeName) {
+                if (!typeName || typeof globalThis.__nsDescribeWinRTType !== 'function') {
+                    return null;
+                }
+                if (Object.prototype.hasOwnProperty.call(typeDescriptorCache, typeName)) {
+                    return typeDescriptorCache[typeName];
+                }
+                try {
+                    var raw = globalThis.__nsDescribeWinRTType(typeName);
+                    typeDescriptorCache[typeName] = raw ? JSON.parse(raw) : null;
+                } catch (_) {
+                    typeDescriptorCache[typeName] = null;
+                }
+                return typeDescriptorCache[typeName];
+            }
+
+            function buildFallbackParameterMetadata(fn) {
+                var params = [];
+                var count = typeof fn === 'function' && Number.isFinite(fn.length) ? fn.length : 0;
+                for (var i = 0; i < count; i++) {
+                    params.push({ name: 'arg' + i, type: 'Object' });
+                }
+                return params;
+            }
+
+            function normalizeMethodMetadata(name, value, descriptors) {
+                for (var i = 0; i < descriptors.length; i++) {
+                    var descriptor = descriptors[i];
+                    if (!descriptor || !Array.isArray(descriptor.methods)) {
+                        continue;
+                    }
+                    for (var j = 0; j < descriptor.methods.length; j++) {
+                        var method = descriptor.methods[j];
+                        if (method && method.name === name) {
+                            return {
+                                name: method.name,
+                                returnType: method.returnType || method.return_type || 'Void',
+                                parameters: Array.isArray(method.parameters) ? method.parameters : [],
+                            };
+                        }
+                    }
+                }
+
+                return {
+                    name: name,
+                    returnType: name === 'init' ? 'Void' : 'Object',
+                    parameters: buildFallbackParameterMetadata(value),
+                };
+            }
+
+            function normalizePropertyMetadata(name, descriptors) {
+                for (var i = 0; i < descriptors.length; i++) {
+                    var descriptor = descriptors[i];
+                    if (!descriptor || !Array.isArray(descriptor.properties)) {
+                        continue;
+                    }
+                    for (var j = 0; j < descriptor.properties.length; j++) {
+                        var property = descriptor.properties[j];
+                        if (property && property.name === name) {
+                            return {
+                                name: property.name,
+                                propType: property.propType || property.prop_type || 'Object',
+                                readable: property.readable !== false,
+                                writable: property.writable !== false,
+                            };
+                        }
+                    }
+                }
+
+                return {
+                    name: name,
+                    propType: 'Object',
+                    readable: true,
+                    writable: true,
+                };
+            }
+
+            function collectProxyMethods(overrides, descriptors) {
+                var methods = [];
+                for (var key in overrides) {
+                    if (!Object.prototype.hasOwnProperty.call(overrides, key)) {
+                        continue;
+                    }
+                    if (key === 'interfaces') {
+                        continue;
+                    }
+                    if (typeof overrides[key] === 'function') {
+                        methods.push(normalizeMethodMetadata(key, overrides[key], descriptors));
+                    }
+                }
+                methods.sort(function (left, right) {
+                    return String(left && left.name || '').localeCompare(String(right && right.name || ''));
+                });
+                return methods;
+            }
+
+            function collectProxyProperties(overrides, descriptors) {
+                var props = [];
+                for (var key in overrides) {
+                    if (!Object.prototype.hasOwnProperty.call(overrides, key)) {
+                        continue;
+                    }
+                    if (key === 'interfaces') {
+                        continue;
+                    }
+                    if (typeof overrides[key] !== 'function') {
+                        props.push(normalizePropertyMetadata(key, descriptors));
+                    }
+                }
+                props.sort(function (left, right) {
+                    return String(left && left.name || '').localeCompare(String(right && right.name || ''));
+                });
+                return props;
+            }
+
+            function safeIdentifier(name) {
+                return String(name || '')
+                    .replace(/[^A-Za-z0-9_]/g, '_')
+                    .replace(/^([^A-Za-z_])/, '_$1') || 'ProxyType';
+            }
+
+            function autoProxyTypeName(baseCtor) {
+                var baseType = ctorName(baseCtor) || 'Object';
+                var baseShort = safeIdentifier(baseType.split('.').pop());
+                var baseNamespace = 'windows';
+                var namespaceIndex = baseType.lastIndexOf('.');
+                if (namespaceIndex >= 0) {
+                    baseNamespace = baseType
+                        .slice(0, namespaceIndex)
+                        .toLowerCase()
+                        .replace(/[^a-z0-9_.]/g, '_');
+                }
+                return 'com.tns.gen.winrt.' + baseNamespace + '.' + baseShort + '_AutoProxy_' + (proxyExtensions.length + 1);
+            }
+
+            function renderProxyCSharp(meta) {
+                var typeName = meta.typeName || ('GeneratedProxy' + (proxyExtensions.length + 1));
+                var safeTypeName = safeIdentifier(typeName.split('.').pop());
+                var baseType = meta.baseType || 'object';
+                var methodStubs = '';
+                for (var i = 0; i < meta.methods.length; i++) {
+                    var methodMeta = meta.methods[i];
+                    var methodName = safeIdentifier((methodMeta && methodMeta.name) || methodMeta);
+                    methodStubs +=
+                        '    public object __ns_' + methodName + '(params object[] args)\\n' +
+                        '    {\\n' +
+                        '        return ProxyDispatcher.Invoke(this.__proxyId, "' + methodName + '", args);\\n' +
+                        '    }\\n\\n';
+                }
+
+                return (
+                    'using System;\\n\\n' +
+                    'namespace NativeScriptGeneratedProxies\\n' +
+                    '{\\n' +
+                    '    public static class ProxyDispatcher\\n' +
+                    '    {\\n' +
+                    '        public static Func<int, string, object[], object> JsInvoke;\\n' +
+                    '        public static object Invoke(int id, string method, object[] args)\\n' +
+                    '        {\\n' +
+                    '            var cb = JsInvoke;\\n' +
+                    '            if (cb == null) throw new InvalidOperationException("JsInvoke callback is not registered.");\\n' +
+                    '            return cb(id, method, args);\\n' +
+                    '        }\\n' +
+                    '    }\\n\\n' +
+                    '    public class ' + safeTypeName + ' : ' + baseType + '\\n' +
+                    '    {\\n' +
+                    '        private readonly int __proxyId;\\n\\n' +
+                    '        public ' + safeTypeName + '(int proxyId)\\n' +
+                    '        {\\n' +
+                    '            this.__proxyId = proxyId;\\n' +
+                    '        }\\n\\n' +
+                    methodStubs +
+                    '    }\\n' +
+                    '}\\n'
+                );
+            }
+
+            function renderProxyCsproj(meta) {
+                var asmName = safeIdentifier((meta.typeName || 'GeneratedProxy').split('.').pop());
+                return (
+                    '<Project Sdk="Microsoft.NET.Sdk">\\n' +
+                    '  <PropertyGroup>\\n' +
+                    '    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>\\n' +
+                    '    <AssemblyName>' + asmName + '</AssemblyName>\\n' +
+                    '    <RootNamespace>NativeScriptGeneratedProxies</RootNamespace>\\n' +
+                    '    <ImplicitUsings>enable</ImplicitUsings>\\n' +
+                    '    <Nullable>disable</Nullable>\\n' +
+                    '    <LangVersion>latest</LangVersion>\\n' +
+                    '  </PropertyGroup>\\n' +
+                    '</Project>\\n'
+                );
+            }
+
+            function buildProxyMetadata(baseCtor, typeName, overrides, Extended) {
+                var baseType = ctorName(baseCtor);
+                var interfaceNames = Array.isArray(overrides.interfaces)
+                    ? overrides.interfaces.map(function (iface) { return ctorName(iface); })
+                    : [];
+                var descriptors = [describeWinRTType(baseType)];
+                for (var i = 0; i < interfaceNames.length; i++) {
+                    descriptors.push(describeWinRTType(interfaceNames[i]));
+                }
+                var namespace = '';
+                var className = typeName || '';
+                if (typeName) {
+                    var splitIndex = typeName.lastIndexOf('.');
+                    if (splitIndex >= 0) {
+                        namespace = typeName.slice(0, splitIndex);
+                        className = typeName.slice(splitIndex + 1);
+                    }
+                }
+                var meta = {
+                    kind: 'windows-proxy',
+                    typeName: typeName || '',
+                    className: className || safeIdentifier((typeName || baseType || 'GeneratedProxy').split('.').pop()),
+                    namespace: namespace || null,
+                    baseType: baseType,
+                    baseClass: baseType,
+                    interfaces: interfaceNames,
+                    methods: collectProxyMethods(overrides, descriptors.filter(Boolean)),
+                    properties: collectProxyProperties(overrides, descriptors.filter(Boolean)),
+                    isAutoGeneratedName: !typeName,
+                    registeredAt: new Date().toISOString(),
+                    registered: false,
+                    generated: null,
+                };
+                try {
+                    Object.defineProperty(Extended, '__proxyMetadata__', {
+                        value: meta,
+                        writable: true,
+                        configurable: true,
+                        enumerable: false,
+                    });
+                } catch (_) {
+                    Extended.__proxyMetadata__ = meta;
+                }
+                proxyExtensions.push(meta);
+                if (typeof globalThis.__nsProxyAutoCapture === 'function') {
+                    try {
+                        globalThis.__nsProxyAutoCapture(JSON.stringify(proxyExtensions));
+                    } catch (_) {
+                        // Capture is best-effort; runtime behavior should remain unaffected.
+                    }
+                }
+                return meta;
+            }
+
+            function ensureProxyInstance(instance, overrides, ctor) {
+                if (!instance || typeof instance !== 'object') {
+                    return -1;
+                }
+
+                var proxyId = instance.__proxyId;
+                if (typeof proxyId !== 'number' || !Number.isFinite(proxyId)) {
+                    proxyId = nextProxyId++;
+                    try {
+                        Object.defineProperty(instance, '__proxyId', {
+                            value: proxyId,
+                            writable: false,
+                            configurable: true,
+                            enumerable: false,
+                        });
+                    } catch (_) {
+                        instance.__proxyId = proxyId;
+                    }
+                }
+
+                proxyInstances.set(proxyId, {
+                    instance: instance,
+                    overrides: overrides,
+                    constructor: ctor,
+                });
+
+                return proxyId;
+            }
+
+            function makeExtendedConstructor(baseCtor, nameOrOverrides, maybeOverrides) {
+                var hasName = typeof nameOrOverrides === 'string';
+                var explicitTypeName = hasName ? nameOrOverrides : '';
+                var typeName = explicitTypeName || autoProxyTypeName(baseCtor);
+                var overrides = hasName ? maybeOverrides : nameOrOverrides;
+                if (!overrides || typeof overrides !== 'object') {
+                    overrides = {};
+                }
+
+                function Extended() {
+                    var instance;
+                    var args = Array.prototype.slice.call(arguments);
+                    try {
+                        instance = Reflect.construct(baseCtor, args);
+                    } catch (_) {
+                        instance = {};
+                    }
+
+                    for (var key in overrides) {
+                        if (key === 'interfaces') {
+                            continue;
+                        }
+                        var value = overrides[key];
+                        if (typeof value === 'function') {
+                            try {
+                                Object.defineProperty(instance, key, {
+                                    value: value,
+                                    writable: true,
+                                    configurable: true,
+                                    enumerable: true,
+                                });
+                            } catch (_) {
+                                instance[key] = value;
+                            }
+                        } else {
+                            instance[key] = value;
+                        }
+                    }
+
+                    // NativeScript-style behavior: call init automatically on construction
+                    // if provided by the extension object.
+                    if (typeof overrides.init === 'function') {
+                        try {
+                            var initResult = overrides.init.apply(instance, args);
+                            if (initResult && typeof initResult === 'object') {
+                                instance = initResult;
+                            }
+                        } catch (_) {
+                            // Keep constructor resilient; init errors should not crash runtime.
+                        }
+                    }
+
+                    if (Array.isArray(overrides.interfaces)) {
+                        try {
+                            Object.defineProperty(instance, '__interfaces__', {
+                                value: overrides.interfaces.slice(),
+                                writable: false,
+                                configurable: true,
+                                enumerable: false,
+                            });
+                        } catch (_) {
+                            instance.__interfaces__ = overrides.interfaces.slice();
+                        }
+                    }
+
+                    ensureProxyInstance(instance, overrides, Extended);
+
+                    return instance;
+                }
+
+                Extended.prototype = Object.create((baseCtor && baseCtor.prototype) || Object.prototype);
+                Extended.prototype.constructor = Extended;
+
+                for (var protoKey in overrides) {
+                    if (protoKey === 'interfaces') {
+                        continue;
+                    }
+                    Extended.prototype[protoKey] = overrides[protoKey];
+                }
+
+                if (typeName) {
+                    try {
+                        Object.defineProperty(Extended, 'name', {
+                            value: typeName,
+                            configurable: true,
+                        });
+                    } catch (_) {
+                        // Non-critical metadata assignment.
+                    }
+                }
+
+                Extended.__typeName__ = typeName || ctorName(baseCtor);
+                var metadata = buildProxyMetadata(baseCtor, typeName, overrides, Extended);
+
+                Extended.extend = function (nextNameOrOverrides, nextMaybeOverrides) {
+                    return makeExtendedConstructor(Extended, nextNameOrOverrides, nextMaybeOverrides);
+                };
+
+                try {
+                    Object.defineProperty(Extended, 'emitProxy', {
+                        value: function (outDir) {
+                            return NSWinRT.proxy.emit(metadata, outDir);
+                        },
+                        writable: true,
+                        configurable: true,
+                        enumerable: false,
+                    });
+                } catch (_) {
+                    Extended.emitProxy = function (outDir) {
+                        return NSWinRT.proxy.emit(metadata, outDir);
+                    };
+                }
+
+                return Extended;
+            }
+
+            if (typeof Function.prototype.extend !== 'function') {
+                Object.defineProperty(Function.prototype, 'extend', {
+                    value: function (nameOrOverrides, maybeOverrides) {
+                        return makeExtendedConstructor(this, nameOrOverrides, maybeOverrides);
+                    },
+                    writable: true,
+                    configurable: true,
+                    enumerable: false,
+                });
+            }
+
+            if (typeof Object.extend !== 'function') {
+                Object.defineProperty(Object, 'extend', {
+                    value: function (nameOrOverrides, maybeOverrides) {
+                        return makeExtendedConstructor(Object, nameOrOverrides, maybeOverrides);
+                    },
+                    writable: true,
+                    configurable: true,
+                    enumerable: false,
+                });
+            }
+
+            function defaultProxyOutDir(meta) {
+                var typeName = (meta && meta.typeName) ? meta.typeName : 'GeneratedProxy';
+                var safe = safeIdentifier(typeName.split('.').pop());
+                return './generated-proxies/' + safe;
+            }
+
+            function emitProxy(meta, outDir) {
+                if (!meta || typeof meta !== 'object') {
+                    throw new Error('NSWinRT.proxy.emit(meta[, outDir]) expects a proxy metadata object');
+                }
+                if (typeof globalThis.__nsProxyWriteTextFile !== 'function') {
+                    throw new Error('Host proxy file emitter is not available');
+                }
+
+                var dir = outDir || defaultProxyOutDir(meta);
+                var csprojPath = dir + '/Proxy.csproj';
+                var csPath = dir + '/Proxy.g.cs';
+                var csproj = renderProxyCsproj(meta);
+                var source = renderProxyCSharp(meta);
+
+                globalThis.__nsProxyWriteTextFile(csprojPath, csproj);
+                globalThis.__nsProxyWriteTextFile(csPath, source);
+
+                meta.generated = {
+                    dir: dir,
+                    csprojPath: csprojPath,
+                    csPath: csPath,
+                };
+
+                return meta.generated;
+            }
+
+            function compileProxy(meta, outDir, configuration) {
+                if (typeof globalThis.__nsProxyCompileProject !== 'function') {
+                    throw new Error('Host proxy compiler is not available');
+                }
+                var generated = emitProxy(meta, outDir);
+                var result = globalThis.__nsProxyCompileProject(generated.csprojPath, configuration || 'Debug');
+                generated.build = result;
+                return generated;
+            }
+
+            function registerProxy(meta, outDir, configuration) {
+                var generated = compileProxy(meta, outDir, configuration);
+                var manifest = {
+                    kind: 'windows-proxy',
+                    typeName: meta.typeName,
+                    baseType: meta.baseType,
+                    interfaces: meta.interfaces,
+                    methods: meta.methods,
+                    properties: meta.properties,
+                    generated: generated,
+                    registration: {
+                        hostCanLoadAssemblies: false,
+                        note: 'Assembly build succeeded, but runtime CLR proxy activation is not wired yet. Dynamic JS fallback remains active.',
+                    },
+                };
+                if (typeof globalThis.__nsProxyRegisterManifest === 'function') {
+                    globalThis.__nsProxyRegisterManifest(JSON.stringify(manifest));
+                }
+                meta.registered = true;
+                meta.registration = manifest.registration;
+                return manifest;
+            }
+
+            function invokeProxyById(proxyId, methodName, argsArray) {
+                var entry = proxyInstances.get(proxyId);
+                if (!entry) {
+                    throw new Error('Proxy instance not found for id ' + proxyId);
+                }
+
+                var target = entry.instance;
+                var method = target && target[methodName];
+                if (typeof method !== 'function') {
+                    throw new Error('Proxy method "' + methodName + '" is not defined on proxy id ' + proxyId);
+                }
+
+                return method.apply(target, Array.isArray(argsArray) ? argsArray : []);
+            }
+
+            globalThis.__nsInvokeProxyJs = invokeProxyById;
+
+            globalThis.NSWinRT.proxy = {
+                getExtensions: function () {
+                    return proxyExtensions.slice();
+                },
+                emit: emitProxy,
+                compile: compileProxy,
+                register: registerProxy,
+                invokeById: invokeProxyById,
+                listRegisteredManifests: function () {
+                    if (typeof globalThis.__nsProxyListManifests === 'function') {
+                        return globalThis.__nsProxyListManifests();
+                    }
+                    return [];
+                },
+            };
+
+            function asDelegate(handler) {
+                if (typeof handler === 'function') {
+                    return handler;
+                }
+                if (handler && typeof handler.invoke === 'function') {
+                    return handler.invoke.bind(handler);
+                }
+                throw new Error('NSWinRT.asDelegate(handler) expects a function or { invoke() } object');
+            }
+
+            function createEventEmitter() {
+                var listeners = [];
+                return {
+                    add: function (handler) {
+                        var normalized = asDelegate(handler);
+                        listeners.push(normalized);
+                        return {
+                            dispose: function () {
+                                var idx = listeners.indexOf(normalized);
+                                if (idx >= 0) {
+                                    listeners.splice(idx, 1);
+                                }
+                            },
+                        };
+                    },
+                    emit: function () {
+                        var args = Array.prototype.slice.call(arguments);
+                        listeners.slice().forEach(function (listener) {
+                            listener.apply(undefined, args);
+                        });
+                    },
+                    count: function () {
+                        return listeners.length;
+                    },
+                };
+            }
+
+            globalThis.NSWinRT.asDelegate = asDelegate;
+            globalThis.NSWinRT.createEventEmitter = createEventEmitter;
+
+            var moduleCache = new Map();
+
+            function esmExportAliasAssignments(list) {
+                if (!list || !list.trim()) {
+                    return '';
+                }
+
+                var pairs = [];
+                list.split(',').forEach(function (part) {
+                    var token = part.trim();
+                    if (!token) {
+                        return;
+                    }
+                    var pieces = token.split(/\s+as\s+/i);
+                    if (pieces.length === 2) {
+                        pairs.push('exports.' + pieces[1].trim() + ' = ' + pieces[0].trim() + ';');
+                    } else {
+                        pairs.push('exports.' + token + ' = ' + token + ';');
+                    }
+                });
+
+                return pairs.join('\n');
+            }
+
+            function transformEsmToRuntimeModule(source) {
+                var transformed = String(source || '');
+
+                transformed = transformed.replace(/^[ \t]*import\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s+['\"]([^'\"]+)['\"];?[ \t]*$/gm,
+                    'const $1 = __nsImport("$2", __filename);');
+                transformed = transformed.replace(/^[ \t]*import\s+\{\s*([^}]+)\s*\}\s+from\s+['\"]([^'\"]+)['\"];?[ \t]*$/gm,
+                    'const { $1 } = __nsImport("$2", __filename);');
+                transformed = transformed.replace(/^[ \t]*import\s+([A-Za-z_$][\w$]*)\s+from\s+['\"]([^'\"]+)['\"];?[ \t]*$/gm,
+                    'const $1 = (function(m){ return (m && Object.prototype.hasOwnProperty.call(m, "default")) ? m.default : m; })(__nsImport("$2", __filename));');
+                transformed = transformed.replace(/^[ \t]*import\s+['\"]([^'\"]+)['\"];?[ \t]*$/gm,
+                    '__nsImport("$1", __filename);');
+
+                transformed = transformed.replace(/\bexport\s+default\s+/g, 'exports.default = ');
+                transformed = transformed.replace(/^[ \t]*export\s+\{\s*([^}]+)\s*\};?[ \t]*$/gm, function (_, list) {
+                    return esmExportAliasAssignments(list);
+                });
+
+                var exportedNames = [];
+                transformed = transformed.replace(/^[ \t]*export\s+(const|let|var)\s+([A-Za-z_$][\w$]*)/gm, function (_, keyword, name) {
+                    exportedNames.push(name);
+                    return keyword + ' ' + name;
+                });
+                transformed = transformed.replace(/^[ \t]*export\s+function\s+([A-Za-z_$][\w$]*)/gm, function (_, name) {
+                    exportedNames.push(name);
+                    return 'function ' + name;
+                });
+                transformed = transformed.replace(/^[ \t]*export\s+class\s+([A-Za-z_$][\w$]*)/gm, function (_, name) {
+                    exportedNames.push(name);
+                    return 'class ' + name;
+                });
+
+                if (exportedNames.length > 0) {
+                    transformed += '\n' + exportedNames.map(function (name) {
+                        return 'exports.' + name + ' = ' + name + ';';
+                    }).join('\n') + '\n';
+                }
+
+                return transformed;
+            }
+
+            function executeRuntimeModule(source, filename) {
+                var modulePath = String(filename || '');
+                if (!modulePath) {
+                    throw new Error('executeRuntimeModule requires a module path');
+                }
+                if (moduleCache.has(modulePath)) {
+                    return moduleCache.get(modulePath);
+                }
+
+                var module = { exports: {} };
+                moduleCache.set(modulePath, module.exports);
+
+                var transformed = transformEsmToRuntimeModule(source);
+                var dirname = modulePath.replace(/[\\/][^\\/]*$/, '');
+                var executor = new Function('exports', 'module', '__nsImport', '__filename', '__dirname', transformed);
+                executor(module.exports, module, __nsImport, modulePath, dirname);
+                moduleCache.set(modulePath, module.exports);
+                return module.exports;
+            }
+
+            function __nsImport(specifier, parentPath) {
+                if (typeof globalThis.__nsResolveModulePath !== 'function') {
+                    throw new Error('Module resolver host function is not available');
+                }
+                if (typeof globalThis.__nsReadTextFile !== 'function') {
+                    throw new Error('Module file reader host function is not available');
+                }
+
+                var resolved = globalThis.__nsResolveModulePath(
+                    String(specifier || ''),
+                    parentPath ? String(parentPath) : '',
+                    globalThis.__nsAppRoot || ''
+                );
+                if (!resolved) {
+                    throw new Error('Unable to resolve module: ' + specifier);
+                }
+                if (moduleCache.has(resolved)) {
+                    return moduleCache.get(resolved);
+                }
+
+                var source = globalThis.__nsReadTextFile(resolved);
+                return executeRuntimeModule(source, resolved);
+            }
+
+            globalThis.__nsEvalAsModule = function (source, filename) {
+                return executeRuntimeModule(source, filename);
+            };
+            globalThis.NSWinRT.import = __nsImport;
+        })();
+        "#;
+
+        let Some(source) = v8::String::new(scope, helper_source) else { return };
+        if let Some(script) = v8::Script::compile(scope, source, None) {
+                script.run(scope);
+        }
+}
+
+fn create_ns_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, scope: &mut v8::PinScope<'a, '_>) -> Local<'a, v8::Value> {
+    
     let name = v8::String::new(scope, name).unwrap();
     let tmpl = FunctionTemplate::new(scope, handle_ns_func);
     tmpl.set_class_name(name);
@@ -178,7 +2103,7 @@ fn create_ns_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, s
             .getter(handle_named_property_getter)
             .setter(handle_named_property_setter)
     );
-    object_tmpl.set_internal_field_count(1);
+    object_tmpl.set_internal_field_count(2);
 
     let object = object_tmpl.new_instance(scope).unwrap();
     let declaration = Box::new(DeclarationFFI::new(declaration));
@@ -188,17 +2113,285 @@ fn create_ns_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, s
     let object_store = v8::Map::new(scope);
     object.set_internal_field(1, object_store.into());
 
-    let ret = scope.escape(object);
+    let ret = object;
 
     ret.into()
 }
 
-fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, parent: Option<Arc<RwLock<dyn Declaration>>>, declaration: Arc<RwLock<dyn Declaration>>, instance: Option<IUnknown>, scope: &mut v8::HandleScope<'a>) -> Local<'a, v8::Value> {
-    let scope = &mut v8::EscapableHandleScope::new(scope);
+/// Build a JS object representing a GUID value struct, mirroring how NativeScript iOS/Android
+/// projects NSUUID: the instance carries the raw fields and `toString()` returns the string form.
+///
+/// Properties exposed on the returned JS object:
+///   .data1   – UInt32
+///   .data2   – UInt16
+///   .data3   – UInt16
+///   .data4   – Array<number> (8 bytes)
+///   .toString() / .valueOf() – "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}"
+unsafe fn guid_ptr_to_js_object<'a>(
+    ptr: *mut std::ffi::c_void,
+    scope: &mut v8::PinScope<'a, '_>,
+) -> v8::Local<'a, v8::Object> {
+    use windows::core::GUID;
+    let g = &*(ptr as *const GUID);
+
+    let guid_str = format!(
+        "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+        g.data1, g.data2, g.data3,
+        g.data4[0], g.data4[1],
+        g.data4[2], g.data4[3], g.data4[4], g.data4[5], g.data4[6], g.data4[7]
+    );
+
+    let obj = v8::Object::new(scope);
+
+    // Scalar fields
+    let key_data1 = v8::String::new(scope, "data1").unwrap();
+    let val_data1 = v8::Integer::new_from_unsigned(scope, g.data1);
+    obj.set(scope, key_data1.into(), val_data1.into());
+
+    let key_data2 = v8::String::new(scope, "data2").unwrap();
+    let val_data2 = v8::Integer::new_from_unsigned(scope, g.data2 as u32);
+    obj.set(scope, key_data2.into(), val_data2.into());
+
+    let key_data3 = v8::String::new(scope, "data3").unwrap();
+    let val_data3 = v8::Integer::new_from_unsigned(scope, g.data3 as u32);
+    obj.set(scope, key_data3.into(), val_data3.into());
+
+    // data4 as a JS Array of 8 numbers
+    let arr = v8::Array::new(scope, 8);
+    for (i, &byte) in g.data4.iter().enumerate() {
+        let byte_val = v8::Integer::new_from_unsigned(scope, byte as u32);
+        arr.set_index(scope, i as u32, byte_val.into());
+    }
+    let key_data4 = v8::String::new(scope, "data4").unwrap();
+    obj.set(scope, key_data4.into(), arr.into());
+
+    // toString() / valueOf() both return the GUID string
+    let guid_v8 = v8::String::new(scope, &guid_str).unwrap();
+    let to_string_fn = v8::FunctionTemplate::builder(
+        |scope: &mut v8::PinScope<'_, '_>,
+         args: v8::FunctionCallbackArguments,
+         mut retval: v8::ReturnValue| {
+            let s = unsafe { args.data().cast::<v8::String>() };
+            retval.set(s.into());
+        },
+    )
+    .data(guid_v8.into())
+    .build(scope)
+    .get_function(scope)
+    .unwrap();
+
+    let key_to_string = v8::String::new(scope, "toString").unwrap();
+    obj.set(scope, key_to_string.into(), to_string_fn.into());
+
+    let key_value_of = v8::String::new(scope, "valueOf").unwrap();
+    obj.set(scope, key_value_of.into(), to_string_fn.into());
+
+    obj
+}
+
+fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, parent: Option<Arc<RwLock<dyn Declaration>>>, declaration: Arc<RwLock<dyn Declaration>>, instance: Option<IUnknown>, scope: &mut v8::PinScope<'a, '_>) -> Local<'a, v8::Value> {
+    
 
     let class_name = v8::String::new(scope, name).unwrap();
 
     let tmpl = FunctionTemplate::new(scope, handle_ns_func);
+    let object_tmpl = v8::ObjectTemplate::new(scope);
+
+    object_tmpl.set_internal_field_count(1);
+
+    let declaration_ffi = Box::into_raw(Box::new(DeclarationFFI::new_with_instance(declaration.clone(), instance.clone())));
+    let ext = v8::External::new(scope, declaration_ffi as _);
+
+    object_tmpl.set_named_property_handler(
+        v8::NamedPropertyHandlerConfiguration::new()
+            .getter(|scope: &mut v8::PinScope<'_, '_>,
+                     key: Local<v8::Name>,
+                     args: v8::PropertyCallbackArguments,
+                     mut rv: v8::ReturnValue<v8::Value>| -> v8::Intercepted {
+                if !key.is_string() {
+                    return v8::Intercepted::kNo;
+                }
+
+                let name = key.to_rust_string_lossy(scope);
+                if name == "__probe__" {
+                    let value = v8::String::new(scope, "instance-handler-active").unwrap();
+                    rv.set(value.into());
+                    return v8::Intercepted::kYes;
+                }
+                let dec = unsafe { args.data().cast::<v8::External>() };
+                let dec = dec.value() as *mut DeclarationFFI;
+                let dec = unsafe { &*dec };
+                let lock = dec.read();
+
+                let Some(clazz) = lock.as_any().downcast_ref::<ClassDeclaration>() else {
+                    return v8::Intercepted::kNo;
+                };
+
+                for property in collect_class_properties(clazz) {
+                    if property.name() != name {
+                        continue;
+                    }
+
+                    let mut property_call = PropertyCall::new(&property, false, dec.instance.clone().unwrap(), false);
+                    let (ret, result) = property_call.call_with_values(scope, &[]);
+
+                    if ret.is_err() {
+                        let message = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                        let error = v8::Exception::error(scope, message);
+                        scope.throw_exception(error);
+                        return v8::Intercepted::kYes;
+                    }
+
+                    if property_call.is_void() {
+                        rv.set_undefined();
+                        return v8::Intercepted::kYes;
+                    }
+
+                    let return_sig = property_call.return_type().to_string();
+                    if return_sig.contains('.') {
+                        let instance = unsafe { IUnknown::from_raw(result) };
+                        let declaration = if return_sig.contains('`') {
+                            let mut generic_name = return_sig.clone();
+                            if let Some(backtick_index) = generic_name.rfind('<') {
+                                generic_name.truncate(backtick_index);
+                            }
+                            MetadataReader::find_by_name(generic_name.as_str())
+                        } else {
+                            MetadataReader::find_by_name(return_sig.as_str())
+                        };
+
+                        if let Some(declaration) = declaration {
+                            let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into();
+                            rv.set(ret);
+                            return v8::Intercepted::kYes;
+                        }
+                    }
+
+                    if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+                        unsafe { set_ret_val(result, scope, rv, return_type); }
+                        return v8::Intercepted::kYes;
+                    }
+
+                    return v8::Intercepted::kNo;
+                }
+
+                for method in collect_class_methods(clazz) {
+                    let mut method_name = method.overload_name();
+                    if method_name.is_empty() {
+                        method_name = method.name();
+                    }
+
+                    if method_name != name {
+                        continue;
+                    }
+
+                    let declaration = Arc::new(RwLock::new(method.clone()));
+                    let declaration = Box::into_raw(Box::new(DeclarationFFI::new_with_instance(declaration, dec.instance.clone())));
+                    let ext = v8::External::new(scope, declaration as _);
+
+                    let builder = v8::Function::builder(|scope: &mut v8::PinScope<'_, '_>,
+                                                         args: v8::FunctionCallbackArguments,
+                                                         mut retval: v8::ReturnValue| {
+                        let dec = unsafe { args.data().cast::<v8::External>() };
+                        let dec = dec.value() as *mut DeclarationFFI;
+                        let dec = unsafe { &*dec };
+                        let lock = dec.read();
+                        let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
+                        let mut method = MethodCall::new(method, method.is_sealed(), dec.instance.clone().unwrap(), false);
+                        let (ret, result) = method.call(scope, &args);
+
+                        if ret.is_err() {
+                            let message = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                            let error = v8::Exception::error(scope, message);
+                            scope.throw_exception(error);
+                            return;
+                        }
+
+                        if method.is_void() {
+                            retval.set_undefined();
+                            return;
+                        }
+
+                        let return_sig = method.return_type().to_string();
+                        if return_sig.contains('.') {
+                            let instance = unsafe { IUnknown::from_raw(result) };
+                            let declaration = if return_sig.contains('`') {
+                                let mut generic_name = return_sig.clone();
+                                if let Some(backtick_index) = generic_name.rfind('<') {
+                                    generic_name.truncate(backtick_index);
+                                }
+                                MetadataReader::find_by_name(generic_name.as_str())
+                            } else {
+                                MetadataReader::find_by_name(return_sig.as_str())
+                            };
+
+                            if let Some(declaration) = declaration {
+                                let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, dec.parent.clone(), declaration, Some(instance), scope).into();
+                                retval.set(ret);
+                                return;
+                            }
+                        }
+
+                        if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+                            unsafe { set_ret_val(result, scope, retval, return_type); }
+                        }
+                    })
+                    .data(ext.into())
+                    .build(scope)
+                    .unwrap();
+
+                    rv.set(builder.into());
+                    return v8::Intercepted::kYes;
+                }
+
+                v8::Intercepted::kNo
+            })
+            .setter(|scope: &mut v8::PinScope<'_, '_>,
+                     key: Local<v8::Name>,
+                     value: Local<v8::Value>,
+                     args: v8::PropertyCallbackArguments,
+                     mut _rv: v8::ReturnValue<()>| -> v8::Intercepted {
+                if !key.is_string() {
+                    return v8::Intercepted::kNo;
+                }
+
+                let name = key.to_rust_string_lossy(scope);
+                let dec = unsafe { args.data().cast::<v8::External>() };
+                let dec = dec.value() as *mut DeclarationFFI;
+                let dec = unsafe { &*dec };
+                let lock = dec.read();
+
+                let Some(clazz) = lock.as_any().downcast_ref::<ClassDeclaration>() else {
+                    return v8::Intercepted::kNo;
+                };
+
+                for property in collect_class_properties(clazz) {
+                    if property.name() != name {
+                        continue;
+                    }
+
+                    if property.setter().is_none() {
+                        return v8::Intercepted::kNo;
+                    }
+
+                    let mut property_call = PropertyCall::new(&property, true, dec.instance.clone().unwrap(), false);
+                    let (ret, _) = property_call.call_with_values(scope, &[value]);
+                    if ret.is_err() {
+                        let message = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                        let error = v8::Exception::error(scope, message);
+                        scope.throw_exception(error);
+                    }
+                    return v8::Intercepted::kYes;
+                }
+
+                v8::Intercepted::kNo
+            })
+            .data(ext.into())
+    );
+
+            let object = object_tmpl.new_instance(scope).unwrap();
+            object.set_internal_field(0, ext.into());
+            return object.into();
 
     tmpl.set_class_name(class_name);
 
@@ -209,14 +2402,24 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
         let kind = lock.kind();
 
-        println!("name {} : kind {}", name, kind);
 
         match kind {
             DeclarationKind::Class => {
                 let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
+                let class_methods = collect_class_methods(clazz);
+                let class_properties = collect_class_properties(clazz);
+
+                if matches!(name, "StackPanel" | "ListView" | "ComboBox" | "ScrollViewer" | "Border") {
+                    eprintln!(
+                        "[runtime] class {} resolved {} methods and {} properties",
+                        name,
+                        class_methods.len(),
+                        class_properties.len()
+                    );
+                }
 
 
-                let to_string_func = FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                let to_string_func = FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                                 args: v8::FunctionCallbackArguments,
                                                                 mut retval: v8::ReturnValue| {
                     retval.set(args.data());
@@ -226,9 +2429,9 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                 let to_string = v8::String::new(scope, "toString").unwrap();
 
-                proto.set(to_string.into(), to_string_func.into());
+                object_tmpl.set(to_string.into(), to_string_func.into());
 
-                for method in clazz.methods().iter() {
+                for method in class_methods.iter() {
                     let name = v8::String::new(scope, method.name());
 
                     let is_static = method.is_static();
@@ -255,12 +2458,17 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     extern "C" fn callback(callback: *const v8::FunctionCallbackInfo) {
                         let info = unsafe { &*callback };
 
-                        let scope = unsafe { &mut v8::CallbackScope::new(info) };
+                        // v8 147: use the official `callback_scope!` macro,
+                        // which stores the storage in one binding and the
+                        // initialized PinScope in another. Hand-rolling the
+                        // pin here is a use-after-free trap because `init()`
+                        // returns a value that must outlive the borrow.
+                        v8::callback_scope!(unsafe scope, info);
                         let args = unsafe { v8::FunctionCallbackArguments::from_function_callback_info(info) };
                         let mut retval = v8::ReturnValue::from_function_callback_info(info);
 
 
-                        let dec = unsafe { Local::<v8::External>::cast(args.data()) };
+                        let dec = unsafe { args.data().cast::<v8::External>() };
 
                         let dec = dec.value() as *mut DeclarationFFI;
 
@@ -278,153 +2486,36 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            println!(">>> {}", ret.message().to_string())
+                            eprintln!("[runtime] {}", ret.message())
                         } else if !method.is_void() {
                             let return_sig = method.return_type().to_string();
+                            if return_sig == "Guid" {
+                                let obj = unsafe { guid_ptr_to_js_object(result, scope) };
+                                retval.set(obj.into());
+                            } else {
                             match NativeType::try_from(return_sig.as_str()) {
                                 Ok(return_type) => {
                                     if return_sig.contains(".") {
                                         let instance = unsafe { IUnknown::from_raw(result) };
 
-                                        if return_sig.contains('`') {
+                                        // For generic types like IAsyncOperation`1<IUICommand>, look
+                                        // up the open generic by name and hand the instance off to
+                                        // the regular wrapper path. Async / IAsyncOperation<T>
+                                        // returns flow through here too: the wrapped object exposes
+                                        // .Status, .ErrorCode, .GetResults, .Completed, .Cancel,
+                                        // .Close — the dev wraps it in a JS Promise if they want
+                                        // (matching the iOS & Android NativeScript runtimes).
+                                        let declaration = if return_sig.contains('`') {
                                             let mut name = return_sig.to_string();
-
                                             if let Some(backtick_index) = name.rfind('<') {
                                                 name.truncate(backtick_index);
                                             }
+                                            MetadataReader::find_by_name(name.as_str()).unwrap()
+                                        } else {
+                                            dec.inner.clone()
+                                        };
 
-
-                                            // use the generic name
-                                            let declaration = MetadataReader::find_by_name(name.as_str()).unwrap();
-
-
-                                            // todo async
-
-                                            // check if async
-
-                                            let is_async = helpers::is_async(&instance);
-
-                                            if is_async {
-                                                let promise = v8::PromiseResolver::new(scope).unwrap();
-
-                                                retval.set(promise.get_promise(scope).into());
-
-                                                let promise: Global<v8::PromiseResolver> = Global::new(scope, promise);
-
-                                                let current_context = scope.get_current_context();
-                                                let context = v8::Global::new(scope, current_context).into_raw();
-
-                                                let callback = FFIPromise::new(context, promise.into_raw());
-
-                                                let runtime = scope.get_slot::<Arc<RwLock<runtime::Runtime>>>();
-
-                                                let runtime = runtime.unwrap();
-
-                                                let runtime = runtime.read();
-
-                                                //  let instance = IUnknownSafe::new(instance);
-
-                                                let declaration = DeclarationFFI::new_with_instance(
-                                                    declaration,
-                                                    Some(instance),
-                                                );
-
-                                                // let declaration = Box::into_raw(Box::new(declaration));
-
-
-                                                runtime.spawn(async {
-                                                    let callback = callback;
-                                                    let callback = callback.0.read();
-
-                                                    let promise: NonNull<v8::PromiseResolver> = callback.promise;
-                                                    let context: NonNull<v8::Context> = callback.context;
-
-                                                    let context = unsafe {
-                                                        std::mem::transmute::<
-                                                            NonNull<v8::Context>,
-                                                            v8::Local<v8::Context>,
-                                                        >(context)
-                                                    };
-
-                                                    let mut cb_scope = unsafe { v8::CallbackScope::new(context) };
-                                                    let scope = &mut v8::HandleScope::new(&mut cb_scope);
-                                                    let promise = unsafe {
-                                                        std::mem::transmute::<
-                                                            NonNull<v8::PromiseResolver>,
-                                                            v8::Local<v8::PromiseResolver>,
-                                                        >(promise)
-                                                    };
-
-
-                                                    let declaration = declaration;
-
-                                                    let instance = declaration.instance.unwrap();
-
-                                                    let declaration = declaration.inner;
-
-                                                    // let instance = instance.inner.lock().0.clone();;
-                                                    let info = unsafe { IAsyncInfo::from_raw(instance.clone().into_raw()) };
-
-                                                    let mut current_status = AsyncStatus::Started;
-
-                                                    let mut is_running = info.Status()
-                                                        .map(|status| {
-                                                            current_status = status;
-                                                            status == AsyncStatus::Started
-                                                        })
-                                                        .unwrap_or_else(|e| {
-                                                            let message = e.message().to_string();
-                                                            let message = v8::String::new(scope, message.as_str()).unwrap();
-                                                            let error = v8::Exception::error(scope, message.into());
-                                                            promise.reject(scope, error.into());
-                                                            false
-                                                        });
-
-                                                    let return_sig = return_sig;
-
-                                                    let ret = create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope);
-
-                                                    let mut did = false;
-                                                    while is_running {
-                                                        match info.Status() {
-                                                            Ok(done) => {
-                                                                match done {
-                                                                    AsyncStatus::Completed => {
-                                                                        is_running = false;
-                                                                        println!("Completed");
-                                                                    }
-                                                                    AsyncStatus::Error => {
-                                                                        is_running = false;
-                                                                        println!("Error");
-                                                                    }
-                                                                    AsyncStatus::Canceled => {
-                                                                        is_running = false;
-                                                                        println!("Canceled");
-                                                                    }
-                                                                    AsyncStatus::Started => {
-                                                                        if !did {
-                                                                            promise.resolve(scope, ret.into());
-                                                                            did = true;
-                                                                        }
-                                                                    }
-                                                                    _ => {}
-                                                                }
-                                                            }
-                                                            Err(error) => {
-                                                                println!("error {}", error.message())
-                                                            }
-                                                        }
-                                                    }
-
-                                                    // IAsyncInfo
-
-                                                    //
-                                                });
-
-                                                return;
-                                            }
-                                        }
-                                        let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, dec.parent.clone(), dec.inner.clone(), Some(instance), scope).into();
+                                        let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, dec.parent.clone(), declaration, Some(instance), scope).into();
                                         retval.set(ret.into());
                                         return;
                                     }
@@ -432,6 +2523,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                 }
                                 Err(_) => {}
                             }
+                            } // end Guid else
                         } else {
                             retval.set_undefined();
                         }
@@ -446,11 +2538,11 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     if is_static {
                         tmpl.set_with_attr(name.unwrap().into(), func.into(), v8::PropertyAttribute::DONT_DELETE);
                     } else {
-                        proto.set_with_attr(name.unwrap().into(), func.into(), v8::PropertyAttribute::DONT_DELETE);
+                        object_tmpl.set_with_attr(name.unwrap().into(), func.into(), v8::PropertyAttribute::DONT_DELETE);
                     }
                 }
 
-                for property in clazz.properties().iter() {
+                for property in class_properties.iter() {
                     let name = v8::String::new(scope, property.name());
                     let is_static = property.is_static();
 
@@ -471,10 +2563,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     let getter_declaration_ext = v8::External::new(scope, getter_declaration as _);
 
 
-                    let getter = FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                    let getter = FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                             args: v8::FunctionCallbackArguments,
                                                             mut retval: v8::ReturnValue| {
-                        let dec = unsafe { Local::<v8::External>::cast(args.data()) };
+                        let dec = unsafe { args.data().cast::<v8::External>() };
 
                         let dec = dec.value() as *mut DeclarationFFI;
 
@@ -491,9 +2583,29 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            println!(">>> {}", ret.message().to_string())
+                            eprintln!("[runtime] {}", ret.message())
                         } else if !method.is_void() {
-                            match NativeType::try_from(method.return_type()) {
+                            let return_sig = method.return_type().to_string();
+                            if return_sig.contains('.') {
+                                let instance = unsafe { IUnknown::from_raw(result) };
+                                let declaration = if return_sig.contains('`') {
+                                    let mut name = return_sig.clone();
+                                    if let Some(backtick_index) = name.rfind('<') {
+                                        name.truncate(backtick_index);
+                                    }
+                                    MetadataReader::find_by_name(name.as_str())
+                                } else {
+                                    MetadataReader::find_by_name(return_sig.as_str())
+                                };
+
+                                if let Some(declaration) = declaration {
+                                    let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into();
+                                    retval.set(ret.into());
+                                    return;
+                                }
+                            }
+
+                            match NativeType::try_from(return_sig.as_str()) {
                                 Ok(return_type) => {
                                     unsafe { set_ret_val(result, scope, retval, return_type); }
                                 }
@@ -518,27 +2630,49 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let setter_declaration_ext = v8::External::new(scope, setter_declaration as _);
 
 
-                        setter = Some(FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                        setter = Some(FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                                  args: v8::FunctionCallbackArguments,
-                                                                 mut retval: v8::ReturnValue| {})
+                                                                 mut retval: v8::ReturnValue| {
+                            let dec = unsafe { args.data().cast::<v8::External>() };
+                            let dec = dec.value() as *mut DeclarationFFI;
+                            let dec = unsafe { &*dec };
+                            let lock = dec.read();
+                            let prop = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
+                            let mut method = PropertyCall::new(prop, true, dec.instance.clone().unwrap(), false);
+                            let (ret, _) = method.call(scope, &args);
+                            if ret.is_err() {
+                                let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                let err = v8::Exception::error(scope, msg);
+                                scope.throw_exception(err);
+                            }
+                        })
                             .data(setter_declaration_ext.into())
                             .build(scope));
                     }
 
 
                     if property.is_static() {
-                        // todo
+                        // Static properties live on the constructor, not the prototype.
+                        let name = name.unwrap();
+                        tmpl.set_accessor_property(name.into(), Some(getter), setter, v8::PropertyAttribute::DONT_DELETE);
                     } else {
                         let name = name.unwrap();
-                        proto.set_accessor_property(name.into(), Some(getter), setter, v8::PropertyAttribute::NONE);
+                        object_tmpl.set_accessor_property(name.into(), Some(getter), setter, v8::PropertyAttribute::NONE);
                     }
                 }
             }
-            DeclarationKind::Interface => {
-                let clazz = lock.as_any().downcast_ref::<InterfaceDeclaration>().unwrap();
+            DeclarationKind::Interface
+            | DeclarationKind::GenericInterface
+            | DeclarationKind::GenericInterfaceInstance => {
+                let clazz: &dyn BaseClassDeclarationImpl = match kind {
+                    DeclarationKind::Interface => lock.as_any().downcast_ref::<InterfaceDeclaration>().unwrap(),
+                    DeclarationKind::GenericInterface => lock.as_any().downcast_ref::<GenericInterfaceDeclaration>().unwrap(),
+                    DeclarationKind::GenericInterfaceInstance => lock.as_any().downcast_ref::<GenericInterfaceInstanceDeclaration>().unwrap(),
+                    _ => unreachable!(),
+                };
 
 
-                let to_string_func = FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                let to_string_func = FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                                 args: v8::FunctionCallbackArguments,
                                                                 mut retval: v8::ReturnValue| {
                     retval.set(args.data());
@@ -574,10 +2708,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                                 let ext = v8::External::new(scope, declaration as _);
 
-                                let func = v8::FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                                let func = v8::FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                                           args: v8::FunctionCallbackArguments,
                                                                           mut retval: v8::ReturnValue| {
-                                    let dec = unsafe { Local::<v8::External>::cast(args.data()) };
+                                    let dec = unsafe { args.data().cast::<v8::External>() };
 
                                     let dec = dec.value() as *mut DeclarationFFI;
 
@@ -594,7 +2728,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let (ret, result) = method.call(scope, &args);
 
                                     if ret.is_err() {
-                                        println!(">>> {}", ret.message().to_string())
+                                        eprintln!("[runtime] {}", ret.message())
                                     } else if !method.is_void() {
                                         match NativeType::try_from(method.return_type()) {
                                             Ok(return_type) => {
@@ -639,10 +2773,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                                 let getter_declaration_ext = v8::External::new(scope, getter_declaration as _);
 
-                                let getter = FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                                let getter = FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                                         args: v8::FunctionCallbackArguments,
                                                                         mut retval: v8::ReturnValue| {
-                                    let dec = unsafe { Local::<v8::External>::cast(args.data()) };
+                                    let dec = unsafe { args.data().cast::<v8::External>() };
 
                                     let dec = dec.value() as *mut DeclarationFFI;
 
@@ -662,7 +2796,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let (ret, result) = method.call(scope, &args);
 
                                     if ret.is_err() {
-                                        println!(">>> {}", ret.message().to_string())
+                                        eprintln!("[runtime] {}", ret.message())
                                     } else if !method.is_void() {
                                         match NativeType::try_from(method.return_type()) {
                                             Ok(return_type) => {
@@ -689,7 +2823,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let setter_declaration_ext = v8::External::new(scope, setter_declaration as _);
 
 
-                                    setter = Some(FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                                    setter = Some(FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                                              args: v8::FunctionCallbackArguments,
                                                                              mut retval: v8::ReturnValue| {})
                                         .data(setter_declaration_ext.into())
@@ -698,15 +2832,23 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
 
                                 if property.is_static() {
-                                    // todo
+                                    let name = name.unwrap();
+                                    tmpl.set_accessor_property(name.into(), Some(getter), setter, v8::PropertyAttribute::DONT_DELETE);
                                 } else {
                                     let name = name.unwrap();
                                     proto.set_accessor_property(name.into(), Some(getter), setter, v8::PropertyAttribute::READ_ONLY | v8::PropertyAttribute::DONT_DELETE);
                                 }
                             }
                         }
-                        DeclarationKind::Interface => {
-                            let clazz = clazz.as_any().downcast_ref::<InterfaceDeclaration>().unwrap();
+                        DeclarationKind::Interface
+                        | DeclarationKind::GenericInterface
+                        | DeclarationKind::GenericInterfaceInstance => {
+                            let clazz: &dyn BaseClassDeclarationImpl = match kind {
+                                DeclarationKind::Interface => clazz.as_any().downcast_ref::<InterfaceDeclaration>().unwrap(),
+                                DeclarationKind::GenericInterface => clazz.as_any().downcast_ref::<GenericInterfaceDeclaration>().unwrap(),
+                                DeclarationKind::GenericInterfaceInstance => clazz.as_any().downcast_ref::<GenericInterfaceInstanceDeclaration>().unwrap(),
+                                _ => unreachable!(),
+                            };
 
                             for method in clazz.methods().iter() {
                                 let name = v8::String::new(scope, method.name());
@@ -725,10 +2867,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                                 let ext = v8::External::new(scope, declaration as _);
 
-                                let func = v8::FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                                let func = v8::FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                                           args: v8::FunctionCallbackArguments,
                                                                           mut retval: v8::ReturnValue| {
-                                    let dec = unsafe { Local::<v8::External>::cast(args.data()) };
+                                    let dec = unsafe { args.data().cast::<v8::External>() };
 
                                     let dec = dec.value() as *mut DeclarationFFI;
 
@@ -745,7 +2887,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let (ret, result) = method.call(scope, &args);
 
                                     if ret.is_err() {
-                                        println!(">>> {}", ret.message().to_string())
+                                        eprintln!("[runtime] {}", ret.message())
                                     } else if !method.is_void() {
                                         match NativeType::try_from(method.return_type()) {
                                             Ok(return_type) => {
@@ -791,10 +2933,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                 let getter_declaration_ext = v8::External::new(scope, getter_declaration as _);
 
 
-                                let getter = FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                                let getter = FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                                         args: v8::FunctionCallbackArguments,
                                                                         mut retval: v8::ReturnValue| {
-                                    let dec = unsafe { Local::<v8::External>::cast(args.data()) };
+                                    let dec = unsafe { args.data().cast::<v8::External>() };
 
                                     let dec = dec.value() as *mut DeclarationFFI;
 
@@ -814,7 +2956,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let (ret, result) = method.call(scope, &args);
 
                                     if ret.is_err() {
-                                        println!(">>> {}", ret.message().to_string())
+                                        eprintln!("[runtime] {}", ret.message())
                                     } else if !method.is_void() {
                                         match NativeType::try_from(method.return_type()) {
                                             Ok(return_type) => {
@@ -841,7 +2983,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let setter_declaration_ext = v8::External::new(scope, setter_declaration as _);
 
 
-                                    setter = Some(FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                                    setter = Some(FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                                              args: v8::FunctionCallbackArguments,
                                                                              mut retval: v8::ReturnValue| {})
                                         .data(setter_declaration_ext.into())
@@ -850,18 +2992,77 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
 
                                 if property.is_static() {
-                                    // todo
+                                    let name = name.unwrap();
+                                    tmpl.set_accessor_property(name.into(), Some(getter), setter, v8::PropertyAttribute::DONT_DELETE);
                                 } else {
                                     let name = name.unwrap();
                                     proto.set_accessor_property(name.into(), Some(getter), setter, v8::PropertyAttribute::READ_ONLY | v8::PropertyAttribute::DONT_DELETE);
                                 }
                             }
                         }
-                        DeclarationKind::GenericInterface => {}
-                        DeclarationKind::GenericInterfaceInstance => {}
-                        DeclarationKind::Delegate => {}
-                        DeclarationKind::GenericDelegate => {}
-                        DeclarationKind::GenericDelegateInstance => {}
+                        DeclarationKind::Delegate
+                        | DeclarationKind::GenericDelegate
+                        | DeclarationKind::GenericDelegateInstance => {
+                            let method = match kind {
+                                DeclarationKind::Delegate => clazz
+                                    .as_any()
+                                    .downcast_ref::<DelegateDeclaration>()
+                                    .map(|delegate| delegate.invoke_method().clone()),
+                                DeclarationKind::GenericDelegate => clazz
+                                    .as_any()
+                                    .downcast_ref::<GenericDelegateDeclaration>()
+                                    .map(|delegate| delegate.invoke_method().clone()),
+                                DeclarationKind::GenericDelegateInstance => clazz
+                                    .as_any()
+                                    .downcast_ref::<GenericDelegateInstanceDeclaration>()
+                                    .map(|delegate| delegate.invoke_method().clone()),
+                                _ => None,
+                            };
+
+                            if let Some(method) = method {
+                                let name = v8::String::new(scope, method.name());
+                                let declaration = DeclarationFFI::new_with_instance(
+                                    Arc::new(RwLock::new(method)),
+                                    instance.clone(),
+                                );
+                                let declaration = Box::into_raw(Box::new(declaration));
+                                let ext = v8::External::new(scope, declaration as _);
+
+                                let func = v8::FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
+                                                                          args: v8::FunctionCallbackArguments,
+                                                                          mut retval: v8::ReturnValue| {
+                                    let dec = unsafe { args.data().cast::<v8::External>() };
+                                    let dec = dec.value() as *mut DeclarationFFI;
+                                    let dec = unsafe { &*dec };
+                                    let lock = dec.read();
+                                    let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
+
+                                    let mut method = MethodCall::new(
+                                        method,
+                                        method.is_sealed(),
+                                        dec.instance.clone().unwrap(),
+                                        false,
+                                    );
+
+                                    let (ret, result) = method.call(scope, &args);
+                                    if ret.is_err() {
+                                        eprintln!("[runtime] {}", ret.message())
+                                    } else if !method.is_void() {
+                                        if let Ok(return_type) = NativeType::try_from(method.return_type()) {
+                                            unsafe { set_ret_val(result, scope, retval, return_type); }
+                                        }
+                                    } else {
+                                        retval.set_undefined();
+                                    }
+                                })
+                                    .data(ext.into())
+                                    .build(scope);
+
+                                if let Some(name) = name {
+                                    proto.set(name.into(), func.into());
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -884,10 +3085,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                     let ext = v8::External::new(scope, declaration as _);
 
-                    let func = v8::FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                    let func = v8::FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                               args: v8::FunctionCallbackArguments,
                                                               mut retval: v8::ReturnValue| {
-                        let dec = unsafe { Local::<v8::External>::cast(args.data()) };
+                        let dec = unsafe { args.data().cast::<v8::External>() };
 
                         let dec = dec.value() as *mut DeclarationFFI;
 
@@ -904,7 +3105,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            println!(">>> {}", ret.message().to_string())
+                            eprintln!("[runtime] {}", ret.message())
                         } else if !method.is_void() {
                             match NativeType::try_from(method.return_type()) {
                                 Ok(return_type) => {
@@ -950,10 +3151,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     let getter_declaration_ext = v8::External::new(scope, getter_declaration as _);
 
 
-                    let getter = FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                    let getter = FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                             args: v8::FunctionCallbackArguments,
                                                             mut retval: v8::ReturnValue| {
-                        let dec = unsafe { Local::<v8::External>::cast(args.data()) };
+                        let dec = unsafe { args.data().cast::<v8::External>() };
 
                         let dec = dec.value() as *mut DeclarationFFI;
 
@@ -973,7 +3174,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            println!(">>> {}", ret.message().to_string())
+                            eprintln!("[runtime] {}", ret.message())
                         } else if !method.is_void() {
                             match NativeType::try_from(method.return_type()) {
                                 Ok(return_type) => {
@@ -1000,16 +3201,30 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let setter_declaration_ext = v8::External::new(scope, setter_declaration as _);
 
 
-                        setter = Some(FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                        setter = Some(FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                                  args: v8::FunctionCallbackArguments,
-                                                                 mut retval: v8::ReturnValue| {})
+                                                                 mut retval: v8::ReturnValue| {
+                            let dec = unsafe { args.data().cast::<v8::External>() };
+                            let dec = dec.value() as *mut DeclarationFFI;
+                            let dec = unsafe { &*dec };
+                            let lock = dec.read();
+                            let prop = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
+                            let mut method = PropertyCall::new(prop, true, dec.instance.clone().unwrap(), false);
+                            let (ret, _) = method.call(scope, &args);
+                            if ret.is_err() {
+                                let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                let err = v8::Exception::error(scope, msg);
+                                scope.throw_exception(err);
+                            }
+                        })
                             .data(setter_declaration_ext.into())
                             .build(scope));
                     }
 
 
                     if property.is_static() {
-                        // todo
+                        let name = name.unwrap();
+                        tmpl.set_accessor_property(name.into(), Some(getter), setter, v8::PropertyAttribute::DONT_DELETE);
                     } else {
                         let name = name.unwrap();
                         proto.set_accessor_property(name.into(), Some(getter), setter, v8::PropertyAttribute::READ_ONLY | v8::PropertyAttribute::DONT_DELETE);
@@ -1057,14 +3272,14 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                     let data = v8::Array::new_with_elements(scope, &[ext.into(), return_type.into()]);
 
-                    let func = FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+                    let func = FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                           args: v8::FunctionCallbackArguments,
                                                           mut retval: v8::ReturnValue| {
                         let data = v8::Local::<v8::Array>::try_from(args.data()).unwrap();
 
                         let return_type = data.get_index(scope, 1).unwrap().to_rust_string_lossy(scope);
 
-                        let dec = unsafe { Local::<v8::External>::cast(data.get_index(scope, 0).unwrap()) };
+                        let dec = unsafe { data.get_index(scope, 0).unwrap().cast::<v8::External>() };
 
                         let dec = dec.value() as *mut DeclarationFFI;
 
@@ -1086,7 +3301,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            println!(">>> {}", ret.message().to_string())
+                            eprintln!("[runtime] {}", ret.message())
                         } else if !method.is_void() {
                             let return_sig = method.return_type();
                             match NativeType::try_from(return_sig) {
@@ -1139,23 +3354,17 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
         }
     }
 
-    let object_tmpl = tmpl.instance_template(scope);
-
-    object_tmpl.set_internal_field_count(1);
-
     let object = object_tmpl.new_instance(scope).unwrap();
 
-    let declaration = Box::new(DeclarationFFI::new_with_instance(declaration, instance));
-    let ext = v8::External::new(scope, Box::into_raw(declaration) as _);
     object.set_internal_field(0, ext.into());
 
-    let ret = scope.escape(object);
+    let ret = object;
 
     ret.into()
 }
 
-fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declaration>>>, declaration: Arc<RwLock<dyn Declaration>>, scope: &mut v8::HandleScope<'a>) -> Local<'a, v8::Value> {
-    let scope = &mut v8::EscapableHandleScope::new(scope);
+fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declaration>>>, declaration: Arc<RwLock<dyn Declaration>>, scope: &mut v8::PinScope<'a, '_>) -> Local<'a, v8::Value> {
+    
 
     let name = v8::String::new(scope, name).unwrap();
 
@@ -1167,12 +3376,12 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
     let ext = v8::External::new(scope, ext as _);
 
-    let tmpl = v8::FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+    let tmpl = v8::FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                               args: v8::FunctionCallbackArguments,
                                               mut retval: v8::ReturnValue| {
         let length = args.length();
 
-        let dec = unsafe { Local::<v8::External>::cast(args.data()) };
+        let dec = unsafe { args.data().cast::<v8::External>() };
 
         let dec = dec.value() as *mut DeclarationFFI;
 
@@ -1224,10 +3433,24 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                                 )
                             };
 
-                            assert!(res.is_ok());
-                            assert!(!ret.is_null());
+                            if res.is_err() || ret.is_null() {
+                                let message = res.message().to_string();
+                                let message = v8::String::new(scope, message.as_str()).unwrap();
+                                let error = v8::Exception::error(scope, message.into());
+                                scope.throw_exception(error);
+                                return;
+                            }
 
-                            let result = IUnknown::from_raw(ret);
+                            let result = unsafe { IUnknown::from_raw(ret) };
+
+                            // For console apps: attach to the console window so that
+                            // UI dialogs (e.g. MessageDialog) know which window to use.
+                            if let Ok(init) = result.cast::<IInitializeWithWindow>() {
+                                let hwnd = unsafe { GetConsoleWindow() };
+                                if !hwnd.is_invalid() {
+                                    let _ = unsafe { init.Initialize(hwnd) };
+                                }
+                            }
 
                             let instance = create_ns_ctor_instance_object(clazz.name(), Some(clazz_factory), None, dec.inner.clone(), Some(result), scope);
                             retval.set(instance);
@@ -1258,12 +3481,32 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                 .setter(handle_indexed_property_setter)
                 .getter(handle_indexed_property_getter)
         );
-        object_tmpl.set_internal_field_count(1);
+        object_tmpl.set_internal_field_count(2);
         let object = object_tmpl.new_instance(scope).unwrap();
 
-        object.set_internal_field(0, ext);
+        object.set_internal_field(0, ext.into());
 
         let object_store = v8::Map::new(scope);
+
+        if matches!(
+            kind,
+            DeclarationKind::Interface
+                | DeclarationKind::GenericInterface
+                | DeclarationKind::GenericInterfaceInstance
+                | DeclarationKind::Delegate
+                | DeclarationKind::GenericDelegate
+                | DeclarationKind::GenericDelegateInstance
+                | DeclarationKind::Event
+        ) && length >= 1
+        {
+            let implementation = args.get(0);
+            if implementation.is_object() || implementation.is_function() {
+                if let Some(impl_key) = v8::String::new(scope, "__implementation__") {
+                    object_store.set(scope, impl_key.into(), implementation);
+                }
+            }
+        }
+
         object.set_internal_field(1, object_store.into());
 
         retval.set(object.into());
@@ -1274,6 +3517,11 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
     {
         let lock = declaration.read();
+
+        if lock.kind() != DeclarationKind::Class {
+            let func = tmpl.get_function(scope).unwrap();
+            return func.into();
+        }
 
         let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
 
@@ -1308,10 +3556,10 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
             let ext = v8::External::new(scope, declaration as _);
 
-            let func = v8::FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+            let func = v8::FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                       args: v8::FunctionCallbackArguments,
                                                       mut retval: v8::ReturnValue| {
-                let dec = unsafe { Local::<v8::External>::cast(args.data()) };
+                let dec = unsafe { args.data().cast::<v8::External>() };
 
                 let dec = dec.value() as *mut DeclarationFFI;
 
@@ -1341,6 +3589,21 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                                     *(result as *mut bool)
                                 )
                             }
+                            "Guid" => {
+                                let obj = guid_ptr_to_js_object(result, scope);
+                                retval.set(obj.into());
+                            }
+                            _ if !signature.contains('.') => {
+                                // Primitive / value-type return: use set_ret_val when possible.
+                                match NativeType::try_from(signature.as_str()) {
+                                    Ok(return_type) => {
+                                        set_ret_val(result, scope, retval, return_type);
+                                    }
+                                    Err(_) => {
+                                        retval.set_undefined();
+                                    }
+                                }
+                            }
                             _ => {
                                 let instance = IUnknown::from_raw(result);
 
@@ -1348,39 +3611,37 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
                                 let lock = declaration.read();
 
-                                let declaration: Arc<RwLock<dyn Declaration>>;
-
-                                {
+                                let declaration: Arc<RwLock<dyn Declaration>> = {
                                     let lock = lock;
 
                                     match lock.base().kind() {
                                         DeclarationKind::Interface => {
                                             let dec = lock.as_declaration().as_any().downcast_ref::<InterfaceDeclaration>();
-
-
-                                            declaration = Arc::new(
-                                                RwLock::new(dec.unwrap().clone())
-                                            )
+                                            Arc::new(RwLock::new(dec.unwrap().clone()))
                                         }
                                         DeclarationKind::Class => {
                                             let dec = lock.as_declaration().as_any().downcast_ref::<ClassDeclaration>();
-                                            declaration = Arc::new(
-                                                RwLock::new(dec.unwrap().clone())
-                                            )
+                                            Arc::new(RwLock::new(dec.unwrap().clone()))
                                         }
-                                        _ => {
-                                            // todo
-                                            unimplemented!()
+                                        other => {
+                                            let message = format!(
+                                                "Unsupported declaration kind for return object wrapping: {}",
+                                                other
+                                            );
+                                            let message = v8::String::new(scope, message.as_str()).unwrap();
+                                            let error = v8::Exception::error(scope, message.into());
+                                            scope.throw_exception(error);
+                                            return;
                                         }
                                     }
-                                }
+                                };
 
 
                                 let ret: Local<v8::Value> = create_ns_ctor_instance_object(signature.as_str(), dec.instance.clone(), dec.parent.clone(), declaration, Some(instance), scope).into();
                                 retval.set(ret.into());
-                            }
-                        }
-                    }
+                            } // end _ (COM object)
+                        } // end match signature
+                    } // end unsafe
                 } else {
                     let message = ret.message().to_string();
                     let message = v8::String::new(scope, message.as_str()).unwrap();
@@ -1396,12 +3657,26 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
     }
 
     let func = tmpl.get_function(scope).unwrap();
-    let ret = scope.escape(func);
+    {
+        let lock = declaration.read();
+        if let Some(full_name) = match lock.kind() {
+            DeclarationKind::Class => lock
+                .as_any()
+                .downcast_ref::<ClassDeclaration>()
+                .map(|clazz| clazz.full_name().to_string()),
+            _ => None,
+        } {
+            let key = v8::String::new(scope, "__typeName__").unwrap();
+            let value = v8::String::new(scope, full_name.as_str()).unwrap();
+            func.set(scope, key.into(), value.into());
+        }
+    }
+    let ret = func;
     ret.into()
 }
 
-fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, scope: &mut v8::HandleScope<'a>) -> Local<'a, v8::Value> {
-    let scope = &mut v8::EscapableHandleScope::new(scope);
+fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, scope: &mut v8::PinScope<'a, '_>) -> Local<'a, v8::Value> {
+    
 
     let name = v8::String::new(scope, name).unwrap();
 
@@ -1411,10 +3686,10 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
 
     let ext = v8::External::new(scope, ext as _);
 
-    let tmpl = FunctionTemplate::builder(|scope: &mut v8::HandleScope,
+    let tmpl = FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                           args: v8::FunctionCallbackArguments,
                                           mut retval: v8::ReturnValue| {
-        let dec = unsafe { Local::<v8::External>::cast(args.data()) };
+        let dec = unsafe { args.data().cast::<v8::External>() };
 
         let dec = dec.value() as *mut DeclarationFFI;
 
@@ -1455,8 +3730,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                 Some(field) => {
                     let value = match native_type {
                         NativeType::Void => {
-                            // todo
-                            unreachable!()
+                            Err(error::type_error("Void is not a valid WinRT struct field type"))
                         }
                         NativeType::Bool => {
                             ffi_parse_bool_arg(field)
@@ -1483,7 +3757,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                             ffi_parse_u64_arg(scope, field)
                         }
                         NativeType::I64 => {
-                            ffi_parse_i16_arg(field)
+                            ffi_parse_i64_arg(scope, field)
                         }
                         NativeType::USize => {
                             ffi_parse_usize_arg(scope, field)
@@ -1573,15 +3847,15 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
 
         let name = v8::String::new(scope, name.as_str()).unwrap();
 
-        let getter = |scope: &mut v8::HandleScope,
+        let getter = |scope: &mut v8::PinScope<'_, '_>,
                       key: Local<v8::Name>,
                       args: v8::PropertyCallbackArguments,
-                      mut rv: v8::ReturnValue| {
+                      mut rv: v8::ReturnValue<v8::Value>| -> v8::Intercepted {
             let key = key.to_rust_string_lossy(scope);
 
             let this = args.data();
 
-            let dec = unsafe { Local::<v8::External>::cast(this) };
+            let dec = unsafe { this.cast::<v8::External>() };
 
             let dec = dec.value() as *mut DeclarationFFI;
 
@@ -1593,7 +3867,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                 let name = lock.name();
 
                 let name = v8::String::new(scope, name).unwrap();
-                let func = v8::Function::builder(|scope: &mut v8::HandleScope,
+                let func = v8::Function::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                   args: v8::FunctionCallbackArguments,
                                                   mut retval: v8::ReturnValue| {
                     retval.set(args.data());
@@ -1602,7 +3876,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
 
 
                 rv.set(func.unwrap().into());
-                return;
+                return v8::Intercepted::kYes;
             }
 
             let struct_dec = lock.as_any().downcast_ref::<StructDeclaration>().unwrap();
@@ -1732,18 +4006,19 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                 }
                 position = position + 1;
             }
+            v8::Intercepted::kYes
         };
 
-        let setter = |scope: &mut v8::HandleScope,
+        let setter = |scope: &mut v8::PinScope<'_, '_>,
                       key: Local<v8::Name>,
                       value: Local<v8::Value>,
                       args: v8::PropertyCallbackArguments,
-                      mut rv: v8::ReturnValue| {
+                      mut rv: v8::ReturnValue<()>| -> v8::Intercepted {
             let key = key.to_rust_string_lossy(scope);
 
             let this = args.data();
 
-            let dec = unsafe { Local::<v8::External>::cast(this) };
+            let dec = unsafe { this.cast::<v8::External>() };
 
             let dec = dec.value() as *mut DeclarationFFI;
 
@@ -1770,8 +4045,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                             if position == current_field_position {
                                 let value = match field_type {
                                     NativeType::Void => {
-                                        // todo
-                                        unreachable!()
+                                        Err(error::type_error("Void is not a valid WinRT struct field type"))
                                     }
                                     NativeType::Bool => {
                                         ffi_parse_bool_arg(field)
@@ -1798,7 +4072,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                                         ffi_parse_u64_arg(scope, field)
                                     }
                                     NativeType::I64 => {
-                                        ffi_parse_i16_arg(field)
+                                        ffi_parse_i64_arg(scope, field)
                                     }
                                     NativeType::USize => {
                                         ffi_parse_usize_arg(scope, field)
@@ -1859,6 +4133,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                 }
                 position = position + 1;
             }
+            v8::Intercepted::kYes
         };
 
         object_tmpl.set_named_property_handler(
@@ -1880,7 +4155,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
 
 
     let func = tmpl.get_function(scope).unwrap();
-    let ret = scope.escape(func);
+    let ret = func;
 
     ret.into()
 }
@@ -1908,118 +4183,110 @@ fn init_meta(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, context
     }
 }
 
-fn handle_named_property_setter(scope: &mut v8::HandleScope,
+// Setter for the namespace/enum/struct *proxy* objects (the ones returned by
+// `create_ns_object`). These are not instances — they're traversal handles like
+// `Windows` or `Windows.UI.Popups`. The rule is:
+//   - Names that resolve to real WinRT metadata are immutable (writes are ignored).
+//   - Anything else is stored in the per-object side map so user code can stash
+//     custom properties (e.g. `Windows.myShim = ...`) without breaking lookups.
+fn handle_named_property_setter(scope: &mut v8::PinScope<'_, '_>,
                                 key: Local<v8::Name>,
                                 value: Local<v8::Value>,
                                 args: v8::PropertyCallbackArguments,
-                                mut rv: v8::ReturnValue) {
+                                mut _rv: v8::ReturnValue<()>) -> v8::Intercepted {
     let this = args.holder();
-    let dec = this.get_internal_field(scope, 0).unwrap();
-    let dec = unsafe { Local::<v8::External>::cast(dec) };
-    let dec = dec.value() as *mut DeclarationFFI;
+    let Some(dec_field) = this.get_internal_field(scope, 0) else { return v8::Intercepted::kNo };
+    let dec = unsafe { dec_field.cast::<v8::External>() }.value() as *mut DeclarationFFI;
     let dec = unsafe { &*dec };
     let lock = dec.read();
     let kind = lock.kind();
-    let store = this.get_internal_field(scope, 1).unwrap();
-    let store = unsafe { Local::<v8::Map>::cast(store) };
+
+    let Some(store_field) = this.get_internal_field(scope, 1) else { return v8::Intercepted::kNo };
+    let store = unsafe { store_field.cast::<v8::Map>() };
+
     let name = key.to_rust_string_lossy(scope);
-    match kind {
-        DeclarationKind::Namespace => {
-            let dec = unsafe { lock.as_any().downcast_ref::<NamespaceDeclaration>() };
-            if let Some(dec) = dec {
-                if !dec.children().contains(&name) {
-                    store.set(scope, key.into(), value);
-                }
-            }
-        }
-        DeclarationKind::Class => {}
-        DeclarationKind::Interface => {}
-        DeclarationKind::GenericInterface => {}
-        DeclarationKind::GenericInterfaceInstance => {}
-        DeclarationKind::Enum => {
-            let dec = unsafe { lock.as_any().downcast_ref::<EnumDeclaration>() };
-            if let Some(dec) = dec {
-                if dec.enum_for_name(&name).is_none() {
-                    store.set(scope, key.into(), value);
-                }
-            }
-        }
-        DeclarationKind::EnumMember => {}
-        DeclarationKind::Struct => {}
-        DeclarationKind::StructField => {}
-        DeclarationKind::Delegate => {}
-        DeclarationKind::GenericDelegate => {}
-        DeclarationKind::GenericDelegateInstance => {}
-        DeclarationKind::Event => {}
-        DeclarationKind::Property => {}
-        DeclarationKind::Method => {
 
+    // Returns true if `name` is a name reserved by the WinRT metadata for this
+    // declaration kind. Reserved names are read-only.
+    let is_reserved = match kind {
+        DeclarationKind::Namespace => lock
+            .as_any()
+            .downcast_ref::<NamespaceDeclaration>()
+            .map(|d| d.children().contains(&name))
+            .unwrap_or(false),
+        DeclarationKind::Enum => lock
+            .as_any()
+            .downcast_ref::<EnumDeclaration>()
+            .map(|d| d.enum_for_name(&name).is_some())
+            .unwrap_or(false),
+        DeclarationKind::Class => lock
+            .as_any()
+            .downcast_ref::<ClassDeclaration>()
+            .map(|d| class_has_member_named(d, &name))
+            .unwrap_or(false),
+        DeclarationKind::Interface => lock
+            .as_any()
+            .downcast_ref::<InterfaceDeclaration>()
+            .map(|d| {
+                d.methods().iter().any(|m| m.name() == name)
+                    || d.properties().iter().any(|p| p.name() == name)
+            })
+            .unwrap_or(false),
+        DeclarationKind::Struct => lock
+            .as_any()
+            .downcast_ref::<StructDeclaration>()
+            .map(|d| d.fields().iter().any(|f| f.name() == name))
+            .unwrap_or(false),
+        // For everything else there's no metadata to clash with, so the
+        // assignment can be stored verbatim.
+        _ => false,
+    };
 
-            // let length = args.length();
-
-            println!("setter {}", name);
-
-
-
-            /* let json = windows::Data::Json::JsonObject::from_raw(result.into_raw());
-
-             let runtime = JsonValue::CreateStringValue(&HSTRING::from("NativeScript")).unwrap();
-             json.SetNamedValue(&HSTRING::from("runtime"), &runtime);
-
-             println!("runtime key: {:?}", json.GetNamedValue(&HSTRING::from("runtime")).unwrap().GetString().unwrap());
-
-
-             // todo
-             for method in clazz.methods() {
-                 let param_count = method.number_of_parameters();
-                 //  println!("count {param_count}");
-                 if param_count == length as usize {
-                     println!("{:?}", method.parameters());
-                 }
-             }
-             */
-        }
-        DeclarationKind::Parameter => {}
+    if !is_reserved {
+        store.set(scope, key.into(), value);
+        v8::Intercepted::kYes
+    } else {
+        v8::Intercepted::kNo
     }
 }
 
-fn handle_named_property_query(_scope: &mut v8::HandleScope,
+fn handle_named_property_query(_scope: &mut v8::PinScope<'_, '_>,
                                _key: v8::Local<v8::Name>,
                                _args: v8::PropertyCallbackArguments,
-                               mut rv: v8::ReturnValue) {
+                               mut rv: v8::ReturnValue<v8::Integer>) -> v8::Intercepted {
     // NONE
     rv.set_int32(0);
+    v8::Intercepted::kNo
 }
 
-fn handle_named_property_getter(scope: &mut v8::HandleScope,
+fn handle_named_property_getter(scope: &mut v8::PinScope<'_, '_>,
                                 key: v8::Local<v8::Name>,
                                 args: v8::PropertyCallbackArguments,
-                                mut rv: v8::ReturnValue) {
-    let this = args.this();
+                                mut rv: v8::ReturnValue<v8::Value>) -> v8::Intercepted {
+    let this = args.holder();
     let dec = this.get_internal_field(scope, 0).unwrap();
-    let dec = unsafe { Local::<v8::External>::cast(dec) };
+    let dec = unsafe { dec.cast::<v8::External>() };
     let dec = dec.value() as *mut DeclarationFFI;
     let dec = unsafe { &*dec };
     let lock = dec.read();
     let store = this.get_internal_field(scope, 1).unwrap();
-    let store = unsafe { Local::<v8::Map>::cast(store) };
+    let store = unsafe { store.cast::<v8::Map>() };
     let kind = lock.kind();
 
     if key.is_string() {
+        if let Some(cache) = store.get(scope, key.into()) {
+            if !cache.is_null_or_undefined() {
+                rv.set(cache);
+                return v8::Intercepted::kYes;
+            }
+        }
+
         let name = key.to_string(scope).unwrap().to_rust_string_lossy(scope);
         match kind {
             DeclarationKind::Namespace => {
                 let parent = dec.inner.clone();
                 let dec = lock.as_any().downcast_ref::<NamespaceDeclaration>();
                 if let Some(dec) = dec {
-                    // let cached_item = store.get(scope, key.into());
-                    // if let Some(cache) = cached_item {
-                    //     if !cache.is_null_or_undefined() {
-                    //         rv.set(cache);
-                    //         return;
-                    //     }
-                    // }
-
                     let full_name = format!("{}.{}", dec.full_name(), name.as_str());
 
                     if let Some(dec) = MetadataReader::find_by_name(full_name.as_str()) {
@@ -2033,32 +4300,45 @@ fn handle_named_property_getter(scope: &mut v8::HandleScope,
                                 drop(lock);
 
                                 let ret = create_ns_struct_ctor_object(name.as_str(), Arc::clone(&dec), scope);
-                                rv.set(ret.into());
+                                let ret: Local<v8::Value> = ret.into();
+                                store.set(scope, key.into(), ret);
+                                rv.set(ret);
                             }
                             DeclarationKind::Class => {
                                 let ret: Local<v8::Value> = create_ns_ctor_object(lock.name(), Some(parent), declaration, scope).into();
-                                rv.set(ret.into());
+                                store.set(scope, key.into(), ret);
+                                rv.set(ret);
+                            }
+                            DeclarationKind::Interface
+                            | DeclarationKind::GenericInterface
+                            | DeclarationKind::GenericInterfaceInstance
+                            | DeclarationKind::Delegate
+                            | DeclarationKind::GenericDelegate
+                            | DeclarationKind::GenericDelegateInstance
+                            | DeclarationKind::Event => {
+                                let ret: Local<v8::Value> = create_ns_ctor_object(lock.name(), Some(parent), declaration, scope).into();
+                                store.set(scope, key.into(), ret);
+                                rv.set(ret);
                             }
                             _ => {
                                 let ret: Local<v8::Value> = create_ns_object(name.as_str(), declaration, scope).into();
-                                rv.set(ret.into());
+                                store.set(scope, key.into(), ret);
+                                rv.set(ret);
                             }
                         }
-
-
-                        //  store.set(scope, key.into(), ret.into());
-                        return;
+                        return v8::Intercepted::kYes;
                     }
 
-                    rv.set_undefined();
-                    return;
+                    // Name isn't a real namespace child — let V8 fall back to
+                    // Object.prototype defaults so toString/valueOf/etc. work.
+                    return v8::Intercepted::kNo;
                 }
             }
             DeclarationKind::Class => {
                 let clazz_dec = lock.as_any().downcast_ref::<ClassDeclaration>();
 
                 if let Some(clazz_dec) = clazz_dec {
-                    for method in clazz_dec.methods() {
+                    for method in collect_class_methods(clazz_dec) {
                         let mut method_name = method.overload_name();
                         if method_name.is_empty() {
                             method_name = method.name();
@@ -2071,12 +4351,12 @@ fn handle_named_property_getter(scope: &mut v8::HandleScope,
 
                             let ext = v8::External::new(scope, declaration as _);
 
-                            let builder = v8::Function::builder(|scope: &mut v8::HandleScope,
+                            let builder = v8::Function::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                                  args: v8::FunctionCallbackArguments,
                                                                  mut retval: v8::ReturnValue| {
                                 let length = args.length();
 
-                                let dec = unsafe { Local::<v8::External>::cast(args.data()) };
+                                let dec = unsafe { args.data().cast::<v8::External>() };
 
                                 let dec = dec.value() as *mut DeclarationFFI;
 
@@ -2101,58 +4381,68 @@ fn handle_named_property_getter(scope: &mut v8::HandleScope,
 
                             let func = builder.unwrap();
 
-                            rv.set(func.into());
-                            return;
+                            let func: Local<v8::Value> = func.into();
+                            store.set(scope, key.into(), func);
+                            rv.set(func);
+                            return v8::Intercepted::kYes;
                         }
                     }
                 }
             }
-            DeclarationKind::Interface => {}
-            DeclarationKind::GenericInterface => {}
-            DeclarationKind::GenericInterfaceInstance => {}
+            DeclarationKind::Interface
+            | DeclarationKind::GenericInterface
+            | DeclarationKind::GenericInterfaceInstance
+            | DeclarationKind::Delegate
+            | DeclarationKind::GenericDelegate
+            | DeclarationKind::GenericDelegateInstance
+            | DeclarationKind::Event => {
+                if let Some(impl_key) = v8::String::new(scope, "__implementation__") {
+                    if let Some(implementation) = store.get(scope, impl_key.into()) {
+                        if let Some(implementation) = implementation.to_object(scope) {
+                            if let Some(value) = implementation.get(scope, key.into()) {
+                                if !value.is_null_or_undefined() {
+                                    store.set(scope, key.into(), value);
+                                    rv.set(value);
+                                    return v8::Intercepted::kYes;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             DeclarationKind::Enum => {
                 let dec = lock.as_any().downcast_ref::<EnumDeclaration>();
                 if let Some(dec) = dec {
-                    let cached_item = store.get(scope, key.into());
-                    if let Some(cache) = cached_item {
-                        if !cache.is_null_or_undefined() {
-                            rv.set(cache);
-                            return;
-                        }
-                    }
-
                     if let Some(value) = dec.enum_for_name(name.as_str()) {
                         match value.value() {
                             Value::Int32(value) => {
                                 rv.set_int32(value);
                                 let ret = v8::Number::new(scope, value as f64).into();
                                 store.set(scope, key.into(), ret);
-                                return;
+                                return v8::Intercepted::kYes;
                             }
                             Value::Uint32(value) => {
                                 rv.set_uint32(value);
                                 let ret = v8::Number::new(scope, value as f64).into();
                                 store.set(scope, key.into(), ret);
-                                return;
+                                return v8::Intercepted::kYes;
                             }
                             _ => {}
                         }
                     }
 
-                    rv.set_undefined();
-                    return;
+                    // Name isn't an enum member (e.g. `toString`, `valueOf`).
+                    // Don't intercept — let V8 fall back to Object.prototype
+                    // so coercion-style operations (console.log on the enum,
+                    // template-string interpolation, etc.) work.
+                    return v8::Intercepted::kNo;
                 }
             }
             DeclarationKind::EnumMember => {}
             DeclarationKind::Struct => {}
             DeclarationKind::StructField => {}
-            DeclarationKind::Delegate => {}
-            DeclarationKind::GenericDelegate => {}
-            DeclarationKind::GenericDelegateInstance => {}
-            DeclarationKind::Event => {}
             DeclarationKind::Property => {}
             DeclarationKind::Method => {
-                println!("getter method {}", name);
                 let dec = lock.as_any().downcast_ref::<ClassDeclaration>();
 
                 if let Some(dec) = dec {
@@ -2161,8 +4451,6 @@ fn handle_named_property_getter(scope: &mut v8::HandleScope,
                         if name.is_empty() {
                             name = method.name();
                         }
-
-                        println!("method name {}", name);
                         // let cached_item = store.get(scope, key.into());
                         // if let Some(cache) = cached_item {
                         //     if !cache.is_null_or_undefined() {
@@ -2199,28 +4487,40 @@ fn handle_named_property_getter(scope: &mut v8::HandleScope,
             }
             DeclarationKind::Parameter => {}
         }
-        return;
+        // Fell through every arm without setting rv — let V8 do its default
+        // lookup (returns `undefined` for missing names, which is what JS
+        // expects for unknown WinRT properties).
+        return v8::Intercepted::kNo;
     }
 
-    rv.set(args.holder().into());
+    // Non-string key (a Symbol like Symbol.toPrimitive). We don't expose
+    // any Symbol-keyed WinRT properties, so let V8 fall back to defaults.
+    // Returning `args.holder()` here was a v8 0.73-era bug that v8 147
+    // treats as "I handled it, here's a value", causing TypeError when V8
+    // tries to invoke the result for primitive coercion.
+    v8::Intercepted::kNo
 }
 
 
-fn handle_indexed_property_setter(_scope: &mut v8::HandleScope,
-                                  index: u32,
-                                  value: v8::Local<v8::Value>,
-                                  args: v8::PropertyCallbackArguments,
-                                  mut rv: v8::ReturnValue,
-) {}
+fn handle_indexed_property_setter(_scope: &mut v8::PinScope<'_, '_>,
+                                  _index: u32,
+                                  _value: v8::Local<v8::Value>,
+                                  _args: v8::PropertyCallbackArguments,
+                                  mut _rv: v8::ReturnValue<()>,
+) -> v8::Intercepted {
+    v8::Intercepted::kNo
+}
 
 
-fn handle_indexed_property_getter(scope: &mut v8::HandleScope,
-                                  index: u32,
-                                  args: v8::PropertyCallbackArguments,
-                                  mut rv: v8::ReturnValue) {}
+fn handle_indexed_property_getter(_scope: &mut v8::PinScope<'_, '_>,
+                                  _index: u32,
+                                  _args: v8::PropertyCallbackArguments,
+                                  mut _rv: v8::ReturnValue<v8::Value>) -> v8::Intercepted {
+    v8::Intercepted::kNo
+}
 
 
-fn handle_ns_func(scope: &mut v8::HandleScope,
+fn handle_ns_func(scope: &mut v8::PinScope<'_, '_>,
                   _args: v8::FunctionCallbackArguments,
                   mut _retval: v8::ReturnValue) {
     // scope.throw_exception(v8::Exception::error(scope, v8::String::new("")))
@@ -2229,88 +4529,76 @@ fn handle_ns_func(scope: &mut v8::HandleScope,
 impl Runtime {
     pub fn new(app_root: &str) -> Self {
         INIT.call_once(|| {
-            /* let _ = unsafe {
-                 // CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)
-                 CoInitialize(None)
-             };
-             */
-            let platform = v8::Platform::new(0, false).make_shared();
+            let platform = v8::new_default_platform(0, false).make_shared();
             v8::V8::initialize_platform(platform);
             v8::V8::initialize();
         });
+
         let params = v8::CreateParams::default();
         let mut isolate = v8::Isolate::new(params);
         isolate.set_capture_stack_trace_for_uncaught_exceptions(true, 100);
 
         let global_context;
-
         {
-            let scope = &mut v8::HandleScope::new(&mut isolate);
-            let global = v8::FunctionTemplate::builder(|_scope: &mut v8::HandleScope,
-                                                               _args: v8::FunctionCallbackArguments,
-                                                               mut _retval: v8::ReturnValue|{})
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
-                .build(scope);
+            v8::scope!(scope, &mut isolate);
 
-            let class_name = v8::String::new(scope, "NativeScriptGlobalObject").unwrap();
-            global.set_class_name(class_name);
+            // v8 147: build a plain ObjectTemplate for the global. The previous
+            // FunctionTemplate-based approach (used in v8 0.73 to give the
+            // global a class name) crashes Context::new in 147 — the tests in
+            // rusty_v8 itself construct globals via ObjectTemplate::new only.
+            let mut global_template = v8::ObjectTemplate::new(scope);
 
-            let mut global_template = v8::ObjectTemplate::new_from_template(scope, global);
+            globals::performance::init_performance(scope, &mut global_template);
+            globals::time::init_time(scope, &mut global_template);
 
-            global_template.set_internal_field_count(1);
-
+            let context = v8::Context::new(
+                scope,
+                v8::ContextOptions {
+                    global_template: Some(global_template),
+                    ..Default::default()
+                },
+            );
             {
-                let template = &mut global_template;
-
-                globals::performance::init_performance(scope, template);
-
-                globals::time::init_time(scope, template);
-
-                let context = v8::Context::new_from_template(scope, global_template);
-                {
-                    let scope = &mut v8::ContextScope::new(scope, context);
-
-                    init_global(scope, context);
-                    globals::console::init_console(scope, context);
-                    init_meta(scope, context);
-                    global_context = Global::new(scope, context);
-                }
+                let scope = &mut v8::ContextScope::new(scope, context);
+                preload_sbg_manifest();
+                init_global(scope, context);
+                globals::console::init_console(scope, context);
+                init_meta(scope, context);
+                init_async_helpers(scope, app_root);
+                global_context = v8::Global::new(scope, context);
             }
         }
-
-        let runtime = runtime::Builder::new_current_thread()
-            .enable_all()
-            .build().unwrap();
-
-        let runtime = Arc::new(RwLock::new(runtime));
-
-        isolate.set_slot(Arc::clone(&runtime));
 
         Self {
             isolate,
             global_context,
             app_root: app_root.to_string(),
-            runtime,
         }
     }
 
     pub fn run_script(&mut self, script: &str) {
-        let runtime = self.runtime.read();
-        runtime.block_on(async {
-            let isolate = &mut self.isolate;
-            let scope = &mut v8::HandleScope::new(isolate);
-            let context = v8::Local::new(scope, &self.global_context);
-            let scope = &mut v8::ContextScope::new(scope, context);
-            let code = v8::String::new(scope, script).unwrap();
-            let script = v8::Script::compile(scope, code, None).unwrap();
-            let _ = script.run(scope);
-            tokio::task::yield_now().await
-        });
+        v8::scope!(scope, &mut self.isolate);
+        let context = v8::Local::new(scope, &self.global_context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+
+        let looks_like_module = script.contains("import ") || script.contains("export ");
+        let source_to_run = if looks_like_module {
+            let entry = PathBuf::from(self.app_root.as_str()).join("App").join("main.js");
+            let entry_json = serde_json::to_string(entry.to_string_lossy().as_ref()).unwrap_or_else(|_| "\"main.js\"".to_string());
+            let source_json = serde_json::to_string(script).unwrap_or_else(|_| "\"\"".to_string());
+            format!("globalThis.__nsEvalAsModule({}, {});", source_json, entry_json)
+        } else {
+            script.to_string()
+        };
+
+        let Some(code) = v8::String::new(scope, source_to_run.as_str()) else { return };
+        if let Some(script) = v8::Script::compile(scope, code, None) {
+            script.run(scope);
+        }
+
+        // Drain any synchronous Promise microtasks that the script may have queued.
+        scope.perform_microtask_checkpoint();
     }
 
-    pub fn dispose(&self) {
-        /* unsafe {
-             CoUninitialize();
-         }*/
-    }
+    pub fn dispose(&self) {}
 }

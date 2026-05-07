@@ -32,89 +32,60 @@ pub fn init_console(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, 
     global.define_own_property(scope, value, console.into(), v8::PropertyAttribute::READ_ONLY);
 }
 
-fn handle_item_log(scope: &mut v8::HandleScope, item: v8::Local<v8::Value>, output: &mut String, is_last: bool){
-
+fn handle_item_log(scope: &mut v8::PinScope<'_, '_>, item: v8::Local<v8::Value>, output: &mut String, is_last: bool) {
     if item.is_array() {
         let item = v8::Local::<v8::Array>::try_from(item).unwrap();
         let length = item.length() as usize;
         for i in 0..length {
-            let item = item.get_index(scope, i as u32);
-            let is_last = i == length.saturating_sub(1);
-            match item {
-                None => {}
-                Some(item) => {
-                    handle_item_log(scope, item, output, is_last);
-                }
+            let inner_is_last = is_last && i == length.saturating_sub(1);
+            if let Some(child) = item.get_index(scope, i as u32) {
+                handle_item_log(scope, child, output, inner_is_last);
             }
         }
-    }else {
-        let item = item.to_rust_string_lossy(scope);
-        if is_last {
-            output.push_str(&item)
-        } else {
-            output.push_str(&item);
-            output.push_str(", ")
-        }
-        if is_last {
-            output.push_str("\n");
+    } else {
+        output.push_str(&item.to_rust_string_lossy(scope));
+        if !is_last {
+            // Standard JS console.log separator: a single space.
+            output.push(' ');
         }
     }
 }
 
-pub(crate) fn handle_console_log(scope: &mut v8::HandleScope, args: v8::FunctionCallbackArguments, _retval: v8::ReturnValue) {
-    let mut value = String::new();
-    let length = args.length() as usize;
-    for i in 0..length {
-        let item = args.get(i as c_int);
-        let is_last = i == length.saturating_sub(1);
-        handle_item_log(scope, item, &mut value, is_last);
-    }
-
+fn write_console(value: &str) {
     let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-
     match handle {
         Ok(handle) => {
-            let result = unsafe {
-                Console::WriteConsoleA(handle, value.as_bytes(), None, None)
-            };
-
-            // try using println
-            if !result.as_bool() {
-                println!("{value}");
+            let result = unsafe { Console::WriteConsoleA(handle, value.as_bytes(), None, None) };
+            if result.is_err() {
+                print!("{value}");
             }
         }
         Err(_) => {
-            let value = CString::new(value).unwrap();
-            unsafe {
-                OutputDebugStringA(
-                    PCSTR::from_raw(value.as_ptr() as _)
-                )
+            if let Ok(c) = CString::new(value) {
+                unsafe { OutputDebugStringA(PCSTR::from_raw(c.as_ptr() as _)) }
             }
         }
     }
-
-
 }
 
-pub(crate) fn handle_console_dir(scope: &mut v8::HandleScope, args: v8::FunctionCallbackArguments, _retval: v8::ReturnValue) {
+pub(crate) fn handle_console_log(scope: &mut v8::PinScope<'_, '_>, args: v8::FunctionCallbackArguments, _retval: v8::ReturnValue) {
     let mut value = String::new();
-    for i in 0..args.length() {
-        let item = args.get(i).to_rust_string_lossy(scope);
-        if i == args.length() - 1 {
-            value.push_str(&item)
-        } else {
-            value.push_str(&item);
-            value.push_str(",")
-        }
+    let length = args.length() as usize;
+    for i in 0..length {
+        let is_last = i == length.saturating_sub(1);
+        handle_item_log(scope, args.get(i as c_int), &mut value, is_last);
     }
-    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    value.push('\n');
+    write_console(&value);
+}
 
-    unsafe {
-        let result = Console::WriteConsoleA(handle.unwrap(), value.as_bytes(), None, None);
-
-        // try using println
-        if !result.as_bool() {
-            println!("{value}");
-        }
+pub(crate) fn handle_console_dir(scope: &mut v8::PinScope<'_, '_>, args: v8::FunctionCallbackArguments, _retval: v8::ReturnValue) {
+    let mut value = String::new();
+    let length = args.length() as usize;
+    for i in 0..length {
+        let is_last = i == length.saturating_sub(1);
+        handle_item_log(scope, args.get(i as c_int), &mut value, is_last);
     }
+    value.push('\n');
+    write_console(&value);
 }

@@ -16,6 +16,36 @@ use crate::prelude::*;
 pub struct Metadata {}
 
 impl Metadata {
+    fn resolve_methods_owner_token(metadata: &IMetaDataImport2, token: CorTokenType) -> Option<u32> {
+        if token.0 == 0 {
+            return None;
+        }
+
+        match CorTokenType(type_from_token(token)) {
+            mdtTypeDef => Some(token.0 as u32),
+            mdtTypeRef => {
+                let type_name = get_type_name(metadata, token);
+                let type_name = HSTRING::from(type_name);
+                let type_name = PCWSTR(type_name.as_ptr());
+                let mut resolved_token = 0_u32;
+                let result = unsafe {
+                    metadata.FindTypeDefByName(
+                        type_name,
+                        0 as _,
+                        &mut resolved_token,
+                    )
+                };
+
+                if result.is_ok() && resolved_token != 0 {
+                    Some(resolved_token)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     pub fn get_method_containing_class_token(metadata: &IMetaDataImport2, method_token: CorTokenType) -> u32 {
         let mut class_token = 0_u32;
 
@@ -218,6 +248,10 @@ impl Metadata {
     }
 
     pub fn get_class_methods(metadata: &IMetaDataImport2, token: CorTokenType) -> Vec<u32> {
+        let Some(token) = Self::resolve_methods_owner_token(metadata, token) else {
+            return Vec::new();
+        };
+
         let mut methods = [0_u32; 1024];
         let mut methods_count = 0;
         let mut methods_enumerator = std::ptr::null_mut();
@@ -225,20 +259,27 @@ impl Metadata {
         let result = unsafe {
             metadata.EnumMethods(
                 addr_of_mut!(methods_enumerator),
-                token.0 as u32,
+                token,
                 methods.as_mut_ptr(),
                 methods.len() as u32,
                 &mut methods_count,
             )
         };
-        debug_assert!(
-            result.is_ok()
-        );
+        if result.is_err() {
+            if !methods_enumerator.is_null() {
+                unsafe {
+                    metadata.CloseEnum(methods_enumerator)
+                }
+            }
+            return Vec::new();
+        }
         debug_assert!(
             methods_count < (methods.len().saturating_sub(1)) as u32
         );
-        unsafe {
-            metadata.CloseEnum(methods_enumerator)
+        if !methods_enumerator.is_null() {
+            unsafe {
+                metadata.CloseEnum(methods_enumerator)
+            }
         }
 
         methods[..methods_count as usize].to_vec()
@@ -305,7 +346,7 @@ impl Metadata {
                     );
 
                     let factory_methods = Metadata::get_class_methods(
-                        metadata, attribute_token,
+                        metadata, CorTokenType(factory_token as i32),
                     );
 
                     for (i, factoryMethod) in factory_methods.iter().enumerate() {
@@ -510,8 +551,6 @@ impl Metadata {
                         &mut method_impls_count,
                     )
                 };
-
-                println!("{}",method_impls_count);
 
                 debug_assert!(
                     result.is_ok()

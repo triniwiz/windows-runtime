@@ -26,7 +26,7 @@ use std::sync::Arc;
 use byteorder::ByteOrder;
 use libffi::middle::{Arg, Cif};
 use v8::FunctionCallbackArguments;
-use windows::core::{ComInterface, IInspectable, IUnknown, Interface, IntoParam, Type, GUID, HRESULT, HSTRING, IUnknown_Vtbl, IInspectable_Vtbl};
+use windows::core::{IInspectable, IUnknown, Interface, GUID, HRESULT, HSTRING, IUnknown_Vtbl, IInspectable_Vtbl};
 use windows::Win32::System::Com::IDispatch;
 use windows::Win32::System::WinRT::IActivationFactory;
 use windows::Win32::System::WinRT::Metadata::{CorElementType, ELEMENT_TYPE_CLASS};
@@ -217,7 +217,9 @@ impl NativeValue {
 
     pub unsafe fn as_arg(&self, native_type: &NativeType) -> Arg {
         match native_type {
-            NativeType::Void => unreachable!(),
+            // Void should never be marshalled as an argument, but return a stable
+            // placeholder to avoid process aborts in malformed metadata scenarios.
+            NativeType::Void => Arg::new(&self.u8_value),
             NativeType::Bool => Arg::new(&self.bool_value),
             NativeType::U8 => Arg::new(&self.u8_value),
             NativeType::I8 => Arg::new(&self.i8_value),
@@ -246,7 +248,7 @@ impl NativeValue {
     #[inline]
     pub unsafe fn to_v8<'a>(
         &'a self,
-        scope: &mut v8::HandleScope<'a>,
+        scope: &mut v8::PinScope<'a, '_>,
         native_type: NativeType,
     ) -> v8::Local<v8::Value> {
         let value = match native_type {
@@ -354,14 +356,15 @@ impl NativeValue {
             }
             NativeType::String => {
                 let local_value: v8::Local<v8::Value> =
-                    v8::String::new_from_two_byte(scope, self.string.as_wide(), v8::NewStringType::Normal).unwrap().into();
+                    v8::String::new_from_two_byte(scope, &*self.string, v8::NewStringType::Normal).unwrap().into();
                 local_value
             }
         };
 
-        let mut scope = v8::EscapableHandleScope::new(scope);
-
-        scope.escape(value)
+        // v8 147 lifetime tracking on Local handles makes the explicit
+        // EscapableHandleScope unnecessary here — the local already lives
+        // in the parent scope's lifetime.
+        value
     }
 }
 
@@ -372,7 +375,7 @@ unsafe impl Send for NativeValue {}
 
 #[inline]
 pub fn ffi_parse_string_arg(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     arg: v8::Local<v8::Value>,
 ) -> std::result::Result<NativeValue, AnyError> {
     let string_value = v8::Local::<v8::String>::try_from(arg)
@@ -456,7 +459,7 @@ pub fn ffi_parse_i32_arg(
 
 #[inline]
 pub fn ffi_parse_u64_arg(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     arg: v8::Local<v8::Value>,
 ) -> std::result::Result<NativeValue, AnyError> {
     // Order of checking:
@@ -477,7 +480,7 @@ pub fn ffi_parse_u64_arg(
 
 #[inline]
 pub fn ffi_parse_i64_arg(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     arg: v8::Local<v8::Value>,
 ) -> std::result::Result<NativeValue, AnyError> {
     // Order of checking:
@@ -496,7 +499,7 @@ pub fn ffi_parse_i64_arg(
 
 #[inline]
 pub fn ffi_parse_usize_arg(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     arg: v8::Local<v8::Value>,
 ) -> std::result::Result<NativeValue, AnyError> {
     // Order of checking:
@@ -515,7 +518,7 @@ pub fn ffi_parse_usize_arg(
 
 #[inline]
 pub fn ffi_parse_isize_arg(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     arg: v8::Local<v8::Value>,
 ) -> std::result::Result<NativeValue, AnyError> {
     // Order of checking:
@@ -553,28 +556,57 @@ pub fn ffi_parse_f64_arg(
 }
 
 #[inline]
+fn try_get_external_handle(
+    scope: &mut v8::PinScope<'_, '_>,
+    arg: v8::Local<v8::Object>,
+) -> Option<*mut c_void> {
+    if let Some(handle_key) = v8::String::new(scope, "handle") {
+        if let Some(handle) = arg.get(scope, handle_key.into()) {
+            if let Ok(value) = v8::Local::<v8::External>::try_from(handle) {
+                return Some(value.value());
+            }
+
+            if handle.is_null_or_undefined() {
+                return Some(std::ptr::null_mut());
+            }
+        }
+    }
+
+    if let Some(dec) = arg.get_internal_field(scope, 0) {
+        let dec = unsafe { dec.cast::<v8::External>() };
+        let dec = dec.value() as *mut DeclarationFFI;
+        let dec = unsafe { &*dec };
+
+        return Some(
+            dec.instance
+                .as_ref()
+                .map(|instance| unsafe { mem::transmute_copy(instance) })
+                .unwrap_or(std::ptr::null_mut()),
+        );
+    }
+
+    None
+}
+
+#[inline]
 pub fn ffi_parse_pointer_arg(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     arg: v8::Local<v8::Value>,
 ) -> std::result::Result<NativeValue, AnyError> {
     if arg.is_object() {
         let arg = arg.to_object(scope).unwrap();
-        let dec = arg.get_internal_field(scope, 0).unwrap();
-        let dec = unsafe { v8::Local::<v8::External>::cast(dec) };
-        let dec = dec.value() as *mut DeclarationFFI;
-        let dec = unsafe { &*dec };
-        return Ok(NativeValue {pointer: dec.instance.as_ref()
-            .map(|instance| unsafe {mem::transmute_copy(instance)})
-            .unwrap_or(std::ptr::null_mut())
-        })
+        if let Some(pointer) = try_get_external_handle(scope, arg) {
+            return Ok(NativeValue { pointer });
+        }
     }
+
     let pointer = if let Ok(value) = v8::Local::<v8::External>::try_from(arg) {
         value.value()
-    } else if arg.is_null() {
+    } else if arg.is_null_or_undefined() {
         std::ptr::null_mut()
     } else {
         return Err(type_error(
-            "Invalid FFI pointer type, expected null, or External",
+            "Invalid FFI pointer type, expected null, External, or { handle: External|null }",
         ));
     };
     Ok(NativeValue { pointer })
@@ -582,7 +614,7 @@ pub fn ffi_parse_pointer_arg(
 
 #[inline]
 pub fn ffi_parse_buffer_arg(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     arg: v8::Local<v8::Value>,
 ) -> std::result::Result<NativeValue, AnyError> {
     // Order of checking:
@@ -623,7 +655,7 @@ pub fn ffi_parse_buffer_arg(
 
 #[inline]
 pub fn ffi_parse_struct_arg(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     arg: v8::Local<v8::Value>,
 ) -> std::result::Result<NativeValue, AnyError> {
     // Order of checking:
@@ -665,16 +697,23 @@ pub fn ffi_parse_struct_arg(
 
 #[inline]
 pub fn ffi_parse_function_arg(
-    _scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     arg: v8::Local<v8::Value>,
 ) -> std::result::Result<NativeValue, AnyError> {
+    if arg.is_object() {
+        let arg = arg.to_object(scope).unwrap();
+        if let Some(pointer) = try_get_external_handle(scope, arg) {
+            return Ok(NativeValue { pointer });
+        }
+    }
+
     let pointer = if let Ok(value) = v8::Local::<v8::External>::try_from(arg) {
         value.value()
-    } else if arg.is_null() {
+    } else if arg.is_null_or_undefined() {
         std::ptr::null_mut()
     } else {
         return Err(type_error(
-            "Invalid FFI function type, expected null, or External",
+            "Invalid FFI function type, expected null, External, or { handle: External|null }",
         ));
     };
 
@@ -684,49 +723,60 @@ pub fn ffi_parse_function_arg(
 
 
 #[inline]
-pub unsafe fn set_ret_val(value:*mut c_void, scope: &mut v8::HandleScope, mut rv: v8::ReturnValue, native_type: NativeType){
+fn external_or_null<'a>(
+    scope: &mut v8::PinScope<'a, '_>,
+    value: *mut c_void,
+) -> v8::Local<'a, v8::Value> {
+    if value.is_null() {
+        v8::null(scope).into()
+    } else {
+        v8::External::new(scope, value).into()
+    }
+}
+
+#[inline]
+pub unsafe fn set_ret_val(value:*mut c_void, scope: &mut v8::PinScope<'_, '_>, mut rv: v8::ReturnValue, native_type: NativeType){
+    let raw = value as usize;
+
     match native_type {
         NativeType::Void => {
-            unimplemented!()
+            rv.set_undefined();
         }
         NativeType::Bool => {
-            // just check if null :D
-            rv.set_bool(!value.is_null());
+            rv.set_bool((raw as u8) != 0);
         }
         NativeType::U8 => {
-            let ret: &u8 = mem::transmute(value as *const u8);
             rv.set_uint32(
-                *ret as u32
+                raw as u8 as u32
             );
         }
         NativeType::I8 => {
-            let ret: &i8 = mem::transmute(value as *const i8);
             rv.set_int32(
-                *ret as i32
+                raw as u8 as i8 as i32
             );
         }
         NativeType::U16 => {
             rv.set_uint32(
-                value as u32
+                raw as u16 as u32
             );
         }
         NativeType::I16 => {
             rv.set_int32(
-                value as i32
+                raw as u16 as i16 as i32
             );
         }
         NativeType::U32 => {
             rv.set_uint32(
-                value as u32
+                raw as u32
             );
         }
         NativeType::I32 => {
             rv.set_int32(
-                value as i32
+                raw as u32 as i32
             );
         }
         NativeType::U64 => {
-            let ret: u64 = *mem::transmute::<*const u64, &u64>(value as *const u64);
+            let ret = raw as u64;
 
             let local_value: v8::Local<v8::Value> =
                 if ret > MAX_SAFE_INTEGER as u64 {
@@ -738,7 +788,7 @@ pub unsafe fn set_ret_val(value:*mut c_void, scope: &mut v8::HandleScope, mut rv
             rv.set(local_value);
         }
         NativeType::I64 => {
-            let ret: i64 = *mem::transmute::<*const i64, &i64>(value as *const i64);
+            let ret = raw as u64 as i64;
             let local_value: v8::Local<v8::Value> =
                 if ret > MAX_SAFE_INTEGER as i64 || ret < MIN_SAFE_INTEGER as i64
                 {
@@ -748,47 +798,49 @@ pub unsafe fn set_ret_val(value:*mut c_void, scope: &mut v8::HandleScope, mut rv
                 };
             rv.set(local_value);
         }
-        NativeType::USize => {}
-        NativeType::ISize => {}
+        NativeType::USize => {
+            let ret = raw;
+            let local_value: v8::Local<v8::Value> =
+                if ret > MAX_SAFE_INTEGER as usize {
+                    v8::BigInt::new_from_u64(scope, ret as u64).into()
+                } else {
+                    v8::Number::new(scope, ret as f64).into()
+                };
+            rv.set(local_value);
+        }
+        NativeType::ISize => {
+            let ret = raw as isize;
+            let local_value: v8::Local<v8::Value> =
+                if !(MIN_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&ret) {
+                    v8::BigInt::new_from_i64(scope, ret as i64).into()
+                } else {
+                    v8::Number::new(scope, ret as f64).into()
+                };
+            rv.set(local_value);
+        }
         NativeType::F32 => {
-            let slice = unsafe {std::slice::from_raw_parts(value as *const u8, 4)};
-            let ret: f32 = if cfg!(target_endian = "big") {
-                byteorder::BigEndian::read_f32(slice)
-            } else {
-                byteorder::LittleEndian::read_f32(slice)
-            };
+            let ret = f32::from_bits(raw as u32);
 
             rv.set(
                 v8::Number::new(scope, ret as f64).into()
             );
         }
         NativeType::F64 => {
-            let slice = unsafe {std::slice::from_raw_parts((&value) as *const _ as *const u8, 8)};
-
-            let ret: f64 = if cfg!(target_endian = "big") {
-                byteorder::BigEndian::read_f64(slice)
-            } else {
-                byteorder::LittleEndian::read_f64(slice)
-            };
+            let ret = f64::from_bits(raw as u64);
             rv.set_double(ret);
         }
         NativeType::Pointer => {
-            // trying something
-            let size = mem::size_of_val(&*value);
-
-            // enum value ??
-            if size == 1 {
-                let result = value as *const _ as i8;
-
-                rv.set_int32(result as i32);
-            }else {
-
-            }
-
+            rv.set(external_or_null(scope, value));
         }
-        NativeType::Buffer => {}
-        NativeType::Function => {}
-        NativeType::Struct(_) => {}
+        NativeType::Buffer => {
+            rv.set(external_or_null(scope, value));
+        }
+        NativeType::Function => {
+            rv.set(external_or_null(scope, value));
+        }
+        NativeType::Struct(_) => {
+            rv.set(external_or_null(scope, value));
+        }
         NativeType::String => {
             let string: HSTRING = unsafe { mem::transmute(value) };
             let string = string.to_string();

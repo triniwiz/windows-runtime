@@ -1,9 +1,6 @@
-use std::ffi::c_void;
-use regex::{Error, Regex};
-use windows::core::{ComInterface, Interface, IUnknown};
-use windows::Foundation::IAsyncInfo;
+use regex::Regex;
 
-pub struct GenericReturnTypes <'s> {
+pub struct GenericReturnTypes<'s> {
     names: Vec<&'s str>,
     types: usize,
 }
@@ -27,7 +24,7 @@ pub fn get_generic_return_types(name: &str) -> GenericReturnTypes {
                 0
             }
         }
-        Err(_) => 0
+        Err(_) => 0,
     };
 
     let names = match Regex::new(r"<(.*?)>") {
@@ -38,32 +35,8 @@ pub fn get_generic_return_types(name: &str) -> GenericReturnTypes {
                 vec![]
             }
         }
-        Err(_) => vec![]
+        Err(_) => vec![],
     };
 
-    GenericReturnTypes {
-        names,
-        types,
-    }
-}
-
-pub fn is_async(interface: &IUnknown) -> bool {
-    let vtable = interface.vtable();
-
-    let mut interface_ptr: *mut c_void = std::ptr::null_mut();
-
-    let _ = unsafe {
-        ((*vtable).QueryInterface)(
-            interface.as_raw(),
-            &IAsyncInfo::IID,
-            &mut interface_ptr as *mut _ as *mut *const c_void,
-        )
-    };
-
-    if !interface_ptr.is_null() {
-        let _ = unsafe { IUnknown::from_raw(interface_ptr) };
-        return true;
-    }
-
-    false
+    GenericReturnTypes { names, types }
 }

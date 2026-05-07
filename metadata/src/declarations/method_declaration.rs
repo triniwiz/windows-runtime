@@ -58,12 +58,9 @@ impl MethodDeclaration {
                             0 as _,
                         )
                     };
-                    assert!(result.is_ok());
-                    /*
-                            #if _DEBUG
-                            PCCOR_SIGNATURE startSignature{ signature };
-                    #endif
-                             */
+                    if result.is_err() {
+                        // Skip methods whose metadata can't be read
+                    } else {
 
                     let mut sig = PCCOR_SIGNATURE(signature);
 
@@ -145,6 +142,7 @@ impl MethodDeclaration {
                     // todo
                     //debug_assert!(signature_size == signature);
                     //debug_assert!(start_signature + signature_size == signature);
+                    } // end else (GetMethodProps succeeded)
                 }
             }
         }

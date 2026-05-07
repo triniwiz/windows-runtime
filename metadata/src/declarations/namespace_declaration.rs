@@ -56,8 +56,15 @@ impl NamespaceDeclaration {
         }
 
 
-        let namespaces = unsafe{spaces.assume_init()};
-        let namespaces = unsafe{std::slice::from_raw_parts(namespaces, namespaces_count as usize).to_vec()};
+        let namespaces = unsafe { spaces.assume_init() };
+        // Modern Rust panics if `from_raw_parts` is given a null/unaligned ptr,
+        // even when len is 0. WinRT leaves the out-pointer null when there are
+        // no children — handle that case explicitly.
+        let namespaces: Vec<_> = if namespaces_count == 0 || namespaces.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(namespaces, namespaces_count as usize).to_vec() }
+        };
 
 
         let children: Vec<_> = unsafe {

@@ -1,6 +1,9 @@
 [workspace]
+resolver = "2"
+members = ["metadata", "playground", "runtime", "runtime-binding-gen", "sbg", "nativescript", "typings-generator"]
 
-members = ["metadata", "playground","runtime","nativescript"]
+[profile.dev]
+debug = true
 
 [profile.release]
 panic = "abort"
@@ -10,3 +13,10 @@ opt-level = 3
 debug = false
 incremental = false
 strip = true
+
+# Release build with development tools and SBG (Static Binding Generator)
+[profile.release-with-devtools]
+inherits = "release"
+debug = true
+strip = false
+opt-level = 2
