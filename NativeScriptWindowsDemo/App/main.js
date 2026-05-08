@@ -1,124 +1,17 @@
+import { createButton, text, withContentPadding } from "./core/ui.js";
+import { createDashboardPage } from "./features/dashboard.js";
+import { createGettingStartedPage } from "./features/getting-started.js";
+import { createSetupPage } from "./features/setup.js";
+import { createComponentsPage } from "./features/components.js";
+import { createExamplesPage } from "./features/examples.js";
+
 console.log("NativeScriptWindowsDemo: booting");
-
-const delegateKeepAlive = [];
-
-function text(value, size) {
-    const control = new Windows.UI.Xaml.Controls.TextBlock();
-    control.Text = String(value);
-    if (size) {
-        control.FontSize = size;
-    }
-    return control;
-}
-
-function resolveType(typeName) {
-    const parts = String(typeName).split(".");
-    let current = globalThis;
-    for (let i = 0; i < parts.length; i++) {
-        current = current && current[parts[i]];
-    }
-    return current;
-}
-
-function createTypedDelegate(typeName, callback) {
-    const TypeCtor = resolveType(typeName);
-    if (typeof TypeCtor !== "function") {
-        return null;
-    }
-
-    try {
-        const delegate = new TypeCtor({
-            Invoke: function () {
-                return callback.apply(null, arguments);
-            },
-        });
-        delegateKeepAlive.push(delegate);
-        return delegate;
-    } catch (_error) {
-        return null;
-    }
-}
-
-function tryCreateAcrylicBrush() {
-    const AcrylicBrush = resolveType("Windows.UI.Xaml.Media.AcrylicBrush");
-    if (typeof AcrylicBrush !== "function") {
-        return null;
-    }
-
-    try {
-        const brush = new AcrylicBrush();
-        brush.TintOpacity = 0.22;
-        return brush;
-    } catch (_error) {
-        return null;
-    }
-}
-
-function bindClick(button, onClick) {
-    const callback = typeof onClick === "function" ? onClick : function () {};
-    const delegate = createTypedDelegate("Windows.UI.Xaml.RoutedEventHandler", callback);
-
-    if (delegate && typeof button.add_Click === "function") {
-        button.add_Click(delegate);
-        return;
-    }
-
-    button.Click = delegate || callback;
-}
-
-function createButton(label, onClick) {
-    const button = new Windows.UI.Xaml.Controls.Button();
-    button.Height = 42;
-    button.Content = String(label);
-    bindClick(button, onClick);
-    return button;
-}
-
-function createCard(titleValue, bodyValue) {
-    const border = new Windows.UI.Xaml.Controls.Border();
-
-    const stack = new Windows.UI.Xaml.Controls.StackPanel();
-    stack.Spacing = 8;
-
-    const titleText = text(titleValue, 19);
-    const bodyText = text(bodyValue, 14);
-    bodyText.TextWrapping = Windows.UI.Xaml.TextWrapping.Wrap;
-
-    const tagLine = text("runtime-ready", 12);
-
-    stack.Children.Append(titleText);
-    stack.Children.Append(bodyText);
-    stack.Children.Append(tagLine);
-
-    border.Child = stack;
-    return border;
-}
-
-function withContentPadding(content) {
-    const outer = new Windows.UI.Xaml.Controls.StackPanel();
-
-    const topSpacer = new Windows.UI.Xaml.Controls.Border();
-    topSpacer.Height = 18;
-    outer.Children.Append(topSpacer);
-
-    const row = new Windows.UI.Xaml.Controls.StackPanel();
-    row.Orientation = Windows.UI.Xaml.Controls.Orientation.Horizontal;
-
-    const leftSpacer = new Windows.UI.Xaml.Controls.Border();
-    leftSpacer.Width = 24;
-
-    row.Children.Append(leftSpacer);
-    row.Children.Append(content);
-    outer.Children.Append(row);
-
-    return outer;
-}
 
 function createShell() {
     console.log("NativeScriptWindowsDemo: createShell start");
     try {
         const navigation = new Windows.UI.Xaml.Controls.NavigationView();
-        navigation.PaneTitle = "Demo Studio";
+        navigation.PaneTitle = "NativeScript Studio";
         navigation.IsSettingsVisible = false;
         navigation.PaneDisplayMode = Windows.UI.Xaml.Controls.NavigationViewPaneDisplayMode.Left;
         navigation.IsBackButtonVisible = Windows.UI.Xaml.Controls.NavigationViewBackButtonVisible.Collapsed;
@@ -136,12 +29,12 @@ function createShell() {
     const split = new Windows.UI.Xaml.Controls.SplitView();
     split.DisplayMode = Windows.UI.Xaml.Controls.SplitViewDisplayMode.Inline;
     split.IsPaneOpen = true;
-    split.OpenPaneLength = 250;
+    split.OpenPaneLength = 260;
 
     const pane = new Windows.UI.Xaml.Controls.StackPanel();
     pane.Spacing = 6;
-    pane.Children.Append(text("Demo Studio", 26));
-    pane.Children.Append(text("Fast native UI from JavaScript", 13));
+    pane.Children.Append(text("NativeScript Studio", 22));
+    pane.Children.Append(text("Windows runtime demo tabs", 12));
 
     split.Pane = pane;
 
@@ -161,119 +54,12 @@ function createNavigationItem(key, label, iconGlyph) {
     return item;
 }
 
-function safeGetChildrenSize(element) {
-    try {
-        const children = element && element.Children;
-        if (children && typeof children.Size === "number") {
-            return children.Size;
-        }
-    } catch (_error) {
-    }
-
-    return -1;
-}
-
-function createDashboardPage(onNavigate) {
-    const root = new Windows.UI.Xaml.Controls.StackPanel();
-    root.Spacing = 12;
-
-    const titleView = text("Dashboard", 34);
-    const subtitle = text("A polished native shell driven by the Rust runtime and WinRT bindings.", 15);
-    subtitle.TextWrapping = Windows.UI.Xaml.TextWrapping.Wrap;
-
-    root.Children.Append(titleView);
-    root.Children.Append(subtitle);
-
-    const buttonStatus = text("Button status: waiting for click", 13);
-    const clickProbeButton = createButton("Dashboard button click probe", function () {
-        buttonStatus.Text = "Button status: click received";
-        console.log("NativeScriptWindowsDemo: dashboard button clicked");
-    });
-
-    const navigateStatus = text("Navigation probe: idle", 13);
-    const navigateProbeButton = createButton("Navigate to Diagnostics (button)", function () {
-        navigateStatus.Text = "Navigation probe: attempting navigation";
-        console.log("NativeScriptWindowsDemo: dashboard navigation probe button clicked");
-        if (typeof onNavigate === "function") {
-            onNavigate("logs");
-        }
-    });
-
-    root.Children.Append(clickProbeButton);
-    root.Children.Append(buttonStatus);
-    root.Children.Append(navigateProbeButton);
-    root.Children.Append(navigateStatus);
-
-    root.Children.Append(
-        createCard(
-            "Visual Shell",
-            "NavigationView navigation, clean hierarchy, and card-based content to make the sample feel like a real app.",
-        ),
-    );
-    root.Children.Append(
-        createCard(
-            "Interop Health",
-            "Enum marshaling, event delegates, and object boxing are active in this build. UI interactions should now remain stable.",
-        ),
-    );
-
-    console.log("NativeScriptWindowsDemo: dashboard children", safeGetChildrenSize(root));
-
-    return root;
-}
-
-function createLogsPage() {
-    const root = new Windows.UI.Xaml.Controls.StackPanel();
-    root.Spacing = 12;
-
-    root.Children.Append(text("Diagnostics", 34));
-
-    const body = text(
-        "Runtime logs are wired to the diagnostics console. Pointer fallback warnings are now filtered for valid WinRT reference types.",
-        14,
-    );
-    body.TextWrapping = Windows.UI.Xaml.TextWrapping.Wrap;
-    root.Children.Append(body);
-
-    root.Children.Append(
-        createCard(
-            "Tip",
-            "If something regresses, capture the first failing runtime line and we can trace straight to the invocation path.",
-        ),
-    );
-
-    console.log("NativeScriptWindowsDemo: logs children", safeGetChildrenSize(root));
-
-    return root;
-}
-
-function createSettingsPage() {
-    const root = new Windows.UI.Xaml.Controls.StackPanel();
-    root.Spacing = 10;
-
-    root.Children.Append(text("Settings", 34));
-    root.Children.Append(text("Tune the demo behavior using native WinRT controls.", 14));
-
-    const card = new Windows.UI.Xaml.Controls.Border();
-
-    const cardStack = new Windows.UI.Xaml.Controls.StackPanel();
-    cardStack.Spacing = 10;
-
-    const toggle = new Windows.UI.Xaml.Controls.ToggleSwitch();
-    toggle.Header = "Enable smooth transitions";
-    toggle.IsOn = true;
-
-    const compact = new Windows.UI.Xaml.Controls.ToggleSwitch();
-    compact.Header = "Compact navigation mode";
-    compact.IsOn = false;
-
-    cardStack.Children.Append(toggle);
-    cardStack.Children.Append(compact);
-    card.Child = cardStack;
-
-    root.Children.Append(card);
-    console.log("NativeScriptWindowsDemo: settings children", safeGetChildrenSize(root));
-    return root;
+function createScrollablePage(content) {
+    const scroll = new Windows.UI.Xaml.Controls.ScrollViewer();
+    scroll.VerticalScrollBarVisibility = Windows.UI.Xaml.Controls.ScrollBarVisibility.Auto;
+    scroll.HorizontalScrollBarVisibility = Windows.UI.Xaml.Controls.ScrollBarVisibility.Disabled;
+    scroll.Content = withContentPadding(content);
+    return scroll;
 }
 
 function buildApp() {
@@ -282,15 +68,12 @@ function buildApp() {
     const shell = createShell();
     const navItemsByKey = {};
 
-    const navigationProbe = function (key) {
-        console.log("NativeScriptWindowsDemo: button-triggered direct page route", key);
-        showPage(key);
-    };
-
     const pages = {
-        dashboard: withContentPadding(createDashboardPage(navigationProbe)),
-        logs: withContentPadding(createLogsPage()),
-        settings: withContentPadding(createSettingsPage()),
+        dashboard: createScrollablePage(createDashboardPage(showPage)),
+        gettingStarted: createScrollablePage(createGettingStartedPage()),
+        setup: createScrollablePage(createSetupPage()),
+        components: createScrollablePage(createComponentsPage()),
+        examples: createScrollablePage(createExamplesPage()),
     };
 
     function showPage(key) {
@@ -314,32 +97,25 @@ function buildApp() {
         shell.contentHost = host;
         shell.navigation.Content = host;
 
-        const dashboardItem = createNavigationItem(
-            "dashboard",
-            "Dashboard",
-            "\uE80F",
-        );
-        const logsItem = createNavigationItem(
-            "logs",
-            "Diagnostics",
-            "\uE7BA",
-        );
-        const settingsItem = createNavigationItem(
-            "settings",
-            "Settings",
-            "\uE713",
-        );
+        const dashboardItem = createNavigationItem("dashboard", "Overview", "\uE80F");
+        const gettingStartedItem = createNavigationItem("gettingStarted", "Getting Started", "\uE8FD");
+        const setupItem = createNavigationItem("setup", "Setup", "\uE713");
+        const componentsItem = createNavigationItem("components", "Components", "\uE8B8");
+        const examplesItem = createNavigationItem("examples", "Examples", "\uE9CE");
 
         navItemsByKey.dashboard = dashboardItem;
-        navItemsByKey.logs = logsItem;
-        navItemsByKey.settings = settingsItem;
+        navItemsByKey.gettingStarted = gettingStartedItem;
+        navItemsByKey.setup = setupItem;
+        navItemsByKey.components = componentsItem;
+        navItemsByKey.examples = examplesItem;
 
         shell.navigation.MenuItems.Append(dashboardItem);
-        shell.navigation.MenuItems.Append(logsItem);
-        shell.navigation.MenuItems.Append(settingsItem);
+        shell.navigation.MenuItems.Append(gettingStartedItem);
+        shell.navigation.MenuItems.Append(setupItem);
+        shell.navigation.MenuItems.Append(componentsItem);
+        shell.navigation.MenuItems.Append(examplesItem);
 
         shell.navigation.SelectedItem = dashboardItem;
-
         host.Child = pages.dashboard;
 
         const resolveNavigationKey = function () {
@@ -363,31 +139,18 @@ function buildApp() {
             return null;
         };
 
-        const onSelectionChanged = function () {
+        shell.navigation.SelectionChanged = function () {
             const key = resolveNavigationKey();
-
             if (key && pages[key]) {
                 showPage(key);
             }
         };
-
-        shell.navigation.SelectionChanged = onSelectionChanged;
     } else {
-        shell.pane.Children.Append(
-            createButton("Dashboard", function () {
-                showPage("dashboard");
-            }),
-        );
-        shell.pane.Children.Append(
-            createButton("Diagnostics", function () {
-                showPage("logs");
-            }),
-        );
-        shell.pane.Children.Append(
-            createButton("Settings", function () {
-                showPage("settings");
-            }),
-        );
+        shell.pane.Children.Append(createButton("Overview", function () { showPage("dashboard"); }));
+        shell.pane.Children.Append(createButton("Getting Started", function () { showPage("gettingStarted"); }));
+        shell.pane.Children.Append(createButton("Setup", function () { showPage("setup"); }));
+        shell.pane.Children.Append(createButton("Components", function () { showPage("components"); }));
+        shell.pane.Children.Append(createButton("Examples", function () { showPage("examples"); }));
     }
 
     showPage("dashboard");
