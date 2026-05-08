@@ -1,13 +1,14 @@
 ﻿using System.Runtime.InteropServices;
 
+const string NativeScriptLibrary = "nativescript";
 
-[DllImport("libs\\nativescript.dll")]
+[DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_init))]
 static extern Int64 runtime_init([MarshalAs(UnmanagedType.LPUTF8Str)] string entry);
 
-[DllImport("libs\\nativescript.dll")]
+[DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_deinit))]
 static extern void runtime_deinit(Int64 runtime);
 
-[DllImport("libs\\nativescript.dll")]
+[DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_runscript))]
 static extern void runtime_runscript(Int64 runtime, [MarshalAs(UnmanagedType.LPUTF8Str)] string entry);
 
 string entry = Path.Join(AppDomain.CurrentDomain.BaseDirectory, "App\\main.js");

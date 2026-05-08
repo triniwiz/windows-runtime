@@ -8,18 +8,18 @@
     <Platforms>AnyCPU;x64</Platforms>
   </PropertyGroup>
 
-    <ItemGroup>
-      <None Update="App\main.js">
-        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      </None>
-      <None Update="libs\nativescript.dll">
-        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      </None>
-    </ItemGroup>
+  <ItemGroup>
+    <None Update="App\main.js">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\libs\x64\nativescript.dll">
+      <Link>nativescript.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
 
-    <ItemGroup>
-      <Folder Include="App\" />
-        <Folder Include="libs\" />
-    </ItemGroup>
+  <ItemGroup>
+    <Folder Include="App\" />
+  </ItemGroup>
 
 </Project>

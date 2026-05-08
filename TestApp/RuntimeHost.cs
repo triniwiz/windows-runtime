@@ -6,21 +6,23 @@ namespace TestApp
 {
     internal sealed class RuntimeHost : IDisposable
     {
+        private const string NativeScriptLibrary = "nativescript";
+
         [DllImport("kernel32.dll")]
         private static extern bool AttachConsole(int dwProcessId);
 
         private const int ATTACH_PARENT_PROCESS = -1;
 
-        [DllImport("libs\\nativescript.dll")]
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_init))]
         private static extern long runtime_init([MarshalAs(UnmanagedType.LPUTF8Str)] string appRoot);
 
-        [DllImport("libs\\nativescript.dll")]
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_deinit))]
         private static extern void runtime_deinit(long runtime);
 
-        [DllImport("libs\\nativescript.dll")]
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_runscript))]
         private static extern void runtime_runscript(long runtime, [MarshalAs(UnmanagedType.LPUTF8Str)] string script);
 
-        [DllImport("libs\\nativescript.dll")]
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_install_ctrlc_handler))]
         private static extern void runtime_install_ctrlc_handler(int exitCode);
 
         private long _runtime;
