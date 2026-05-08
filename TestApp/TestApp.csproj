@@ -37,15 +37,15 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="..\libs\x64\nativescript.dll" Condition="'$(Platform)' == 'x64'">
-      <Link>libs\x64\nativescript.dll</Link>
+      <Link>nativescript.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="..\libs\x86\nativescript.dll" Condition="'$(Platform)' == 'x86'">
-      <Link>libs\x86\nativescript.dll</Link>
+      <Link>nativescript.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="..\libs\arm64\nativescript.dll" Condition="'$(Platform)' == 'arm64'">
-      <Link>libs\arm64\nativescript.dll</Link>
+      <Link>nativescript.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
