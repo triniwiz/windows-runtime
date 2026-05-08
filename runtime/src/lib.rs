@@ -17,6 +17,8 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::{c_char, c_void, CString};
 use std::fs;
+use std::hash::{Hash, Hasher};
+use ahash::AHasher;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -35,7 +37,7 @@ use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, IUnknown_Vtbl, 
 use windows::Foundation::GuidHelper;
 use windows::Win32::System::Com::{IDispatch, IDispatch_Vtbl};
 use windows::Win32::System::Console::GetConsoleWindow;
-use windows::Win32::System::WinRT::{IActivationFactory, RoActivateInstance, RoGetActivationFactory};
+use windows::Win32::System::WinRT::{IActivationFactory, RoActivateInstance, RoGetActivationFactory, RoInitialize, RoUninitialize, RO_INIT_SINGLETHREADED};
 use windows::Win32::System::WinRT::Metadata::ELEMENT_TYPE_CHAR;
 use windows::Win32::UI::Shell::IInitializeWithWindow;
 use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PeekMessageW, PM_REMOVE, TranslateMessage};
@@ -75,6 +77,7 @@ pub struct Runtime {
     isolate: v8::OwnedIsolate,
     global_context: v8::Global<v8::Context>,
     app_root: String,
+    winrt_initialized: bool,
 }
 
 static INIT: Once = Once::new();
@@ -82,6 +85,19 @@ static PROXY_MANIFESTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
 fn proxy_manifests() -> &'static Mutex<Vec<String>> {
     PROXY_MANIFESTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Tracks hashes of already-loaded manifests to avoid O(N×size) string comparison.
+static MANIFEST_HASHES: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+
+fn manifest_hashes() -> &'static Mutex<HashSet<u64>> {
+    MANIFEST_HASHES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn content_hash(s: &str) -> u64 {
+    let mut h = AHasher::default();
+    s.hash(&mut h);
+    h.finish()
 }
 
 fn default_sbg_manifest_path() -> PathBuf {
@@ -100,14 +116,20 @@ fn preload_sbg_manifest() {
         return;
     }
 
-    let mut loader = SbgManifestLoader::new();
-    if loader.load_manifest_file(&manifest_path).is_ok() {
-        if let Ok(content) = fs::read_to_string(&manifest_path) {
-            let mut manifests = proxy_manifests().lock();
-            if manifests.iter().all(|item| item != &content) {
-                manifests.push(content);
-            }
+    // Read once; feed the same string to both the loader and the dedup check.
+    let Ok(content) = fs::read_to_string(&manifest_path) else { return; };
+
+    let hash = content_hash(&content);
+    {
+        let mut hashes = manifest_hashes().lock();
+        if !hashes.insert(hash) {
+            return; // already loaded
         }
+    }
+
+    let mut loader = SbgManifestLoader::new();
+    if loader.load_manifest_json(&content).is_ok() {
+        proxy_manifests().lock().push(content);
     }
 }
 
@@ -213,16 +235,57 @@ fn collect_class_properties(class_declaration: &ClassDeclaration) -> Vec<Propert
     properties
 }
 
+fn class_method_matches(class_declaration: &ClassDeclaration, name: &str) -> bool {
+    let method_match = |m: &MethodDeclaration| {
+        let on = m.overload_name();
+        (!on.is_empty() && on == name) || m.name() == name
+    };
+
+    if class_declaration.methods().iter().any(method_match) { return true; }
+
+    if let Some(di) = class_declaration.default_interface() {
+        if di.methods().iter().any(method_match) { return true; }
+    }
+
+    for iface in class_declaration.implemented_interfaces() {
+        if iface.methods().iter().any(method_match) { return true; }
+    }
+
+    if !class_declaration.base_full_name().is_empty() {
+        if let Some(base_decl) = MetadataReader::find_by_name(class_declaration.base_full_name()) {
+            let lock = base_decl.read();
+            if let Some(base) = lock.as_any().downcast_ref::<ClassDeclaration>() {
+                return class_method_matches(base, name);
+            }
+        }
+    }
+    false
+}
+
+fn class_property_matches(class_declaration: &ClassDeclaration, name: &str) -> bool {
+    if class_declaration.properties().iter().any(|p| p.name() == name) { return true; }
+
+    if let Some(di) = class_declaration.default_interface() {
+        if di.properties().iter().any(|p| p.name() == name) { return true; }
+    }
+
+    for iface in class_declaration.implemented_interfaces() {
+        if iface.properties().iter().any(|p| p.name() == name) { return true; }
+    }
+
+    if !class_declaration.base_full_name().is_empty() {
+        if let Some(base_decl) = MetadataReader::find_by_name(class_declaration.base_full_name()) {
+            let lock = base_decl.read();
+            if let Some(base) = lock.as_any().downcast_ref::<ClassDeclaration>() {
+                return class_property_matches(base, name);
+            }
+        }
+    }
+    false
+}
+
 fn class_has_member_named(class_declaration: &ClassDeclaration, name: &str) -> bool {
-    collect_class_methods(class_declaration)
-        .iter()
-        .any(|method| {
-            let overload_name = method.overload_name();
-            (!overload_name.is_empty() && overload_name == name) || method.name() == name
-        })
-        || collect_class_properties(class_declaration)
-            .iter()
-            .any(|property| property.name() == name)
+    class_method_matches(class_declaration, name) || class_property_matches(class_declaration, name)
 }
 
 fn runtime_method_metadata_from_method(method: &MethodDeclaration) -> RuntimeMethodMetadata {
@@ -423,6 +486,34 @@ fn throw_js_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
     }
 }
 
+fn class_activation_factory(full_name: &str) -> windows::core::Result<IUnknown> {
+    let clazz_name = HSTRING::from(full_name);
+    unsafe { RoGetActivationFactory::<IUnknown>(&clazz_name) }
+}
+
+fn resolve_class_factory_from_parent(dec: &DeclarationFFI) -> windows::core::Result<IUnknown> {
+    if let Some(instance) = dec.instance.clone() {
+        return Ok(instance);
+    }
+
+    let Some(parent) = dec.parent.as_ref() else {
+        return Err(Error::new(
+            HRESULT(0x80004005u32 as i32),
+            "Static WinRT member is missing its owning class declaration",
+        ));
+    };
+
+    let parent = parent.read();
+    let Some(clazz) = parent.as_any().downcast_ref::<ClassDeclaration>() else {
+        return Err(Error::new(
+            HRESULT(0x80004005u32 as i32),
+            "Static WinRT member parent is not a class declaration",
+        ));
+    };
+
+    class_activation_factory(clazz.full_name())
+}
+
 fn try_get_async_status(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<v8::Value>,
@@ -503,6 +594,14 @@ fn handle_host_wait_for_async(
     } else {
         0
     };
+
+    // Fast-path: already completed before we enter the loop.
+    match try_get_async_status(scope, op_value) {
+        Ok(0) => {} // still running — proceed to wait
+        Ok(_) => { retval.set(op_value); return; }
+        Err(msg) => { throw_js_error(scope, msg.as_str()); return; }
+    }
+
     let deadline = if timeout_ms == 0 {
         None
     } else {
@@ -523,21 +622,23 @@ fn handle_host_wait_for_async(
 
         match try_get_async_status(scope, op_value) {
             Ok(0) => {
+                // Still running: drain the message queue then block for 5 ms.
+                // Using 5 ms instead of 1 ms reduces CPU burn 5× while keeping
+                // perceived latency well below a UI frame budget.
                 while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.into() {
                     unsafe {
                         TranslateMessage(&message);
                         DispatchMessageW(&message);
                     }
                 }
-                std::thread::sleep(Duration::from_millis(1));
-                std::thread::yield_now();
+                std::thread::sleep(Duration::from_millis(5));
             }
             Ok(_) => {
                 retval.set(op_value);
                 return;
             }
-            Err(message) => {
-                throw_js_error(scope, message.as_str());
+            Err(msg) => {
+                throw_js_error(scope, msg.as_str());
                 return;
             }
         }
@@ -3397,13 +3498,21 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
             DeclarationKind::Class => {
                 let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
 
-                let clazz_name = HSTRING::from(clazz.full_name());
-
-                let clazz_factory = unsafe { RoGetActivationFactory::<IUnknown>(&clazz_name) };
-
-                assert!(clazz_factory.is_ok());
-
-                let clazz_factory = clazz_factory.unwrap();
+                let clazz_factory = match class_activation_factory(clazz.full_name()) {
+                    Ok(factory) => factory,
+                    Err(error) => {
+                        throw_js_error(
+                            scope,
+                            format!(
+                                "Failed to activate WinRT class {}: {}",
+                                clazz.full_name(),
+                                error.message()
+                            )
+                            .as_str(),
+                        );
+                        return;
+                    }
+                };
 
                 unsafe {
                     let is_sealed = clazz.is_sealed();
@@ -3525,12 +3634,6 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
         let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
 
-        let clazz_name = HSTRING::from(clazz.full_name());
-
-        let clazz_factory = unsafe { RoGetActivationFactory::<IUnknown>(&clazz_name) };
-
-        let clazz_factory = clazz_factory.unwrap();
-
         for method in clazz.methods().iter() {
             let name = v8::String::new(scope, method.name());
             let is_static = method.is_static();
@@ -3547,7 +3650,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                         method.clone()
                     )
                 ),
-                Some(clazz_factory.clone()),
+                None,
             );
 
             declaration.parent = Some(parent);
@@ -3574,8 +3677,24 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                 let signature = Signature::to_string(method.metadata().unwrap(), &return_type);
 
 
+                let factory = match resolve_class_factory_from_parent(dec) {
+                    Ok(factory) => factory,
+                    Err(error) => {
+                        throw_js_error(
+                            scope,
+                            format!(
+                                "Failed to resolve WinRT static method factory for {}: {}",
+                                method.name(),
+                                error.message()
+                            )
+                            .as_str(),
+                        );
+                        return;
+                    }
+                };
+
                 let mut method = MethodCall::new(
-                    method, method.is_sealed(), dec.instance.clone().unwrap(), false,
+                    method, method.is_sealed(), factory, false,
                 );
 
                 let (ret, result) = method.call(scope, &args);
@@ -4534,6 +4653,12 @@ impl Runtime {
             v8::V8::initialize();
         });
 
+        let winrt_initialized = match unsafe { RoInitialize(RO_INIT_SINGLETHREADED) } {
+            Ok(_) => true,
+            Err(error) if error.code() == HRESULT(0x80010106u32 as i32) => false,
+            Err(error) => panic!("RoInitialize failed: {}", error.message()),
+        };
+
         let params = v8::CreateParams::default();
         let mut isolate = v8::Isolate::new(params);
         isolate.set_capture_stack_trace_for_uncaught_exceptions(true, 100);
@@ -4573,6 +4698,7 @@ impl Runtime {
             isolate,
             global_context,
             app_root: app_root.to_string(),
+            winrt_initialized,
         }
     }
 
@@ -4580,6 +4706,7 @@ impl Runtime {
         v8::scope!(scope, &mut self.isolate);
         let context = v8::Local::new(scope, &self.global_context);
         let scope = &mut v8::ContextScope::new(scope, context);
+        v8::tc_scope!(tc, scope);
 
         let looks_like_module = script.contains("import ") || script.contains("export ");
         let source_to_run = if looks_like_module {
@@ -4591,14 +4718,47 @@ impl Runtime {
             script.to_string()
         };
 
-        let Some(code) = v8::String::new(scope, source_to_run.as_str()) else { return };
-        if let Some(script) = v8::Script::compile(scope, code, None) {
-            script.run(scope);
+        let Some(code) = v8::String::new(tc, source_to_run.as_str()) else { return };
+        if let Some(compiled) = v8::Script::compile(tc, code, None) {
+            compiled.run(tc);
+        }
+
+        // Log and rethrow any JS exception back into V8 (mirrors NativeScript behaviour).
+        if tc.has_caught() {
+            if let Some(msg) = tc.message() {
+                let text = msg.get(tc).to_rust_string_lossy(tc);
+                let line = msg.get_line_number(tc).unwrap_or(0);
+                eprintln!("[NativeScript] Uncaught exception at line {}: {}", line, text);
+                if let Some(stack) = msg.get_stack_trace(tc) {
+                    for i in 0..stack.get_frame_count() {
+                        if let Some(frame) = stack.get_frame(tc, i) {
+                            let fn_name = frame.get_function_name(tc)
+                                .map(|s| s.to_rust_string_lossy(tc))
+                                .unwrap_or_else(|| "<anonymous>".to_string());
+                            let file = frame.get_script_name(tc)
+                                .map(|s| s.to_rust_string_lossy(tc))
+                                .unwrap_or_else(|| "<unknown>".to_string());
+                            eprintln!("    at {} ({}:{}:{})", fn_name, file,
+                                frame.get_line_number(), frame.get_column());
+                        }
+                    }
+                }
+            }
+            tc.rethrow();
+            return;
         }
 
         // Drain any synchronous Promise microtasks that the script may have queued.
-        scope.perform_microtask_checkpoint();
+        tc.perform_microtask_checkpoint();
     }
 
     pub fn dispose(&self) {}
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        if self.winrt_initialized {
+            unsafe { RoUninitialize() };
+        }
+    }
 }

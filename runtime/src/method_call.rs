@@ -13,6 +13,7 @@ use metadata::declarations::parameter_declaration::ParameterDeclaration;
 use metadata::declaring_interface_for_method::Metadata;
 use metadata::signature::Signature;
 use crate::error::AnyError;
+use crate::helpers::ffi_native_type_from_signature;
 use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue};
 
 pub struct MethodCall {
@@ -34,26 +35,8 @@ pub struct MethodCall {
     /// Scratch buffer used when a WinRT method returns a value type (e.g. GUID, Rect)
     /// that is larger than, or cannot be safely aliased through, a single pointer slot.
     return_value_buf: [u8; 128],
-}
-
-#[inline]
-fn ffi_native_type_from_signature(signature: &str) -> NativeType {
-    match signature {
-        "Void" => NativeType::Void,
-        "String" => NativeType::Pointer,
-        "Boolean" => NativeType::Bool,
-        "UInt8" => NativeType::U8,
-        "UInt16" => NativeType::U16,
-        "UInt32" => NativeType::U32,
-        "UInt64" => NativeType::U64,
-        "Int8" => NativeType::I8,
-        "Int16" => NativeType::I16,
-        "Int32" => NativeType::I32,
-        "Int64" => NativeType::I64,
-        "Single" => NativeType::F32,
-        "Double" => NativeType::F64,
-        _ => NativeType::Pointer,
-    }
+    /// Pre-allocated argument buffer reused on every call to avoid per-call heap allocation.
+    argument_buf: Vec<NativeValue>,
 }
 
 #[inline]
@@ -227,6 +210,7 @@ impl MethodCall {
             declaration,
             return_type,
             return_value_buf: [0u8; 128],
+            argument_buf: Vec::with_capacity(number_of_abi_parameters),
         }
     }
 
@@ -246,11 +230,20 @@ impl MethodCall {
         args: &v8::FunctionCallbackArguments,
     ) -> (HRESULT, *mut c_void) {
 
+        // Snapshot fields before the mutable borrow of argument_buf begins.
         let number_of_abi_parameters = self.number_of_abi_parameters;
+        let is_initializer = self.is_initializer;
+        let is_sealed = self.is_sealed;
+        let is_void = self.is_void;
+        let is_value_type = matches!(
+            self.return_type.as_str(),
+            "Guid" | "Rect" | "Matrix3x2" | "Matrix4x4"
+        );
 
-        let mut arguments: Vec<NativeValue> = Vec::with_capacity(number_of_abi_parameters);
+        // Reuse the pre-allocated buffer — avoids a heap allocation on every call.
+        self.argument_buf.clear();
 
-        unsafe { arguments.push(NativeValue { pointer: std::mem::transmute_copy(&self.interface) }) };
+        unsafe { self.argument_buf.push(NativeValue { pointer: std::mem::transmute_copy(&self.interface) }) };
 
         for (i, native_type) in self.parse_parameter_types.iter().enumerate() {
             let value = args.get(i as i32);
@@ -320,58 +313,48 @@ impl MethodCall {
                 Err(_) => return (call_failure(), std::ptr::null_mut()),
             };
 
-            arguments.push(value);
+            self.argument_buf.push(value);
         }
 
         let mut result: *mut c_void = std::ptr::null_mut();
         let mut composition_outer: *mut c_void = std::ptr::null_mut();
         let mut composition_inner: *mut c_void = std::ptr::null_mut();
 
-
-        if self.is_initializer {
-
-            if !self.is_sealed {
+        if is_initializer {
+            if !is_sealed {
                 // WinRT composition constructors receive separate outer/inner pointers.
                 unsafe {
-                    arguments.push(NativeValue {
+                    self.argument_buf.push(NativeValue {
                         pointer: &mut composition_outer as *mut _ as *mut c_void,
                     })
                 };
                 unsafe {
-                    arguments.push(NativeValue {
+                    self.argument_buf.push(NativeValue {
                         pointer: &mut composition_inner as *mut _ as *mut c_void,
                     })
                 };
             }
-
-            unsafe { arguments.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void }) };
-        } else {
-            if !self.is_void {
-                if self.is_value_type_return() {
-                    // Value structs (GUID=16B, Rect=16B, …) are written directly into the
-                    // out-param location — not through a pointer-to-pointer.  Use the
-                    // pre-allocated scratch buffer so we don't overflow a pointer-sized slot.
-                    let buf_ptr = self.return_value_buf.as_mut_ptr() as *mut c_void;
-                    arguments.push(NativeValue { pointer: buf_ptr });
-                } else {
-                    arguments.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
-                }
+            unsafe { self.argument_buf.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void }) };
+        } else if !is_void {
+            if is_value_type {
+                // Value structs (GUID=16B, Rect=16B, …) are written directly into the
+                // out-param location — not through a pointer-to-pointer.  Use the
+                // pre-allocated scratch buffer so we don't overflow a pointer-sized slot.
+                let buf_ptr = self.return_value_buf.as_mut_ptr() as *mut c_void;
+                self.argument_buf.push(NativeValue { pointer: buf_ptr });
+            } else {
+                self.argument_buf.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
             }
         }
 
-        //let mut func = std::ptr::null_mut();
-
-       // get_method(&self.interface, self.index, addr_of_mut!(func));
-
-        let mut call_args: Vec<Arg> = Vec::with_capacity(arguments.len());
-        for (i, v) in arguments.iter().enumerate() {
+        let mut call_args: Vec<Arg> = Vec::with_capacity(self.argument_buf.len());
+        for (i, v) in self.argument_buf.iter().enumerate() {
             // SAFETY: Creating a `Arg` from a `NativeValue` is safe when the parallel type vector matches.
             let Some(native_type) = self.parameter_types.get(i) else {
                 return (call_failure(), std::ptr::null_mut());
             };
             call_args.push(unsafe { v.as_arg(native_type) });
         }
-
 
         let ret = unsafe {
             self.cif.call(
@@ -380,7 +363,7 @@ impl MethodCall {
             )
         };
 
-        if self.is_initializer && !self.is_sealed && result.is_null() {
+        if is_initializer && !is_sealed && result.is_null() {
             if !composition_inner.is_null() {
                 result = composition_inner;
             } else if !composition_outer.is_null() {
@@ -388,7 +371,7 @@ impl MethodCall {
             }
         }
 
-        if !self.is_initializer && !self.is_void && self.is_value_type_return() {
+        if !is_initializer && !is_void && is_value_type {
             // Point result at the scratch buffer so the caller can read the bytes.
             result = self.return_value_buf.as_mut_ptr() as *mut c_void;
         }

@@ -27,10 +27,12 @@ fn bench_async_paths(c: &mut Criterion) {
         b.iter_batched(
             || {
                 r#"
-                    let p = Promise.resolve(0);
-                    for (let i = 0; i < 1000; i++) {
-                        p.then(v => v + 1);
-                    }
+                    (function() {
+                        let p = Promise.resolve(0);
+                        for (let i = 0; i < 1000; i++) {
+                            p.then(v => v + 1);
+                        }
+                    })();
                 "#
             },
             |script| runtime.run_script(script),

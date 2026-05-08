@@ -95,7 +95,11 @@ impl Generator {
         let method_modifier = if base_type == "object" { "public" } else { "public override" };
         let property_modifier = method_modifier;
 
-        let mut class_code = String::new();
+        // Pre-size the buffer: header ~400 bytes + ~150 per method + ~120 per property
+        let capacity = 400
+            + ext_meta.methods.len() * 150
+            + ext_meta.properties.len() * 120;
+        let mut class_code = String::with_capacity(capacity);
         class_code.push_str(GENERATED_FILE_HEADER);
         class_code.push_str("using System;\n\n");
         class_code.push_str(&format!("namespace {}\n{{\n", namespace));
