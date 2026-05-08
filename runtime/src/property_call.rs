@@ -5,18 +5,19 @@ use parking_lot::RwLock;
 use windows::core::{GUID, HRESULT, Interface, IUnknown};
 use windows::Win32::System::WinRT::IActivationFactory;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
-use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration::{Declaration, DeclarationKind};
-use metadata::declarations::enum_declaration::EnumDeclaration;
 use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
 use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
 use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::declarations::parameter_declaration::ParameterDeclaration;
 use metadata::declarations::property_declaration::PropertyDeclaration;
 use metadata::declaring_interface_for_method::Metadata;
-use metadata::meta_data_reader::MetadataReader;
 use metadata::signature::Signature;
 use crate::error::AnyError;
+use crate::helpers::{
+    call_failure, ffi_native_type_from_signature, inherited_interface_method_count,
+    normalize_parameter_signature, parse_native_type_from_signature,
+};
 use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg_with_signature, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue};
 
 pub struct PropertyCall {
@@ -38,94 +39,6 @@ pub struct PropertyCall {
     return_type: String,
     pub(crate) declaration: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>>,
     is_valid: bool,
-}
-
-#[inline]
-fn ffi_native_type_from_signature(signature: &str) -> NativeType {
-    match signature {
-        "Void" => NativeType::Void,
-        "String" => NativeType::Pointer,
-        "Boolean" => NativeType::Bool,
-        "UInt8" => NativeType::U8,
-        "UInt16" => NativeType::U16,
-        "UInt32" => NativeType::U32,
-        "UInt64" => NativeType::U64,
-        "Int8" => NativeType::I8,
-        "Int16" => NativeType::I16,
-        "Int32" => NativeType::I32,
-        "Int64" => NativeType::I64,
-        "Single" => NativeType::F32,
-        "Double" => NativeType::F64,
-        _ => NativeType::Pointer,
-    }
-}
-
-#[inline]
-fn call_failure() -> HRESULT {
-    // E_FAIL
-    HRESULT(0x8000_4005u32 as i32)
-}
-
-#[inline]
-fn normalize_parameter_signature(signature: &str) -> &str {
-    if signature.starts_with("Var!") || signature.starts_with("MVar!") {
-        return "Object";
-    }
-
-    signature
-}
-
-fn inherited_interface_method_count(interfaces: &[&InterfaceDeclaration]) -> usize {
-    let mut count = 0;
-    for inherited in interfaces {
-        count += inherited.methods().len();
-        count += inherited_interface_method_count(inherited.implemented_interfaces().as_slice());
-    }
-    count
-}
-
-#[inline]
-fn describe_js_value(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> String {
-    if value.is_undefined() {
-        return "undefined".to_string();
-    }
-    if value.is_null() {
-        return "null".to_string();
-    }
-    if value.is_boolean() {
-        return "boolean".to_string();
-    }
-    if value.is_int32() {
-        return "int32".to_string();
-    }
-    if value.is_uint32() {
-        return "uint32".to_string();
-    }
-    if value.is_number() {
-        return "number".to_string();
-    }
-    if value.is_big_int() {
-        return "bigint".to_string();
-    }
-    if value.is_string() {
-        return "string".to_string();
-    }
-    if value.is_function() {
-        return "function".to_string();
-    }
-    if value.is_array() {
-        return "array".to_string();
-    }
-    if value.is_object() {
-        if let Some(obj) = value.to_object(scope) {
-            if obj.internal_field_count() > 0 {
-                return format!("object(internal_fields={})", obj.internal_field_count());
-            }
-        }
-        return "object".to_string();
-    }
-
-    "unknown".to_string()
 }
 
 impl PropertyCall {
@@ -305,17 +218,7 @@ impl PropertyCall {
         };
 
         if result.is_err() || interface_ptr.is_null() {
-            eprintln!(
-                "[runtime][property_call] QueryInterface failed iid={:?} hr={} null_ptr={}",
-                iid,
-                result.0,
-                interface_ptr.is_null()
-            );
-            if allow_qi_fallback && !is_initializer {
-                eprintln!(
-                    "[runtime][property_call] continuing with original interface pointer for generic binding"
-                );
-            } else {
+            if !(allow_qi_fallback && !is_initializer) {
                 is_valid = false;
             }
             interface_ptr = interface.as_raw() as *mut c_void;
@@ -360,14 +263,6 @@ impl PropertyCall {
             let signature = normalize_parameter_signature(signature.as_str()).to_string();
 
             let parse_native_type = parse_native_type_from_signature(signature.as_str());
-            if parse_native_type == NativeType::Pointer
-                && should_warn_pointer_fallback(signature.as_str())
-            {
-                eprintln!(
-                    "[runtime][property_call] parse type failed signature={} (defaulting parse type to pointer)",
-                    signature
-                );
-            }
             parse_parameter_types.push(parse_native_type.clone());
 
             let abi_type = if parse_native_type != NativeType::Pointer {
@@ -375,15 +270,6 @@ impl PropertyCall {
             } else {
                 ffi_native_type_from_signature(signature.as_str())
             };
-
-            eprintln!(
-                "[runtime][property_call] bind property={} setter={} param_sig={} parse_type={:?} abi_type={:?}",
-                property.name(),
-                is_setter,
-                signature,
-                parse_native_type,
-                abi_type
-            );
 
             parameter_types.push(abi_type);
         }
@@ -412,7 +298,6 @@ impl PropertyCall {
         let params = if let Ok(params) = params {
             params
         } else {
-            eprintln!("[runtime][property_call] ffi parameter conversion failed");
             is_valid = false;
             vec![Type::pointer()]
         };
@@ -434,25 +319,7 @@ impl PropertyCall {
 
         if func.is_null() {
             is_valid = false;
-            eprintln!(
-                "[runtime][property_call] unresolved function pointer index={} setter={}",
-                index,
-                is_setter
-            );
         }
-
-        eprintln!(
-            "[runtime][property_call] ready property={} setter={} valid={} vtable_index={} params={} abi_params={} return_type={} iid={:?}",
-            property.name(),
-            is_setter,
-            is_valid,
-            index,
-            number_of_parameters,
-            number_of_abi_parameters,
-            return_type,
-            iid
-        );
-
 
         Self {
             index,
@@ -505,17 +372,7 @@ impl PropertyCall {
         };
 
         if result.is_err() || interface_ptr.is_null() {
-            eprintln!(
-                "[runtime][property_call] QueryInterface failed iid={:?} hr={} null_ptr={}",
-                iid,
-                result.0,
-                interface_ptr.is_null()
-            );
-            if !is_initializer {
-                eprintln!(
-                    "[runtime][property_call] continuing with existing interface pointer for parent-bound call"
-                );
-            } else {
+            if is_initializer {
                 is_valid = false;
             }
             interface_ptr = interface.as_raw() as *mut c_void;
@@ -584,24 +441,7 @@ impl PropertyCall {
         let mut final_valid = is_valid;
         if func.is_null() {
             final_valid = false;
-            eprintln!(
-                "[runtime][property_call] unresolved function pointer index={} setter={}",
-                index,
-                is_setter
-            );
         }
-
-        eprintln!(
-            "[runtime][property_call] ready property={} setter={} valid={} vtable_index={} params={} abi_params={} return_type={} iid={:?}",
-            property.name(),
-            is_setter,
-            final_valid,
-            index,
-            number_of_parameters,
-            number_of_abi_parameters,
-            return_type,
-            iid
-        );
 
         Self {
             index,
@@ -644,12 +484,6 @@ impl PropertyCall {
         values: &[v8::Local<v8::Value>],
     ) -> (HRESULT, *mut c_void) {
         if !self.is_valid || self.func.is_null() {
-            eprintln!(
-                "[runtime][property_call] refusing call on invalid binding index={} setter={} return_type={}",
-                self.index,
-                self.is_setter,
-                self.return_type
-            );
             return (call_failure(), std::ptr::null_mut());
         }
 
@@ -676,22 +510,6 @@ impl PropertyCall {
                             normalize_parameter_signature(signature.as_str()).to_string()
                         })
                 });
-
-            let abi_type = self
-                .parameter_types
-                .get(i + 1)
-                .cloned()
-                .unwrap_or(NativeType::Pointer);
-
-            let js_kind = describe_js_value(scope, value);
-            eprintln!(
-                "[runtime][property_call] arg property_call_index={} parse_type={:?} abi_type={:?} expected_sig={} js_kind={}",
-                i,
-                native_type,
-                abi_type,
-                expected_signature.as_deref().unwrap_or("<unknown>"),
-                js_kind
-            );
 
             let value = match *native_type {
                 NativeType::Void => {
@@ -748,17 +566,7 @@ impl PropertyCall {
                             }
                             Ok(native_value)
                         }
-                        Err(error) => {
-                            eprintln!(
-                                "[runtime][property_call] pointer arg parse failed index={} signature={} err={}",
-                                i,
-                                expected_signature
-                                    .as_deref()
-                                    .unwrap_or("<unknown>"),
-                                error
-                            );
-                            Err(error)
-                        }
+                        Err(error) => Err(error),
                     }
                 }
                 NativeType::Buffer => {
@@ -778,16 +586,7 @@ impl PropertyCall {
 
             let value = match value {
                 Ok(value) => value,
-                Err(error) => {
-                    eprintln!(
-                        "[runtime][property_call] arg parse failed index={} setter={} return_type={} err={}",
-                        i,
-                        self.is_setter,
-                        self.return_type,
-                        error
-                    );
-                    return (call_failure(), std::ptr::null_mut());
-                }
+                Err(_) => return (call_failure(), std::ptr::null_mut()),
             };
 
             arguments.push(value);
@@ -826,72 +625,4 @@ impl PropertyCall {
 
         (HRESULT(ret), result)
     }
-}
-
-#[inline]
-fn parse_native_type_from_signature(signature: &str) -> NativeType {
-    if signature.starts_with("Var!") || signature.starts_with("MVar!") {
-        return NativeType::Pointer;
-    }
-
-    if let Ok(native_type) = NativeType::try_from(signature) {
-        if native_type != NativeType::Pointer {
-            return native_type;
-        }
-    }
-
-    if let Some(declaration) = MetadataReader::find_by_name(signature) {
-        let lock = declaration.read();
-        match lock.kind() {
-            DeclarationKind::Enum => {
-                if let Some(enum_declaration) = lock.as_any().downcast_ref::<EnumDeclaration>() {
-                    let underlying_signature = Signature::as_string(&enum_declaration.type_());
-                    if let Ok(enum_native) = NativeType::try_from(underlying_signature.as_str()) {
-                        return enum_native;
-                    }
-                }
-
-                return NativeType::I32;
-            }
-            DeclarationKind::Class => {
-                if let Some(class_declaration) = lock.as_any().downcast_ref::<ClassDeclaration>() {
-                    if class_declaration.base_full_name() == "System.Enum" {
-                        return NativeType::I32;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    NativeType::Pointer
-}
-
-#[inline]
-fn should_warn_pointer_fallback(signature: &str) -> bool {
-    if signature.starts_with("Var!") || signature.starts_with("MVar!") {
-        return false;
-    }
-
-    if signature == "Object" {
-        return false;
-    }
-
-    if let Some(declaration) = MetadataReader::find_by_name(signature) {
-        let lock = declaration.read();
-        return !matches!(
-            lock.kind(),
-            DeclarationKind::Class
-                | DeclarationKind::Interface
-                | DeclarationKind::GenericInterface
-                | DeclarationKind::GenericInterfaceInstance
-                | DeclarationKind::Delegate
-                | DeclarationKind::GenericDelegate
-                | DeclarationKind::GenericDelegateInstance
-                | DeclarationKind::Struct
-                | DeclarationKind::Event
-        );
-    }
-
-    true
 }

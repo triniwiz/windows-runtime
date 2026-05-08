@@ -95,7 +95,6 @@ struct JsDelegateComObject {
     delegate_iid: GUID,
     base_delegate_iid: Option<GUID>,
     handler_id: u64,
-    supports_inspectable: bool,
 }
 
 #[repr(C)]
@@ -104,21 +103,6 @@ struct JsDelegateComVtable {
         unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
     iunknown_add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
     iunknown_release: unsafe extern "system" fn(*mut c_void) -> u32,
-    delegate_invoke: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT,
-}
-
-#[repr(C)]
-struct JsInspectableDelegateComVtable {
-    iunknown_query_interface:
-        unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
-    iunknown_add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
-    iunknown_release: unsafe extern "system" fn(*mut c_void) -> u32,
-    iinspectable_get_iids:
-        unsafe extern "system" fn(*mut c_void, *mut u32, *mut *mut GUID) -> HRESULT,
-    iinspectable_get_runtime_class_name:
-        unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
-    iinspectable_get_trust_level:
-        unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
     delegate_invoke: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT,
 }
 
@@ -145,12 +129,6 @@ unsafe extern "system" fn js_delegate_query_interface(
         || base_delegate_iid == Some(requested)
         || requested == IAgileObject::IID
     {
-        *interface = this;
-        js_delegate_add_ref(this);
-        return HRESULT(0);
-    }
-
-    if (*object).supports_inspectable && requested == IInspectable::IID {
         *interface = this;
         js_delegate_add_ref(this);
         return HRESULT(0);
@@ -199,45 +177,8 @@ unsafe extern "system" fn js_delegate_invoke(
 
     match result {
         Ok(hr) => hr,
-        Err(_) => {
-            eprintln!("[runtime][delegate] invoke panicked");
-            HRESULT(0x8000_4005u32 as i32)
-        }
+        Err(_) => HRESULT(0x8000_4005u32 as i32),
     }
-}
-
-unsafe extern "system" fn js_delegate_get_iids(
-    _this: *mut c_void,
-    count: *mut u32,
-    iids: *mut *mut GUID,
-) -> HRESULT {
-    if !count.is_null() {
-        *count = 0;
-    }
-    if !iids.is_null() {
-        *iids = std::ptr::null_mut();
-    }
-    HRESULT(0)
-}
-
-unsafe extern "system" fn js_delegate_get_runtime_class_name(
-    _this: *mut c_void,
-    class_name: *mut *mut c_void,
-) -> HRESULT {
-    if !class_name.is_null() {
-        *class_name = std::ptr::null_mut();
-    }
-    HRESULT(0x80004001u32 as i32)
-}
-
-unsafe extern "system" fn js_delegate_get_trust_level(
-    _this: *mut c_void,
-    trust_level: *mut i32,
-) -> HRESULT {
-    if !trust_level.is_null() {
-        *trust_level = 0;
-    }
-    HRESULT(0)
 }
 
 static JS_TWO_ARG_DELEGATE_VTABLE: JsDelegateComVtable = JsDelegateComVtable {
@@ -247,36 +188,17 @@ static JS_TWO_ARG_DELEGATE_VTABLE: JsDelegateComVtable = JsDelegateComVtable {
     delegate_invoke: js_delegate_invoke,
 };
 
-static JS_INSPECTABLE_TWO_ARG_DELEGATE_VTABLE: JsInspectableDelegateComVtable =
-    JsInspectableDelegateComVtable {
-        iunknown_query_interface: js_delegate_query_interface,
-        iunknown_add_ref: js_delegate_add_ref,
-        iunknown_release: js_delegate_release,
-        iinspectable_get_iids: js_delegate_get_iids,
-        iinspectable_get_runtime_class_name: js_delegate_get_runtime_class_name,
-        iinspectable_get_trust_level: js_delegate_get_trust_level,
-        delegate_invoke: js_delegate_invoke,
-    };
-
 fn create_native_delegate_instance(
     delegate_iid: GUID,
     base_delegate_iid: Option<GUID>,
     handler_id: u64,
-    supports_inspectable: bool,
 ) -> IUnknown {
-    let vtable = if supports_inspectable {
-        &JS_INSPECTABLE_TWO_ARG_DELEGATE_VTABLE as *const _ as *const c_void
-    } else {
-        &JS_TWO_ARG_DELEGATE_VTABLE as *const _ as *const c_void
-    };
-
     let object = Box::new(JsDelegateComObject {
-        vtable,
+        vtable: &JS_TWO_ARG_DELEGATE_VTABLE as *const _ as *const c_void,
         ref_count: AtomicU32::new(1),
         delegate_iid,
         base_delegate_iid,
         handler_id,
-        supports_inspectable,
     });
 
     let raw = Box::into_raw(object) as *mut c_void;
@@ -359,12 +281,7 @@ fn invoke_registered_js_delegate(
     let sender_value = wrap_inspectable_pointer_for_js(scope, sender);
     let args_value = wrap_inspectable_pointer_for_js(scope, args);
 
-    if callback
-        .call(scope, recv, &[sender_value, args_value])
-        .is_none()
-    {
-        eprintln!("[runtime][delegate] invoke failed id={} (JS callback threw)", handler_id);
-    }
+    let _ = callback.call(scope, recv, &[sender_value, args_value]);
 
     scope.perform_microtask_checkpoint();
 }
@@ -2814,7 +2731,6 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                 let dec = unsafe { &*dec };
                 let lock = dec.read();
 
-                let declaration_name = lock.full_name().to_string();
                 let properties = collect_declaration_properties(&*lock);
                 let events = collect_declaration_events(&*lock);
 
@@ -2826,34 +2742,6 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     if property.name() != name {
                         continue;
                     }
-
-                    let js_kind = if value.is_undefined() {
-                        "undefined"
-                    } else if value.is_null() {
-                        "null"
-                    } else if value.is_boolean() {
-                        "boolean"
-                    } else if value.is_int32() {
-                        "int32"
-                    } else if value.is_uint32() {
-                        "uint32"
-                    } else if value.is_number() {
-                        "number"
-                    } else if value.is_string() {
-                        "string"
-                    } else if value.is_object() {
-                        "object"
-                    } else {
-                        "unknown"
-                    };
-
-                    eprintln!(
-                        "[runtime][setter] class={} property={} has_setter={} js_kind={}",
-                        declaration_name,
-                        property.name(),
-                        property.setter().is_some(),
-                        js_kind
-                    );
 
                     if property.setter().is_none() {
                         return v8::Intercepted::kNo;
@@ -2950,14 +2838,6 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     if let Some(delegate_arc) =
                                         MetadataReader::find_by_name(lookup_name.as_str())
                                     {
-                                        // WinRT delegates such as TypedEventHandler use
-                                        // an IUnknown-based ABI with Invoke directly after
-                                        // QueryInterface/AddRef/Release. Using an
-                                        // IInspectable-shaped vtable causes event
-                                        // subscription to succeed but callback dispatch to
-                                        // jump to the wrong slot when the event fires.
-                                        let supports_inspectable = false;
-
                                         let cb_global = v8::Global::new(scope, callback);
                                         let handler_id =
                                             register_js_delegate_handler(cb_global);
@@ -2967,7 +2847,6 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                             delegate_iid,
                                             base_delegate_iid,
                                             handler_id,
-                                            supports_inspectable,
                                         );
                                         let delegate_name = {
                                             let dlock = delegate_arc.read();
@@ -3040,16 +2919,6 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                 let class_methods = collect_class_methods(clazz);
                 let class_properties = collect_class_properties(clazz);
                 let class_events = collect_class_events(clazz);
-
-                if matches!(name, "StackPanel" | "ListView" | "ComboBox" | "ScrollViewer" | "Border") {
-                    eprintln!(
-                        "[runtime] class {} resolved {} methods and {} properties",
-                        name,
-                        class_methods.len(),
-                        class_properties.len()
-                    );
-                }
-
 
                 let to_string_func = FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                                 args: v8::FunctionCallbackArguments,
@@ -4064,20 +3933,8 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                 let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
                 let clazz_name = HSTRING::from(clazz.full_name());
 
-                eprintln!(
-                    "[runtime][ctor] begin class={} sealed={} arg_len={}",
-                    clazz.full_name(),
-                    clazz.is_sealed(),
-                    length
-                );
-
                 let clazz_factory = unsafe { RoGetActivationFactory::<IUnknown>(&clazz_name) };
                 if let Err(err) = clazz_factory {
-                    eprintln!(
-                        "[runtime][ctor] RoGetActivationFactory failed class={} hr={}",
-                        clazz.full_name(),
-                        err.code().0
-                    );
                     let message = v8::String::new(scope, err.message().to_string().as_str()).unwrap();
                     let error = v8::Exception::error(scope, message.into());
                     scope.throw_exception(error);
@@ -4089,28 +3946,13 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                 unsafe {
                     for ctor in clazz.initializers() {
                         let number_of_parameters = ctor.number_of_parameters();
-                        eprintln!(
-                            "[runtime][ctor] candidate class={} ctor={} params={} requested_args={}",
-                            clazz.full_name(),
-                            ctor.name(),
-                            number_of_parameters,
-                            length
-                        );
                         if number_of_parameters != length as usize {
                             continue;
                         }
                         if number_of_parameters == 0 {
-                            eprintln!(
-                                "[runtime][ctor] attempting RoActivateInstance class={}",
-                                clazz.full_name()
-                            );
                             let activated = unsafe { RoActivateInstance(&clazz_name) };
                             match activated {
                                 Ok(result) => {
-                                    eprintln!(
-                                        "[runtime][ctor] RoActivateInstance succeeded class={}",
-                                        clazz.full_name()
-                                    );
                                     let result: IUnknown = result.into();
 
                                     // For console apps: attach to the console window so that
@@ -4130,62 +3972,34 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                                         Some(result),
                                         scope,
                                     );
-                                    eprintln!(
-                                        "[runtime][ctor] wrapped activated instance class={}",
-                                        clazz.full_name()
-                                    );
                                     retval.set(instance);
                                     return;
                                 }
-                                Err(err) => {
-                                    let hr = err.code().0;
-                                    eprintln!(
-                                        "[runtime][ctor] RoActivateInstance failed class={} hr={} (will try ctor fallback)",
-                                        clazz.full_name(),
-                                        hr
-                                    );
-
+                                Err(_) => {
                                     // Zero-arg activation should be handled via WinRT activation factory.
                                     // Calling metadata constructor stubs through the generic FFI path here can
                                     // crash the process for some XAML controls (e.g. NavigationView).
                                     if let Ok(factory) = clazz_factory.cast::<IActivationFactory>() {
-                                        eprintln!(
-                                            "[runtime][ctor] attempting factory ActivateInstance class={}",
-                                            clazz.full_name()
-                                        );
-                                        match factory.ActivateInstance() {
-                                            Ok(instance_obj) => {
-                                                eprintln!(
-                                                    "[runtime][ctor] factory ActivateInstance succeeded class={}",
-                                                    clazz.full_name()
-                                                );
-                                                let result: IUnknown = instance_obj.into();
+                                        if let Ok(instance_obj) = factory.ActivateInstance() {
+                                            let result: IUnknown = instance_obj.into();
 
-                                                if let Ok(init) = result.cast::<IInitializeWithWindow>() {
-                                                    let hwnd = unsafe { GetConsoleWindow() };
-                                                    if !hwnd.is_invalid() {
-                                                        let _ = unsafe { init.Initialize(hwnd) };
-                                                    }
+                                            if let Ok(init) = result.cast::<IInitializeWithWindow>() {
+                                                let hwnd = unsafe { GetConsoleWindow() };
+                                                if !hwnd.is_invalid() {
+                                                    let _ = unsafe { init.Initialize(hwnd) };
                                                 }
+                                            }
 
-                                                let instance = create_ns_ctor_instance_object(
-                                                    clazz.name(),
-                                                    Some(clazz_factory.clone()),
-                                                    None,
-                                                    dec.inner.clone(),
-                                                    Some(result),
-                                                    scope,
-                                                );
-                                                retval.set(instance);
-                                                return;
-                                            }
-                                            Err(factory_err) => {
-                                                eprintln!(
-                                                    "[runtime][ctor] factory ActivateInstance failed class={} hr={}",
-                                                    clazz.full_name(),
-                                                    factory_err.code().0
-                                                );
-                                            }
+                                            let instance = create_ns_ctor_instance_object(
+                                                clazz.name(),
+                                                Some(clazz_factory.clone()),
+                                                None,
+                                                dec.inner.clone(),
+                                                Some(result),
+                                                scope,
+                                            );
+                                            retval.set(instance);
+                                            return;
                                         }
                                     }
 
@@ -4198,22 +4012,9 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                             ctor, ctor.is_sealed(), clazz_factory.clone(), true,
                         );
 
-                        eprintln!(
-                            "[runtime][ctor] invoking ctor fallback class={} ctor={} params={}",
-                            clazz.full_name(),
-                            ctor.name(),
-                            number_of_parameters
-                        );
-
                         let (ret, result) = method.call(scope, &args);
 
                         if ret.is_ok() {
-                            eprintln!(
-                                "[runtime][ctor] ctor fallback call succeeded class={} ctor={} result_ptr={:p}",
-                                clazz.full_name(),
-                                ctor.name(),
-                                result
-                            );
                             if result.is_null() {
                                 let message = v8::String::new(scope, "Constructor returned null instance pointer").unwrap();
                                 let error = v8::Exception::error(scope, message.into());
@@ -4254,21 +4055,10 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                             }
 
                             let instance = create_ns_ctor_instance_object(clazz.name(), Some(clazz_factory), None, dec.inner.clone(), Some(result), scope);
-                            eprintln!(
-                                "[runtime][ctor] wrapped fallback ctor instance class={} ctor={}",
-                                clazz.full_name(),
-                                ctor.name()
-                            );
                             retval.set(instance);
 
                             return;
                         } else {
-                            eprintln!(
-                                "[runtime][ctor] ctor fallback call failed class={} ctor={} hr={}",
-                                clazz.full_name(),
-                                ctor.name(),
-                                ret.0
-                            );
                             let message = ret.message().to_string();
                             let message = v8::String::new(scope, message.as_str()).unwrap();
                             let error = v8::Exception::error(scope, message.into());
@@ -4298,13 +4088,10 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                         if let Some(delegate_iid) = get_delegate_iid(lock.deref()) {
                             let base_delegate_iid =
                                 get_generic_delegate_base_iid(lock.full_name());
-                            let supports_inspectable = lock.full_name()
-                                == "Windows.UI.Xaml.Controls.NavigationViewSelectionChangedEventHandler";
                             let instance = create_native_delegate_instance(
                                 delegate_iid,
                                 base_delegate_iid,
                                 handler_id,
-                                supports_inspectable,
                             );
                             let instance = create_ns_ctor_instance_object(
                                 lock.name(),

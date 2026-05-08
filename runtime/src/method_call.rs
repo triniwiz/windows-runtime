@@ -6,18 +6,19 @@ use metadata::declarations::declaration::Declaration;
 use windows::core::{GUID, HRESULT, Interface, IUnknown};
 use windows::Win32::System::WinRT::IActivationFactory;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
-use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration::DeclarationKind;
-use metadata::declarations::enum_declaration::EnumDeclaration;
 use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
 use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
 use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::declarations::method_declaration::MethodDeclaration;
 use metadata::declarations::parameter_declaration::ParameterDeclaration;
 use metadata::declaring_interface_for_method::Metadata;
-use metadata::meta_data_reader::MetadataReader;
 use metadata::signature::Signature;
 use crate::error::AnyError;
+use crate::helpers::{
+    call_failure, ffi_native_type_from_signature, inherited_interface_method_count,
+    normalize_parameter_signature, parse_native_type_from_signature,
+};
 use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg_with_signature, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue};
 
 pub struct MethodCall {
@@ -40,52 +41,6 @@ pub struct MethodCall {
     /// Scratch buffer used when a WinRT method returns a value type (e.g. GUID, Rect)
     /// that is larger than, or cannot be safely aliased through, a single pointer slot.
     return_value_buf: [u8; 128],
-}
-
-#[inline]
-fn ffi_native_type_from_signature(signature: &str) -> NativeType {
-    match signature {
-        "Void" => NativeType::Void,
-        "String" => NativeType::Pointer,
-        "Boolean" => NativeType::Bool,
-        "UInt8" => NativeType::U8,
-        "UInt16" => NativeType::U16,
-        "UInt32" => NativeType::U32,
-        "UInt64" => NativeType::U64,
-        "Int8" => NativeType::I8,
-        "Int16" => NativeType::I16,
-        "Int32" => NativeType::I32,
-        "Int64" => NativeType::I64,
-        "Single" => NativeType::F32,
-        "Double" => NativeType::F64,
-        _ => NativeType::Pointer,
-    }
-}
-
-#[inline]
-fn call_failure() -> HRESULT {
-    // E_FAIL
-    HRESULT(0x8000_4005u32 as i32)
-}
-
-#[inline]
-fn normalize_parameter_signature(signature: &str) -> &str {
-    if signature.starts_with("Var!") || signature.starts_with("MVar!") {
-        // Generic type parameters in projected WinRT signatures map to object pointers.
-        return "Object";
-    }
-
-    signature
-}
-
-fn inherited_interface_method_count(interfaces: &[&InterfaceDeclaration]) -> usize {
-    let mut count = 0usize;
-    for interface in interfaces {
-        count += interface.methods().len();
-        let inherited = interface.implemented_interfaces();
-        count += inherited_interface_method_count(inherited.as_slice());
-    }
-    count
 }
 
 impl MethodCall {
@@ -142,21 +97,12 @@ impl MethodCall {
                                 parent_interface.implemented_interfaces().as_slice(),
                             );
                             declaration = None;
-                            let iid = parent_interface.id();
-                            eprintln!(
-                                "[runtime][method_call] parent-bind interface={} method={} token={:?} index={} iid={:?}",
-                                parent_interface.full_name(),
-                                method.name(),
-                                method.token(),
-                                parent_index.saturating_add(6 + inherited_count),
-                                iid
-                            );
                             return Self::new_bound_to_iid(
                                 method,
                                 is_sealed,
                                 interface,
                                 is_initializer,
-                                iid,
+                                parent_interface.id(),
                                 parent_index.saturating_add(6 + inherited_count),
                                 declaration,
                             );
@@ -173,21 +119,12 @@ impl MethodCall {
                                 parent_interface.implemented_interfaces().as_slice(),
                             );
                             declaration = None;
-                            let iid = parent_interface.id();
-                            eprintln!(
-                                "[runtime][method_call] parent-bind generic_interface={} method={} token={:?} index={} iid={:?}",
-                                parent_interface.full_name(),
-                                method.name(),
-                                method.token(),
-                                parent_index.saturating_add(6 + inherited_count),
-                                iid
-                            );
                             return Self::new_bound_to_iid(
                                 method,
                                 is_sealed,
                                 interface,
                                 is_initializer,
-                                iid,
+                                parent_interface.id(),
                                 parent_index.saturating_add(6 + inherited_count),
                                 declaration,
                             );
@@ -207,21 +144,12 @@ impl MethodCall {
                                 parent_interface.implemented_interfaces().as_slice(),
                             );
                             declaration = None;
-                            let iid = parent_interface.id();
-                            eprintln!(
-                                "[runtime][method_call] parent-bind generic_instance={} method={} token={:?} index={} iid={:?}",
-                                parent_interface.full_name(),
-                                method.name(),
-                                method.token(),
-                                parent_index.saturating_add(6 + inherited_count),
-                                iid
-                            );
                             return Self::new_bound_to_iid(
                                 method,
                                 is_sealed,
                                 interface,
                                 is_initializer,
-                                iid,
+                                parent_interface.id(),
                                 parent_index.saturating_add(6 + inherited_count),
                                 declaration,
                             );
@@ -295,17 +223,7 @@ impl MethodCall {
         };
 
         if result.is_err() || interface_ptr.is_null() {
-            eprintln!(
-                "[runtime][method_call] QueryInterface failed iid={:?} hr={} null_ptr={}",
-                iid,
-                result.0,
-                interface_ptr.is_null()
-            );
-            if allow_qi_fallback && !is_initializer {
-                eprintln!(
-                    "[runtime][method_call] continuing with original interface pointer for generic binding"
-                );
-            } else {
+            if !(allow_qi_fallback && !is_initializer) {
                 is_valid = false;
             }
             interface_ptr = interface.as_raw() as *mut c_void;
@@ -345,14 +263,6 @@ impl MethodCall {
             let signature = normalize_parameter_signature(signature.as_str()).to_string();
 
             let parse_native_type = parse_native_type_from_signature(signature.as_str());
-            if parse_native_type == NativeType::Pointer
-                && should_warn_pointer_fallback(signature.as_str())
-            {
-                eprintln!(
-                    "[runtime][method_call] parse type failed signature={} (defaulting parse type to pointer)",
-                    signature
-                );
-            }
             parse_parameter_types.push(parse_native_type.clone());
 
             let abi_type = if parse_native_type != NativeType::Pointer {
@@ -385,7 +295,6 @@ impl MethodCall {
         let params = if let Ok(params) = params {
             params
         } else {
-            eprintln!("[runtime][method_call] ffi parameter conversion failed");
             is_valid = false;
             vec![Type::pointer()]
         };
@@ -405,12 +314,6 @@ impl MethodCall {
 
         if func.is_null() {
             is_valid = false;
-            eprintln!(
-                "[runtime][method_call] unresolved function pointer index={} initializer={} sealed={}",
-                index,
-                is_initializer,
-                is_sealed
-            );
         }
 
         Self {
@@ -461,17 +364,7 @@ impl MethodCall {
         };
 
         if result.is_err() || interface_ptr.is_null() {
-            eprintln!(
-                "[runtime][method_call] QueryInterface failed iid={:?} hr={} null_ptr={}",
-                iid,
-                result.0,
-                interface_ptr.is_null()
-            );
-            if !is_initializer {
-                eprintln!(
-                    "[runtime][method_call] continuing with existing interface pointer for parent-bound call"
-                );
-            } else {
+            if is_initializer {
                 is_valid = false;
             }
             interface_ptr = interface.as_raw() as *mut c_void;
@@ -505,14 +398,6 @@ impl MethodCall {
             let signature = normalize_parameter_signature(signature.as_str()).to_string();
 
             let parse_native_type = parse_native_type_from_signature(signature.as_str());
-            if parse_native_type == NativeType::Pointer
-                && should_warn_pointer_fallback(signature.as_str())
-            {
-                eprintln!(
-                    "[runtime][method_call] parse type failed signature={} (defaulting parse type to pointer)",
-                    signature
-                );
-            }
             parse_parameter_types.push(parse_native_type.clone());
 
             let abi_type = if parse_native_type != NativeType::Pointer {
@@ -542,7 +427,6 @@ impl MethodCall {
         let params = if let Ok(params) = params {
             params
         } else {
-            eprintln!("[runtime][method_call] ffi parameter conversion failed");
             is_valid = false;
             vec![Type::pointer()]
         };
@@ -559,12 +443,6 @@ impl MethodCall {
 
         if func.is_null() {
             is_valid = false;
-            eprintln!(
-                "[runtime][method_call] unresolved function pointer index={} initializer={} sealed={}",
-                index,
-                is_initializer,
-                is_sealed
-            );
         }
 
         Self {
@@ -622,12 +500,6 @@ impl MethodCall {
         values: &[v8::Local<v8::Value>],
     ) -> (HRESULT, *mut c_void) {
         if !self.is_valid || self.func.is_null() {
-            eprintln!(
-                "[runtime][method_call] refusing call on invalid binding index={} initializer={} return_type={}",
-                self.index,
-                self.is_initializer,
-                self.return_type
-            );
             return (call_failure(), std::ptr::null_mut());
         }
 
@@ -640,12 +512,6 @@ impl MethodCall {
 
         for (i, native_type) in self.parse_parameter_types.iter().enumerate() {
             let Some(value) = values.get(i).copied() else {
-                eprintln!(
-                    "[runtime][method_call] missing argument index={} expected={} return_type={}",
-                    i,
-                    self.parse_parameter_types.len(),
-                    self.return_type
-                );
                 return (call_failure(), std::ptr::null_mut());
             };
 
@@ -716,17 +582,7 @@ impl MethodCall {
                             }
                             Ok(native_value)
                         }
-                        Err(error) => {
-                            eprintln!(
-                                "[runtime][method_call] pointer arg parse failed index={} signature={} err={}",
-                                i,
-                                expected_signature
-                                    .as_deref()
-                                    .unwrap_or("<unknown>"),
-                                error
-                            );
-                            Err(error)
-                        }
+                        Err(error) => Err(error),
                     }
                 }
                 NativeType::Buffer => {
@@ -745,15 +601,7 @@ impl MethodCall {
 
             let value = match value {
                 Ok(value) => value,
-                Err(error) => {
-                    eprintln!(
-                        "[runtime][method_call] arg parse failed index={} return_type={} err={}",
-                        i,
-                        self.return_type,
-                        error
-                    );
-                    return (call_failure(), std::ptr::null_mut());
-                }
+                Err(_) => return (call_failure(), std::ptr::null_mut()),
             };
 
             arguments.push(value);
@@ -828,72 +676,4 @@ impl MethodCall {
 
         (HRESULT(ret), result)
     }
-}
-
-#[inline]
-fn parse_native_type_from_signature(signature: &str) -> NativeType {
-    if signature.starts_with("Var!") || signature.starts_with("MVar!") {
-        return NativeType::Pointer;
-    }
-
-    if let Ok(native_type) = NativeType::try_from(signature) {
-        if native_type != NativeType::Pointer {
-            return native_type;
-        }
-    }
-
-    if let Some(declaration) = MetadataReader::find_by_name(signature) {
-        let lock = declaration.read();
-        match lock.kind() {
-            DeclarationKind::Enum => {
-                if let Some(enum_declaration) = lock.as_any().downcast_ref::<EnumDeclaration>() {
-                    let underlying_signature = Signature::as_string(&enum_declaration.type_());
-                    if let Ok(enum_native) = NativeType::try_from(underlying_signature.as_str()) {
-                        return enum_native;
-                    }
-                }
-
-                return NativeType::I32;
-            }
-            DeclarationKind::Class => {
-                if let Some(class_declaration) = lock.as_any().downcast_ref::<ClassDeclaration>() {
-                    if class_declaration.base_full_name() == "System.Enum" {
-                        return NativeType::I32;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    NativeType::Pointer
-}
-
-#[inline]
-fn should_warn_pointer_fallback(signature: &str) -> bool {
-    if signature.starts_with("Var!") || signature.starts_with("MVar!") {
-        return false;
-    }
-
-    if signature == "Object" {
-        return false;
-    }
-
-    if let Some(declaration) = MetadataReader::find_by_name(signature) {
-        let lock = declaration.read();
-        return !matches!(
-            lock.kind(),
-            DeclarationKind::Class
-                | DeclarationKind::Interface
-                | DeclarationKind::GenericInterface
-                | DeclarationKind::GenericInterfaceInstance
-                | DeclarationKind::Delegate
-                | DeclarationKind::GenericDelegate
-                | DeclarationKind::GenericDelegateInstance
-                | DeclarationKind::Struct
-                | DeclarationKind::Event
-        );
-    }
-
-    true
 }
