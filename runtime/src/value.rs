@@ -173,25 +173,45 @@ impl TryFrom<&str> for NativeType {
     type Error = AnyError;
 
     fn try_from(native_type: &str) -> std::result::Result<Self, Self::Error> {
-        if native_type.contains(".") {
+        let signature = native_type.trim();
+        let by_ref_inner = signature.strip_prefix("ByRef ").unwrap_or(signature);
+
+        // Array signatures are represented as "T[]" by metadata::Signature.
+        // Byte arrays are best treated as buffer sources in JS; all other arrays
+        // are opaque pointers in this bridge.
+        if let Some(element) = by_ref_inner.strip_suffix("[]") {
+            return Ok(match element {
+                "UInt8" | "Uint8" | "Int8" | "Byte" | "SByte" => NativeType::Buffer,
+                _ => NativeType::Pointer,
+            });
+        }
+
+        // Generic vars and non-primitive named WinRT types are pointer-marshalled.
+        if by_ref_inner.starts_with("Var!")
+            || by_ref_inner.contains('.')
+            || by_ref_inner == "Object"
+            || by_ref_inner == "Guid"
+        {
             return Ok(NativeType::Pointer);
         }
-        Ok(match native_type {
+
+        Ok(match by_ref_inner {
             "Void" => NativeType::Void,
-            "Uint8" => NativeType::U8,
+            "UInt8" | "Uint8" | "Byte" => NativeType::U8,
             "Boolean" => NativeType::Bool,
-            "Int8" => NativeType::I8,
+            "Int8" | "SByte" => NativeType::I8,
             "UInt16" => NativeType::U16,
             "Int16" => NativeType::I16,
             "UInt32" => NativeType::U32,
-            "IntI32" => NativeType::I32,
+            "Int32" | "IntI32" => NativeType::I32,
             "UInt64" => NativeType::U64,
             "Int64" => NativeType::I64,
             "USize" => NativeType::USize,
             "ISize" => NativeType::ISize,
             "Single" => NativeType::F32,
             "Double" => NativeType::F64,
-            "String" | "Char16" => NativeType::String,
+            "String" => NativeType::String,
+            "Char16" => NativeType::U16,
             _ => {
                 return Err(type_error("Unsupported type"));
             }

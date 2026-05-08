@@ -185,22 +185,38 @@ impl Metadata {
             metadata.CloseEnum(attributes_enumerator)
         }
 
+        // Resolve the desired attribute class to a token once so we can compare
+        // tokens (integer equality) in the loop instead of allocating a String
+        // per attribute to compare names.
+        let attr_hstring = HSTRING::from(attribute_name);
+        let mut target_typedef_token = 0_u32;
+        let target_resolved = unsafe {
+            metadata.FindTypeDefByName(
+                PCWSTR(attr_hstring.as_ptr()),
+                0 as _,
+                &mut target_typedef_token,
+            )
+        }.is_ok();
 
         let mut filtered_attributes: Vec<u32> = Vec::new();
         for i in 0..attributes_count as usize {
             let attribute = attributes[i];
-            let class_attribute_class_token = Metadata::get_custom_attribute_class_token(metadata, CorTokenType(attribute as i32));
-            // let mut name = [0_u16; MAX_IDENTIFIER_LENGTH];
-            let class_attribute_class_name = get_type_name(metadata, CorTokenType(class_attribute_class_token as i32));
-            //let mut class_attribute_class_name = windows::HSTRING::from_wide(name[..length]);
-            // TODO
-            if class_attribute_class_name.as_str() != attribute_name {
-                continue;
-            }
-
-            filtered_attributes.push(
-                attribute
+            let class_token = Metadata::get_custom_attribute_class_token(
+                metadata, CorTokenType(attribute as i32),
             );
+
+            let matches = if target_resolved {
+                // Fast path: integer comparison, no allocation.
+                class_token == target_typedef_token
+            } else {
+                // Fallback: name comparison (typedef lookup failed, e.g. external assembly).
+                let name = get_type_name(metadata, CorTokenType(class_token as i32));
+                name.as_str() == attribute_name
+            };
+
+            if matches {
+                filtered_attributes.push(attribute);
+            }
         }
 
         filtered_attributes
@@ -413,7 +429,7 @@ impl Metadata {
                     }
                 }
 
-                std::unreachable!();
+                None
             }
         }
     }
@@ -495,7 +511,7 @@ impl Metadata {
                     return ret;
                 }
 
-                std::unreachable!();
+                None
             }
         }
     }

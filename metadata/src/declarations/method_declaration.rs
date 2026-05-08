@@ -109,8 +109,9 @@ impl MethodDeclaration {
                         ))
                     }
 
-
-                    let mut name_length = 0;
+                    // Read name in the same GetMethodProps call as the signature above
+                    // to avoid a second COM round-trip.
+                    let mut name_length = 0_u32;
                     let mut data = [0_u16; MAX_IDENTIFIER_LENGTH];
                     let result = metadata.GetMethodProps(
                         token.0 as u32,
@@ -125,11 +126,7 @@ impl MethodDeclaration {
                     );
                     debug_assert!(result.is_ok());
 
-
-                    //let name = &data[0..name_length as usize];
                     full_name = String::from_utf16_lossy(&data[0..name_length.saturating_sub(1) as usize]);
-                    //full_name = unsafe { PCWSTR::from_raw(name.as_ptr()).to_string().unwrap_or("".to_string()) };
-
 
                     overload_name = get_unary_custom_attribute_string_value(
                         &metadata,
@@ -137,11 +134,10 @@ impl MethodDeclaration {
                         OVERLOAD_ATTRIBUTE,
                     );
 
-                    is_void = Signature::to_string(metadata, &return_type) == "Void";
+                    // Use the element-type byte directly rather than allocating a String.
+                    is_void = Signature::get_signature_element_type(&return_type)
+                        == windows::Win32::System::WinRT::Metadata::ELEMENT_TYPE_VOID;
 
-                    // todo
-                    //debug_assert!(signature_size == signature);
-                    //debug_assert!(start_signature + signature_size == signature);
                     } // end else (GetMethodProps succeeded)
                 }
             }

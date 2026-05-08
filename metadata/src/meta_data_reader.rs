@@ -2,6 +2,8 @@ use std::ffi::{CString, OsString};
 use std::mem::MaybeUninit;
 use std::os::windows::prelude::OsStringExt;
 use std::sync::Arc;
+use std::cell::RefCell;
+use ahash::AHashMap;
 use parking_lot::{RwLock};
 use windows::core::{HRESULT, HSTRING, Interface, PCWSTR, Result};
 use windows::Win32::Foundation::RO_E_METADATA_NAME_IS_NAMESPACE;
@@ -19,6 +21,14 @@ use crate::declarations::namespace_declaration::NamespaceDeclaration;
 use crate::declarations::struct_declaration::StructDeclaration;
 use crate::prelude::*;
 
+// Thread-local cache for resolved declarations.  V8 (and therefore all metadata
+// lookups) runs on a single thread, so a thread_local avoids the Send+Sync
+// requirements that a global static cache would impose on `dyn Declaration`.
+thread_local! {
+    static DECLARATION_CACHE: RefCell<AHashMap<String, Arc<RwLock<dyn Declaration>>>> =
+        RefCell::new(AHashMap::new());
+}
+
 
 #[derive(Debug)]
 pub struct MetadataReader {}
@@ -30,6 +40,24 @@ impl MetadataReader {
         MetadataReader::find_by_name(name.as_ref())
     }
     pub fn find_by_name(full_name: &str) -> Option<Arc<RwLock<dyn Declaration>>> {
+        let cached = DECLARATION_CACHE.with(|cache| {
+            cache.borrow().get(full_name).map(Arc::clone)
+        });
+        if let Some(arc) = cached {
+            return Some(arc);
+        }
+
+        let declaration = MetadataReader::find_by_name_uncached(full_name)?;
+        
+        DECLARATION_CACHE.with(|cache| {
+            cache.borrow_mut()
+                .entry(full_name.to_string())
+                .or_insert_with(|| Arc::clone(&declaration));
+        });
+        Some(declaration)
+    }
+
+    fn find_by_name_uncached(full_name: &str) -> Option<Arc<RwLock<dyn Declaration>>> {
         if full_name.is_empty() {
             return Some(
                 Arc::new(
@@ -101,16 +129,13 @@ impl MetadataReader {
                     );
                 }
                 _ => {
-                    unreachable!()
+                    // Unexpected parent token type — not a known WinRT declaration.
+                    return None;
                 }
             }
 
-            let parent_name_buf = &parent_name[0..size as usize];
-            let parent_name_string = unsafe { PCWSTR::from_raw(parent_name_buf.as_ptr()).to_string().unwrap_or("".to_string())};
-
-            // todo find a better way
-            // let parent_name_string = String::from_utf16_lossy(&parent_name[0..size as usize]);
-            // let parent_name_string = unsafe { CString::from_vec_with_nul_unchecked(parent_name_string.into_bytes())}.into_string().unwrap();
+            let parent_name_buf = &parent_name[0..size.saturating_sub(1) as usize];
+            let parent_name_string = String::from_utf16_lossy(parent_name_buf);
 
 
             if parent_name_string == SYSTEM_ENUM {
@@ -168,6 +193,9 @@ impl MetadataReader {
         }
 
 
-        std::unreachable!();
-    }
+        // The token is neither a class-family type nor an interface — not a
+        // recognised WinRT declaration.  Return None rather than panicking so
+        // callers can handle unknown types gracefully.
+        None
+    } // end find_by_name_uncached
 }

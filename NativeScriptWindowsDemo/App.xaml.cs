@@ -21,7 +21,6 @@ namespace NativeScriptWindowsDemo
 
         public App()
         {
-            this.InitializeComponent();
             this.Suspending += OnSuspending;
         }
 
@@ -35,12 +34,33 @@ namespace NativeScriptWindowsDemo
             _lastLaunchArgs = e.Arguments ?? string.Empty;
 
             _runtimeHost.Initialize();
-            _runtimeHost.RunMainScript();
+            try
+            {
+                _runtimeHost.RunMainScript();
+            }
+            catch (Exception scriptEx)
+            {
+                System.Diagnostics.Debug.WriteLine($"[NativeScript] Script exception: {scriptEx.Message}");
+            }
 
             if (e.PreviousExecutionState == ApplicationExecutionState.Terminated
                 && ApplicationData.Current.LocalSettings.Values.TryGetValue(LastLaunchArgsKey, out object value))
             {
                 _lastLaunchArgs = value as string ?? _lastLaunchArgs;
+            }
+
+            // If JS did not set a root view, show a fallback so the window is not blank.
+            // JS errors will appear in the VS Output window (stderr from the Rust runtime).
+            if (Window.Current.Content == null)
+            {
+                Window.Current.Content = new Windows.UI.Xaml.Controls.TextBlock
+                {
+                    Text = "NativeScript runtime initialized but no UI was rendered.\n" +
+                           "Check the VS Output window for JS errors.",
+                    Margin = new Windows.UI.Xaml.Thickness(20),
+                    TextWrapping = Windows.UI.Xaml.TextWrapping.Wrap,
+                    FontSize = 16,
+                };
             }
 
             if (!e.PrelaunchActivated)
