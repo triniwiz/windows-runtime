@@ -10,7 +10,7 @@ edition = "2021"
 
 [lib]
 name = "nativescript"
-crate-type = ["dylib"]
+crate-type = ["cdylib", "rlib"]
 
 
 [dependencies]

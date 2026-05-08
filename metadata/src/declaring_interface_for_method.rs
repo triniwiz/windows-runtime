@@ -330,6 +330,17 @@ impl Metadata {
                 let method_argument_count = Metadata::get_method_argument_count(metadata, method_token);
 
                 let class_token = Metadata::get_method_containing_class_token(metadata, method_token);
+                let class_name = get_type_name(metadata, CorTokenType(class_token as i32));
+                let trace_nav = class_name.contains("NavigationView");
+
+                if trace_nav {
+                    eprintln!(
+                        "[metadata][init] class={} method_token={} ctor_arg_count={}",
+                        class_name,
+                        method_token.0,
+                        method_argument_count
+                    );
+                }
 
                 debug_assert!(
                     CorTokenType(type_from_token(CorTokenType(class_token as i32))) == mdtTypeDef
@@ -339,11 +350,29 @@ impl Metadata {
                     metadata, CorTokenType(class_token as i32), COMPOSABLE_ATTRIBUTE,
                 );
 
+                if trace_nav {
+                    eprintln!(
+                        "[metadata][init] class={} composable_attr_count={}",
+                        class_name,
+                        composable_attributes.len()
+                    );
+                }
+
                 for attributeToken in composable_attributes.iter() {
                     let attribute_token = CorTokenType(*attributeToken as i32);
                     let factory_token = Metadata::get_custom_attribute_type_argument(
                         metadata, attribute_token,
                     );
+
+                    if trace_nav {
+                        let factory_name = get_type_name(metadata, CorTokenType(factory_token as i32));
+                        eprintln!(
+                            "[metadata][init] class={} composable_factory={} token={}",
+                            class_name,
+                            factory_name,
+                            factory_token
+                        );
+                    }
 
                     let factory_methods = Metadata::get_class_methods(
                         metadata, CorTokenType(factory_token as i32),
@@ -351,11 +380,27 @@ impl Metadata {
 
                     for (i, factoryMethod) in factory_methods.iter().enumerate() {
                         let factory_method_arguments_count = Metadata::get_method_argument_count(metadata, CorTokenType(*factoryMethod as i32));
+                        if trace_nav {
+                            eprintln!(
+                                "[metadata][init] class={} candidate_factory_method_token={} arg_count={} normalized={}",
+                                class_name,
+                                factoryMethod,
+                                factory_method_arguments_count,
+                                factory_method_arguments_count.saturating_sub(2)
+                            );
+                        }
                         if factory_method_arguments_count.saturating_sub(2) != method_argument_count {
                             continue;
                         }
 
                         *out_index = i;
+                        if trace_nav {
+                            eprintln!(
+                                "[metadata][init] class={} composable_match out_index={}",
+                                class_name,
+                                i
+                            );
+                        }
                         return Some(
                             Arc::new(
                                 RwLock::new(
@@ -367,6 +412,12 @@ impl Metadata {
                 }
 
                 if method_argument_count == 0 {
+                    if trace_nav {
+                        eprintln!(
+                            "[metadata][init] class={} no_composable_match_zero_arg -> return None",
+                            class_name
+                        );
+                    }
                     *out_index = usize::MAX;
                     return None;
                 }

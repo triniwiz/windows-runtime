@@ -10,8 +10,12 @@ use crate::DeclarationFFI;
 use libffi::low::*;
 use libffi::raw::ffi_call;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
+use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration::{Declaration, DeclarationKind};
+use metadata::declarations::delegate_declaration::DelegateDeclaration;
+use metadata::declarations::delegate_declaration::DelegateDeclarationImpl;
 use metadata::declarations::delegate_declaration::generic_delegate_declaration::GenericDelegateDeclaration;
+use metadata::declarations::delegate_declaration::generic_delegate_instance_declaration::GenericDelegateInstanceDeclaration;
 use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
 use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
 use metadata::declarations::interface_declaration::InterfaceDeclaration;
@@ -19,6 +23,7 @@ use metadata::declarations::method_declaration::MethodDeclaration;
 use metadata::declarations::parameter_declaration::ParameterDeclaration;
 use metadata::declarations::property_declaration::PropertyDeclaration;
 use metadata::declaring_interface_for_method::Metadata;
+use metadata::meta_data_reader::MetadataReader;
 use metadata::prelude::cor_sig_uncompress_element_type;
 use metadata::signature::Signature;
 use parking_lot::RwLock;
@@ -27,6 +32,7 @@ use byteorder::ByteOrder;
 use libffi::middle::{Arg, Cif};
 use v8::FunctionCallbackArguments;
 use windows::core::{IInspectable, IUnknown, Interface, GUID, HRESULT, HSTRING, IUnknown_Vtbl, IInspectable_Vtbl};
+use windows::Foundation::PropertyValue;
 use windows::Win32::System::Com::IDispatch;
 use windows::Win32::System::WinRT::IActivationFactory;
 use windows::Win32::System::WinRT::Metadata::{CorElementType, ELEMENT_TYPE_CLASS};
@@ -580,12 +586,153 @@ fn try_get_external_handle(
         return Some(
             dec.instance
                 .as_ref()
-                .map(|instance| unsafe { mem::transmute_copy(instance) })
+                .map(|instance| {
+                    if let Ok(inspectable) = instance.cast::<IInspectable>() {
+                        inspectable.as_raw() as *mut c_void
+                    } else {
+                        instance.as_raw() as *mut c_void
+                    }
+                })
                 .unwrap_or(std::ptr::null_mut()),
         );
     }
 
     None
+}
+
+#[inline]
+fn expected_iid_for_signature(signature: &str) -> Option<GUID> {
+    if signature.is_empty() || !signature.contains('.') {
+        return None;
+    }
+
+    let declaration = MetadataReader::find_by_name(signature).or_else(|| {
+        let mut lookup = signature.to_string();
+        if let Some(generic_index) = lookup.find('<') {
+            lookup.truncate(generic_index);
+        }
+        MetadataReader::find_by_name(lookup.as_str())
+    })?;
+    let lock = declaration.read();
+
+    match lock.kind() {
+        DeclarationKind::Interface => {
+            let interface = lock.as_any().downcast_ref::<InterfaceDeclaration>()?;
+            Some(interface.id())
+        }
+        DeclarationKind::GenericInterface => {
+            let interface = lock
+                .as_any()
+                .downcast_ref::<GenericInterfaceDeclaration>()?;
+            Some(interface.id())
+        }
+        DeclarationKind::GenericInterfaceInstance => {
+            let interface = lock
+                .as_any()
+                .downcast_ref::<GenericInterfaceInstanceDeclaration>()?;
+            Some(interface.id())
+        }
+        DeclarationKind::Class => {
+            let class = lock.as_any().downcast_ref::<ClassDeclaration>()?;
+            class.default_interface().map(|interface| interface.id())
+        }
+        DeclarationKind::Delegate => {
+            let delegate = lock.as_any().downcast_ref::<DelegateDeclaration>()?;
+            Some(delegate.id())
+        }
+        DeclarationKind::GenericDelegate => {
+            let delegate = lock
+                .as_any()
+                .downcast_ref::<GenericDelegateDeclaration>()?;
+            Some(delegate.id())
+        }
+        DeclarationKind::GenericDelegateInstance => {
+            let delegate = lock
+                .as_any()
+                .downcast_ref::<GenericDelegateInstanceDeclaration>()?;
+            Some(delegate.id())
+        }
+        _ => None,
+    }
+}
+
+#[inline]
+fn try_query_instance_for_signature(instance: &IUnknown, signature: &str) -> Option<IUnknown> {
+    let iid = expected_iid_for_signature(signature)?;
+    let vtable = instance.vtable();
+
+    let mut queried: *mut c_void = std::ptr::null_mut();
+    let hr = unsafe {
+        ((*vtable).QueryInterface)(
+            instance.as_raw(),
+            &iid,
+            &mut queried as *mut _ as *mut *mut c_void,
+        )
+    };
+
+    if hr.is_ok() && !queried.is_null() {
+        Some(unsafe { IUnknown::from_raw(queried) })
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn try_box_js_value_for_object_signature(
+    scope: &mut v8::PinScope<'_, '_>,
+    arg: v8::Local<v8::Value>,
+    expected_signature: Option<&str>,
+) -> Option<IUnknown> {
+    let signature = expected_signature?;
+    if !matches!(
+        signature,
+        "Object" | "IInspectable" | "Windows.Foundation.IInspectable"
+    ) {
+        return None;
+    }
+
+    if arg.is_null_or_undefined() {
+        return None;
+    }
+
+    if arg.is_string() {
+        let value = arg.to_string(scope)?.to_rust_string_lossy(scope);
+        if let Ok(inspectable) = PropertyValue::CreateString(&HSTRING::from(value)) {
+            return Some(inspectable.into());
+        }
+    }
+
+    if arg.is_boolean() {
+        if let Ok(inspectable) = PropertyValue::CreateBoolean(arg.boolean_value(scope)) {
+            return Some(inspectable.into());
+        }
+    }
+
+    if arg.is_number() {
+        if let Some(value) = arg.number_value(scope) {
+            if let Ok(inspectable) = PropertyValue::CreateDouble(value) {
+                return Some(inspectable.into());
+            }
+        }
+    }
+
+    None
+}
+
+#[inline]
+fn try_get_inspectable_for_object_signature(
+    instance: &IUnknown,
+    expected_signature: Option<&str>,
+) -> Option<IUnknown> {
+    let signature = expected_signature?;
+    if !matches!(
+        signature,
+        "Object" | "IInspectable" | "Windows.Foundation.IInspectable"
+    ) {
+        return None;
+    }
+
+    instance.cast::<IInspectable>().ok().map(Into::into)
 }
 
 #[inline]
@@ -610,6 +757,44 @@ pub fn ffi_parse_pointer_arg(
         ));
     };
     Ok(NativeValue { pointer })
+}
+
+#[inline]
+pub fn ffi_parse_pointer_arg_with_signature(
+    scope: &mut v8::PinScope<'_, '_>,
+    arg: v8::Local<v8::Value>,
+    expected_signature: Option<&str>,
+) -> std::result::Result<(NativeValue, Option<IUnknown>), AnyError> {
+    if let Some(boxed) = try_box_js_value_for_object_signature(scope, arg, expected_signature) {
+        let pointer = boxed.as_raw() as *mut c_void;
+        return Ok((NativeValue { pointer }, Some(boxed)));
+    }
+
+    if arg.is_object() {
+        let arg_obj = arg.to_object(scope).unwrap();
+
+        if let Some(dec) = arg_obj.get_internal_field(scope, 0) {
+            let dec = unsafe { dec.cast::<v8::External>() };
+            let dec = dec.value() as *mut DeclarationFFI;
+            let dec = unsafe { &*dec };
+
+            if let (Some(signature), Some(instance)) = (expected_signature, dec.instance.as_ref()) {
+                if let Some(inspectable) =
+                    try_get_inspectable_for_object_signature(instance, Some(signature))
+                {
+                    let pointer = inspectable.as_raw() as *mut c_void;
+                    return Ok((NativeValue { pointer }, Some(inspectable)));
+                }
+
+                if let Some(typed) = try_query_instance_for_signature(instance, signature) {
+                    let pointer = typed.as_raw() as *mut c_void;
+                    return Ok((NativeValue { pointer }, Some(typed)));
+                }
+            }
+        }
+    }
+
+    ffi_parse_pointer_arg(scope, arg).map(|value| (value, None))
 }
 
 #[inline]
