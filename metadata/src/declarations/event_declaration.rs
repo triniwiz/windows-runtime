@@ -204,6 +204,21 @@ impl EventDeclaration {
             .flatten()
     }
 
+    /// Returns the full name of the underlying delegate type, regardless of
+    /// whether it's a non-generic delegate, generic delegate, or generic
+    /// delegate instance (e.g. `TypedEventHandler<TSender, TArgs>`).
+    pub fn delegate_type_full_name(&self) -> Option<String> {
+        self.type_
+            .as_ref()
+            .map(|f| f.as_declaration().full_name().to_string())
+    }
+
+    /// Returns the GUID of the underlying delegate type for any kind of
+    /// delegate declaration (non-generic or generic instance).
+    pub fn delegate_type_id(&self) -> Option<windows::core::GUID> {
+        self.type_.as_ref().map(|f| f.id())
+    }
+
     pub fn add_method(&self) -> &MethodDeclaration {
         &self.add_method
     }

@@ -14,18 +14,19 @@ mod proxy_manifest_loader;
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void, CString};
 use std::fs;
-use std::hash::{Hash, Hasher};
-use ahash::AHasher;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::ptr::{addr_of, addr_of_mut, NonNull};
 use std::process::Command;
 use std::result;
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Once, OnceLock};
+use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 use libffi::high::arg;
 use libffi::low::{CodePtr, ffi_type};
@@ -35,7 +36,7 @@ use parking_lot::lock_api::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLoc
 use v8::{FunctionTemplate, Global, Local, Number, Object};
 use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, IUnknown_Vtbl, PCWSTR, IInspectable, Error};
 use windows::Foundation::GuidHelper;
-use windows::Win32::System::Com::{IDispatch, IDispatch_Vtbl};
+use windows::Win32::System::Com::{IAgileObject, IDispatch, IDispatch_Vtbl};
 use windows::Win32::System::Console::GetConsoleWindow;
 use windows::Win32::System::WinRT::{IActivationFactory, RoActivateInstance, RoGetActivationFactory, RoInitialize, RoUninitialize, RO_INIT_SINGLETHREADED};
 use windows::Win32::System::WinRT::Metadata::ELEMENT_TYPE_CHAR;
@@ -53,6 +54,7 @@ use metadata::declarations::delegate_declaration::DelegateDeclarationImpl;
 use metadata::declarations::delegate_declaration::generic_delegate_declaration::GenericDelegateDeclaration;
 use metadata::declarations::delegate_declaration::generic_delegate_instance_declaration::GenericDelegateInstanceDeclaration;
 use metadata::declarations::enum_declaration::EnumDeclaration;
+use metadata::declarations::event_declaration::EventDeclaration;
 use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::declarations::namespace_declaration::NamespaceDeclaration;
 use metadata::declarations::type_declaration::TypeDeclaration;
@@ -72,6 +74,7 @@ use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, 
 use crate::proxy_manifest_loader::SbgManifestLoader;
 
 thread_local!(static ISOLATE: RefCell<Option<&'static mut v8::Isolate>> = RefCell::new(None));
+thread_local!(static JS_DELEGATE_HANDLERS: RefCell<HashMap<u64, v8::Global<v8::Function>>> = RefCell::new(HashMap::new()));
 
 pub struct Runtime {
     isolate: v8::OwnedIsolate,
@@ -82,22 +85,267 @@ pub struct Runtime {
 
 static INIT: Once = Once::new();
 static PROXY_MANIFESTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static ACTIVE_RUNTIME_PTR: AtomicPtr<Runtime> = AtomicPtr::new(std::ptr::null_mut());
+static ACTIVE_RUNTIME_THREAD: OnceLock<Mutex<Option<ThreadId>>> = OnceLock::new();
+static NEXT_DELEGATE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[repr(C)]
+struct JsDelegateComObject {
+    vtable: *const c_void,
+    ref_count: AtomicU32,
+    delegate_iid: GUID,
+    base_delegate_iid: Option<GUID>,
+    handler_id: u64,
+}
+
+#[repr(C)]
+struct JsDelegateComVtable {
+    iunknown_query_interface:
+        unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+    iunknown_add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    iunknown_release: unsafe extern "system" fn(*mut c_void) -> u32,
+    delegate_invoke: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT,
+}
+
+unsafe extern "system" fn js_delegate_query_interface(
+    this: *mut c_void,
+    iid: *const GUID,
+    interface: *mut *mut c_void,
+) -> HRESULT {
+    if interface.is_null() {
+        return HRESULT(0x80004003u32 as i32);
+    }
+
+    let object = this as *mut JsDelegateComObject;
+    if object.is_null() || iid.is_null() {
+        *interface = std::ptr::null_mut();
+        return HRESULT(0x80004003u32 as i32);
+    }
+
+    let requested = *iid;
+    let delegate_iid = (*object).delegate_iid;
+    let base_delegate_iid = (*object).base_delegate_iid;
+    if requested == IUnknown::IID
+        || requested == delegate_iid
+        || base_delegate_iid == Some(requested)
+        || requested == IAgileObject::IID
+    {
+        *interface = this;
+        js_delegate_add_ref(this);
+        return HRESULT(0);
+    }
+
+    *interface = std::ptr::null_mut();
+    HRESULT(0x80004002u32 as i32)
+}
+
+unsafe extern "system" fn js_delegate_add_ref(this: *mut c_void) -> u32 {
+    let object = this as *mut JsDelegateComObject;
+    if object.is_null() {
+        return 0;
+    }
+    (*object).ref_count.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+unsafe extern "system" fn js_delegate_release(this: *mut c_void) -> u32 {
+    let object = this as *mut JsDelegateComObject;
+    if object.is_null() {
+        return 0;
+    }
+
+    let remaining = (*object).ref_count.fetch_sub(1, Ordering::SeqCst) - 1;
+    if remaining == 0 {
+        let _ = Box::from_raw(object);
+    }
+    remaining
+}
+
+unsafe extern "system" fn js_delegate_invoke(
+    this: *mut c_void,
+    sender: *mut c_void,
+    args: *mut c_void,
+) -> HRESULT {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let object = this as *mut JsDelegateComObject;
+        if object.is_null() {
+            return HRESULT(0x80004003u32 as i32);
+        }
+
+        let handler_id = (*object).handler_id;
+        invoke_registered_js_delegate(handler_id, sender, args);
+        HRESULT(0)
+    }));
+
+    match result {
+        Ok(hr) => hr,
+        Err(_) => HRESULT(0x8000_4005u32 as i32),
+    }
+}
+
+static JS_TWO_ARG_DELEGATE_VTABLE: JsDelegateComVtable = JsDelegateComVtable {
+    iunknown_query_interface: js_delegate_query_interface,
+    iunknown_add_ref: js_delegate_add_ref,
+    iunknown_release: js_delegate_release,
+    delegate_invoke: js_delegate_invoke,
+};
+
+fn create_native_delegate_instance(
+    delegate_iid: GUID,
+    base_delegate_iid: Option<GUID>,
+    handler_id: u64,
+) -> IUnknown {
+    let object = Box::new(JsDelegateComObject {
+        vtable: &JS_TWO_ARG_DELEGATE_VTABLE as *const _ as *const c_void,
+        ref_count: AtomicU32::new(1),
+        delegate_iid,
+        base_delegate_iid,
+        handler_id,
+    });
+
+    let raw = Box::into_raw(object) as *mut c_void;
+    unsafe { IUnknown::from_raw(raw) }
+}
+
+fn get_delegate_iid(lock: &dyn Declaration) -> Option<GUID> {
+    match lock.kind() {
+        DeclarationKind::Delegate => lock
+            .as_any()
+            .downcast_ref::<DelegateDeclaration>()
+            .map(|d| d.id()),
+        DeclarationKind::GenericDelegate => lock
+            .as_any()
+            .downcast_ref::<GenericDelegateDeclaration>()
+            .map(|d| d.id()),
+        DeclarationKind::GenericDelegateInstance => lock
+            .as_any()
+            .downcast_ref::<GenericDelegateInstanceDeclaration>()
+            .map(|d| d.id()),
+        _ => None,
+    }
+}
+
+fn get_generic_delegate_base_iid(full_name: &str) -> Option<GUID> {
+    let generic_index = full_name.find('<')?;
+    let lookup_name = &full_name[..generic_index];
+    let declaration = MetadataReader::find_by_name(lookup_name)?;
+    let lock = declaration.read();
+    get_delegate_iid(lock.deref())
+}
+
+fn register_js_delegate_handler(callback: v8::Global<v8::Function>) -> u64 {
+    let handler_id = NEXT_DELEGATE_ID.fetch_add(1, Ordering::SeqCst);
+
+    JS_DELEGATE_HANDLERS.with(|handlers| {
+        handlers.borrow_mut().insert(handler_id, callback);
+    });
+
+    handler_id
+}
+
+fn invoke_registered_js_delegate(
+    handler_id: u64,
+    sender: *mut c_void,
+    args: *mut c_void,
+) {
+    if let Some(thread_lock) = ACTIVE_RUNTIME_THREAD.get() {
+        let expected_thread = thread_lock.lock().clone();
+        if let Some(expected_thread) = expected_thread {
+            if std::thread::current().id() != expected_thread {
+                return;
+            }
+        }
+    }
+
+    let runtime_ptr = ACTIVE_RUNTIME_PTR.load(Ordering::SeqCst);
+    if runtime_ptr.is_null() {
+        return;
+    }
+
+    let callback = JS_DELEGATE_HANDLERS.with(|handlers| {
+        let handlers = handlers.borrow();
+        handlers.get(&handler_id).cloned()
+    });
+
+    let Some(callback) = callback else {
+        return;
+    };
+
+    let runtime = unsafe { &mut *runtime_ptr };
+
+    v8::scope!(scope, &mut runtime.isolate);
+    let context = v8::Local::new(scope, &runtime.global_context);
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let callback = v8::Local::new(scope, callback);
+    let recv: v8::Local<v8::Value> = context.global(scope).into();
+
+    let sender_value = wrap_inspectable_pointer_for_js(scope, sender);
+    let args_value = wrap_inspectable_pointer_for_js(scope, args);
+
+    let _ = callback.call(scope, recv, &[sender_value, args_value]);
+
+    scope.perform_microtask_checkpoint();
+}
+
+/// Best-effort wrap of a raw IInspectable pointer (as received in a delegate
+/// Invoke call) into a JS object backed by the corresponding metadata-driven
+/// declaration, so the JS handler can read properties like
+/// `args.SelectedItem`.
+///
+/// Returns `null` when the pointer is null or when the runtime class cannot be
+/// resolved from metadata.
+fn wrap_inspectable_pointer_for_js<'a>(
+    scope: &mut v8::PinScope<'a, '_>,
+    raw: *mut c_void,
+) -> v8::Local<'a, v8::Value> {
+    if raw.is_null() {
+        return v8::null(scope).into();
+    }
+
+    let unknown = unsafe {
+        let u = IUnknown::from_raw_borrowed(&raw);
+        match u {
+            Some(u) => u.clone(),
+            None => {
+                return v8::null(scope).into();
+            }
+        }
+    };
+
+    let inspectable: Option<IInspectable> = unknown.cast().ok();
+
+    if let Some(inspectable) = inspectable.as_ref() {
+        match inspectable.GetRuntimeClassName() {
+            Ok(runtime_class) => {
+                let class_name = runtime_class.to_string();
+                if !class_name.is_empty() {
+                    if let Some(declaration) = MetadataReader::find_by_name(class_name.as_str())
+                    {
+                        let short_name = {
+                            let lock = declaration.read();
+                            lock.name().to_string()
+                        };
+                        let inspectable_unknown: IUnknown = inspectable.clone().into();
+                        return create_ns_ctor_instance_object(
+                            short_name.as_str(),
+                            None,
+                            None,
+                            declaration,
+                            Some(inspectable_unknown),
+                            scope,
+                        );
+                    }
+                }
+            }
+            Err(_e) => {}
+        }
+    }
+
+    v8::null(scope).into()
+}
 
 fn proxy_manifests() -> &'static Mutex<Vec<String>> {
     PROXY_MANIFESTS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// Tracks hashes of already-loaded manifests to avoid O(N×size) string comparison.
-static MANIFEST_HASHES: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
-
-fn manifest_hashes() -> &'static Mutex<HashSet<u64>> {
-    MANIFEST_HASHES.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-fn content_hash(s: &str) -> u64 {
-    let mut h = AHasher::default();
-    s.hash(&mut h);
-    h.finish()
 }
 
 fn default_sbg_manifest_path() -> PathBuf {
@@ -116,20 +364,14 @@ fn preload_sbg_manifest() {
         return;
     }
 
-    // Read once; feed the same string to both the loader and the dedup check.
-    let Ok(content) = fs::read_to_string(&manifest_path) else { return; };
-
-    let hash = content_hash(&content);
-    {
-        let mut hashes = manifest_hashes().lock();
-        if !hashes.insert(hash) {
-            return; // already loaded
-        }
-    }
-
     let mut loader = SbgManifestLoader::new();
-    if loader.load_manifest_json(&content).is_ok() {
-        proxy_manifests().lock().push(content);
+    if loader.load_manifest_file(&manifest_path).is_ok() {
+        if let Ok(content) = fs::read_to_string(&manifest_path) {
+            let mut manifests = proxy_manifests().lock();
+            if manifests.iter().all(|item| item != &content) {
+                manifests.push(content);
+            }
+        }
     }
 }
 
@@ -235,57 +477,121 @@ fn collect_class_properties(class_declaration: &ClassDeclaration) -> Vec<Propert
     properties
 }
 
-fn class_method_matches(class_declaration: &ClassDeclaration, name: &str) -> bool {
-    let method_match = |m: &MethodDeclaration| {
-        let on = m.overload_name();
-        (!on.is_empty() && on == name) || m.name() == name
-    };
-
-    if class_declaration.methods().iter().any(method_match) { return true; }
-
-    if let Some(di) = class_declaration.default_interface() {
-        if di.methods().iter().any(method_match) { return true; }
+fn collect_declaration_methods(declaration: &dyn Declaration) -> Vec<MethodDeclaration> {
+    match declaration.kind() {
+        DeclarationKind::Class => declaration
+            .as_any()
+            .downcast_ref::<ClassDeclaration>()
+            .map(collect_class_methods)
+            .unwrap_or_default(),
+        DeclarationKind::Interface => declaration
+            .as_any()
+            .downcast_ref::<InterfaceDeclaration>()
+            .map(|interface| interface.methods().iter().cloned().collect())
+            .unwrap_or_default(),
+        DeclarationKind::GenericInterface => declaration
+            .as_any()
+            .downcast_ref::<GenericInterfaceDeclaration>()
+            .map(|interface| interface.methods().iter().cloned().collect())
+            .unwrap_or_default(),
+        DeclarationKind::GenericInterfaceInstance => declaration
+            .as_any()
+            .downcast_ref::<GenericInterfaceInstanceDeclaration>()
+            .map(|interface| interface.methods().iter().cloned().collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
     }
-
-    for iface in class_declaration.implemented_interfaces() {
-        if iface.methods().iter().any(method_match) { return true; }
-    }
-
-    if !class_declaration.base_full_name().is_empty() {
-        if let Some(base_decl) = MetadataReader::find_by_name(class_declaration.base_full_name()) {
-            let lock = base_decl.read();
-            if let Some(base) = lock.as_any().downcast_ref::<ClassDeclaration>() {
-                return class_method_matches(base, name);
-            }
-        }
-    }
-    false
 }
 
-fn class_property_matches(class_declaration: &ClassDeclaration, name: &str) -> bool {
-    if class_declaration.properties().iter().any(|p| p.name() == name) { return true; }
+fn collect_declaration_properties(declaration: &dyn Declaration) -> Vec<PropertyDeclaration> {
+    match declaration.kind() {
+        DeclarationKind::Class => declaration
+            .as_any()
+            .downcast_ref::<ClassDeclaration>()
+            .map(collect_class_properties)
+            .unwrap_or_default(),
+        DeclarationKind::Interface => declaration
+            .as_any()
+            .downcast_ref::<InterfaceDeclaration>()
+            .map(|interface| interface.properties().iter().cloned().collect())
+            .unwrap_or_default(),
+        DeclarationKind::GenericInterface => declaration
+            .as_any()
+            .downcast_ref::<GenericInterfaceDeclaration>()
+            .map(|interface| interface.properties().iter().cloned().collect())
+            .unwrap_or_default(),
+        DeclarationKind::GenericInterfaceInstance => declaration
+            .as_any()
+            .downcast_ref::<GenericInterfaceInstanceDeclaration>()
+            .map(|interface| interface.properties().iter().cloned().collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
 
-    if let Some(di) = class_declaration.default_interface() {
-        if di.properties().iter().any(|p| p.name() == name) { return true; }
+fn collect_declaration_events(declaration: &dyn Declaration) -> Vec<EventDeclaration> {
+    if declaration.kind() == DeclarationKind::Class {
+        return declaration
+            .as_any()
+            .downcast_ref::<ClassDeclaration>()
+            .map(collect_class_events)
+            .unwrap_or_default();
     }
 
-    for iface in class_declaration.implemented_interfaces() {
-        if iface.properties().iter().any(|p| p.name() == name) { return true; }
+    Vec::new()
+}
+
+fn resolve_return_declaration(return_sig: &str) -> Option<Arc<RwLock<dyn Declaration>>> {
+    if let Some(declaration) = MetadataReader::find_by_name(return_sig) {
+        return Some(declaration);
     }
 
-    if !class_declaration.base_full_name().is_empty() {
-        if let Some(base_decl) = MetadataReader::find_by_name(class_declaration.base_full_name()) {
-            let lock = base_decl.read();
-            if let Some(base) = lock.as_any().downcast_ref::<ClassDeclaration>() {
-                return class_property_matches(base, name);
-            }
+    if return_sig.contains('`') {
+        let mut generic_name = return_sig.to_string();
+        if let Some(backtick_index) = generic_name.rfind('<') {
+            generic_name.truncate(backtick_index);
+        }
+
+        if let Some(declaration) = MetadataReader::find_by_name(generic_name.as_str()) {
+            let closed_declaration = {
+                let lock = declaration.read();
+                if lock.kind() == DeclarationKind::GenericInterface {
+                    lock.as_any()
+                        .downcast_ref::<GenericInterfaceDeclaration>()
+                        .map(|interface| {
+                            Arc::new(RwLock::new(
+                                GenericInterfaceInstanceDeclaration::new_with_full_name(
+                                    interface.base().metadata(),
+                                    interface.base().token(),
+                                    return_sig.to_string(),
+                                ),
+                            )) as Arc<RwLock<dyn Declaration>>
+                        })
+                } else {
+                    None
+                }
+            };
+
+            return closed_declaration.or(Some(declaration));
         }
     }
-    false
+
+    None
 }
 
 fn class_has_member_named(class_declaration: &ClassDeclaration, name: &str) -> bool {
-    class_method_matches(class_declaration, name) || class_property_matches(class_declaration, name)
+    collect_class_methods(class_declaration)
+        .iter()
+        .any(|method| {
+            let overload_name = method.overload_name();
+            (!overload_name.is_empty() && overload_name == name) || method.name() == name
+        })
+        || collect_class_properties(class_declaration)
+            .iter()
+            .any(|property| property.name() == name)
+        || collect_class_events(class_declaration)
+            .iter()
+            .any(|event| event.name() == name)
 }
 
 fn runtime_method_metadata_from_method(method: &MethodDeclaration) -> RuntimeMethodMetadata {
@@ -487,31 +793,8 @@ fn throw_js_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
 }
 
 fn class_activation_factory(full_name: &str) -> windows::core::Result<IUnknown> {
-    let clazz_name = HSTRING::from(full_name);
-    unsafe { RoGetActivationFactory::<IUnknown>(&clazz_name) }
-}
-
-fn resolve_class_factory_from_parent(dec: &DeclarationFFI) -> windows::core::Result<IUnknown> {
-    if let Some(instance) = dec.instance.clone() {
-        return Ok(instance);
-    }
-
-    let Some(parent) = dec.parent.as_ref() else {
-        return Err(Error::new(
-            HRESULT(0x80004005u32 as i32),
-            "Static WinRT member is missing its owning class declaration",
-        ));
-    };
-
-    let parent = parent.read();
-    let Some(clazz) = parent.as_any().downcast_ref::<ClassDeclaration>() else {
-        return Err(Error::new(
-            HRESULT(0x80004005u32 as i32),
-            "Static WinRT member parent is not a class declaration",
-        ));
-    };
-
-    class_activation_factory(clazz.full_name())
+    let class_name = HSTRING::from(full_name);
+    unsafe { RoGetActivationFactory::<IUnknown>(&class_name) }
 }
 
 fn try_get_async_status(
@@ -594,14 +877,6 @@ fn handle_host_wait_for_async(
     } else {
         0
     };
-
-    // Fast-path: already completed before we enter the loop.
-    match try_get_async_status(scope, op_value) {
-        Ok(0) => {} // still running — proceed to wait
-        Ok(_) => { retval.set(op_value); return; }
-        Err(msg) => { throw_js_error(scope, msg.as_str()); return; }
-    }
-
     let deadline = if timeout_ms == 0 {
         None
     } else {
@@ -622,23 +897,21 @@ fn handle_host_wait_for_async(
 
         match try_get_async_status(scope, op_value) {
             Ok(0) => {
-                // Still running: drain the message queue then block for 5 ms.
-                // Using 5 ms instead of 1 ms reduces CPU burn 5× while keeping
-                // perceived latency well below a UI frame budget.
                 while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.into() {
                     unsafe {
                         TranslateMessage(&message);
                         DispatchMessageW(&message);
                     }
                 }
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::sleep(Duration::from_millis(1));
+                std::thread::yield_now();
             }
             Ok(_) => {
                 retval.set(op_value);
                 return;
             }
-            Err(msg) => {
-                throw_js_error(scope, msg.as_str());
+            Err(message) => {
+                throw_js_error(scope, message.as_str());
                 return;
             }
         }
@@ -2300,7 +2573,9 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
     object_tmpl.set_internal_field_count(1);
 
-    let declaration_ffi = Box::into_raw(Box::new(DeclarationFFI::new_with_instance(declaration.clone(), instance.clone())));
+    let mut declaration_ffi = DeclarationFFI::new_with_instance(declaration.clone(), instance.clone());
+    declaration_ffi.parent = parent;
+    let declaration_ffi = Box::into_raw(Box::new(declaration_ffi));
     let ext = v8::External::new(scope, declaration_ffi as _);
 
     object_tmpl.set_named_property_handler(
@@ -2324,16 +2599,24 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                 let dec = unsafe { &*dec };
                 let lock = dec.read();
 
-                let Some(clazz) = lock.as_any().downcast_ref::<ClassDeclaration>() else {
+                let methods = collect_declaration_methods(&*lock);
+                let properties = collect_declaration_properties(&*lock);
+                if methods.is_empty() && properties.is_empty() {
                     return v8::Intercepted::kNo;
-                };
+                }
 
-                for property in collect_class_properties(clazz) {
+                for property in properties {
                     if property.name() != name {
                         continue;
                     }
 
-                    let mut property_call = PropertyCall::new(&property, false, dec.instance.clone().unwrap(), false);
+                    let mut property_call = PropertyCall::new_with_parent(
+                        &property,
+                        false,
+                        dec.instance.clone().unwrap(),
+                        false,
+                        dec.parent.clone().or_else(|| Some(dec.inner.clone())),
+                    );
                     let (ret, result) = property_call.call_with_values(scope, &[]);
 
                     if ret.is_err() {
@@ -2351,15 +2634,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     let return_sig = property_call.return_type().to_string();
                     if return_sig.contains('.') {
                         let instance = unsafe { IUnknown::from_raw(result) };
-                        let declaration = if return_sig.contains('`') {
-                            let mut generic_name = return_sig.clone();
-                            if let Some(backtick_index) = generic_name.rfind('<') {
-                                generic_name.truncate(backtick_index);
-                            }
-                            MetadataReader::find_by_name(generic_name.as_str())
-                        } else {
-                            MetadataReader::find_by_name(return_sig.as_str())
-                        };
+                        let declaration = resolve_return_declaration(return_sig.as_str());
 
                         if let Some(declaration) = declaration {
                             let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into();
@@ -2376,7 +2651,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     return v8::Intercepted::kNo;
                 }
 
-                for method in collect_class_methods(clazz) {
+                for method in methods {
                     let mut method_name = method.overload_name();
                     if method_name.is_empty() {
                         method_name = method.name();
@@ -2387,7 +2662,9 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     }
 
                     let declaration = Arc::new(RwLock::new(method.clone()));
-                    let declaration = Box::into_raw(Box::new(DeclarationFFI::new_with_instance(declaration, dec.instance.clone())));
+                    let mut declaration = DeclarationFFI::new_with_instance(declaration, dec.instance.clone());
+                    declaration.parent = Some(dec.inner.clone());
+                    let declaration = Box::into_raw(Box::new(declaration));
                     let ext = v8::External::new(scope, declaration as _);
 
                     let builder = v8::Function::builder(|scope: &mut v8::PinScope<'_, '_>,
@@ -2398,7 +2675,13 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let dec = unsafe { &*dec };
                         let lock = dec.read();
                         let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
-                        let mut method = MethodCall::new(method, method.is_sealed(), dec.instance.clone().unwrap(), false);
+                        let mut method = MethodCall::new_with_parent(
+                            method,
+                            method.is_sealed(),
+                            dec.instance.clone().unwrap(),
+                            false,
+                            dec.parent.clone(),
+                        );
                         let (ret, result) = method.call(scope, &args);
 
                         if ret.is_err() {
@@ -2416,15 +2699,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let return_sig = method.return_type().to_string();
                         if return_sig.contains('.') {
                             let instance = unsafe { IUnknown::from_raw(result) };
-                            let declaration = if return_sig.contains('`') {
-                                let mut generic_name = return_sig.clone();
-                                if let Some(backtick_index) = generic_name.rfind('<') {
-                                    generic_name.truncate(backtick_index);
-                                }
-                                MetadataReader::find_by_name(generic_name.as_str())
-                            } else {
-                                MetadataReader::find_by_name(return_sig.as_str())
-                            };
+                            let declaration = resolve_return_declaration(return_sig.as_str());
 
                             if let Some(declaration) = declaration {
                                 let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, dec.parent.clone(), declaration, Some(instance), scope).into();
@@ -2462,11 +2737,14 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                 let dec = unsafe { &*dec };
                 let lock = dec.read();
 
-                let Some(clazz) = lock.as_any().downcast_ref::<ClassDeclaration>() else {
-                    return v8::Intercepted::kNo;
-                };
+                let properties = collect_declaration_properties(&*lock);
+                let events = collect_declaration_events(&*lock);
 
-                for property in collect_class_properties(clazz) {
+                if properties.is_empty() && events.is_empty() {
+                    return v8::Intercepted::kNo;
+                }
+
+                for property in properties {
                     if property.name() != name {
                         continue;
                     }
@@ -2475,13 +2753,150 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         return v8::Intercepted::kNo;
                     }
 
-                    let mut property_call = PropertyCall::new(&property, true, dec.instance.clone().unwrap(), false);
+                    let mut property_call = PropertyCall::new_with_parent(
+                        &property,
+                        true,
+                        dec.instance.clone().unwrap(),
+                        false,
+                        dec.parent.clone().or_else(|| Some(dec.inner.clone())),
+                    );
                     let (ret, _) = property_call.call_with_values(scope, &[value]);
                     if ret.is_err() {
                         let message = v8::String::new(scope, &ret.message().to_string()).unwrap();
                         let error = v8::Exception::error(scope, message);
                         scope.throw_exception(error);
                     }
+                    return v8::Intercepted::kYes;
+                }
+
+                for event in events {
+                    if event.name() != name {
+                        continue;
+                    }
+
+                    // into a real native COM delegate so the WinRT event raise
+                    // path has a valid IUnknown to dereference. Without this,
+                    // assigning `obj.SomeEvent = fn` would forward a null/garbage
+                    // pointer to add_*, and XAML would AV when the event fires.
+                    let wrapped_value: Local<v8::Value> = {
+                        // Extract a callable, if the user supplied one.
+                        let mut callback_fn: Option<v8::Local<v8::Function>> = None;
+                        let mut needs_wrap = false;
+
+                        if let Ok(func) = v8::Local::<v8::Function>::try_from(value) {
+                            callback_fn = Some(func);
+                            needs_wrap = true;
+                        } else if value.is_object() {
+                            if let Some(obj) = value.to_object(scope) {
+                                // If the object already carries a native COM
+                                // instance (constructed via `new DelegateType(..)`),
+                                // do nothing — pass through as-is.
+                                let mut has_native_instance = false;
+                                if obj.internal_field_count() > 0 {
+                                    if let Some(field) = obj.get_internal_field(scope, 0) {
+                                        let ext = unsafe { field.cast::<v8::External>() };
+                                        let ptr = ext.value() as *mut DeclarationFFI;
+                                        if !ptr.is_null() {
+                                            let dec_ref = unsafe { &*ptr };
+                                            if dec_ref.instance.is_some() {
+                                                has_native_instance = true;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if !has_native_instance {
+                                    if let Some(invoke_key) = v8::String::new(scope, "Invoke") {
+                                        if let Some(invoke_val) = obj.get(scope, invoke_key.into()) {
+                                            if let Ok(func) =
+                                                v8::Local::<v8::Function>::try_from(invoke_val)
+                                            {
+                                                callback_fn = Some(func);
+                                                needs_wrap = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if needs_wrap {
+                            if let Some(callback) = callback_fn {
+                                let delegate_full_name = event.delegate_type_full_name();
+                                let delegate_iid = event.delegate_type_id();
+
+                                if let (Some(delegate_full_name), Some(delegate_iid)) =
+                                    (delegate_full_name.as_ref(), delegate_iid)
+                                {
+                                    // For generic delegate instances (e.g.
+                                    // `TypedEventHandler<TSender,TArgs>`) the
+                                    // closed name is not in the metadata index;
+                                    // look up the open generic by truncating
+                                    // at the first `<`.
+                                    let lookup_name: String = if let Some(idx) =
+                                        delegate_full_name.find('<')
+                                    {
+                                        delegate_full_name[..idx].to_string()
+                                    } else {
+                                        delegate_full_name.clone()
+                                    };
+
+                                    if let Some(delegate_arc) =
+                                        MetadataReader::find_by_name(lookup_name.as_str())
+                                    {
+                                        let cb_global = v8::Global::new(scope, callback);
+                                        let handler_id =
+                                            register_js_delegate_handler(cb_global);
+                                        let base_delegate_iid =
+                                            get_generic_delegate_base_iid(delegate_full_name);
+                                        let native = create_native_delegate_instance(
+                                            delegate_iid,
+                                            base_delegate_iid,
+                                            handler_id,
+                                        );
+                                        let delegate_name = {
+                                            let dlock = delegate_arc.read();
+                                            dlock.name().to_string()
+                                        };
+                                        create_ns_ctor_instance_object(
+                                            delegate_name.as_str(),
+                                            None,
+                                            None,
+                                            delegate_arc.clone(),
+                                            Some(native),
+                                            scope,
+                                        )
+                                    } else {
+                                        return v8::Intercepted::kYes;
+                                    }
+                                } else {
+                                    return v8::Intercepted::kYes;
+                                }
+                            } else {
+                                value
+                            }
+                        } else {
+                            value
+                        }
+                    };
+
+                    let add_method = event.add_method();
+
+                    let mut method = MethodCall::new(
+                        add_method,
+                        add_method.is_sealed(),
+                        dec.instance.clone().unwrap(),
+                        false,
+                    );
+
+                    let (ret, _) = method.call_with_values(scope, &[wrapped_value]);
+
+                    if ret.is_err() {
+                        let message = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                        let error = v8::Exception::error(scope, message);
+                        scope.throw_exception(error);
+                    }
+
                     return v8::Intercepted::kYes;
                 }
 
@@ -2509,16 +2924,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                 let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
                 let class_methods = collect_class_methods(clazz);
                 let class_properties = collect_class_properties(clazz);
-
-                if matches!(name, "StackPanel" | "ListView" | "ComboBox" | "ScrollViewer" | "Border") {
-                    eprintln!(
-                        "[runtime] class {} resolved {} methods and {} properties",
-                        name,
-                        class_methods.len(),
-                        class_properties.len()
-                    );
-                }
-
+                let class_events = collect_class_events(clazz);
 
                 let to_string_func = FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                                 args: v8::FunctionCallbackArguments,
@@ -2606,15 +3012,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                         // .Status, .ErrorCode, .GetResults, .Completed, .Cancel,
                                         // .Close — the dev wraps it in a JS Promise if they want
                                         // (matching the iOS & Android NativeScript runtimes).
-                                        let declaration = if return_sig.contains('`') {
-                                            let mut name = return_sig.to_string();
-                                            if let Some(backtick_index) = name.rfind('<') {
-                                                name.truncate(backtick_index);
-                                            }
-                                            MetadataReader::find_by_name(name.as_str()).unwrap()
-                                        } else {
-                                            dec.inner.clone()
-                                        };
+                                        let declaration = resolve_return_declaration(return_sig.as_str())
+                                            .unwrap_or_else(|| dec.inner.clone());
 
                                         let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, dec.parent.clone(), declaration, Some(instance), scope).into();
                                         retval.set(ret.into());
@@ -2689,15 +3088,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             let return_sig = method.return_type().to_string();
                             if return_sig.contains('.') {
                                 let instance = unsafe { IUnknown::from_raw(result) };
-                                let declaration = if return_sig.contains('`') {
-                                    let mut name = return_sig.clone();
-                                    if let Some(backtick_index) = name.rfind('<') {
-                                        name.truncate(backtick_index);
-                                    }
-                                    MetadataReader::find_by_name(name.as_str())
-                                } else {
-                                    MetadataReader::find_by_name(return_sig.as_str())
-                                };
+                                let declaration = resolve_return_declaration(return_sig.as_str());
 
                                 if let Some(declaration) = declaration {
                                     let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into();
@@ -2759,6 +3150,62 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     } else {
                         let name = name.unwrap();
                         object_tmpl.set_accessor_property(name.into(), Some(getter), setter, v8::PropertyAttribute::NONE);
+                    }
+                }
+
+                for event in class_events.iter() {
+                    let name = v8::String::new(scope, event.name()).unwrap();
+                    let is_static = event.is_static();
+
+                    let declaration = DeclarationFFI::new_with_instance(
+                        Arc::new(RwLock::new(event.add_method().clone())),
+                        if is_static { factory.clone() } else { instance.clone() },
+                    );
+
+                    let setter_declaration = Box::into_raw(Box::new(declaration));
+                    let setter_declaration_ext = v8::External::new(scope, setter_declaration as _);
+
+                    let setter = FunctionTemplate::builder(
+                        |scope: &mut v8::PinScope<'_, '_>,
+                         args: v8::FunctionCallbackArguments,
+                         _retval: v8::ReturnValue| {
+                            let dec = unsafe { args.data().cast::<v8::External>() };
+                            let dec = dec.value() as *mut DeclarationFFI;
+                            let dec = unsafe { &*dec };
+                            let lock = dec.read();
+                            let add_method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
+
+                            let mut method = MethodCall::new(
+                                add_method,
+                                add_method.is_sealed(),
+                                dec.instance.clone().unwrap(),
+                                false,
+                            );
+                            let (ret, _) = method.call(scope, &args);
+                            if ret.is_err() {
+                                let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                let err = v8::Exception::error(scope, msg);
+                                scope.throw_exception(err);
+                            }
+                        },
+                    )
+                    .data(setter_declaration_ext.into())
+                    .build(scope);
+
+                    if is_static {
+                        tmpl.set_accessor_property(
+                            name.into(),
+                            None,
+                            Some(setter),
+                            v8::PropertyAttribute::DONT_DELETE,
+                        );
+                    } else {
+                        object_tmpl.set_accessor_property(
+                            name.into(),
+                            None,
+                            Some(setter),
+                            v8::PropertyAttribute::NONE,
+                        );
                     }
                 }
             }
@@ -3411,15 +3858,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                         let instance = unsafe { IUnknown::from_raw(*(result as *mut *mut c_void)) };
 
                                         if return_sig.contains('`') {
-                                            let mut name = return_sig.to_string();
-
-                                            if let Some(backtick_index) = name.rfind('<') {
-                                                name.truncate(backtick_index);
-                                            }
-
-                                            // use the generic name
-                                            let declaration = MetadataReader::find_by_name(name.as_str()).unwrap();
-
+                                            let declaration = resolve_return_declaration(return_sig)
+                                                .unwrap_or_else(|| dec.inner.clone());
 
                                             let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig, None, dec.parent.clone(), declaration, Some(instance), scope).into();
                                             retval.set(ret.into());
@@ -3497,7 +3937,6 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
         match kind {
             DeclarationKind::Class => {
                 let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
-
                 let clazz_factory = match class_activation_factory(clazz.full_name()) {
                     Ok(factory) => factory,
                     Err(error) => {
@@ -3513,21 +3952,87 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                         return;
                     }
                 };
+                let clazz_name = HSTRING::from(clazz.full_name());
 
                 unsafe {
-                    let is_sealed = clazz.is_sealed();
                     for ctor in clazz.initializers() {
                         let number_of_parameters = ctor.number_of_parameters();
                         if number_of_parameters != length as usize {
                             continue;
                         }
+                        if number_of_parameters == 0 {
+                            let activated = unsafe { RoActivateInstance(&clazz_name) };
+                            match activated {
+                                Ok(result) => {
+                                    let result: IUnknown = result.into();
+
+                                    // For console apps: attach to the console window so that
+                                    // UI dialogs (e.g. MessageDialog) know which window to use.
+                                    if let Ok(init) = result.cast::<IInitializeWithWindow>() {
+                                        let hwnd = unsafe { GetConsoleWindow() };
+                                        if !hwnd.is_invalid() {
+                                            let _ = unsafe { init.Initialize(hwnd) };
+                                        }
+                                    }
+
+                                    let instance = create_ns_ctor_instance_object(
+                                        clazz.name(),
+                                        Some(clazz_factory.clone()),
+                                        None,
+                                        dec.inner.clone(),
+                                        Some(result),
+                                        scope,
+                                    );
+                                    retval.set(instance);
+                                    return;
+                                }
+                                Err(_) => {
+                                    // Zero-arg activation should be handled via WinRT activation factory.
+                                    // Calling metadata constructor stubs through the generic FFI path here can
+                                    // crash the process for some XAML controls (e.g. NavigationView).
+                                    if let Ok(factory) = clazz_factory.cast::<IActivationFactory>() {
+                                        if let Ok(instance_obj) = factory.ActivateInstance() {
+                                            let result: IUnknown = instance_obj.into();
+
+                                            if let Ok(init) = result.cast::<IInitializeWithWindow>() {
+                                                let hwnd = unsafe { GetConsoleWindow() };
+                                                if !hwnd.is_invalid() {
+                                                    let _ = unsafe { init.Initialize(hwnd) };
+                                                }
+                                            }
+
+                                            let instance = create_ns_ctor_instance_object(
+                                                clazz.name(),
+                                                Some(clazz_factory.clone()),
+                                                None,
+                                                dec.inner.clone(),
+                                                Some(result),
+                                                scope,
+                                            );
+                                            retval.set(instance);
+                                            return;
+                                        }
+                                    }
+
+                                    // Activation failed; continue into constructor fallback path.
+                                }
+                            }
+                        }
+
                         let mut method = MethodCall::new(
-                            ctor, is_sealed, clazz_factory.clone(), true,
+                            ctor, ctor.is_sealed(), clazz_factory.clone(), true,
                         );
 
                         let (ret, result) = method.call(scope, &args);
 
                         if ret.is_ok() {
+                            if result.is_null() {
+                                let message = v8::String::new(scope, "Constructor returned null instance pointer").unwrap();
+                                let error = v8::Exception::error(scope, message.into());
+                                scope.throw_exception(error);
+                                return;
+                            }
+
                             let result = unsafe { IUnknown::from_raw(result) };
 
                             let vtable = result.vtable();
@@ -3541,7 +4046,6 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                                     std::mem::transmute(&mut ret),
                                 )
                             };
-
                             if res.is_err() || ret.is_null() {
                                 let message = res.message().to_string();
                                 let message = v8::String::new(scope, message.as_str()).unwrap();
@@ -3570,6 +4074,46 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                             let message = v8::String::new(scope, message.as_str()).unwrap();
                             let error = v8::Exception::error(scope, message.into());
                             scope.throw_exception(error);
+                        }
+                    }
+                }
+            }
+            DeclarationKind::Delegate
+            | DeclarationKind::GenericDelegate
+            | DeclarationKind::GenericDelegateInstance => {
+                if length >= 1 {
+                    let arg = args.get(0);
+                    let callback = if let Ok(func) = v8::Local::<v8::Function>::try_from(arg) {
+                        Some(func)
+                    } else if arg.is_object() {
+                        arg.to_object(scope)
+                            .and_then(|obj| v8::String::new(scope, "Invoke").and_then(|key| obj.get(scope, key.into())))
+                            .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+                    } else {
+                        None
+                    };
+
+                    if let Some(callback) = callback {
+                        let callback = v8::Global::new(scope, callback);
+                        let handler_id = register_js_delegate_handler(callback);
+                        if let Some(delegate_iid) = get_delegate_iid(lock.deref()) {
+                            let base_delegate_iid =
+                                get_generic_delegate_base_iid(lock.full_name());
+                            let instance = create_native_delegate_instance(
+                                delegate_iid,
+                                base_delegate_iid,
+                                handler_id,
+                            );
+                            let instance = create_ns_ctor_instance_object(
+                                lock.name(),
+                                None,
+                                dec.parent.clone(),
+                                dec.inner.clone(),
+                                Some(instance),
+                                scope,
+                            );
+                            retval.set(instance);
+                            return;
                         }
                     }
                 }
@@ -3634,6 +4178,11 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
         let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
 
+        let Ok(clazz_factory) = class_activation_factory(clazz.full_name()) else {
+            let func = tmpl.get_function(scope).unwrap();
+            return func.into();
+        };
+
         for method in clazz.methods().iter() {
             let name = v8::String::new(scope, method.name());
             let is_static = method.is_static();
@@ -3650,7 +4199,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                         method.clone()
                     )
                 ),
-                None,
+                Some(clazz_factory.clone()),
             );
 
             declaration.parent = Some(parent);
@@ -3677,24 +4226,8 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                 let signature = Signature::to_string(method.metadata().unwrap(), &return_type);
 
 
-                let factory = match resolve_class_factory_from_parent(dec) {
-                    Ok(factory) => factory,
-                    Err(error) => {
-                        throw_js_error(
-                            scope,
-                            format!(
-                                "Failed to resolve WinRT static method factory for {}: {}",
-                                method.name(),
-                                error.message()
-                            )
-                            .as_str(),
-                        );
-                        return;
-                    }
-                };
-
                 let mut method = MethodCall::new(
-                    method, method.is_sealed(), factory, false,
+                    method, method.is_sealed(), dec.instance.clone().unwrap(), false,
                 );
 
                 let (ret, result) = method.call(scope, &args);
@@ -3772,6 +4305,120 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                 .build(scope);
 
             tmpl.set(name.unwrap().into(), func.into());
+        }
+
+        for property in clazz.properties().iter() {
+            if !property.is_static() {
+                continue;
+            }
+
+            let name = v8::String::new(scope, property.name()).unwrap();
+
+            let declaration = DeclarationFFI::new_with_instance(
+                Arc::new(RwLock::new(property.clone())),
+                Some(clazz_factory.clone()),
+            );
+
+            let getter_declaration = Box::into_raw(Box::new(declaration.clone()));
+            let getter_declaration_ext = v8::External::new(scope, getter_declaration as _);
+
+            let getter = v8::FunctionTemplate::builder(
+                |scope: &mut v8::PinScope<'_, '_>,
+                 args: v8::FunctionCallbackArguments,
+                 mut retval: v8::ReturnValue| {
+                    let dec = unsafe { args.data().cast::<v8::External>() };
+                    let dec = dec.value() as *mut DeclarationFFI;
+                    let dec = unsafe { &*dec };
+                    let lock = dec.read();
+                    let prop = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
+
+                    let mut method = PropertyCall::new(prop, false, dec.instance.clone().unwrap(), false);
+                    let (ret, result) = method.call(scope, &args);
+
+                    if ret.is_err() {
+                        let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                        let err = v8::Exception::error(scope, msg);
+                        scope.throw_exception(err);
+                        return;
+                    }
+
+                    if method.is_void() {
+                        retval.set_undefined();
+                        return;
+                    }
+
+                    let return_sig = method.return_type().to_string();
+                    if return_sig.contains('.') {
+                        let instance = unsafe { IUnknown::from_raw(result) };
+                        let declaration = if return_sig.contains('`') {
+                            let mut name = return_sig.clone();
+                            if let Some(backtick_index) = name.rfind('<') {
+                                name.truncate(backtick_index);
+                            }
+                            MetadataReader::find_by_name(name.as_str())
+                        } else {
+                            MetadataReader::find_by_name(return_sig.as_str())
+                        };
+
+                        if let Some(declaration) = declaration {
+                            let ret: Local<v8::Value> = create_ns_ctor_instance_object(
+                                return_sig.as_str(),
+                                None,
+                                None,
+                                declaration,
+                                Some(instance),
+                                scope,
+                            )
+                                .into();
+                            retval.set(ret.into());
+                            return;
+                        }
+                    }
+
+                    if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+                        unsafe { set_ret_val(result, scope, retval, return_type); }
+                    }
+                },
+            )
+            .data(getter_declaration_ext.into())
+            .build(scope);
+
+            let mut setter: Option<Local<FunctionTemplate>> = None;
+            if property.setter().is_some() {
+                let setter_declaration = Box::into_raw(Box::new(declaration));
+                let setter_declaration_ext = v8::External::new(scope, setter_declaration as _);
+
+                setter = Some(
+                    v8::FunctionTemplate::builder(
+                        |scope: &mut v8::PinScope<'_, '_>,
+                         args: v8::FunctionCallbackArguments,
+                         _retval: v8::ReturnValue| {
+                            let dec = unsafe { args.data().cast::<v8::External>() };
+                            let dec = dec.value() as *mut DeclarationFFI;
+                            let dec = unsafe { &*dec };
+                            let lock = dec.read();
+                            let prop = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
+
+                            let mut method = PropertyCall::new(prop, true, dec.instance.clone().unwrap(), false);
+                            let (ret, _) = method.call(scope, &args);
+                            if ret.is_err() {
+                                let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                let err = v8::Exception::error(scope, msg);
+                                scope.throw_exception(err);
+                            }
+                        },
+                    )
+                    .data(setter_declaration_ext.into())
+                    .build(scope),
+                );
+            }
+
+            tmpl.set_accessor_property(
+                name.into(),
+                Some(getter),
+                setter,
+                v8::PropertyAttribute::DONT_DELETE,
+            );
         }
     }
 
@@ -4703,6 +5350,14 @@ impl Runtime {
     }
 
     pub fn run_script(&mut self, script: &str) {
+        ACTIVE_RUNTIME_PTR.store(self as *mut Runtime, Ordering::SeqCst);
+
+        let thread_lock = ACTIVE_RUNTIME_THREAD.get_or_init(|| Mutex::new(None));
+        let mut thread_guard = thread_lock.lock();
+        if thread_guard.is_none() {
+            *thread_guard = Some(std::thread::current().id());
+        }
+
         v8::scope!(scope, &mut self.isolate);
         let context = v8::Local::new(scope, &self.global_context);
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -4719,11 +5374,10 @@ impl Runtime {
         };
 
         let Some(code) = v8::String::new(tc, source_to_run.as_str()) else { return };
-        if let Some(compiled) = v8::Script::compile(tc, code, None) {
-            compiled.run(tc);
+        if let Some(script) = v8::Script::compile(tc, code, None) {
+            script.run(tc);
         }
 
-        // Log and rethrow any JS exception back into V8 (mirrors NativeScript behaviour).
         if tc.has_caught() {
             if let Some(msg) = tc.message() {
                 let text = msg.get(tc).to_rust_string_lossy(tc);
@@ -4738,8 +5392,13 @@ impl Runtime {
                             let file = frame.get_script_name(tc)
                                 .map(|s| s.to_rust_string_lossy(tc))
                                 .unwrap_or_else(|| "<unknown>".to_string());
-                            eprintln!("    at {} ({}:{}:{})", fn_name, file,
-                                frame.get_line_number(), frame.get_column());
+                            eprintln!(
+                                "    at {} ({}:{}:{})",
+                                fn_name,
+                                file,
+                                frame.get_line_number(),
+                                frame.get_column()
+                            );
                         }
                     }
                 }
@@ -4761,4 +5420,44 @@ impl Drop for Runtime {
             unsafe { RoUninitialize() };
         }
     }
+}
+
+fn extend_class_events(class_declaration: &ClassDeclaration, events: &mut Vec<EventDeclaration>, seen: &mut HashSet<String>) {
+    for event in class_declaration.events() {
+        if seen.insert(event.name().to_string()) {
+            events.push(event.clone());
+        }
+    }
+
+    if let Some(default_interface) = class_declaration.default_interface() {
+        for event in default_interface.events() {
+            if seen.insert(event.name().to_string()) {
+                events.push(event.clone());
+            }
+        }
+    }
+
+    for interface in class_declaration.implemented_interfaces() {
+        for event in interface.events() {
+            if seen.insert(event.name().to_string()) {
+                events.push(event.clone());
+            }
+        }
+    }
+
+    if !class_declaration.base_full_name().is_empty() {
+        if let Some(base_declaration) = MetadataReader::find_by_name(class_declaration.base_full_name()) {
+            let base_lock = base_declaration.read();
+            if let Some(base_class) = base_lock.as_any().downcast_ref::<ClassDeclaration>() {
+                extend_class_events(base_class, events, seen);
+            }
+        }
+    }
+}
+
+fn collect_class_events(class_declaration: &ClassDeclaration) -> Vec<EventDeclaration> {
+    let mut events = Vec::new();
+    let mut seen = HashSet::new();
+    extend_class_events(class_declaration, &mut events, &mut seen);
+    events
 }

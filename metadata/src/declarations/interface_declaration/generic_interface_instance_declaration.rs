@@ -74,6 +74,24 @@ impl GenericInterfaceInstanceDeclaration {
             full_name
         }
     }
+
+    pub fn new_with_full_name(
+        open_metadata: Option<&IMetaDataImport2>,
+        open_token: CorTokenType,
+        full_name: String,
+    ) -> Self {
+        Self {
+            base: InterfaceDeclaration::new_with_kind(
+                DeclarationKind::GenericInterfaceInstance,
+                open_metadata,
+                open_token,
+            ),
+            closed_metadata: None,
+            closed_token: CorTokenType::default(),
+            full_name,
+        }
+    }
+
     pub fn id(&self) -> GUID {
         return GenericInstanceIdBuilder::generate_id(self);
     }

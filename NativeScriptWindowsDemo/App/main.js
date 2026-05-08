@@ -1,159 +1,169 @@
-console.log("NativeScriptWindowsDemo: booting JS UI demo");
+import { createButton, text, withContentPadding } from "./core/ui.js";
+import { createDashboardPage } from "./features/dashboard.js";
+import { createGettingStartedPage } from "./features/getting-started.js";
+import { createSetupPage } from "./features/setup.js";
+import { createComponentsPage } from "./features/components.js";
+import { createExamplesPage } from "./features/examples.js";
 
-function createSectionTitle(text) {
-	const title = new Windows.UI.Xaml.Controls.TextBlock();
-	title.Text = text;
-	title.FontSize = 18;
-	title.Margin = new Windows.UI.Xaml.Thickness(0, 16, 0, 8);
-	return title;
+console.log("NativeScriptWindowsDemo: booting");
+
+function createShell() {
+    console.log("NativeScriptWindowsDemo: createShell start");
+    try {
+        const navigation = new Windows.UI.Xaml.Controls.NavigationView();
+        navigation.PaneTitle = "NativeScript Studio";
+        navigation.IsSettingsVisible = false;
+        navigation.PaneDisplayMode = Windows.UI.Xaml.Controls.NavigationViewPaneDisplayMode.Left;
+        navigation.IsBackButtonVisible = Windows.UI.Xaml.Controls.NavigationViewBackButtonVisible.Collapsed;
+        navigation.IsPaneToggleButtonVisible = true;
+
+        console.log("NativeScriptWindowsDemo: createShell done (NavigationView)");
+        return { kind: "navigation", navigation };
+    } catch (error) {
+        console.log(
+            "NativeScriptWindowsDemo: NavigationView unavailable, falling back to SplitView",
+            error && error.message ? error.message : error,
+        );
+    }
+
+    const split = new Windows.UI.Xaml.Controls.SplitView();
+    split.DisplayMode = Windows.UI.Xaml.Controls.SplitViewDisplayMode.Inline;
+    split.IsPaneOpen = true;
+    split.OpenPaneLength = 260;
+
+    const pane = new Windows.UI.Xaml.Controls.StackPanel();
+    pane.Spacing = 6;
+    pane.Children.Append(text("NativeScript Studio", 22));
+    pane.Children.Append(text("Windows runtime demo tabs", 12));
+
+    split.Pane = pane;
+
+    console.log("NativeScriptWindowsDemo: createShell done (SplitView fallback)");
+    return { kind: "split", split, pane };
 }
 
-function createControlCard() {
-	const border = new Windows.UI.Xaml.Controls.Border();
-	border.BorderBrush = new Windows.UI.Xaml.Media.SolidColorBrush(Windows.UI.Colors.LightGray);
-	border.BorderThickness = new Windows.UI.Xaml.Thickness(1);
-	border.Padding = new Windows.UI.Xaml.Thickness(12);
-	border.CornerRadius = new Windows.UI.Xaml.CornerRadius(8);
+function createNavigationItem(key, label, iconGlyph) {
+    const item = new Windows.UI.Xaml.Controls.NavigationViewItem();
+    item.Tag = key;
+    item.Content = String(label);
 
-	const stack = new Windows.UI.Xaml.Controls.StackPanel();
-	stack.Spacing = 8;
-	border.Child = stack;
-	return { border, stack };
+    const icon = new Windows.UI.Xaml.Controls.FontIcon();
+    icon.Glyph = iconGlyph;
+    item.Icon = icon;
+
+    return item;
 }
 
-function buildDemoLayout() {
-	const rootScroll = new Windows.UI.Xaml.Controls.ScrollViewer();
-	rootScroll.VerticalScrollBarVisibility = Windows.UI.Xaml.Controls.ScrollBarVisibility.Auto;
+function createScrollablePage(content) {
+    const scroll = new Windows.UI.Xaml.Controls.ScrollViewer();
+    scroll.VerticalScrollBarVisibility = Windows.UI.Xaml.Controls.ScrollBarVisibility.Auto;
+    scroll.HorizontalScrollBarVisibility = Windows.UI.Xaml.Controls.ScrollBarVisibility.Disabled;
+    scroll.Content = withContentPadding(content);
+    return scroll;
+}
 
-	const content = new Windows.UI.Xaml.Controls.StackPanel();
-	content.Margin = new Windows.UI.Xaml.Thickness(24, 20, 24, 20);
-	content.Spacing = 10;
-	rootScroll.Content = content;
+function buildApp() {
+    console.log("NativeScriptWindowsDemo: buildApp start");
 
-	const header = new Windows.UI.Xaml.Controls.TextBlock();
-	header.Text = "NativeScript Windows Demo";
-	header.FontSize = 30;
-	header.FontWeight = Windows.UI.Text.FontWeights.SemiBold;
-	content.Children.Append(header);
+    const shell = createShell();
+    const navItemsByKey = {};
 
-	const subtitle = new Windows.UI.Xaml.Controls.TextBlock();
-	subtitle.Text = "WinRT XAML controls created directly from JavaScript";
-	subtitle.FontSize = 14;
-	subtitle.Foreground = new Windows.UI.Xaml.Media.SolidColorBrush(Windows.UI.Colors.DimGray);
-	subtitle.Margin = new Windows.UI.Xaml.Thickness(0, 0, 0, 6);
-	content.Children.Append(subtitle);
+    const pages = {
+        dashboard: createScrollablePage(createDashboardPage(showPage)),
+        gettingStarted: createScrollablePage(createGettingStartedPage()),
+        setup: createScrollablePage(createSetupPage()),
+        components: createScrollablePage(createComponentsPage()),
+        examples: createScrollablePage(createExamplesPage()),
+    };
 
-	content.Children.Append(createSectionTitle("Inputs"));
-	const inputCard = createControlCard();
+    function showPage(key) {
+        const page = pages[key] || pages.dashboard;
+        if (shell.kind === "navigation") {
+            const host = shell.contentHost;
+            if (host && typeof host === "object") {
+                host.Child = page;
+            } else {
+                shell.navigation.Content = page;
+            }
+            return;
+        }
 
-	const nameBox = new Windows.UI.Xaml.Controls.TextBox();
-	nameBox.Header = "Display name";
-	nameBox.PlaceholderText = "Type your name";
+        shell.split.Content = page;
+        shell.split.IsPaneOpen = true;
+    }
 
-	const password = new Windows.UI.Xaml.Controls.PasswordBox();
-	password.Header = "Password";
+    if (shell.kind === "navigation") {
+        const host = new Windows.UI.Xaml.Controls.Border();
+        shell.contentHost = host;
+        shell.navigation.Content = host;
 
-	const toggle = new Windows.UI.Xaml.Controls.ToggleSwitch();
-	toggle.Header = "Enable notifications";
-	toggle.IsOn = true;
+        const dashboardItem = createNavigationItem("dashboard", "Overview", "\uE80F");
+        const gettingStartedItem = createNavigationItem("gettingStarted", "Getting Started", "\uE8FD");
+        const setupItem = createNavigationItem("setup", "Setup", "\uE713");
+        const componentsItem = createNavigationItem("components", "Components", "\uE8B8");
+        const examplesItem = createNavigationItem("examples", "Examples", "\uE9CE");
 
-	inputCard.stack.Children.Append(nameBox);
-	inputCard.stack.Children.Append(password);
-	inputCard.stack.Children.Append(toggle);
-	content.Children.Append(inputCard.border);
+        navItemsByKey.dashboard = dashboardItem;
+        navItemsByKey.gettingStarted = gettingStartedItem;
+        navItemsByKey.setup = setupItem;
+        navItemsByKey.components = componentsItem;
+        navItemsByKey.examples = examplesItem;
 
-	content.Children.Append(createSectionTitle("Selection"));
-	const selectionCard = createControlCard();
+        shell.navigation.MenuItems.Append(dashboardItem);
+        shell.navigation.MenuItems.Append(gettingStartedItem);
+        shell.navigation.MenuItems.Append(setupItem);
+        shell.navigation.MenuItems.Append(componentsItem);
+        shell.navigation.MenuItems.Append(examplesItem);
 
-	const combo = new Windows.UI.Xaml.Controls.ComboBox();
-	combo.Header = "Theme";
-	combo.Items.Append("Ocean");
-	combo.Items.Append("Forest");
-	combo.Items.Append("Sunset");
-	combo.SelectedIndex = 0;
+        shell.navigation.SelectedItem = dashboardItem;
+        host.Child = pages.dashboard;
 
-	const sliderLabel = new Windows.UI.Xaml.Controls.TextBlock();
-	sliderLabel.Text = "Volume";
-	const slider = new Windows.UI.Xaml.Controls.Slider();
-	slider.Minimum = 0;
-	slider.Maximum = 100;
-	slider.Value = 72;
+        const resolveNavigationKey = function () {
+            const keys = Object.keys(navItemsByKey);
 
-	const progress = new Windows.UI.Xaml.Controls.ProgressBar();
-	progress.Minimum = 0;
-	progress.Maximum = 100;
-	progress.Value = slider.Value;
-	progress.Height = 8;
+            for (let i = 0; i < keys.length; i += 1) {
+                const key = keys[i];
+                const item = navItemsByKey[key];
+                if (!item) {
+                    continue;
+                }
 
-	slider.ValueChanged = function (sender) {
-		progress.Value = sender.Value;
-	};
+                try {
+                    if (item.IsSelected) {
+                        return key;
+                    }
+                } catch (_error) {
+                }
+            }
 
-	selectionCard.stack.Children.Append(combo);
-	selectionCard.stack.Children.Append(sliderLabel);
-	selectionCard.stack.Children.Append(slider);
-	selectionCard.stack.Children.Append(progress);
-	content.Children.Append(selectionCard.border);
+            return null;
+        };
 
-	content.Children.Append(createSectionTitle("Actions"));
-	const actionCard = createControlCard();
-	const actionRow = new Windows.UI.Xaml.Controls.StackPanel();
-	actionRow.Orientation = Windows.UI.Xaml.Controls.Orientation.Horizontal;
-	actionRow.Spacing = 10;
+        shell.navigation.SelectionChanged = function () {
+            const key = resolveNavigationKey();
+            if (key && pages[key]) {
+                showPage(key);
+            }
+        };
+    } else {
+        shell.pane.Children.Append(createButton("Overview", function () { showPage("dashboard"); }));
+        shell.pane.Children.Append(createButton("Getting Started", function () { showPage("gettingStarted"); }));
+        shell.pane.Children.Append(createButton("Setup", function () { showPage("setup"); }));
+        shell.pane.Children.Append(createButton("Components", function () { showPage("components"); }));
+        shell.pane.Children.Append(createButton("Examples", function () { showPage("examples"); }));
+    }
 
-	const applyButton = new Windows.UI.Xaml.Controls.Button();
-	applyButton.Content = "Apply";
-	applyButton.MinWidth = 120;
-
-	const resetButton = new Windows.UI.Xaml.Controls.Button();
-	resetButton.Content = "Reset";
-	resetButton.MinWidth = 120;
-
-	const status = new Windows.UI.Xaml.Controls.TextBlock();
-	status.Text = "Ready";
-	status.Margin = new Windows.UI.Xaml.Thickness(0, 6, 0, 0);
-
-	applyButton.Click = function () {
-		const selectedTheme = combo.SelectedItem ? String(combo.SelectedItem) : "Unknown";
-		status.Text = "Saved for " + (nameBox.Text || "Guest") + " with " + selectedTheme + " theme";
-	};
-
-	resetButton.Click = function () {
-		nameBox.Text = "";
-		password.Password = "";
-		toggle.IsOn = true;
-		combo.SelectedIndex = 0;
-		slider.Value = 72;
-		status.Text = "Reset complete";
-	};
-
-	actionRow.Children.Append(applyButton);
-	actionRow.Children.Append(resetButton);
-	actionCard.stack.Children.Append(actionRow);
-	actionCard.stack.Children.Append(status);
-	content.Children.Append(actionCard.border);
-
-	content.Children.Append(createSectionTitle("Data List"));
-	const listCard = createControlCard();
-	const list = new Windows.UI.Xaml.Controls.ListView();
-	list.Height = 180;
-	list.Items.Append("Dashboard");
-	list.Items.Append("Analytics");
-	list.Items.Append("Notifications");
-	list.Items.Append("Reports");
-	list.Items.Append("Settings");
-	listCard.stack.Children.Append(list);
-	content.Children.Append(listCard.border);
-
-	return rootScroll;
+    showPage("dashboard");
+    console.log("NativeScriptWindowsDemo: buildApp done");
+    return shell.kind === "navigation" ? shell.navigation : shell.split;
 }
 
 try {
-	const window = Windows.UI.Xaml.Window.Current;
-	window.Content = buildDemoLayout();
-	window.Activate();
-	console.log("NativeScriptWindowsDemo: layout created");
+    const window = Windows.UI.Xaml.Window.Current;
+    window.Content = buildApp();
+    window.Activate();
+    console.log("NativeScriptWindowsDemo: loaded");
 } catch (error) {
-	console.log("NativeScriptWindowsDemo: failed to build layout", error && error.message ? error.message : error);
-	throw error;
+    console.log("NativeScriptWindowsDemo: failed", error && error.message ? error.message : error);
+    throw error;
 }
