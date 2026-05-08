@@ -20,15 +20,35 @@ pub fn call_failure() -> HRESULT {
 /// the native parameter slot.
 #[inline]
 pub fn ffi_native_type_from_signature(signature: &str) -> NativeType {
-    match signature {
+    let signature = signature.trim();
+    let by_ref_inner = signature.strip_prefix("ByRef ").unwrap_or(signature);
+
+    if let Some(element) = by_ref_inner.strip_suffix("[]") {
+        return match element {
+            "UInt8" | "Uint8" | "Int8" | "Byte" | "SByte" => NativeType::Buffer,
+            _ => NativeType::Pointer,
+        };
+    }
+
+    if by_ref_inner.starts_with("Var!")
+        || by_ref_inner.starts_with("MVar!")
+        || by_ref_inner.contains('.')
+        || by_ref_inner == "Object"
+        || by_ref_inner == "Guid"
+    {
+        return NativeType::Pointer;
+    }
+
+    match by_ref_inner {
         "Void" => NativeType::Void,
         "String" => NativeType::Pointer,
+        "Char16" => NativeType::U16,
         "Boolean" => NativeType::Bool,
-        "UInt8" => NativeType::U8,
+        "UInt8" | "Uint8" | "Byte" => NativeType::U8,
+        "Int8" | "SByte" => NativeType::I8,
         "UInt16" => NativeType::U16,
         "UInt32" => NativeType::U32,
         "UInt64" => NativeType::U64,
-        "Int8" => NativeType::I8,
         "Int16" => NativeType::I16,
         "Int32" => NativeType::I32,
         "Int64" => NativeType::I64,

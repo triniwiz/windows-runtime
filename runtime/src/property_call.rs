@@ -39,6 +39,8 @@ pub struct PropertyCall {
     return_type: String,
     pub(crate) declaration: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>>,
     is_valid: bool,
+    /// Pre-allocated argument buffer reused on every call to avoid per-call heap allocation.
+    argument_buf: Vec<NativeValue>,
 }
 
 impl PropertyCall {
@@ -340,6 +342,7 @@ impl PropertyCall {
             return_type,
             is_setter,
             is_valid,
+            argument_buf: Vec::with_capacity(number_of_abi_parameters),
         }
     }
 
@@ -462,6 +465,7 @@ impl PropertyCall {
             return_type,
             is_setter,
             is_valid: final_valid,
+            argument_buf: Vec::with_capacity(number_of_abi_parameters),
         }
     }
 
@@ -487,12 +491,10 @@ impl PropertyCall {
             return (call_failure(), std::ptr::null_mut());
         }
 
-        let number_of_abi_parameters = self.number_of_abi_parameters;
-
-        let mut arguments: Vec<NativeValue> = Vec::with_capacity(number_of_abi_parameters);
+        self.argument_buf.clear();
         let mut pointer_keepalive: Vec<IUnknown> = Vec::new();
 
-        unsafe { arguments.push(NativeValue { pointer: std::mem::transmute_copy(&self.interface) }) };
+        unsafe { self.argument_buf.push(NativeValue { pointer: std::mem::transmute_copy(&self.interface) }) };
 
         for (i, native_type) in self.parse_parameter_types.iter().enumerate() {
             let Some(value) = values.get(i).copied() else {
@@ -589,7 +591,7 @@ impl PropertyCall {
                 Err(_) => return (call_failure(), std::ptr::null_mut()),
             };
 
-            arguments.push(value);
+            self.argument_buf.push(value);
         }
 
         let mut result: *mut c_void = std::ptr::null_mut();
@@ -599,7 +601,7 @@ impl PropertyCall {
             // arguments.push(result_ptr as *mut c_void);
         } else {
             if !self.is_void {
-                arguments.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
+                self.argument_buf.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
             }
         }
 
@@ -607,8 +609,8 @@ impl PropertyCall {
         //
         // get_method(&self.interface, self.index, addr_of_mut!(func));
 
-        let mut call_args: Vec<Arg> = Vec::with_capacity(arguments.len());
-        for (i, v) in arguments.iter().enumerate() {
+        let mut call_args: Vec<Arg> = Vec::with_capacity(self.argument_buf.len());
+        for (i, v) in self.argument_buf.iter().enumerate() {
             // SAFETY: Creating a `Arg` from a `NativeValue` is safe when the parallel type vector matches.
             let Some(native_type) = self.parameter_types.get(i) else {
                 return (call_failure(), std::ptr::null_mut());

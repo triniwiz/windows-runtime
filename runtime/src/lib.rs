@@ -38,7 +38,7 @@ use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, IUnknown_Vtbl, 
 use windows::Foundation::GuidHelper;
 use windows::Win32::System::Com::{IAgileObject, IDispatch, IDispatch_Vtbl};
 use windows::Win32::System::Console::GetConsoleWindow;
-use windows::Win32::System::WinRT::{IActivationFactory, RoActivateInstance, RoGetActivationFactory};
+use windows::Win32::System::WinRT::{IActivationFactory, RoActivateInstance, RoGetActivationFactory, RoInitialize, RoUninitialize, RO_INIT_SINGLETHREADED};
 use windows::Win32::System::WinRT::Metadata::ELEMENT_TYPE_CHAR;
 use windows::Win32::UI::Shell::IInitializeWithWindow;
 use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PeekMessageW, PM_REMOVE, TranslateMessage};
@@ -80,6 +80,7 @@ pub struct Runtime {
     isolate: v8::OwnedIsolate,
     global_context: v8::Global<v8::Context>,
     app_root: String,
+    winrt_initialized: bool,
 }
 
 static INIT: Once = Once::new();
@@ -789,6 +790,11 @@ fn throw_js_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
         let err = v8::Exception::error(scope, msg.into());
         scope.throw_exception(err);
     }
+}
+
+fn class_activation_factory(full_name: &str) -> windows::core::Result<IUnknown> {
+    let class_name = HSTRING::from(full_name);
+    unsafe { RoGetActivationFactory::<IUnknown>(&class_name) }
 }
 
 fn try_get_async_status(
@@ -3931,17 +3937,22 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
         match kind {
             DeclarationKind::Class => {
                 let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
+                let clazz_factory = match class_activation_factory(clazz.full_name()) {
+                    Ok(factory) => factory,
+                    Err(error) => {
+                        throw_js_error(
+                            scope,
+                            format!(
+                                "Failed to activate WinRT class {}: {}",
+                                clazz.full_name(),
+                                error.message()
+                            )
+                            .as_str(),
+                        );
+                        return;
+                    }
+                };
                 let clazz_name = HSTRING::from(clazz.full_name());
-
-                let clazz_factory = unsafe { RoGetActivationFactory::<IUnknown>(&clazz_name) };
-                if let Err(err) = clazz_factory {
-                    let message = v8::String::new(scope, err.message().to_string().as_str()).unwrap();
-                    let error = v8::Exception::error(scope, message.into());
-                    scope.throw_exception(error);
-                    return;
-                }
-
-                let clazz_factory = clazz_factory.unwrap();
 
                 unsafe {
                     for ctor in clazz.initializers() {
@@ -4167,11 +4178,10 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
         let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
 
-        let clazz_name = HSTRING::from(clazz.full_name());
-
-        let clazz_factory = unsafe { RoGetActivationFactory::<IUnknown>(&clazz_name) };
-
-        let clazz_factory = clazz_factory.unwrap();
+        let Ok(clazz_factory) = class_activation_factory(clazz.full_name()) else {
+            let func = tmpl.get_function(scope).unwrap();
+            return func.into();
+        };
 
         for method in clazz.methods().iter() {
             let name = v8::String::new(scope, method.name());
@@ -5290,6 +5300,12 @@ impl Runtime {
             v8::V8::initialize();
         });
 
+        let winrt_initialized = match unsafe { RoInitialize(RO_INIT_SINGLETHREADED) } {
+            Ok(_) => true,
+            Err(error) if error.code() == HRESULT(0x80010106u32 as i32) => false,
+            Err(error) => panic!("RoInitialize failed: {}", error.message()),
+        };
+
         let params = v8::CreateParams::default();
         let mut isolate = v8::Isolate::new(params);
         isolate.set_capture_stack_trace_for_uncaught_exceptions(true, 100);
@@ -5329,6 +5345,7 @@ impl Runtime {
             isolate,
             global_context,
             app_root: app_root.to_string(),
+            winrt_initialized,
         }
     }
 
@@ -5344,6 +5361,7 @@ impl Runtime {
         v8::scope!(scope, &mut self.isolate);
         let context = v8::Local::new(scope, &self.global_context);
         let scope = &mut v8::ContextScope::new(scope, context);
+        v8::tc_scope!(tc, scope);
 
         let looks_like_module = script.contains("import ") || script.contains("export ");
         let source_to_run = if looks_like_module {
@@ -5355,16 +5373,53 @@ impl Runtime {
             script.to_string()
         };
 
-        let Some(code) = v8::String::new(scope, source_to_run.as_str()) else { return };
-        if let Some(script) = v8::Script::compile(scope, code, None) {
-            script.run(scope);
+        let Some(code) = v8::String::new(tc, source_to_run.as_str()) else { return };
+        if let Some(script) = v8::Script::compile(tc, code, None) {
+            script.run(tc);
+        }
+
+        if tc.has_caught() {
+            if let Some(msg) = tc.message() {
+                let text = msg.get(tc).to_rust_string_lossy(tc);
+                let line = msg.get_line_number(tc).unwrap_or(0);
+                eprintln!("[NativeScript] Uncaught exception at line {}: {}", line, text);
+                if let Some(stack) = msg.get_stack_trace(tc) {
+                    for i in 0..stack.get_frame_count() {
+                        if let Some(frame) = stack.get_frame(tc, i) {
+                            let fn_name = frame.get_function_name(tc)
+                                .map(|s| s.to_rust_string_lossy(tc))
+                                .unwrap_or_else(|| "<anonymous>".to_string());
+                            let file = frame.get_script_name(tc)
+                                .map(|s| s.to_rust_string_lossy(tc))
+                                .unwrap_or_else(|| "<unknown>".to_string());
+                            eprintln!(
+                                "    at {} ({}:{}:{})",
+                                fn_name,
+                                file,
+                                frame.get_line_number(),
+                                frame.get_column()
+                            );
+                        }
+                    }
+                }
+            }
+            tc.rethrow();
+            return;
         }
 
         // Drain any synchronous Promise microtasks that the script may have queued.
-        scope.perform_microtask_checkpoint();
+        tc.perform_microtask_checkpoint();
     }
 
     pub fn dispose(&self) {}
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        if self.winrt_initialized {
+            unsafe { RoUninitialize() };
+        }
+    }
 }
 
 fn extend_class_events(class_declaration: &ClassDeclaration, events: &mut Vec<EventDeclaration>, seen: &mut HashSet<String>) {
