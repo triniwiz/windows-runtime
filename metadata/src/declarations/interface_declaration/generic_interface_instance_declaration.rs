@@ -32,7 +32,7 @@ impl GenericInterfaceInstanceDeclaration {
     ) -> Self {
         debug_assert!(closed_metadata.is_some());
         debug_assert!(
-            type_from_token(closed_token) == mdtTypeSpec.0 as i32
+            type_from_token(closed_token) == mdtTypeSpec.0
         );
         debug_assert!(closed_token.0 != 0);
 

@@ -26,11 +26,14 @@ pub extern "C" fn runtime_install_ctrlc_handler(exit_code: i32) {
 
 #[no_mangle]
 pub extern "C" fn runtime_init(app_root: *const c_char) -> i64 {
-    if app_root.is_null() {
-        return Box::into_raw(Box::new(Runtime::new(""))) as i64
-    }
-    let string = unsafe { CStr::from_ptr(app_root) }.to_string_lossy();
-    Box::into_raw(Box::new(Runtime::new(string.as_ref()))) as i64
+    let mut boxed = if app_root.is_null() {
+        Box::new(Runtime::new(""))
+    } else {
+        let string = unsafe { CStr::from_ptr(app_root) }.to_string_lossy();
+        Box::new(Runtime::new(string.as_ref()))
+    };
+    boxed.register_delegate_isolate_ptr();
+    Box::into_raw(boxed) as i64
 }
 
 #[no_mangle]

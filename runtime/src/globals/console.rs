@@ -1,9 +1,11 @@
 use std::env::var;
 use std::ffi::{c_int, CString};
+use std::sync::OnceLock;
 use v8::{Local, Value};
 use windows::core::{HSTRING, PCSTR, PCWSTR};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::{Console};
-use windows::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
+use windows::Win32::System::Console::{CONSOLE_MODE, GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE};
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringA;
 
 pub fn init_console(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, context: v8::Local<v8::Context>) {
@@ -51,20 +53,38 @@ fn handle_item_log(scope: &mut v8::PinScope<'_, '_>, item: v8::Local<v8::Value>,
     }
 }
 
+/// Detect once whether stdout is attached to a real console. Packaged AppX
+/// apps (and most GUI apps) have no console — `WriteConsoleA` fails silently
+/// every call, and `print!` writes into a buffer nobody reads. Probing once
+/// at startup lets the hot path go straight to `OutputDebugStringA`, which
+/// is what the user actually sees in the VS Output window.
+fn console_handle() -> Option<HANDLE> {
+    static PROBED: OnceLock<Option<isize>> = OnceLock::new();
+    let raw = *PROBED.get_or_init(|| unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE).ok()?;
+        if h.is_invalid() {
+            return None;
+        }
+        // GetConsoleMode succeeds only if `h` points at a real console
+        // screen buffer — perfect detector for "is there actually a console
+        // to write to". Returns false for the null handle UWP apps get.
+        let mut mode = CONSOLE_MODE::default();
+        if GetConsoleMode(h, &mut mode).is_ok() {
+            Some(h.0 as isize)
+        } else {
+            None
+        }
+    });
+    raw.map(|p| HANDLE(p as *mut _))
+}
+
 fn write_console(value: &str) {
-    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-    match handle {
-        Ok(handle) => {
-            let result = unsafe { Console::WriteConsoleA(handle, value.as_bytes(), None, None) };
-            if result.is_err() {
-                print!("{value}");
-            }
-        }
-        Err(_) => {
-            if let Ok(c) = CString::new(value) {
-                unsafe { OutputDebugStringA(PCSTR::from_raw(c.as_ptr() as _)) }
-            }
-        }
+    if let Some(handle) = console_handle() {
+        let _ = unsafe { Console::WriteConsoleA(handle, value.as_bytes(), None, None) };
+        return;
+    }
+    if let Ok(c) = CString::new(value) {
+        unsafe { OutputDebugStringA(PCSTR::from_raw(c.as_ptr() as _)) }
     }
 }
 

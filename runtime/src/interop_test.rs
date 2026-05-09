@@ -67,7 +67,7 @@ fn run_js_assert(name: &str, body: &str) {
         body = body,
     );
 
-    runtime.run_script(&script);
+    runtime.run_script(&script, &format!("{}.js", name));
 
     let mut found = false;
     for _ in 0..200 {
