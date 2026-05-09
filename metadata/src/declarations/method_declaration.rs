@@ -1,12 +1,9 @@
 use std::any::Any;
 use std::ptr::addr_of_mut;
-use std::sync::{Arc};
-use parking_lot::RwLock;
-use windows::core::{HSTRING, PCWSTR, PWSTR};
+use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMAGE_CEE_CS_CALLCONV_GENERIC, IMetaDataImport2, mdtMethodDef};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::parameter_declaration::ParameterDeclaration;
-use crate::declarations::type_declaration::TypeDeclaration;
 use crate::signature::Signature;
 
 use crate::prelude::*;
@@ -70,7 +67,7 @@ impl MethodDeclaration {
                         unimplemented!()
                     }
 
-                    let mut arguments_count =
+                    let arguments_count =
                         { cor_sig_uncompress_data(&mut sig) };
 
                     return_type = Signature::consume_type(&mut sig);

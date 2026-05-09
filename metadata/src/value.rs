@@ -1,9 +1,8 @@
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use windows::core::{BSTR, Interface};
-use windows::Win32::Foundation::VARIANT_BOOL;
-use windows::Win32::System::Com::{IDispatch, SAFEARRAY};
-use windows::Win32::System::Variant::{VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_ARRAY, VT_BOOL, VT_BSTR, VT_I1, VT_I2, VT_I4, VT_I8, VT_NULL, VT_PTR, VT_R4, VT_R8, VT_UI2, VT_UI4, VT_UI8, VT_VARIANT};
+use windows::Win32::System::Com::IDispatch;
+use windows::Win32::System::Variant::{VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_BOOL, VT_BSTR, VT_I1, VT_I2, VT_I4, VT_I8, VT_NULL, VT_PTR, VT_R4, VT_R8, VT_UI2, VT_UI4, VT_UI8};
 
 #[derive(Debug)]
 pub enum Value {

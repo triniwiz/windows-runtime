@@ -1,11 +1,8 @@
 use std::any::Any;
 use std::fmt::{Display, Formatter};
-use std::sync::Arc;
-use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2, mdtFieldDef};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 
-use crate::declarations::type_declaration::TypeDeclaration;
 use crate::prelude::*;
 
 #[derive(Clone, Debug)]

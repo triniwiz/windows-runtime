@@ -1,9 +1,7 @@
 use std::any::Any;
 use std::ptr::addr_of_mut;
-use std::sync::{Arc};
-use parking_lot::RwLock;
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::System::WinRT::Metadata::{COR_CTOR_METHOD_NAME, COR_CTOR_METHOD_NAME_W, CorTokenType, IMetaDataImport2, mdtInterfaceImpl, mdtTypeDef};
+use windows::Win32::System::WinRT::Metadata::{COR_CTOR_METHOD_NAME_W, CorTokenType, IMetaDataImport2};
 use crate::declaration_factory::DeclarationFactory;
 use crate::declarations::base_class_declaration::{BaseClassDeclaration, BaseClassDeclarationImpl};
 use crate::declarations::declaration::{Declaration, DeclarationKind};

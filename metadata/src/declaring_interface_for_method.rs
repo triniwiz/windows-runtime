@@ -1,6 +1,5 @@
-use std::ffi::{c_void, OsString};
+use std::ffi::c_void;
 use std::mem::MaybeUninit;
-use std::os::windows::prelude::OsStrExt;
 use std::ptr::addr_of_mut;
 use std::sync::Arc;
 use parking_lot::RwLock;
@@ -147,7 +146,7 @@ impl Metadata {
         unsafe { PCCOR_SIGNATURE(signature.offset(1)) }
     }
 
-    pub fn get_signature_argument_count(metadata: &IMetaDataImport2, signature: &mut PCCOR_SIGNATURE) -> u32 {
+    pub fn get_signature_argument_count(_metadata: &IMetaDataImport2, signature: &mut PCCOR_SIGNATURE) -> u32 {
         cor_sig_uncompress_data(signature)
     }
 
@@ -388,7 +387,7 @@ impl Metadata {
                 }
 
 
-                let mut activatable_attributes = Metadata::get_custom_attributes_with_name(
+                let activatable_attributes = Metadata::get_custom_attributes_with_name(
                     metadata, CorTokenType(class_token as i32), ACTIVATABLE_ATTRIBUTE,
                 );
 
@@ -557,7 +556,7 @@ impl Metadata {
                 let mut method_impls_count = 0;
                 let mut method_impls_enumerator = std::ptr::null_mut();
 
-                let mut result = unsafe {
+                let result = unsafe {
                     metadata.EnumMethodImpls(
                         addr_of_mut!(method_impls_enumerator),
                         class_token,

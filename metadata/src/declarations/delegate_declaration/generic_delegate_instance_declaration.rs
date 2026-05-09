@@ -1,9 +1,7 @@
 use std::any::Any;
-use std::borrow::Cow;
 use std::ptr::addr_of_mut;
 
 use crate::prelude::*;
-use parking_lot::RwLock;
 use windows::core::GUID;
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2, mdtTypeSpec};
 use crate::declarations::declaration::{Declaration, DeclarationKind};

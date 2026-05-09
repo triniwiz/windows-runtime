@@ -1,8 +1,5 @@
 use std::any::Any;
 use std::ptr::addr_of_mut;
-use crate::prelude::*;
-use std::sync::{Arc};
-use parking_lot::RwLock;
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::delegate_declaration::{DelegateDeclaration, DelegateDeclarationImpl};

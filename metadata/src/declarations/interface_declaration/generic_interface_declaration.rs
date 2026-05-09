@@ -1,7 +1,5 @@
 use std::any::Any;
 use std::ptr::addr_of_mut;
-use std::sync::Arc;
-use parking_lot::RwLock;
 use windows::core::GUID;
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 use crate::declarations::base_class_declaration::BaseClassDeclarationImpl;

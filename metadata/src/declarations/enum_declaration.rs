@@ -1,8 +1,6 @@
 use std::any::Any;
 use std::ffi::{c_void};
 use std::ptr::addr_of_mut;
-use std::sync::Arc;
-use parking_lot::RwLock;
 use windows::Win32::System::WinRT::Metadata::COR_ENUM_FIELD_NAME_W;
 use windows::Win32::System::WinRT::Metadata::CorTokenType;
 use windows::Win32::System::WinRT::Metadata::IMAGE_CEE_CS_CALLCONV_FIELD;

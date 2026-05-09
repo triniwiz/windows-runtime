@@ -1,8 +1,5 @@
-use std::hint::black_box;
 use std::mem::MaybeUninit;
 use std::ptr::addr_of_mut;
-use std::sync::Arc;
-use parking_lot::RwLock;
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, ELEMENT_TYPE_CLASS, ELEMENT_TYPE_GENERICINST, IMetaDataImport2, mdtTypeDef, mdtTypeRef, mdtTypeSpec};
 use crate::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use crate::declarations::delegate_declaration::{DelegateDeclaration, DelegateDeclarationImpl};

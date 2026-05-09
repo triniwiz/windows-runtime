@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::fmt::{Display, Formatter, write};
+use std::fmt::{Display, Formatter};
 
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq)]

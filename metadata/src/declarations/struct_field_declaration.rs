@@ -1,9 +1,6 @@
 use std::any::Any;
-use std::borrow::Cow;
 use std::ptr::addr_of_mut;
-use std::sync::Arc;
 
-use parking_lot::RwLock;
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMAGE_CEE_CS_CALLCONV_FIELD, IMetaDataImport2};
 
 use crate::declarations::declaration::{Declaration, DeclarationKind};

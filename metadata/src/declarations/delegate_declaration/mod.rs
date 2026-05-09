@@ -4,8 +4,6 @@ pub mod generic_delegate_instance_declaration;
 
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
-use std::sync::{Arc};
-use parking_lot::RwLock;
 use windows::core::{GUID, HSTRING, PCWSTR};
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 use crate::declarations::declaration::{Declaration, DeclarationKind};

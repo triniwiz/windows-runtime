@@ -1,10 +1,8 @@
 use std::any::Any;
-use std::fmt::{Debug, Formatter, Pointer};
+use std::fmt::{Debug, Formatter};
 use std::ptr::addr_of_mut;
-use std::sync::Arc;
-use parking_lot::{MappedRwLockReadGuard, RwLock};
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2, mdtFieldDef, mdtMethodDef, mdtProperty};
+use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 use crate::declaration_factory::DeclarationFactory;
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::event_declaration::EventDeclaration;
@@ -12,7 +10,6 @@ use crate::declarations::interface_declaration::InterfaceDeclaration;
 use crate::declarations::method_declaration::MethodDeclaration;
 use crate::declarations::property_declaration::PropertyDeclaration;
 use crate::declarations::type_declaration::TypeDeclaration;
-use crate::prelude::type_from_token;
 
 #[derive(Clone)]
 pub struct BaseClassDeclaration {
@@ -265,7 +262,7 @@ pub trait BaseClassDeclarationImpl {
         // let mut methods = self.find_methods_with_name(name).into_iter().map(|item| Box::new(item)).collect();
         // result.append(&mut methods);
 
-        let mut methods = self.find_methods_with_name(name);
+        let methods = self.find_methods_with_name(name);
         for method in methods.into_iter() {
             result.push(Box::new(method));
         }
@@ -273,7 +270,7 @@ pub trait BaseClassDeclarationImpl {
         // let mut properties = self.properties().into_iter().filter(|prop| prop.full_name() == name).collect();
         // result.append(&mut properties);
 
-        let mut properties = self.properties().to_vec();
+        let properties = self.properties().to_vec();
 
         for property in properties.into_iter() {
             if property.full_name() == name {
@@ -284,7 +281,7 @@ pub trait BaseClassDeclarationImpl {
         // let mut events = self.events().into_iter().filter(|event| event.full_name() == name).collect();
         // result.append(&mut events);
 
-        let mut events = self.events().to_vec();
+        let events = self.events().to_vec();
 
         for event in events {
             if event.full_name() == name {

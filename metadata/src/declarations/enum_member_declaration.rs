@@ -1,11 +1,9 @@
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::field_declaration::FieldDeclaration;
 use crate::value::Value;
-use parking_lot::RwLock;
 use std::any::Any;
 use std::fmt::{Display, Formatter};
 use std::ptr::addr_of_mut;
-use std::sync::Arc;
 use windows::Win32::System::WinRT::Metadata::{CorElementType, CorTokenType, IMetaDataImport2};
 
 #[derive(Debug)]

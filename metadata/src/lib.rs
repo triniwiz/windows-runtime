@@ -1,14 +1,7 @@
-use std::borrow::Cow;
-use std::ffi::{c_void, OsString};
+use std::ffi::c_void;
 use std::fmt::{Debug, Formatter};
-use std::os::windows::ffi::EncodeWide;
-use std::os::windows::prelude::OsStrExt;
-use std::ptr::{addr_of, addr_of_mut};
 use cxx::UniquePtr;
-use windows::core::{GUID, HSTRING, Interface, IUnknown, PCWSTR, Type};
-use windows::Win32::System::Com::{CLSIDFromProgID, CLSIDFromString};
-use windows::Win32::System::WinRT::Metadata::{CorElementType, CorTokenType, IMetaDataImport2, MDTypeRefToDef};
-use crate::prelude::PCCOR_SIGNATURE;
+use windows::core::{GUID, IUnknown};
 
 pub mod com_helpers;
 pub mod declarations;

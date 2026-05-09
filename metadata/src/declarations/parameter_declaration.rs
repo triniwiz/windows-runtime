@@ -1,11 +1,7 @@
 use std::any::Any;
 use crate::prelude::*;
-use std::borrow::Cow;
-use std::sync::{Arc};
-use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, ELEMENT_TYPE_BYREF, IMetaDataImport2, mdtParamDef};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
-use crate::declarations::type_declaration::TypeDeclaration;
 
 #[derive(Clone, Debug)]
 pub struct ParameterDeclaration {

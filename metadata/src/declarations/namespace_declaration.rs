@@ -44,7 +44,7 @@ impl NamespaceDeclaration {
         let name = windows::core::HSTRING::from(full_name);
         let mut spaces: MaybeUninit<*mut HSTRING> = MaybeUninit::zeroed();
         unsafe {
-            let result = RoResolveNamespace(
+            let _result = RoResolveNamespace(
                 &name,
                 &none,
                 None,

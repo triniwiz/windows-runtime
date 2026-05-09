@@ -1,21 +1,17 @@
-use std::ffi::{c_void, OsString};
-use std::mem::MaybeUninit;
+use std::ffi::OsString;
 use std::os::windows::prelude::OsStringExt;
 use std::ptr::addr_of_mut;
-use windows::core::{GUID, HRESULT, HSTRING, PCWSTR, Ref};
+use windows::core::{GUID, HSTRING, PCWSTR, Ref};
 use windows::Win32::System::WinRT::Metadata::{IRoMetaDataLocator, IRoMetaDataLocator_Impl, IRoSimpleMetaDataBuilder, RoGetParameterizedTypeInstanceIID, RoParseTypeName};
-use windows::Win32::System::WinRT::WindowsGetStringRawBuffer;
 use crate::declarations::class_declaration::ClassDeclaration;
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::delegate_declaration::{DelegateDeclaration, DelegateDeclarationImpl};
 use crate::declarations::delegate_declaration::generic_delegate_declaration::GenericDelegateDeclaration;
 use crate::declarations::enum_declaration::EnumDeclaration;
 use crate::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
-use crate::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
 use crate::declarations::interface_declaration::InterfaceDeclaration;
 use crate::declarations::struct_declaration::StructDeclaration;
 use crate::meta_data_reader::MetadataReader;
-use crate::prelude::*;
 use crate::signature::Signature;
 
 pub struct GenericInstanceIdBuilder {}
@@ -42,7 +38,7 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
 
                 match declaration.kind() {
                     DeclarationKind::Class => {
-                        let mut class_declaration = declaration
+                        let class_declaration = declaration
                             .as_any()
                             .downcast_ref::<ClassDeclaration>()
                             .unwrap();
@@ -67,7 +63,7 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                         return Ok(());
                     }
                     DeclarationKind::Interface => {
-                        let mut interface_declaration = declaration
+                        let interface_declaration = declaration
                             .as_any()
                             .downcast_ref::<InterfaceDeclaration>()
                             .unwrap();
@@ -85,7 +81,7 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                         return Ok(());
                     }
                     DeclarationKind::GenericInterface => {
-                        let mut generic_interface_declaration = declaration
+                        let generic_interface_declaration = declaration
                             .as_any()
                             .downcast_ref::<GenericInterfaceDeclaration>()
                             .unwrap();
@@ -101,7 +97,7 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                         return Ok(());
                     }
                     DeclarationKind::Enum => {
-                        let mut enum_declaration = declaration
+                        let enum_declaration = declaration
                             .as_any()
                             .downcast_ref::<EnumDeclaration>()
                             .unwrap();
@@ -128,7 +124,7 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                         return Ok(());
                     }
                     DeclarationKind::Struct => {
-                        let mut struct_declaration =
+                        let struct_declaration =
                             declaration.as_any().downcast_ref::<StructDeclaration>().unwrap();
 
                         if let Ok(builder) = metadatadestination.ok() {
@@ -165,7 +161,7 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                         return Ok(());
                     }
                     DeclarationKind::Delegate => {
-                        let mut delegate_declaration = declaration
+                        let delegate_declaration = declaration
                             .as_any()
                             .downcast_ref::<DelegateDeclaration>()
                             .unwrap();
@@ -183,7 +179,7 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                         return Ok(());
                     }
                     DeclarationKind::GenericDelegate => {
-                        let mut generic_delegate_declaration = declaration
+                        let generic_delegate_declaration = declaration
                             .as_any()
                             .downcast_ref::<GenericDelegateDeclaration>()
                             .unwrap();
@@ -213,7 +209,7 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
 
 impl GenericInstanceIdBuilder {
     pub fn generate_id(declaration: &dyn Declaration) -> GUID {
-        let mut declaration_full_name = declaration.full_name().to_string();
+        let declaration_full_name = declaration.full_name().to_string();
 
         let type_name = HSTRING::from(declaration_full_name);
         let mut parts_count = 0_u32;

@@ -1,14 +1,11 @@
 use std::any::Any;
-use std::fmt::{Debug, Formatter, Pointer};
-use std::sync::Arc;
-use parking_lot::RwLock;
-use windows::core::{HSTRING, PCWSTR};
+use std::fmt::{Debug, Formatter};
+use windows::core::PCWSTR;
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 use crate::declaration_factory::DeclarationFactory;
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::delegate_declaration::{DelegateDeclaration, DelegateDeclarationImpl};
 use crate::declarations::method_declaration::MethodDeclaration;
-use crate::declarations::type_declaration::TypeDeclaration;
 use crate::prelude::*;
 
 #[derive(Clone)]

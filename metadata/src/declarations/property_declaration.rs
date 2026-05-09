@@ -1,12 +1,8 @@
 use std::any::Any;
-use std::ffi::OsString;
 use std::ptr::addr_of_mut;
-use std::sync::Arc;
-use parking_lot::RwLock;
-use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMAGE_CEE_CS_CALLCONV_GENERICINST, IMAGE_CEE_CS_CALLCONV_HASTHIS, IMetaDataImport2, mdtMethodDef, mdtProperty};
+use windows::core::PCWSTR;
+use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMAGE_CEE_CS_CALLCONV_HASTHIS, IMetaDataImport2, mdtMethodDef, mdtProperty};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
-use crate::declarations::field_declaration::FieldDeclaration;
 use crate::declarations::method_declaration::MethodDeclaration;
 
 use crate::prelude::*;

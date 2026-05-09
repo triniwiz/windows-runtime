@@ -1,12 +1,10 @@
-use std::ffi::{c_void, OsStr, OsString};
-use std::fmt::{Debug, Formatter};
+use std::ffi::c_void;
+use std::fmt::Debug;
 use std::mem::MaybeUninit;
 use windows::core::{GUID, HSTRING, PCSTR, PCWSTR, Type};
-use windows::Win32::System::WinRT::Metadata::{tdAbstract, tdAnsiClass, tdAutoClass, tdAutoLayout, tdBeforeFieldInit, tdClass, tdClassSemanticsMask, tdCustomFormatClass, tdExplicitLayout, tdForwarder, tdHasSecurity, tdImport, tdInterface, tdLayoutMask, tdNestedAssembly, tdNestedFamANDAssem, tdNestedFamORAssem, tdNestedFamily, tdNestedPrivate, tdNestedPublic, tdNotPublic, tdPublic, tdRTSpecialName, tdSealed, tdSequentialLayout, tdSerializable, tdSpecialName, tdStringFormatMask, tdUnicodeClass, tdVisibilityMask, tdWindowsRuntime, CorTokenType, IMetaDataImport2, mdtTypeDef, mdtTypeRef, RoParseTypeName, mdMemberAccessMask, mdPrivateScope, mdPrivate, mdFamANDAssem, mdAssem, mdFamily, mdFamORAssem, mdPublic, mdStatic, mdFinal, mdVirtual, mdHideBySig, mdVtableLayoutMask, mdReuseSlot, mdNewSlot, mdCheckAccessOnOverride, mdAbstract, mdSpecialName, mdPinvokeImpl, mdUnmanagedExport, mdRTSpecialName, COR_CTOR_METHOD_NAME, COR_CTOR_METHOD_NAME_W, COR_CCTOR_METHOD_NAME, COR_CCTOR_METHOD_NAME_W, mdHasSecurity, mdRequireSecObject, prSpecialName, prHasDefault, prRTSpecialName, RoGetMetaDataFile, IMetaDataDispenserEx, evSpecialName, evRTSpecialName, CorElementType, mdtTypeSpec, mdtBaseType};
+use windows::Win32::System::WinRT::Metadata::{tdAbstract, tdAnsiClass, tdAutoClass, tdAutoLayout, tdBeforeFieldInit, tdClass, tdClassSemanticsMask, tdCustomFormatClass, tdExplicitLayout, tdForwarder, tdHasSecurity, tdImport, tdInterface, tdLayoutMask, tdNestedAssembly, tdNestedFamANDAssem, tdNestedFamORAssem, tdNestedFamily, tdNestedPrivate, tdNestedPublic, tdNotPublic, tdPublic, tdRTSpecialName, tdSealed, tdSequentialLayout, tdSerializable, tdSpecialName, tdStringFormatMask, tdUnicodeClass, tdVisibilityMask, tdWindowsRuntime, CorTokenType, IMetaDataImport2, mdtTypeDef, mdtTypeRef, mdMemberAccessMask, mdPrivateScope, mdPrivate, mdFamANDAssem, mdAssem, mdFamily, mdFamORAssem, mdPublic, mdStatic, mdFinal, mdVirtual, mdHideBySig, mdVtableLayoutMask, mdReuseSlot, mdNewSlot, mdCheckAccessOnOverride, mdAbstract, mdSpecialName, mdPinvokeImpl, mdUnmanagedExport, mdRTSpecialName, COR_CTOR_METHOD_NAME, COR_CTOR_METHOD_NAME_W, COR_CCTOR_METHOD_NAME, COR_CCTOR_METHOD_NAME_W, mdHasSecurity, mdRequireSecObject, prSpecialName, prHasDefault, prRTSpecialName, RoGetMetaDataFile, IMetaDataDispenserEx, evSpecialName, evRTSpecialName, CorElementType, mdtTypeSpec, mdtBaseType};
 use std::os::windows::prelude::*;
-use std::ptr::{addr_of, addr_of_mut, NonNull};
-use std::str::FromStr;
-use crate::signature::Signature;
+use std::ptr::addr_of_mut;
 
 pub const LOCALE_SYSTEM_DEFAULT: u32 = 0x0800;
 
@@ -69,7 +67,7 @@ pub fn cor_sig_uncompress_token(p_data: &mut PCCOR_SIGNATURE) -> u32 {
 }
 
 pub fn TokenFromRid(rid: u32, tktype: u32) -> u32 {
-    ((rid) | (tktype))
+    (rid) | (tktype) 
 }
 
 pub fn cor_sig_uncompress_element_type(p_data: &mut PCCOR_SIGNATURE) -> CorElementType {
@@ -281,7 +279,7 @@ pub fn resolve_type_ref(
                 )
             };
             debug_assert!(result.is_ok());
-            let mut string = HSTRING::from_wide(&data[..length.saturating_sub(1) as usize]);
+            let string = HSTRING::from_wide(&data[..length.saturating_sub(1) as usize]);
 
             let dispenser: MaybeUninit<IMetaDataDispenserEx> = MaybeUninit::zeroed();
             let mut value = external_token.0 as u32;//0_u32;
@@ -344,55 +342,55 @@ pub const fn is_td_not_public(x: i32) -> bool {
 }
 
 pub const fn is_td_public(x: i32) -> bool {
-    (((x) & tdVisibilityMask.0) == tdPublic.0)
+    ((x) & tdVisibilityMask.0) == tdPublic.0 
 }
 
 pub const fn is_td_nested_public(x: i32) -> bool {
-    (((x) & tdVisibilityMask.0) == tdNestedPublic.0)
+    ((x) & tdVisibilityMask.0) == tdNestedPublic.0 
 }
 
 pub const fn is_td_nested_private(x: i32) -> bool {
-    (((x) & tdVisibilityMask.0) == tdNestedPrivate.0)
+    ((x) & tdVisibilityMask.0) == tdNestedPrivate.0 
 }
 
 pub const fn is_td_nested_family(x: i32) -> bool {
-    (((x) & tdVisibilityMask.0) == tdNestedFamily.0)
+    ((x) & tdVisibilityMask.0) == tdNestedFamily.0 
 }
 
 pub const fn is_td_nested_assembly(x: i32) -> bool {
-    (((x) & tdVisibilityMask.0) == tdNestedAssembly.0)
+    ((x) & tdVisibilityMask.0) == tdNestedAssembly.0 
 }
 
 pub const fn is_td_nested_fam_andassem(x: i32) -> bool {
-    (((x) & tdVisibilityMask.0) == tdNestedFamANDAssem.0)
+    ((x) & tdVisibilityMask.0) == tdNestedFamANDAssem.0 
 }
 
 pub const fn is_td_nested_fam_orassem(x: i32) -> bool {
-    (((x) & tdVisibilityMask.0) == tdNestedFamORAssem.0)
+    ((x) & tdVisibilityMask.0) == tdNestedFamORAssem.0 
 }
 
 pub const fn is_td_nested(x: i32) -> bool {
-    (((x) & tdVisibilityMask.0) >= tdNestedPublic.0)
+    ((x) & tdVisibilityMask.0) >= tdNestedPublic.0 
 }
 
 pub const fn is_td_auto_layout(x: i32) -> bool {
-    (((x) & tdLayoutMask.0) == tdAutoLayout.0)
+    ((x) & tdLayoutMask.0) == tdAutoLayout.0 
 }
 
 pub const fn is_td_sequential_layout(x: i32) -> bool {
-    (((x) & tdLayoutMask.0) == tdSequentialLayout.0)
+    ((x) & tdLayoutMask.0) == tdSequentialLayout.0 
 }
 
 pub const fn is_td_explicit_layout(x: i32) -> bool {
-    (((x) & tdLayoutMask.0) == tdExplicitLayout.0)
+    ((x) & tdLayoutMask.0) == tdExplicitLayout.0 
 }
 
 pub const fn is_td_class(x: i32) -> bool {
-    (((x) & tdClassSemanticsMask.0) == tdClass.0)
+    ((x) & tdClassSemanticsMask.0) == tdClass.0 
 }
 
 pub const fn is_td_interface(x: i32) -> bool {
-    (((x) & tdClassSemanticsMask.0) == tdInterface.0)
+    ((x) & tdClassSemanticsMask.0) == tdInterface.0 
 }
 
 pub const fn is_td_abstract(x: i32) -> bool {
@@ -420,19 +418,19 @@ pub const fn is_td_windows_runtime(x: i32) -> bool {
 }
 
 pub const fn is_td_ansi_class(x: i32) -> bool {
-    (((x) & tdStringFormatMask.0) == tdAnsiClass.0)
+    ((x) & tdStringFormatMask.0) == tdAnsiClass.0 
 }
 
 pub const fn is_td_unicode_class(x: i32) -> bool {
-    (((x) & tdStringFormatMask.0) == tdUnicodeClass.0)
+    ((x) & tdStringFormatMask.0) == tdUnicodeClass.0 
 }
 
 pub const fn is_td_auto_class(x: i32) -> bool {
-    (((x) & tdStringFormatMask.0) == tdAutoClass.0)
+    ((x) & tdStringFormatMask.0) == tdAutoClass.0 
 }
 
 pub const fn is_td_custom_format_class(x: i32) -> bool {
-    (((x) & tdStringFormatMask.0) == tdCustomFormatClass.0)
+    ((x) & tdStringFormatMask.0) == tdCustomFormatClass.0 
 }
 
 pub const fn is_td_before_field_init(x: i32) -> bool {
@@ -458,27 +456,27 @@ pub fn type_from_token(tk: CorTokenType) -> i32 {
 
 // Macros for accessing the members of CorMethodAttr.
 pub const fn is_md_private_scope(x: i32) -> bool {
-    (((x) & mdMemberAccessMask.0) == mdPrivateScope.0)
+    ((x) & mdMemberAccessMask.0) == mdPrivateScope.0 
 }
 
 pub const fn is_md_private(x: i32) -> bool {
-    (((x) & mdMemberAccessMask.0) == mdPrivate.0)
+    ((x) & mdMemberAccessMask.0) == mdPrivate.0 
 }
 
 pub const fn is_md_fam_andassem(x: i32) -> bool {
-    (((x) & mdMemberAccessMask.0) == mdFamANDAssem.0)
+    ((x) & mdMemberAccessMask.0) == mdFamANDAssem.0 
 }
 
 pub const fn is_md_assem(x: i32) -> bool {
-    (((x) & mdMemberAccessMask.0) == mdAssem.0)
+    ((x) & mdMemberAccessMask.0) == mdAssem.0 
 }
 
 pub const fn is_md_family(x: i32) -> bool {
-    (((x) & mdMemberAccessMask.0) == mdFamily.0)
+    ((x) & mdMemberAccessMask.0) == mdFamily.0 
 }
 
 pub const fn is_md_fam_orassem(x: i32) -> bool {
-    (((x) & mdMemberAccessMask.0) == mdFamORAssem.0)
+    ((x) & mdMemberAccessMask.0) == mdFamORAssem.0 
 }
 
 pub const fn is_md_public(x: i32) -> bool {
@@ -502,11 +500,11 @@ pub const fn is_md_hide_by_sig(x: i32) -> bool {
 }
 
 pub const fn is_md_reuse_slot(x: i32) -> bool {
-    (((x) & mdVtableLayoutMask.0) == mdReuseSlot.0)
+    ((x) & mdVtableLayoutMask.0) == mdReuseSlot.0 
 }
 
 pub const fn is_md_new_slot(x: i32) -> bool {
-    (((x) & mdVtableLayoutMask.0) == mdNewSlot.0)
+    ((x) & mdVtableLayoutMask.0) == mdNewSlot.0 
 }
 
 pub const fn is_md_check_access_on_override(x: i32) -> bool {
@@ -534,19 +532,19 @@ pub const fn is_md_rtspecial_name(x: i32) -> bool {
 }
 
 pub fn is_md_instance_initializer(x: i32, str: &PCSTR) -> bool {
-    (((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && *str != COR_CTOR_METHOD_NAME)
+    ((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && *str != COR_CTOR_METHOD_NAME 
 }
 
 pub fn is_md_instance_initializer_w(x: i32, str: &PCWSTR) -> bool {
-    (((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && *str != COR_CTOR_METHOD_NAME_W)
+    ((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && *str != COR_CTOR_METHOD_NAME_W 
 }
 
 pub fn is_md_class_constructor(x: i32, str: &PCSTR) -> bool {
-    (((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && str != &COR_CCTOR_METHOD_NAME)
+    ((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && str != &COR_CCTOR_METHOD_NAME 
 }
 
 pub fn is_md_class_constructor_w(x: i32, str: &PCWSTR) -> bool {
-    (((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && str != &COR_CCTOR_METHOD_NAME_W)
+    ((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && str != &COR_CCTOR_METHOD_NAME_W 
 }
 
 pub const fn is_md_has_security(x: i32) -> bool {
