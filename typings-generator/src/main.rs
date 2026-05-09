@@ -210,13 +210,9 @@ fn map_type_to_ts_with_generics(value: &str, generic_params: &[String]) -> Strin
         }
     }
 
-    // Fully-qualified WinRT reference type usage: return the name with arity stripped.
-    if let Some(idx) = value.find('`') {
-        return value[..idx].to_string();
-    }
-
-    if !value.is_empty() && value.chars().next().unwrap().is_alphabetic() {
-        return value.to_string();
+    if !value.is_empty() && (value.chars().next().unwrap().is_alphabetic() || value.contains('.')) {
+        let result = if let Some(idx) = value.find('`') { &value[..idx] } else { value };
+        return result.to_string();
     }
 
     "unknown".to_string()
@@ -243,25 +239,19 @@ fn method_signature_with_generics(
                 .metadata()
                 .map(|m| Signature::to_string(m, &p.type_()))
                 .unwrap_or_else(|| "Object".to_string());
-            let rendered = if !generic_params.is_empty()
-                && (
-                    (method_name == "GetMany"
-                        && ((total_params == 1 && index == 0) || (total_params >= 2 && index + 1 == total_params)))
-                        || (method_name == "ReplaceAll" && index == 0)
-                        || (name == "items" && (method_name == "GetMany" || method_name == "ReplaceAll"))
-                )
-            {
+            
+            let rendered = if !generic_params.is_empty() && (
+                (method_name == "GetMany" && ((total_params == 1 && index == 0) || (total_params >= 2 && index + 1 == total_params)))
+                || (method_name == "ReplaceAll" && index == 0)
+                || (name == "items" && (method_name == "GetMany" || method_name == "ReplaceAll"))
+            ) {
                 format!("{}[]", generic_params[0])
             } else if method_name == "GetMany" && total_params >= 2 && index == 0 {
                 "number".to_string()
             } else {
                 map_type_to_ts_with_generics(param_ty.as_str(), generic_params)
             };
-            format!(
-                "{}: {}",
-                name,
-                rendered
-            )
+            format!("{}: {}", name, rendered)
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -272,17 +262,16 @@ fn method_signature_with_generics(
         .unwrap_or_else(|| "Void".to_string());
 
     let sep = if use_arrow { " => " } else { ": " };
-    format!(
-        "({params}){sep}{}",
-        map_type_to_ts_with_generics(ret_ty.as_str(), generic_params)
-    )
+    format!("({params}){sep}{}", map_type_to_ts_with_generics(ret_ty.as_str(), generic_params))
 }
 
 fn collect_all_interface_methods(interface: &InterfaceDeclaration, methods: &mut Vec<metadata::declarations::method_declaration::MethodDeclaration>, seen: &mut BTreeSet<String>) {
     for method in interface.methods().iter().filter(|m| m.is_exported()) {
-        // We use a combination of name and param count to distinguish overloads for the 'seen' check
-        // but TypeScript allows grouped overloads with the same name.
-        let sig_key = format!("{}:{}", method.name(), method.parameters().len());
+        let mut param_types = String::new();
+        for p in method.parameters() {
+            param_types.push_str(&Signature::as_string(&p.type_()));
+        }
+        let sig_key = format!("{}:{}:{}", method.name(), method.is_static(), param_types);
         if seen.insert(sig_key) {
             methods.push(method.clone());
         }
@@ -294,7 +283,11 @@ fn collect_all_interface_methods(interface: &InterfaceDeclaration, methods: &mut
 
 fn collect_all_class_methods(class_decl: &ClassDeclaration, methods: &mut Vec<metadata::declarations::method_declaration::MethodDeclaration>, seen: &mut BTreeSet<String>) {
     for method in class_decl.methods().iter().filter(|m| m.is_exported()) {
-        let sig_key = format!("{}:{}", method.name(), method.parameters().len());
+        let mut param_types = String::new();
+        for p in method.parameters() {
+            param_types.push_str(&Signature::as_string(&p.type_()));
+        }
+        let sig_key = format!("{}:{}:{}", method.name(), method.is_static(), param_types);
         if seen.insert(sig_key) {
             methods.push(method.clone());
         }
@@ -360,11 +353,12 @@ fn render_interface(name: &str, interface: &InterfaceDeclaration) -> String {
 
     for prop in properties {
         let return_ty = Signature::to_string(prop.getter().metadata().unwrap(), &prop.getter().return_type());
-        out.push_str(&format!("  {}: {};\n", prop.name(), map_type_to_ts(return_ty.as_str())));
+        out.push_str(&format!("  {}: {};\n", prop.name(), map_type_to_ts_with_generics(return_ty.as_str(), &[])));
     }
 
     for event in interface.events().iter().filter(|e| e.is_exported()) {
-        out.push_str(&format!("  {}: {};\n", event.name(), event_type_name(event)));
+        let event_type = event.type_().map(|d| d.full_name().to_string()).unwrap_or_else(|| "unknown".to_string());
+        out.push_str(&format!("  {}: {};\n", event.name(), map_type_to_ts_with_generics(&event_type, &[])));
     }
 
     out.push_str("}\n\n");
@@ -377,12 +371,12 @@ fn render_class(name: &str, class_decl: &ClassDeclaration) -> String {
     let extends = if base.is_empty() || base == "System.Object" {
         String::new()
     } else {
-        format!(" extends {}", map_type_to_ts(base))
+        format!(" extends {}", map_type_to_ts_with_generics(base, &[]))
     };
     let mut interfaces = class_decl
         .implemented_interfaces()
         .iter()
-        .map(|iface| map_type_to_ts(iface.full_name()))
+        .map(|iface| map_type_to_ts_with_generics(iface.full_name(), &[]))
         .filter(|name| !name.is_empty())
         .collect::<Vec<_>>();
     interfaces.sort();
@@ -419,18 +413,21 @@ fn render_class(name: &str, class_decl: &ClassDeclaration) -> String {
 
     for prop in properties {
         let return_ty = Signature::to_string(prop.getter().metadata().unwrap(), &prop.getter().return_type());
+        let ts_ty = map_type_to_ts_with_generics(return_ty.as_str(), &[]);
         if prop.is_static() {
-            out.push_str(&format!("  static {}: {};\n", prop.name(), map_type_to_ts(return_ty.as_str())));
+            out.push_str(&format!("  static {}: {};\n", prop.name(), ts_ty));
         } else {
-            out.push_str(&format!("  {}: {};\n", prop.name(), map_type_to_ts(return_ty.as_str())));
+            out.push_str(&format!("  {}: {};\n", prop.name(), ts_ty));
         }
     }
 
     for event in class_decl.events().iter().filter(|e| e.is_exported()) {
+        let event_type = event.type_().map(|d| d.full_name().to_string()).unwrap_or_else(|| "unknown".to_string());
+        let ts_ty = map_type_to_ts_with_generics(&event_type, &[]);
         if event.is_static() {
-            out.push_str(&format!("  static {}: {};\n", event.name(), event_type_name(event)));
+            out.push_str(&format!("  static {}: {};\n", event.name(), ts_ty));
         } else {
-            out.push_str(&format!("  {}: {};\n", event.name(), event_type_name(event)));
+            out.push_str(&format!("  {}: {};\n", event.name(), ts_ty));
         }
     }
 
@@ -1098,29 +1095,68 @@ fn augment_modules_from_winmd_scan(
     }
 }
 
+fn extract_types_from_signature(sig: &str, candidates: &mut VecDeque<String>) {
+    // Regex to find potential WinRT type names (e.g. Windows.Foundation.Uri)
+    let re = Regex::new(r"([A-Za-z][A-Za-z0-9_]*\.)+[A-Za-z][A-Za-z0-9_`]*").unwrap();
+    for cap in re.captures_iter(sig) {
+        candidates.push_back(cap[0].to_string());
+    }
+}
+
+fn collect_dependencies(lock: &dyn Declaration, candidates: &mut VecDeque<String>) {
+    match lock.kind() {
+        DeclarationKind::Class => {
+            if let Some(item) = lock.as_any().downcast_ref::<ClassDeclaration>() {
+                if !item.base_full_name().is_empty() { candidates.push_back(item.base_full_name().to_string()); }
+                for iface in item.implemented_interfaces() { candidates.push_back(iface.full_name().to_string()); }
+                for method in item.methods().iter().filter(|m| m.is_exported()) {
+                    let ret_ty = method.metadata().map(|m| Signature::to_string(m, &method.return_type())).unwrap_or_default();
+                    extract_types_from_signature(&ret_ty, candidates);
+                    for p in method.parameters() {
+                        let p_ty = p.metadata().map(|m| Signature::to_string(m, &p.type_())).unwrap_or_default();
+                        extract_types_from_signature(&p_ty, candidates);
+                    }
+                }
+                for prop in item.properties().iter().filter(|p| p.is_exported()) {
+                    let p_ty = Signature::to_string(prop.getter().metadata().unwrap(), &prop.getter().return_type());
+                    extract_types_from_signature(&p_ty, candidates);
+                }
+            }
+        }
+        DeclarationKind::Interface | DeclarationKind::GenericInterface => {
+            let implemented = if lock.kind() == DeclarationKind::Interface {
+                lock.as_any().downcast_ref::<InterfaceDeclaration>().unwrap().implemented_interfaces()
+            } else {
+                lock.as_any().downcast_ref::<GenericInterfaceDeclaration>().unwrap().implemented_interfaces()
+            };
+            for iface in implemented { candidates.push_back(iface.full_name().to_string()); }
+        }
+        _ => {}
+    }
+}
+
 fn main() {
     let (roots, out_path, input) = parse_args();
-
     let mut body = String::new();
     body.push_str("// Auto-generated by typings-generator\n");
     body.push_str("// Experimental: incomplete WinRT projection coverage\n\n");
 
     // Built-in value struct projections
     body.push_str(concat!(
-        "/** Projected WinRT GUID value struct. toString()/valueOf() return the standard\n",
-        " *  {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX} string form. */\n",
-        "interface Guid {\n",
-        "  /** High 32 bits */\n",
-        "  data1: number;\n",
-        "  /** Bits 32-47 */\n",
-        "  data2: number;\n",
-        "  /** Bits 48-63 */\n",
-        "  data3: number;\n",
-        "  /** Low 64 bits as 8 individual bytes */\n",
-        "  data4: number[];\n",
-        "  toString(): string;\n",
-        "  valueOf(): string;\n",
-        "}\n\n",
+        "/** Projected WinRT GUID value struct. toString()/valueOf() return the standard\\n",
+        " *  {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX} string form. */\\n",
+        "interface Guid {\\n",
+        "  /** High 32 bits */\\n",
+        "  data1: number;\\n",
+        "  /** Bits 32-47 */\\n",
+        "  data2: number;\\n",
+        "  /** Bits 48-63 */\\n",
+        "  data3: number;\\n",
+        "  /** Low 64 bits as 8 individual bytes */\\n",
+        "  data4: number[];\\n",
+        "  toString(): string;\\n",
+        "  valueOf(): string;\\n",
+        "}\\n\\n",
     ));
 
     if let Some(path) = &input {
@@ -1129,14 +1165,29 @@ fn main() {
     body.push_str(&format!("// Roots: {}\n\n", roots.join(", ")));
 
     let mut modules: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut discovery_queue = VecDeque::new();
+    let mut seen_types = BTreeSet::new();
+    let mut pending_modules = BTreeMap::new();
+
+    // Seed queue with roots
     for root in &roots {
-        let generated = walk_namespace(root.as_str());
-        for (namespace, mut declarations) in generated {
-            modules.entry(namespace).or_default().append(&mut declarations);
+        discovery_queue.push_back(root.to_string());
+    }
+
+    // discovery loop
+    while let Some(full_name) = discovery_queue.pop_front() {
+        if !seen_types.insert(full_name.clone()) { continue; }
+        let lookup = if let Some(idx) = full_name.find('`') { &full_name[..idx] } else { &full_name };
+        if let Some(dec) = MetadataReader::find_by_name(lookup) {
+            let lock = dec.read();
+            collect_dependencies(&*lock, &mut discovery_queue);
+            append_rendered_declaration(&*lock, &mut pending_modules);
         }
     }
 
-    augment_modules_from_winmd_scan(&roots, input.as_ref(), &mut modules);
+    for (ns, mut decls) in pending_modules {
+        modules.entry(ns).or_default().append(&mut decls);
+    }
 
     // Deduplicate declaration text per namespace to keep output stable.
     for declarations in modules.values_mut() {
