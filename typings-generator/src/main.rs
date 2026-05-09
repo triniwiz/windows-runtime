@@ -352,7 +352,7 @@ fn render_interface(name: &str, interface: &InterfaceDeclaration) -> String {
     methods.sort_by_key(|m| m.name());
 
     for method in methods {
-        out.push_str(&format!("  {}{};\n", method.name(), method_signature(method, false)));
+        out.push_str(&format!("  {}{};\n", method.name(), method_signature(&method, false)));
     }
 
     let mut properties = interface.properties().iter().filter(|p| p.is_exported()).collect::<Vec<_>>();
@@ -406,7 +406,7 @@ fn render_class(name: &str, class_decl: &ClassDeclaration) -> String {
     methods.sort_by_key(|m| m.name());
 
     for method in methods {
-        let sig = method_signature(method, false);
+        let sig = method_signature(&method, false);
         if method.is_static() {
             out.push_str(&format!("  static {}{};\n", method.name(), sig));
         } else {
