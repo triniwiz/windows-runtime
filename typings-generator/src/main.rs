@@ -349,14 +349,14 @@ fn render_interface(name: &str, interface: &InterfaceDeclaration) -> String {
     let mut seen = BTreeSet::new();
     collect_all_interface_methods(interface, &mut methods, &mut seen);
     
-    methods.sort_by_key(|m| m.name());
+    methods.sort_by(|a, b| a.name().cmp(b.name()));
 
     for method in methods {
         out.push_str(&format!("  {}{};\n", method.name(), method_signature(&method, false)));
     }
 
     let mut properties = interface.properties().iter().filter(|p| p.is_exported()).collect::<Vec<_>>();
-    properties.sort_by_key(|p| p.name());
+    properties.sort_by(|a, b| a.name().cmp(b.name()));
 
     for prop in properties {
         let return_ty = Signature::to_string(prop.getter().metadata().unwrap(), &prop.getter().return_type());
@@ -403,7 +403,7 @@ fn render_class(name: &str, class_decl: &ClassDeclaration) -> String {
     let mut seen = BTreeSet::new();
     collect_all_class_methods(class_decl, &mut methods, &mut seen);
 
-    methods.sort_by_key(|m| m.name());
+    methods.sort_by(|a, b| a.name().cmp(b.name()));
 
     for method in methods {
         let sig = method_signature(&method, false);
@@ -415,7 +415,7 @@ fn render_class(name: &str, class_decl: &ClassDeclaration) -> String {
     }
 
     let mut properties = class_decl.properties().iter().filter(|p| p.is_exported()).collect::<Vec<_>>();
-    properties.sort_by_key(|p| p.name());
+    properties.sort_by(|a, b| a.name().cmp(b.name()));
 
     for prop in properties {
         let return_ty = Signature::to_string(prop.getter().metadata().unwrap(), &prop.getter().return_type());
@@ -500,9 +500,8 @@ fn render_generic_interface(interface: &GenericInterfaceDeclaration) -> String {
     let extends = interface_extends_clause(interface.implemented_interfaces(), &generic_params);
     out.push_str(&format!("interface {}{}{} {{\n", name, generic_suffix, extends));
 
-    let methods = interface.methods().iter().filter(|m| m.is_exported()).collect::<Vec<_>>();
     let mut methods = interface.methods().iter().filter(|m| m.is_exported()).collect::<Vec<_>>();
-    methods.sort_by_key(|m| m.name());
+    methods.sort_by(|a, b| a.name().cmp(b.name()));
 
     for method in methods {
         out.push_str(&format!(
@@ -513,7 +512,7 @@ fn render_generic_interface(interface: &GenericInterfaceDeclaration) -> String {
     }
 
     let mut properties = interface.properties().iter().filter(|p| p.is_exported()).collect::<Vec<_>>();
-    properties.sort_by_key(|p| p.name());
+    properties.sort_by(|a, b| a.name().cmp(b.name()));
 
     for prop in properties {
         let return_ty = Signature::to_string(prop.getter().metadata().unwrap(), &prop.getter().return_type());
