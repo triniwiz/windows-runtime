@@ -46,7 +46,7 @@ impl Default for SbgConfig {
     fn default() -> Self {
         Self {
             metadata_source: PathBuf::from("./sbg_output/sbg_metadata.json"),
-            output_dir: PathBuf::from("./sbg_output"),
+            output_dir: PathBuf::from("./obj/_ns_/gen"),
             dotnet_path: "dotnet".to_string(),
             target_framework: "net8.0-windows10.0.19041.0".to_string(),
             app_cs_sources_dirs: Vec::new(),
@@ -130,11 +130,14 @@ impl StaticBindingGenerator {
             return Err(anyhow!("C# compilation failed:\n{}", stderr));
         }
 
-        // Determine assembly output path (convention: bin/Release/net*/ProjectName.dll)
+        // Determine assembly output path (convention: bin/Release/<target framework>/ProjectName.dll)
         let assembly_path = project_path
             .parent()
             .ok_or_else(|| anyhow!("Invalid project path"))?
-            .join("bin/Release/net8.0-windows10.0.19041.0/NSWinRTProxies.dll");
+            .join("bin")
+            .join("Release")
+            .join(&self.config.target_framework)
+            .join("NSWinRTProxies.dll");
 
         if !assembly_path.exists() {
             return Err(anyhow!(

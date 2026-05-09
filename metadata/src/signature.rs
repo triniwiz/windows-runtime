@@ -1,10 +1,50 @@
 #![allow(non_upper_case_globals)]
 
 use std::ffi::c_void;
-use windows::Win32::System::WinRT::Metadata::{ELEMENT_TYPE_VOID, ELEMENT_TYPE_BOOLEAN, ELEMENT_TYPE_CHAR, ELEMENT_TYPE_I1, ELEMENT_TYPE_U1, ELEMENT_TYPE_I2, ELEMENT_TYPE_U2, ELEMENT_TYPE_I4, ELEMENT_TYPE_U4, ELEMENT_TYPE_I8, ELEMENT_TYPE_U8, ELEMENT_TYPE_R4, ELEMENT_TYPE_R8, ELEMENT_TYPE_STRING, IMetaDataImport2, ELEMENT_TYPE_VALUETYPE, ELEMENT_TYPE_CLASS, ELEMENT_TYPE_OBJECT, ELEMENT_TYPE_SZARRAY, ELEMENT_TYPE_VAR, ELEMENT_TYPE_GENERICINST, ELEMENT_TYPE_BYREF, CorTokenType, CorElementType};
+use std::mem::MaybeUninit;
+use windows::Win32::System::WinRT::Metadata::{ELEMENT_TYPE_VOID, ELEMENT_TYPE_BOOLEAN, ELEMENT_TYPE_CHAR, ELEMENT_TYPE_I1, ELEMENT_TYPE_U1, ELEMENT_TYPE_I2, ELEMENT_TYPE_U2, ELEMENT_TYPE_I4, ELEMENT_TYPE_U4, ELEMENT_TYPE_I8, ELEMENT_TYPE_U8, ELEMENT_TYPE_R4, ELEMENT_TYPE_R8, ELEMENT_TYPE_STRING, IMetaDataImport2, ELEMENT_TYPE_VALUETYPE, ELEMENT_TYPE_CLASS, ELEMENT_TYPE_OBJECT, ELEMENT_TYPE_SZARRAY, ELEMENT_TYPE_VAR, ELEMENT_TYPE_GENERICINST, ELEMENT_TYPE_BYREF, CorTokenType, CorElementType, mdtTypeDef, mdtTypeRef};
 use crate::prelude::*;
 
 const Guid: &str = "Guid";
+
+/// Returns true when `token` is a TypeDef (or a TypeRef that resolves to one) whose base
+/// class is `System.Enum` — the invariant for all WinRT enum types.
+/// WinRT enums are always backed by a 32-bit integer on the ABI wire.
+fn is_enum_type(metadata: &IMetaDataImport2, token: CorTokenType) -> bool {
+    let token_kind = CorTokenType(type_from_token(token));
+
+    // For TypeRef tokens, resolve to the TypeDef in the external metadata scope first.
+    if token_kind == mdtTypeRef {
+        // resolve_type_ref opens the metadata file that owns the referenced type and
+        // returns both the external IMetaDataImport2 scope and the TypeDef token within it.
+        let mut ext_metadata: MaybeUninit<IMetaDataImport2> = MaybeUninit::zeroed();
+        let mut ext_token = token;
+        if resolve_type_ref(Some(metadata), token, unsafe { ext_metadata.assume_init_mut() }, &mut ext_token) {
+            return is_enum_type(unsafe { ext_metadata.assume_init_ref() }, ext_token);
+        }
+        return false;
+    }
+
+    if token_kind != mdtTypeDef {
+        return false;
+    }
+
+    let mut extends = 0u32;
+    let mut len = 0u32;
+    let ok = unsafe {
+        metadata
+            .GetTypeDefProps(token.0 as u32, None, &mut len, 0 as _, &mut extends)
+            .is_ok()
+    };
+    if !ok || extends == 0 {
+        return false;
+    }
+    let extends_kind = CorTokenType(type_from_token(CorTokenType(extends as i32)));
+    if extends_kind != mdtTypeDef && extends_kind != mdtTypeRef {
+        return false;
+    }
+    get_type_name(metadata, CorTokenType(extends as i32)) == SYSTEM_ENUM
+}
 
 pub struct Signature {}
 
@@ -90,13 +130,21 @@ impl Signature {
                 assert!(metadata.is_some());
 
                 let token = cor_sig_uncompress_token(&mut signature);
+                let metadata_ref = metadata.unwrap();
+                let token_type = CorTokenType(token as i32);
 
-                let class_name = get_type_name(metadata.unwrap(), CorTokenType(token as i32));
+                // WinRT enums are ELEMENT_TYPE_VALUETYPE but must be passed as
+                // Int32 on the ABI — not as a COM pointer.  Identify them early
+                // so downstream NativeType mapping never mistakes them for Pointer.
+                if is_enum_type(metadata_ref, token_type) {
+                    return "Int32".to_string();
+                }
 
+                let class_name = get_type_name(metadata_ref, token_type);
                 if class_name.eq("System.Guid") {
                     Guid.to_string()
                 } else {
-                    class_name.to_string()
+                    class_name
                 }
             }
             ELEMENT_TYPE_CLASS => {

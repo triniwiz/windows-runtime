@@ -27,6 +27,7 @@ use byteorder::ByteOrder;
 use libffi::middle::{Arg, Cif};
 use v8::FunctionCallbackArguments;
 use windows::core::{IInspectable, IUnknown, Interface, GUID, HRESULT, HSTRING, IUnknown_Vtbl, IInspectable_Vtbl};
+use windows::Foundation::PropertyValue;
 use windows::Win32::System::Com::IDispatch;
 use windows::Win32::System::WinRT::IActivationFactory;
 use windows::Win32::System::WinRT::Metadata::{CorElementType, ELEMENT_TYPE_CLASS};
@@ -421,60 +422,99 @@ pub fn ffi_parse_bool_arg(
 pub fn ffi_parse_u8_arg(
     arg: v8::Local<v8::Value>,
 ) -> std::result::Result<NativeValue, AnyError> {
-    let u8_value = v8::Local::<v8::Uint32>::try_from(arg)
-        .map_err(|_| type_error("Invalid FFI u8 type, expected unsigned integer"))?
-        .value() as u8;
-    Ok(NativeValue { u8_value })
+    if let Ok(v) = v8::Local::<v8::Uint32>::try_from(arg) {
+        return Ok(NativeValue { u8_value: v.value() as u8 });
+    }
+    if let Ok(v) = v8::Local::<v8::Number>::try_from(arg) {
+        let f = v.value();
+        if f.fract() == 0.0 && f >= 0.0 && f <= u8::MAX as f64 {
+            return Ok(NativeValue { u8_value: f as u8 });
+        }
+    }
+    Err(type_error("Invalid FFI u8 type, expected unsigned integer"))
 }
 
 #[inline]
 pub fn ffi_parse_i8_arg(
     arg: v8::Local<v8::Value>,
 ) -> std::result::Result<NativeValue, AnyError> {
-    let i8_value = v8::Local::<v8::Int32>::try_from(arg)
-        .map_err(|_| type_error("Invalid FFI i8 type, expected integer"))?
-        .value() as i8;
-    Ok(NativeValue { i8_value })
+    if let Ok(v) = v8::Local::<v8::Int32>::try_from(arg) {
+        return Ok(NativeValue { i8_value: v.value() as i8 });
+    }
+    if let Ok(v) = v8::Local::<v8::Number>::try_from(arg) {
+        let f = v.value();
+        if f.fract() == 0.0 && f >= i8::MIN as f64 && f <= i8::MAX as f64 {
+            return Ok(NativeValue { i8_value: f as i8 });
+        }
+    }
+    Err(type_error("Invalid FFI i8 type, expected integer"))
 }
 
 #[inline]
 pub fn ffi_parse_u16_arg(
     arg: v8::Local<v8::Value>,
 ) -> std::result::Result<NativeValue, AnyError> {
-    let u16_value = v8::Local::<v8::Uint32>::try_from(arg)
-        .map_err(|_| type_error("Invalid FFI u16 type, expected unsigned integer"))?
-        .value() as u16;
-    Ok(NativeValue { u16_value })
+    if let Ok(v) = v8::Local::<v8::Uint32>::try_from(arg) {
+        return Ok(NativeValue { u16_value: v.value() as u16 });
+    }
+    if let Ok(v) = v8::Local::<v8::Number>::try_from(arg) {
+        let f = v.value();
+        if f.fract() == 0.0 && f >= 0.0 && f <= u16::MAX as f64 {
+            return Ok(NativeValue { u16_value: f as u16 });
+        }
+    }
+    Err(type_error("Invalid FFI u16 type, expected unsigned integer"))
 }
 
 #[inline]
 pub fn ffi_parse_i16_arg(
     arg: v8::Local<v8::Value>,
 ) -> std::result::Result<NativeValue, AnyError> {
-    let i16_value = v8::Local::<v8::Int32>::try_from(arg)
-        .map_err(|_| type_error("Invalid FFI i16 type, expected integer"))?
-        .value() as i16;
-    Ok(NativeValue { i16_value })
+    if let Ok(v) = v8::Local::<v8::Int32>::try_from(arg) {
+        return Ok(NativeValue { i16_value: v.value() as i16 });
+    }
+    if let Ok(v) = v8::Local::<v8::Number>::try_from(arg) {
+        let f = v.value();
+        if f.fract() == 0.0 && f >= i16::MIN as f64 && f <= i16::MAX as f64 {
+            return Ok(NativeValue { i16_value: f as i16 });
+        }
+    }
+    Err(type_error("Invalid FFI i16 type, expected integer"))
 }
 
 #[inline]
 pub fn ffi_parse_u32_arg(
     arg: v8::Local<v8::Value>,
 ) -> std::result::Result<NativeValue, AnyError> {
-    let u32_value = v8::Local::<v8::Uint32>::try_from(arg)
-        .map_err(|_| type_error("Invalid FFI u32 type, expected unsigned integer"))?
-        .value();
-    Ok(NativeValue { u32_value })
+    if let Ok(v) = v8::Local::<v8::Uint32>::try_from(arg) {
+        return Ok(NativeValue { u32_value: v.value() });
+    }
+    if let Ok(v) = v8::Local::<v8::Number>::try_from(arg) {
+        let f = v.value();
+        if f.fract() == 0.0 && f >= 0.0 && f <= u32::MAX as f64 {
+            return Ok(NativeValue { u32_value: f as u32 });
+        }
+    }
+    Err(type_error("Invalid FFI u32 type, expected unsigned integer"))
 }
 
 #[inline]
 pub fn ffi_parse_i32_arg(
     arg: v8::Local<v8::Value>,
 ) -> std::result::Result<NativeValue, AnyError> {
-    let i32_value = v8::Local::<v8::Int32>::try_from(arg)
-        .map_err(|_| type_error("Invalid FFI i32 type, expected integer"))?
-        .value();
-    Ok(NativeValue { i32_value })
+    // Accept both Smi (Int32) and HeapNumber (Number) — WinRT enum values are
+    // cached as v8::Integer in the interceptor but may arrive as v8::Number when
+    // stored in JS variables or passed through expressions.
+    if let Ok(v) = v8::Local::<v8::Int32>::try_from(arg) {
+        return Ok(NativeValue { i32_value: v.value() });
+    }
+    if let Ok(v) = v8::Local::<v8::Number>::try_from(arg) {
+        let f = v.value();
+        if f.fract() == 0.0 && f >= i32::MIN as f64 && f <= i32::MAX as f64 {
+            return Ok(NativeValue { i32_value: f as i32 });
+        }
+    }
+    Err(type_error("Invalid FFI i32 type, expected integer"))
 }
 
 #[inline]
@@ -586,7 +626,7 @@ fn try_get_external_handle(
                 return Some(value.value());
             }
 
-            if handle.is_null_or_undefined() {
+            if handle.is_null() {
                 return Some(std::ptr::null_mut());
             }
         }
@@ -597,12 +637,17 @@ fn try_get_external_handle(
         let dec = dec.value() as *mut DeclarationFFI;
         let dec = unsafe { &*dec };
 
-        return Some(
-            dec.instance
-                .as_ref()
-                .map(|instance| unsafe { mem::transmute_copy(instance) })
-                .unwrap_or(std::ptr::null_mut()),
-        );
+        if let Some(ref instance) = dec.instance {
+            return Some(instance.as_raw() as *mut c_void);
+        }
+
+        // Struct objects have no COM instance; return a pointer to the raw
+        // byte buffer so WinRT setters receive the struct data by reference.
+        if let Some((ref buf, _)) = dec.struct_instance {
+            return Some(buf.as_ptr() as *mut c_void);
+        }
+
+        return Some(std::ptr::null_mut());
     }
 
     None
@@ -620,6 +665,44 @@ pub fn ffi_parse_pointer_arg(
         }
     }
 
+    // Box primitive JS values as WinRT IPropertyValue (IInspectable) so they can be
+    // passed to Object-typed parameters like Header, Content, or IVector<Object>.Append.
+    if arg.is_string() {
+        let s = arg.to_rust_string_lossy(scope);
+        let hstring = HSTRING::from(s.as_str());
+        if let Ok(inspectable) = PropertyValue::CreateString(&hstring) {
+            let ptr = inspectable.as_raw() as *mut c_void;
+            // WinRT callees AddRef when storing; our reference is intentionally leaked
+            // here so the raw pointer stays valid through the FFI call.
+            std::mem::forget(inspectable);
+            return Ok(NativeValue { pointer: ptr });
+        }
+    }
+
+    if arg.is_number() {
+        let n = arg.number_value(scope).unwrap_or(0.0);
+        if n == n.trunc() && n >= i32::MIN as f64 && n <= i32::MAX as f64 {
+            if let Ok(inspectable) = PropertyValue::CreateInt32(n as i32) {
+                let ptr = inspectable.as_raw() as *mut c_void;
+                std::mem::forget(inspectable);
+                return Ok(NativeValue { pointer: ptr });
+            }
+        } else if let Ok(inspectable) = PropertyValue::CreateDouble(n) {
+            let ptr = inspectable.as_raw() as *mut c_void;
+            std::mem::forget(inspectable);
+            return Ok(NativeValue { pointer: ptr });
+        }
+    }
+
+    if arg.is_boolean() {
+        let b = arg.boolean_value(scope);
+        if let Ok(inspectable) = PropertyValue::CreateBoolean(b) {
+            let ptr = inspectable.as_raw() as *mut c_void;
+            std::mem::forget(inspectable);
+            return Ok(NativeValue { pointer: ptr });
+        }
+    }
+
     let pointer = if let Ok(value) = v8::Local::<v8::External>::try_from(arg) {
         value.value()
     } else if arg.is_null_or_undefined() {
@@ -633,23 +716,76 @@ pub fn ffi_parse_pointer_arg(
 }
 
 #[inline]
+pub fn ffi_parse_query_interface_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    arg: v8::Local<v8::Value>,
+    iid: &GUID,
+) -> std::result::Result<(NativeValue, Option<IUnknown>), AnyError> {
+    if arg.is_null_or_undefined() {
+        return Ok((NativeValue { pointer: std::ptr::null_mut() }, None));
+    }
+
+    if arg.is_object() {
+        let arg = arg.to_object(scope).unwrap();
+        if let Some(pointer) = try_get_external_handle(scope, arg) {
+            if pointer.is_null() {
+                return Ok((NativeValue { pointer: std::ptr::null_mut() }, None));
+            }
+
+            let unknown = ManuallyDrop::new(unsafe { IUnknown::from_raw(pointer) });
+            let vtable = unknown.vtable();
+            let mut queried: *mut c_void = std::ptr::null_mut();
+
+            let result = unsafe {
+                ((*vtable).QueryInterface)(
+                    unknown.as_raw(),
+                    iid,
+                    &mut queried as *mut _ as *mut *mut c_void,
+                )
+            };
+
+            if result.is_ok() && !queried.is_null() {
+                let queried = unsafe { IUnknown::from_raw(queried) };
+                let pointer = queried.as_raw() as *mut c_void;
+                return Ok((NativeValue { pointer }, Some(queried)));
+            }
+
+            return Err(type_error("Invalid FFI interface argument for expected WinRT type"));
+        }
+    }
+
+    Ok((ffi_parse_pointer_arg(scope, arg)?, None))
+}
+
+#[inline]
 pub fn ffi_parse_buffer_arg(
     scope: &mut v8::PinScope<'_, '_>,
     arg: v8::Local<v8::Value>,
 ) -> std::result::Result<NativeValue, AnyError> {
+    let (value, _) = ffi_parse_buffer_arg_with_length(scope, arg)?;
+    Ok(value)
+}
+
+#[inline]
+pub fn ffi_parse_buffer_arg_with_length(
+    scope: &mut v8::PinScope<'_, '_>,
+    arg: v8::Local<v8::Value>,
+) -> std::result::Result<(NativeValue, u32), AnyError> {
     // Order of checking:
     // 1. ArrayBuffer: Fairly common and not supported by Fast API, optimise this case.
     // 2. ArrayBufferView: Common and supported by Fast API
     // 5. Null: Very uncommon / can be represented by a 0.
 
-    let pointer = if let Ok(value) = v8::Local::<v8::ArrayBuffer>::try_from(arg) {
+    let (pointer, byte_length) = if let Ok(value) = v8::Local::<v8::ArrayBuffer>::try_from(arg) {
+        let len = value.byte_length() as u32;
         if let Some(non_null) = value.data() {
-            non_null.as_ptr()
+            (non_null.as_ptr(), len)
         } else {
-            std::ptr::null_mut()
+            (std::ptr::null_mut(), len)
         }
     } else if let Ok(value) = v8::Local::<v8::ArrayBufferView>::try_from(arg) {
         let byte_offset = value.byte_offset();
+        let len = value.byte_length() as u32;
         let pointer = value
             .buffer(scope)
             .ok_or_else(|| {
@@ -659,18 +795,18 @@ pub fn ffi_parse_buffer_arg(
         if let Some(non_null) = pointer {
             // SAFETY: Pointer is non-null, and V8 guarantees that the byte_offset
             // is within the buffer backing store.
-            unsafe { non_null.as_ptr().add(byte_offset) }
+            (unsafe { non_null.as_ptr().add(byte_offset) }, len)
         } else {
-            std::ptr::null_mut()
+            (std::ptr::null_mut(), len)
         }
     } else if arg.is_null() {
-        std::ptr::null_mut()
+        (std::ptr::null_mut(), 0)
     } else {
         return Err(type_error(
             "Invalid FFI buffer type, expected null, ArrayBuffer, or ArrayBufferView",
         ));
     };
-    Ok(NativeValue { pointer })
+    Ok((NativeValue { pointer }, byte_length))
 }
 
 #[inline]

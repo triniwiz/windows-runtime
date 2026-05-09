@@ -37,6 +37,10 @@ namespace TestApp
             _runtimeHost.Initialize();
             _runtimeHost.RunMainScript();
 
+#if DEBUG
+            Windows.UI.Xaml.Media.CompositionTarget.Rendering += OnRenderFrame;
+#endif
+
             if (e.PreviousExecutionState == ApplicationExecutionState.Terminated
                 && ApplicationData.Current.LocalSettings.Values.TryGetValue(LastLaunchArgsKey, out object value))
             {
@@ -69,9 +73,16 @@ namespace TestApp
         private void OnSuspending(object sender, SuspendingEventArgs e)
         {
             var deferral = e.SuspendingOperation.GetDeferral();
+#if DEBUG
+            Windows.UI.Xaml.Media.CompositionTarget.Rendering -= OnRenderFrame;
+#endif
             ApplicationData.Current.LocalSettings.Values[LastLaunchArgsKey] = _lastLaunchArgs;
             _runtimeHost.Dispose();
             deferral.Complete();
         }
+
+#if DEBUG
+        private void OnRenderFrame(object sender, object e) => _runtimeHost.PumpDevtools();
+#endif
     }
 }

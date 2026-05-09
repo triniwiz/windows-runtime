@@ -8,7 +8,8 @@ use metadata::declarations::parameter_declaration::ParameterDeclaration;
 use metadata::declaring_interface_for_method::Metadata;
 use metadata::signature::Signature;
 use crate::error::AnyError;
-use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue};
+use crate::helpers::ffi_native_type_from_signature;
+use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue};
 
 pub struct GenericMethodCall {
     index: usize,
@@ -24,52 +25,15 @@ pub struct GenericMethodCall {
     parameter_types: Vec<NativeType>,
     parse_parameter_types: Vec<NativeType>,
     parameters: Vec<ParameterDeclaration>,
-    return_type: String
+    return_type: String,
+    /// Scratch buffer for value-type returns (same role as in MethodCall).
+    return_value_buf: [u8; 128],
 }
 
 #[inline]
 fn call_failure() -> HRESULT {
     // E_FAIL
     HRESULT(0x8000_4005u32 as i32)
-}
-
-#[inline]
-fn ffi_native_type_from_signature(signature: &str) -> NativeType {
-    let signature = signature.trim();
-    let by_ref_inner = signature.strip_prefix("ByRef ").unwrap_or(signature);
-
-    if let Some(element) = by_ref_inner.strip_suffix("[]") {
-        return match element {
-            "UInt8" | "Uint8" | "Int8" | "Byte" | "SByte" => NativeType::Buffer,
-            _ => NativeType::Pointer,
-        };
-    }
-
-    if by_ref_inner.starts_with("Var!")
-        || by_ref_inner.contains('.')
-        || by_ref_inner == "Object"
-        || by_ref_inner == "Guid"
-    {
-        return NativeType::Pointer;
-    }
-
-    match by_ref_inner {
-        "Void" => NativeType::Void,
-        "String" => NativeType::Pointer,
-        "Char16" => NativeType::U16,
-        "Boolean" => NativeType::Bool,
-        "UInt8" | "Uint8" | "Byte" => NativeType::U8,
-        "Int8" | "SByte" => NativeType::I8,
-        "UInt16" => NativeType::U16,
-        "UInt32" => NativeType::U32,
-        "UInt64" => NativeType::U64,
-        "Int16" => NativeType::I16,
-        "Int32" => NativeType::I32,
-        "Int64" => NativeType::I64,
-        "Single" => NativeType::F32,
-        "Double" => NativeType::F64,
-        _ => NativeType::Pointer,
-    }
 }
 
 impl GenericMethodCall {
@@ -97,22 +61,19 @@ impl GenericMethodCall {
 
         index = index.saturating_add(6); // account for IInspectable vtable overhead
 
-        let mut interface_ptr: *mut c_void = std::ptr::null_mut(); // IActivationFactory
-
-        let vtable = interface.vtable();
-
         let mut interface_ptr: *mut c_void = std::ptr::null_mut();
 
         let result = unsafe {
-            ((*vtable).QueryInterface)(
+            ((*interface.vtable()).QueryInterface)(
                 interface.as_raw(),
                 &iid,
                 &mut interface_ptr as *mut _ as *mut *mut c_void,
             )
         };
 
-        // assert!(result.is_ok());
-        // assert!(!interface_ptr.is_null());
+        // Generic interface QI is best-effort: fall back to the original interface
+        // when the object doesn't implement the expected instantiation.
+        let qi_ok = result.is_ok() && !interface_ptr.is_null();
 
         let is_composition = !is_sealed;
 
@@ -132,9 +93,7 @@ impl GenericMethodCall {
             }
         };
 
-        let number_of_abi_parameters = number_of_parameters + other_params;
-
-        let mut parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_abi_parameters);
+        let mut parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters + other_params + 4);
         let mut parse_parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters);
         parameter_types.push(NativeType::Pointer);
 
@@ -147,7 +106,13 @@ impl GenericMethodCall {
             let parse_native_type = NativeType::try_from(signature.as_str());
             assert!(parse_native_type.is_ok());
             parse_parameter_types.push(parse_native_type.unwrap());
-            parameter_types.push(ffi_native_type_from_signature(signature.as_str()));
+            let abi_native = ffi_native_type_from_signature(signature.as_str());
+            if matches!(abi_native, NativeType::Buffer) {
+                parameter_types.push(NativeType::U32);
+                parameter_types.push(NativeType::Buffer);
+            } else {
+                parameter_types.push(abi_native);
+            }
         }
 
         if is_initializer {
@@ -161,6 +126,8 @@ impl GenericMethodCall {
                 parameter_types.push(NativeType::Pointer);
             }
         }
+
+        let number_of_abi_parameters = parameter_types.len();
 
         let params =
             parameter_types
@@ -176,7 +143,12 @@ impl GenericMethodCall {
             Type::i32(),
         );
 
-        let vtable: *mut *mut c_void = unsafe { std::mem::transmute(interface.vtable()) };
+        let effective_interface = if qi_ok {
+            unsafe { IUnknown::from_raw(interface_ptr) }
+        } else {
+            interface.clone()
+        };
+        let vtable: *mut *mut c_void = unsafe { std::mem::transmute(effective_interface.vtable()) };
         let func = unsafe { *vtable.offset(index as isize) };
 
         Self {
@@ -189,11 +161,12 @@ impl GenericMethodCall {
             is_sealed,
             is_void: method.is_void(),
             iid,
-            interface,
+            interface: effective_interface,
             parameter_types,
             parse_parameter_types,
             parameters: method.parameters().to_vec(),
             return_type,
+            return_value_buf: [0u8; 128],
         }
     }
 
@@ -206,7 +179,7 @@ impl GenericMethodCall {
 
         let mut arguments: Vec<NativeValue> = Vec::with_capacity(number_of_abi_parameters);
 
-        unsafe { arguments.push(NativeValue { pointer: std::mem::transmute_copy(&self.interface) }) };
+        arguments.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
 
         for (i, native_type) in self.parse_parameter_types.iter().enumerate() {
             let value = args.get(i as i32);
@@ -258,7 +231,15 @@ impl GenericMethodCall {
                     ffi_parse_pointer_arg(scope, value)
                 }
                 NativeType::Buffer => {
-                    ffi_parse_buffer_arg(scope, value)
+                    let parsed = ffi_parse_buffer_arg_with_length(scope, value);
+                    let (buffer_value, byte_length) = match parsed {
+                        Ok(value) => value,
+                        Err(_) => return (call_failure(), std::ptr::null_mut()),
+                    };
+
+                    arguments.push(NativeValue { u32_value: byte_length });
+                    arguments.push(buffer_value);
+                    continue;
                 }
                 NativeType::Function => {
                     ffi_parse_function_arg(scope, value)

@@ -4,6 +4,7 @@ use libffi::middle::*;
 use parking_lot::RwLock;
 use windows::core::{GUID, HRESULT, Interface, IUnknown};
 use windows::Win32::System::WinRT::IActivationFactory;
+use windows::Win32::System::WinRT::Metadata::CorTokenType;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use metadata::declarations::declaration::DeclarationKind;
 use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
@@ -14,7 +15,7 @@ use metadata::declaring_interface_for_method::Metadata;
 use metadata::signature::Signature;
 use crate::error::AnyError;
 use crate::helpers::ffi_native_type_from_signature;
-use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue};
+use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue};
 
 pub struct PropertyCall {
     index: usize,
@@ -53,12 +54,20 @@ impl PropertyCall {
         self.return_type.as_str()
     }
 
+    pub fn parse_types_debug(&self) -> &[NativeType] {
+        &self.parse_parameter_types
+    }
+
+    pub fn abi_types_debug(&self) -> &[NativeType] {
+        &self.parameter_types
+    }
+
     pub fn new(
         property: &PropertyDeclaration,
         is_setter: bool,
         interface: IUnknown,
         is_initializer: bool,
-    ) -> Self {
+    ) -> Option<Self> {
         let method = if is_setter {
             property.setter().unwrap()
         } else {
@@ -73,8 +82,28 @@ impl PropertyCall {
 
         let iid = match Metadata::find_declaring_interface_for_method(method, &mut index) {
             None => {
-                index = 0;
-                IActivationFactory::IID
+                if let Some(metadata) = method.metadata() {
+                    let containing_type = CorTokenType(
+                        Metadata::get_method_containing_class_token(metadata, method.token()) as i32,
+                    );
+
+                    if containing_type.0 != 0 {
+                        let interface_declaration = Arc::new(RwLock::new(InterfaceDeclaration::new(
+                            Some(metadata),
+                            containing_type,
+                        )));
+                        index = Metadata::find_method_index(metadata, containing_type, method.token());
+                        let iid = interface_declaration.read().id();
+                        declaration = Some(interface_declaration);
+                        iid
+                    } else {
+                        index = 0;
+                        IActivationFactory::IID
+                    }
+                } else {
+                    index = 0;
+                    IActivationFactory::IID
+                }
             }
             Some(interface) => {
                 let iid;
@@ -88,16 +117,14 @@ impl PropertyCall {
                             let ii = ii_lock
                                 .as_declaration()
                                 .as_any()
-                                .downcast_ref::<GenericInterfaceInstanceDeclaration>();
-                            let ii = ii.unwrap();
+                                .downcast_ref::<GenericInterfaceInstanceDeclaration>()?;
                             iid = ii.id();
                         }
                         _ => {
                             let ii = ii_lock
                                 .as_declaration()
                                 .as_any()
-                                .downcast_ref::<InterfaceDeclaration>();
-                            let ii = ii.unwrap();
+                                .downcast_ref::<InterfaceDeclaration>()?;
                             iid = ii.id();
                         }
                     }
@@ -108,8 +135,6 @@ impl PropertyCall {
         };
 
         index = index.saturating_add(6); // account for IInspectable vtable overhead
-
-        let mut interface_ptr: *const c_void = std::ptr::null_mut(); // IActivationFactory
 
         let vtable = interface.vtable();
 
@@ -123,8 +148,9 @@ impl PropertyCall {
             )
         };
 
-        assert!(result.is_ok());
-        assert!(!interface_ptr.is_null());
+        if result.is_err() || interface_ptr.is_null() {
+            return None;
+        }
 
         let is_sealed = method.is_sealed();
 
@@ -134,7 +160,7 @@ impl PropertyCall {
 
         let signature = method.return_type();
 
-        let return_type = Signature::to_string(method.metadata().unwrap(), &signature);
+        let return_type = Signature::to_string(method.metadata()?, &signature);
 
 
         let other_params: usize = if is_initializer {
@@ -151,22 +177,25 @@ impl PropertyCall {
             }
         };
 
-        let number_of_abi_parameters = number_of_parameters + other_params;
-
-        let mut parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_abi_parameters);
+        let mut parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters + other_params + 4);
         let mut parse_parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters);
         parameter_types.push(NativeType::Pointer);
 
         for parameter in method.parameters().iter() {
             let type_ = parameter.type_();
-            let metadata = parameter.metadata().unwrap();
+            let metadata = parameter.metadata()?;
 
             let signature = Signature::to_string(metadata, &type_);
 
-            let parse_native_type = NativeType::try_from(signature.as_str());
-            assert!(parse_native_type.is_ok());
-            parse_parameter_types.push(parse_native_type.unwrap());
-            parameter_types.push(ffi_native_type_from_signature(signature.as_str()));
+            let parse_native_type = NativeType::try_from(signature.as_str()).ok()?;
+            parse_parameter_types.push(parse_native_type);
+            let abi_native = ffi_native_type_from_signature(signature.as_str());
+            if matches!(abi_native, NativeType::Buffer) {
+                parameter_types.push(NativeType::U32);
+                parameter_types.push(NativeType::Buffer);
+            } else {
+                parameter_types.push(abi_native);
+            }
         }
 
         if is_initializer {
@@ -183,6 +212,8 @@ impl PropertyCall {
         }
 
 
+        let number_of_abi_parameters = parameter_types.len();
+
         let params =
             parameter_types
                 .iter()
@@ -190,10 +221,10 @@ impl PropertyCall {
                 .map(libffi::middle::Type::try_from)
                 .collect::<std::result::Result<Vec<Type>, AnyError>>();
 
-        assert!(params.is_ok());
+        let params = params.ok()?;
 
         let cif = Cif::new(
-            params.unwrap(),
+            params,
             Type::i32(),
         );
 
@@ -204,7 +235,7 @@ impl PropertyCall {
         let func = unsafe { *vtable.offset(index as isize) };
 
 
-        Self {
+        Some(Self {
             index,
             number_of_parameters,
             number_of_abi_parameters,
@@ -223,7 +254,7 @@ impl PropertyCall {
             return_type,
             is_setter,
             argument_buf: Vec::with_capacity(number_of_abi_parameters),
-        }
+        })
     }
 
     pub fn call(
@@ -249,7 +280,7 @@ impl PropertyCall {
         // Reuse the pre-allocated buffer — avoids a heap allocation on every call.
         self.argument_buf.clear();
 
-        unsafe { self.argument_buf.push(NativeValue { pointer: std::mem::transmute_copy(&self.interface) }) };
+        self.argument_buf.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
 
         for (i, native_type) in self.parse_parameter_types.iter().enumerate() {
             let Some(value) = values.get(i).copied() else {
@@ -303,7 +334,15 @@ impl PropertyCall {
                     ffi_parse_pointer_arg(scope, value)
                 }
                 NativeType::Buffer => {
-                    ffi_parse_buffer_arg(scope, value)
+                    let parsed = ffi_parse_buffer_arg_with_length(scope, value);
+                    let (buffer_value, byte_length) = match parsed {
+                        Ok(value) => value,
+                        Err(_) => return (call_failure(), std::ptr::null_mut()),
+                    };
+
+                    self.argument_buf.push(NativeValue { u32_value: byte_length });
+                    self.argument_buf.push(buffer_value);
+                    continue;
                 }
                 NativeType::Function => {
                     ffi_parse_function_arg(scope, value)

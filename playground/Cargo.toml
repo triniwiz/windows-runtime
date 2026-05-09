@@ -8,7 +8,7 @@ metadata = { path = "../metadata" }
 nativescript = { path = "../nativescript" }
 
 [dependencies.windows]
-version = "0.62"
+workspace = true
 features = [
     "Foundation",
     "Foundation_Collections",

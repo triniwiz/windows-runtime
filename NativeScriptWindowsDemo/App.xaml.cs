@@ -21,7 +21,9 @@ namespace NativeScriptWindowsDemo
 
         public App()
         {
+            CrashDiagnostics.InstallGlobalHandlers();
             this.Suspending += OnSuspending;
+            this.UnhandledException += OnUnhandledException;
         }
 
         /// <summary>
@@ -42,6 +44,10 @@ namespace NativeScriptWindowsDemo
             {
                 System.Diagnostics.Debug.WriteLine($"[NativeScript] Script exception: {scriptEx.Message}");
             }
+
+#if DEBUG
+            Windows.UI.Xaml.Media.CompositionTarget.Rendering += OnRenderFrame;
+#endif
 
             if (e.PreviousExecutionState == ApplicationExecutionState.Terminated
                 && ApplicationData.Current.LocalSettings.Values.TryGetValue(LastLaunchArgsKey, out object value))
@@ -89,9 +95,24 @@ namespace NativeScriptWindowsDemo
         private void OnSuspending(object sender, SuspendingEventArgs e)
         {
             var deferral = e.SuspendingOperation.GetDeferral();
+#if DEBUG
+            Windows.UI.Xaml.Media.CompositionTarget.Rendering -= OnRenderFrame;
+#endif
             ApplicationData.Current.LocalSettings.Values[LastLaunchArgsKey] = _lastLaunchArgs;
             _runtimeHost.Dispose();
             deferral.Complete();
         }
+
+        private void OnUnhandledException(object sender, Windows.UI.Xaml.UnhandledExceptionEventArgs e)
+        {
+            CrashDiagnostics.WriteExceptionReport(
+                "Xaml.UnhandledException",
+                e.Exception,
+                "Message=" + e.Message + "; Handled=" + e.Handled);
+        }
+
+#if DEBUG
+        private void OnRenderFrame(object sender, object e) => _runtimeHost.PumpDevtools();
+#endif
     }
 }

@@ -87,6 +87,13 @@ impl ProxyManifest {
         extensions: Vec<ExtensionMetadata>,
         assembly_path: &Path,
     ) -> Result<Self> {
+        let stored_assembly_path = assembly_path
+            .ancestors()
+            .nth(4)
+            .and_then(|generation_root| assembly_path.strip_prefix(generation_root).ok())
+            .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| assembly_path.to_string_lossy().replace('\\', "/"));
+
         let proxy_classes = extensions
             .into_iter()
             .map(|ext| ProxyClass {
@@ -120,7 +127,7 @@ impl ProxyManifest {
 
         Ok(Self {
             version: "1.0".to_string(),
-            assembly_path: Some(assembly_path.to_string_lossy().to_string()),
+            assembly_path: Some(stored_assembly_path),
             proxy_classes,
             generated_at: chrono::Utc::now().to_rfc3339(),
         })
