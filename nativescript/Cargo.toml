@@ -10,9 +10,13 @@ edition = "2021"
 
 [lib]
 name = "nativescript"
-crate-type = ["dylib"]
+crate-type = ["cdylib", "rlib"]
 
+
+[features]
+devtools = ["dep:runtime-devtools"]
 
 [dependencies]
 runtime = { path = "../runtime" }
 ctrlc = "3.4"
+runtime-devtools = { path = "../runtime-devtools", optional = true }

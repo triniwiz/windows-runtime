@@ -1,12 +1,12 @@
+use crate::declarations::declaration::{Declaration, DeclarationKind};
+use crate::declarations::field_declaration::FieldDeclaration;
+use crate::value::Value;
+use parking_lot::RwLock;
 use std::any::Any;
 use std::fmt::{Display, Formatter};
 use std::ptr::addr_of_mut;
 use std::sync::Arc;
-use parking_lot::{RwLock};
 use windows::Win32::System::WinRT::Metadata::{CorElementType, CorTokenType, IMetaDataImport2};
-use crate::declarations::declaration::{Declaration, DeclarationKind};
-use crate::declarations::field_declaration::FieldDeclaration;
-use crate::value::Value;
 
 #[derive(Debug)]
 pub struct EnumMemberDeclaration {
@@ -22,7 +22,7 @@ impl Display for EnumMemberDeclaration {
 impl EnumMemberDeclaration {
     pub fn new(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> Self {
         Self {
-            base: FieldDeclaration::new(DeclarationKind::EnumMember, metadata, token)
+            base: FieldDeclaration::new(DeclarationKind::EnumMember, metadata, token),
         }
     }
 
@@ -53,12 +53,12 @@ impl EnumMemberDeclaration {
 
                 match CorElementType(value_type as u8) {
                     windows::Win32::System::WinRT::Metadata::ELEMENT_TYPE_I4 => {
-                        let value: &mut i32 = unsafe {std::mem::transmute(value)};
+                        let value: &mut i32 = unsafe { std::mem::transmute(value) };
                         Value::Int32(*value)
                     }
 
                     windows::Win32::System::WinRT::Metadata::ELEMENT_TYPE_U4 => {
-                        let value:&mut u32 = unsafe {std::mem::transmute(value)};
+                        let value: &mut u32 = unsafe { std::mem::transmute(value) };
                         Value::Uint32(*value)
                     }
                     _ => {

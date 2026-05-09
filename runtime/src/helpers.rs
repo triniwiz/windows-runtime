@@ -1,6 +1,21 @@
 use regex::Regex;
 use crate::value::NativeType;
 
+/// Strip the generic instantiation suffix from a WinRT type name.
+///
+/// `"Windows.Foundation.IAsyncOperation`1<IUICommand>"` → `"Windows.Foundation.IAsyncOperation"`.
+///
+/// Returns the input unchanged when no backtick / angle-bracket suffix is present.
+#[inline]
+pub fn strip_generic_suffix(name: &str) -> &str {
+    if let Some(angle) = name.find('<') {
+        // Prefer cutting at the backtick count marker just before '<'.
+        let backtick_pos = name[..angle].rfind('`').unwrap_or(angle);
+        return &name[..backtick_pos];
+    }
+    name
+}
+
 pub struct GenericReturnTypes<'s> {
     names: Vec<&'s str>,
     types: usize,
@@ -54,6 +69,12 @@ pub(crate) fn ffi_native_type_from_signature(signature: &str) -> NativeType {
             "UInt8" | "Uint8" | "Int8" | "Byte" | "SByte" => NativeType::Buffer,
             _ => NativeType::Pointer,
         };
+    }
+
+    // EventRegistrationToken passed by value in remove_* methods — treat as i64.
+    // "ByRef Windows.Foundation.EventRegistrationToken" (add out-param) stays as Pointer below.
+    if signature == "Windows.Foundation.EventRegistrationToken" {
+        return NativeType::I64;
     }
 
     if by_ref_inner.starts_with("Var!")

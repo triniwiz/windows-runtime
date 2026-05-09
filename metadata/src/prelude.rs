@@ -191,9 +191,16 @@ pub fn get_guid_attribute_value(metadata: Option<&IMetaDataImport2>, token: CorT
 
             assert!(result.is_ok());
 
-            let mut data = data as *mut u8;
-            // Skip prolog
-            let os_data = unsafe { data.offset(2) };
+            // GetCustomAttributeByName returns S_FALSE (is_ok() == true) when the
+            // attribute is absent, leaving data == null and size == 0. Guard both
+            // to avoid a null-pointer dereference in GetGUID.
+            if data.is_null() || size < 2 {
+                return guid; // zeroed GUID
+            }
+
+            let data = data as *const u8;
+            // Skip the 2-byte custom-attribute prolog (0x01 0x00).
+            let os_data = unsafe { data.add(2) };
 
             guid = crate::get_guid(os_data);
         }

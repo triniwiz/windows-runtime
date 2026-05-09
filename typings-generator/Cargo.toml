@@ -9,5 +9,5 @@ parking_lot = "0.12"
 regex = "1.10"
 
 [dependencies.windows]
-version = "0.62"
+workspace = true
 features = ["Win32_System_WinRT_Metadata"]

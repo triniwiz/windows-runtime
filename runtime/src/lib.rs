@@ -11,10 +11,19 @@ mod helpers;
 mod class;
 mod name_space;
 mod proxy_manifest_loader;
+mod message_port;
+mod worker_support;
+mod hmr_support;
+mod worker_threads;
+mod livesync;
+mod class_helpers;
+mod type_description;
+mod global_fns;
+mod ns_proxy;
 
 use std::any::Any;
-use std::cell::RefCell;
-use std::collections::HashSet;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void, CString};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -26,6 +35,7 @@ use std::ptr::{addr_of, addr_of_mut, NonNull};
 use std::process::Command;
 use std::result;
 use std::sync::{Arc, Once, OnceLock};
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 use libffi::high::arg;
 use libffi::low::{CodePtr, ffi_type};
@@ -33,10 +43,11 @@ use libffi::middle::Cif;
 use parking_lot::{Mutex, RawRwLock, RwLock};
 use parking_lot::lock_api::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLockReadGuard, RwLockWriteGuard};
 use v8::{FunctionTemplate, Global, Local, Number, Object};
-use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, IUnknown_Vtbl, PCWSTR, IInspectable, Error};
+use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, IUnknown_Vtbl, PCSTR, PCWSTR, IInspectable, Error};
 use windows::Foundation::GuidHelper;
 use windows::Win32::System::Com::{IDispatch, IDispatch_Vtbl};
 use windows::Win32::System::Console::GetConsoleWindow;
+use windows::Win32::System::Diagnostics::Debug::OutputDebugStringA;
 use windows::Win32::System::WinRT::{IActivationFactory, RoActivateInstance, RoGetActivationFactory, RoInitialize, RoUninitialize, RO_INIT_SINGLETHREADED};
 use windows::Win32::System::WinRT::Metadata::ELEMENT_TYPE_CHAR;
 use windows::Win32::UI::Shell::IInitializeWithWindow;
@@ -61,6 +72,7 @@ use metadata::meta_data_reader::MetadataReader;
 use metadata::prelude::{get_guid_attribute_value, get_string_value_from_blob, get_type_name, LOCALE_SYSTEM_DEFAULT};
 use metadata::{guid_to_string, query_interface, signature};
 use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
+use metadata::declarations::event_declaration::EventDeclaration;
 use metadata::declarations::method_declaration::MethodDeclaration;
 use metadata::declarations::property_declaration::PropertyDeclaration;
 use metadata::declarations::struct_declaration::StructDeclaration;
@@ -73,6 +85,15 @@ use crate::proxy_manifest_loader::SbgManifestLoader;
 
 thread_local!(static ISOLATE: RefCell<Option<&'static mut v8::Isolate>> = RefCell::new(None));
 
+/// Raw pointer to the V8 isolate, set once during Runtime::new so that
+/// JS delegate Invoke trampolines can enter V8 without a scope on the stack.
+thread_local!(static DELEGATE_ISOLATE_PTR: Cell<*mut v8::Isolate> = Cell::new(std::ptr::null_mut()));
+
+/// Optional hook called from the async-wait message loop so external tools
+/// (e.g. the devtools server) can pump their own messages without the runtime
+/// needing to depend on those crates directly.
+thread_local!(pub static ASYNC_PUMP_HOOK: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None));
+
 pub struct Runtime {
     isolate: v8::OwnedIsolate,
     global_context: v8::Global<v8::Context>,
@@ -83,18 +104,18 @@ pub struct Runtime {
 static INIT: Once = Once::new();
 static PROXY_MANIFESTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
-fn proxy_manifests() -> &'static Mutex<Vec<String>> {
+pub(crate) fn proxy_manifests() -> &'static Mutex<Vec<String>> {
     PROXY_MANIFESTS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// Tracks hashes of already-loaded manifests to avoid O(N×size) string comparison.
 static MANIFEST_HASHES: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
 
-fn manifest_hashes() -> &'static Mutex<HashSet<u64>> {
+pub(crate) fn manifest_hashes() -> &'static Mutex<HashSet<u64>> {
     MANIFEST_HASHES.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-fn content_hash(s: &str) -> u64 {
+pub(crate) fn content_hash(s: &str) -> u64 {
     let mut h = AHasher::default();
     s.hash(&mut h);
     h.finish()
@@ -107,7 +128,7 @@ fn default_sbg_manifest_path() -> PathBuf {
     if let Ok(out_dir) = std::env::var("SBG_OUTPUT_DIR") {
         return PathBuf::from(out_dir).join("sbg-manifest.json");
     }
-    PathBuf::from("sbg_output").join("sbg-manifest.json")
+    PathBuf::from("obj").join("_ns_").join("gen").join("sbg-manifest.json")
 }
 
 fn preload_sbg_manifest() {
@@ -235,6 +256,74 @@ fn collect_class_properties(class_declaration: &ClassDeclaration) -> Vec<Propert
     properties
 }
 
+struct ClassMembers {
+    properties: HashMap<String, PropertyDeclaration>,
+    /// Keyed by overload name when present, plain name otherwise.
+    methods: HashMap<String, MethodDeclaration>,
+}
+
+/// Per-thread because `PropertyDeclaration` / `MethodDeclaration` carry raw
+/// WinMD pointers that aren't `Send`. UWP runs single-threaded, so this is
+/// effectively a global cache.
+thread_local!(static CLASS_MEMBERS_CACHE: RefCell<HashMap<String, ClassMembers>> = RefCell::new(HashMap::new()));
+
+fn fill_class_members(
+    class_declaration: &ClassDeclaration,
+    properties: &mut HashMap<String, PropertyDeclaration>,
+    methods: &mut HashMap<String, MethodDeclaration>,
+) {
+    let mut absorb_props = |list: &[PropertyDeclaration]| {
+        for p in list {
+            properties.entry(p.name().to_string()).or_insert_with(|| p.clone());
+        }
+    };
+    let mut absorb_methods = |list: &[MethodDeclaration]| {
+        for m in list {
+            let key = if !m.overload_name().is_empty() { m.overload_name() } else { m.name() };
+            methods.entry(key.to_string()).or_insert_with(|| m.clone());
+        }
+    };
+    absorb_props(class_declaration.properties());
+    absorb_methods(class_declaration.methods());
+    if let Some(di) = class_declaration.default_interface() {
+        absorb_props(di.properties());
+        absorb_methods(di.methods());
+    }
+    for iface in class_declaration.implemented_interfaces() {
+        absorb_props(iface.properties());
+        absorb_methods(iface.methods());
+    }
+    if !class_declaration.base_full_name().is_empty() {
+        if let Some(base_decl) = MetadataReader::find_by_name(class_declaration.base_full_name()) {
+            let lock = base_decl.read();
+            if let Some(base) = lock.as_any().downcast_ref::<ClassDeclaration>() {
+                fill_class_members(base, properties, methods);
+            }
+        }
+    }
+}
+
+fn with_class_members<R>(class_declaration: &ClassDeclaration, f: impl FnOnce(&ClassMembers) -> R) -> R {
+    CLASS_MEMBERS_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let entry = cache.entry(class_declaration.full_name().to_string()).or_insert_with(|| {
+            let mut properties = HashMap::new();
+            let mut methods = HashMap::new();
+            fill_class_members(class_declaration, &mut properties, &mut methods);
+            ClassMembers { properties, methods }
+        });
+        f(entry)
+    })
+}
+
+fn find_class_property(class_declaration: &ClassDeclaration, name: &str) -> Option<PropertyDeclaration> {
+    with_class_members(class_declaration, |m| m.properties.get(name).cloned())
+}
+
+fn find_class_method(class_declaration: &ClassDeclaration, name: &str) -> Option<MethodDeclaration> {
+    with_class_members(class_declaration, |m| m.methods.get(name).cloned())
+}
+
 fn class_method_matches(class_declaration: &ClassDeclaration, name: &str) -> bool {
     let method_match = |m: &MethodDeclaration| {
         let on = m.overload_name();
@@ -286,6 +375,29 @@ fn class_property_matches(class_declaration: &ClassDeclaration, name: &str) -> b
 
 fn class_has_member_named(class_declaration: &ClassDeclaration, name: &str) -> bool {
     class_method_matches(class_declaration, name) || class_property_matches(class_declaration, name)
+}
+
+fn find_event_methods(class_declaration: &ClassDeclaration, name: &str) -> Option<(MethodDeclaration, MethodDeclaration)> {
+    let check = |events: &[EventDeclaration]| -> Option<(MethodDeclaration, MethodDeclaration)> {
+        events.iter().find(|e| e.name() == name)
+            .map(|e| (e.add_method().clone(), e.remove_method().clone()))
+    };
+    if let Some(m) = check(class_declaration.events()) { return Some(m); }
+    if let Some(di) = class_declaration.default_interface() {
+        if let Some(m) = check(di.events()) { return Some(m); }
+    }
+    for iface in class_declaration.implemented_interfaces() {
+        if let Some(m) = check(iface.events()) { return Some(m); }
+    }
+    if !class_declaration.base_full_name().is_empty() {
+        if let Some(base_decl) = MetadataReader::find_by_name(class_declaration.base_full_name()) {
+            let lock = base_decl.read();
+            if let Some(base) = lock.as_any().downcast_ref::<ClassDeclaration>() {
+                return find_event_methods(base, name);
+            }
+        }
+    }
+    None
 }
 
 fn runtime_method_metadata_from_method(method: &MethodDeclaration) -> RuntimeMethodMetadata {
@@ -424,11 +536,12 @@ fn handle_describe_winrt_type(
 
 
 #[derive(Clone)]
-struct DeclarationFFI {
-    inner: Arc<RwLock<dyn Declaration>>,
+pub(crate) struct DeclarationFFI {
+    pub(crate) inner: Arc<RwLock<dyn Declaration>>,
     pub(crate) instance: Option<IUnknown>,
-    parent: Option<Arc<RwLock<dyn Declaration>>>,
+    pub(crate) parent: Option<Arc<RwLock<dyn Declaration>>>,
     pub(crate) struct_instance: Option<(Vec<u8>, Vec<NativeType>)>,
+    pub(crate) event_tokens: std::collections::HashMap<String, i64>,
 }
 
 unsafe impl Sync for DeclarationFFI {}
@@ -437,11 +550,11 @@ unsafe impl Send for DeclarationFFI {}
 
 impl DeclarationFFI {
     pub fn new(declaration: Arc<RwLock<dyn Declaration>>) -> Self {
-        Self { inner: declaration, instance: None, parent: None, struct_instance: None }
+        Self { inner: declaration, instance: None, parent: None, struct_instance: None, event_tokens: std::collections::HashMap::new() }
     }
 
     pub fn new_with_instance(declaration: Arc<RwLock<dyn Declaration>>, instance: Option<IUnknown>) -> Self {
-        Self { inner: declaration, instance, parent: None, struct_instance: None }
+        Self { inner: declaration, instance, parent: None, struct_instance: None, event_tokens: std::collections::HashMap::new() }
     }
 
     pub fn as_any(&self) -> MappedRwLockReadGuard<'_, RawRwLock, dyn Any> {
@@ -479,19 +592,55 @@ fn init_global(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, conte
     global.define_own_property(scope, value, global.into(), v8::PropertyAttribute::READ_ONLY);
 }
 
-fn throw_js_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
+pub(crate) fn debug_output(msg: &str) {
+    if let Ok(c) = CString::new(msg) {
+        unsafe { OutputDebugStringA(PCSTR::from_raw(c.as_ptr() as _)) };
+    }
+    eprint!("{}", msg);
+    use std::io::Write;
+    LOG_FILE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            // TEMP first because USERPROFILE writes fail in the AppX sandbox.
+            static LOG_PATH: OnceLock<String> = OnceLock::new();
+            let path = LOG_PATH.get_or_init(|| {
+                let mut p = std::env::temp_dir();
+                p.push("ns_trace.log");
+                let chosen = if std::fs::OpenOptions::new().create(true).append(true).open(&p).is_ok() {
+                    p.to_string_lossy().into_owned()
+                } else {
+                    let base = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\fortu".into());
+                    format!("{}\\ns_trace.log", base)
+                };
+                let banner = format!("[NativeScript] log file: {}\n", chosen);
+                if let Ok(c) = CString::new(banner) {
+                    unsafe { OutputDebugStringA(PCSTR::from_raw(c.as_ptr() as _)) };
+                }
+                chosen
+            });
+            *slot = std::fs::OpenOptions::new().create(true).append(true).open(path).ok();
+        }
+        if let Some(f) = slot.as_mut() {
+            let _ = f.write_all(msg.as_bytes());
+        }
+    });
+}
+
+thread_local!(static LOG_FILE: RefCell<Option<fs::File>> = RefCell::new(None));
+
+pub(crate) fn throw_js_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
     if let Some(msg) = v8::String::new(scope, message) {
         let err = v8::Exception::error(scope, msg.into());
         scope.throw_exception(err);
     }
 }
 
-fn class_activation_factory(full_name: &str) -> windows::core::Result<IUnknown> {
+pub(crate) fn class_activation_factory(full_name: &str) -> windows::core::Result<IUnknown> {
     let clazz_name = HSTRING::from(full_name);
     unsafe { RoGetActivationFactory::<IUnknown>(&clazz_name) }
 }
 
-fn resolve_class_factory_from_parent(dec: &DeclarationFFI) -> windows::core::Result<IUnknown> {
+pub(crate) fn resolve_class_factory_from_parent(dec: &DeclarationFFI) -> windows::core::Result<IUnknown> {
     if let Some(instance) = dec.instance.clone() {
         return Ok(instance);
     }
@@ -631,6 +780,11 @@ fn handle_host_wait_for_async(
                         DispatchMessageW(&message);
                     }
                 }
+                ASYNC_PUMP_HOOK.with(|hook| {
+                    if let Ok(mut guard) = hook.try_borrow_mut() {
+                        if let Some(f) = guard.as_mut() { f(); }
+                    }
+                });
                 std::thread::sleep(Duration::from_millis(5));
             }
             Ok(_) => {
@@ -643,6 +797,28 @@ fn handle_host_wait_for_async(
             }
         }
     }
+}
+
+fn handle_enqueue_microtask(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 1 {
+        throw_js_error(scope, "__nsEnqueueMicrotask(callback) expects 1 argument");
+        return;
+    }
+
+    let callback = match v8::Local::<v8::Function>::try_from(args.get(0)) {
+        Ok(callback) => callback,
+        Err(_) => {
+            throw_js_error(scope, "__nsEnqueueMicrotask(callback) expects callback to be a function");
+            return;
+        }
+    };
+
+    scope.enqueue_microtask(callback);
+    retval.set_undefined();
 }
 
 fn try_extract_pointer_from_value(
@@ -964,6 +1140,33 @@ fn handle_read_text_file(
     }
 }
 
+fn handle_livesync_copy_file(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 2 {
+        throw_js_error(scope, "__nsLiveSyncCopyFile(sourcePath, destPath) expects 2 arguments");
+        return;
+    }
+
+    let Some(source_path) = value_to_string(scope, args.get(0)) else {
+        throw_js_error(scope, "Unable to convert sourcePath argument to string");
+        return;
+    };
+    let Some(dest_path) = value_to_string(scope, args.get(1)) else {
+        throw_js_error(scope, "Unable to convert destPath argument to string");
+        return;
+    };
+
+    if let Err(err) = livesync::copy_file(source_path.as_str(), dest_path.as_str()) {
+        throw_js_error(scope, err.as_str());
+        return;
+    }
+
+    retval.set_bool(true);
+}
+
 fn normalize_js_path(path: &str) -> PathBuf {
     if let Some(raw) = path.strip_prefix("file:///") {
         return PathBuf::from(raw.replace('/', "\\"));
@@ -1076,11 +1279,199 @@ fn handle_proxy_list_manifests(
     retval.set(array.into());
 }
 
+fn value_to_json_string(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> Option<String> {
+    let json = v8::json::stringify(scope, value)?;
+    Some(json.to_rust_string_lossy(scope))
+}
+
+fn handle_worker_create_threaded(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 3 {
+        throw_js_error(scope, "__nsWorkerCreateThreaded(source, filename, appRoot) expects 3 arguments");
+        return;
+    }
+
+    let Some(source) = value_to_string(scope, args.get(0)) else {
+        throw_js_error(scope, "Unable to convert worker source to string");
+        return;
+    };
+
+    let Some(filename) = value_to_string(scope, args.get(1)) else {
+        throw_js_error(scope, "Unable to convert worker filename to string");
+        return;
+    };
+
+    let Some(app_root) = value_to_string(scope, args.get(2)) else {
+        throw_js_error(scope, "Unable to convert appRoot to string");
+        return;
+    };
+
+    match worker_threads::create_worker(app_root, source, filename) {
+        Ok(worker_id) => retval.set_double(worker_id as f64),
+        Err(err) => throw_js_error(scope, err.as_str()),
+    }
+}
+
+fn handle_worker_post_message(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    _retval: v8::ReturnValue,
+) {
+    if args.length() < 2 {
+        throw_js_error(scope, "__nsWorkerPostMessage(workerId, value) expects 2 arguments");
+        return;
+    }
+
+    let worker_id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    if worker_id < 0.0 {
+        throw_js_error(scope, "Invalid worker id");
+        return;
+    }
+
+    let value = args.get(1);
+    let Some(bytes) = Runtime::serialize_value(scope, value) else {
+        throw_js_error(scope, "DataCloneError: value could not be cloned.");
+        return;
+    };
+
+    if let Err(err) = worker_threads::post_message(worker_id as u64, bytes) {
+        throw_js_error(scope, err.as_str());
+    }
+}
+
+/// Convert a `PolledWorkerEvent` to a V8 value suitable for returning to JS.
+/// `Message` bytes are deserialized via V8 structured clone.
+fn polled_event_to_v8<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    event: worker_threads::PolledWorkerEvent,
+) -> Option<v8::Local<'s, v8::Value>> {
+    match event {
+        worker_threads::PolledWorkerEvent::Message(bytes) => {
+            Runtime::deserialize_value(scope, &bytes)
+        }
+        worker_threads::PolledWorkerEvent::Error(error) => {
+            let obj = v8::Object::new(scope);
+            if let Some(key) = v8::String::new(scope, "__workerError") {
+                if let Some(val) = v8::String::new(scope, error.as_str()) {
+                    obj.set(scope, key.into(), val.into());
+                }
+            }
+            Some(obj.into())
+        }
+        worker_threads::PolledWorkerEvent::Exited => {
+            let obj = v8::Object::new(scope);
+            if let Some(key) = v8::String::new(scope, "__workerExit") {
+                obj.set(scope, key.into(), v8::Boolean::new(scope, true).into());
+            }
+            Some(obj.into())
+        }
+    }
+}
+
+fn handle_worker_poll_messages(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 1 {
+        throw_js_error(scope, "__nsWorkerPollMessages(workerId) expects 1 argument");
+        return;
+    }
+
+    let worker_id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    if worker_id < 0.0 {
+        throw_js_error(scope, "Invalid worker id");
+        return;
+    }
+
+    let events = match worker_threads::poll_events(worker_id as u64) {
+        Ok(events) => events,
+        Err(err) => {
+            throw_js_error(scope, err.as_str());
+            return;
+        }
+    };
+
+    let array = v8::Array::new(scope, events.len() as i32);
+    for (index, event) in events.into_iter().enumerate() {
+        if let Some(value) = polled_event_to_v8(scope, event) {
+            array.set_index(scope, index as u32, value);
+        }
+    }
+    retval.set(array.into());
+}
+
+fn handle_worker_terminate(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    _retval: v8::ReturnValue,
+) {
+    if args.length() < 1 {
+        throw_js_error(scope, "__nsWorkerTerminate(workerId) expects 1 argument");
+        return;
+    }
+
+    let worker_id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    if worker_id < 0.0 {
+        throw_js_error(scope, "Invalid worker id");
+        return;
+    }
+
+    if let Err(err) = worker_threads::terminate_worker(worker_id as u64) {
+        throw_js_error(scope, err.as_str());
+    }
+}
+
+fn handle_worker_poll_messages_blocking(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 2 {
+        throw_js_error(scope, "__nsWorkerPollMessagesBlocking(workerId, timeoutMs) expects 2 arguments");
+        return;
+    }
+
+    let worker_id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    if worker_id < 0.0 {
+        throw_js_error(scope, "Invalid worker id");
+        return;
+    }
+
+    let timeout_ms = args.get(1).number_value(scope).unwrap_or(0.0);
+    let timeout_ms = if timeout_ms.is_sign_negative() { 0_u64 } else { timeout_ms as u64 };
+
+    let events = match worker_threads::poll_events_blocking(worker_id as u64, timeout_ms) {
+        Ok(events) => events,
+        Err(err) => {
+            throw_js_error(scope, err.as_str());
+            return;
+        }
+    };
+
+    let array = v8::Array::new(scope, events.len() as i32);
+    for (index, event) in events.into_iter().enumerate() {
+        if let Some(value) = polled_event_to_v8(scope, event) {
+            array.set_index(scope, index as u32, value);
+        }
+    }
+    retval.set(array.into());
+}
+
 fn init_async_helpers(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, app_root: &str) {
     let global = scope.get_current_context().global(scope);
     if let Some(wait_name) = v8::String::new(scope, "__nsHostWaitForAsync") {
         if let Some(wait_fn) = v8::Function::new(scope, handle_host_wait_for_async) {
             global.define_own_property(scope, wait_name.into(), wait_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    if let Some(enqueue_name) = v8::String::new(scope, "__nsEnqueueMicrotask") {
+        if let Some(enqueue_fn) = v8::Function::new(scope, handle_enqueue_microtask) {
+            global.define_own_property(scope, enqueue_name.into(), enqueue_fn.into(), v8::PropertyAttribute::READ_ONLY);
         }
     }
 
@@ -1150,8 +1541,67 @@ fn init_async_helpers(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>
         }
     }
 
+    if let Some(worker_create_name) = v8::String::new(scope, "__nsWorkerCreateThreaded") {
+        if let Some(worker_create_fn) = v8::Function::new(scope, handle_worker_create_threaded) {
+            global.define_own_property(scope, worker_create_name.into(), worker_create_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    if let Some(worker_post_name) = v8::String::new(scope, "__nsWorkerPostMessage") {
+        if let Some(worker_post_fn) = v8::Function::new(scope, handle_worker_post_message) {
+            global.define_own_property(scope, worker_post_name.into(), worker_post_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    if let Some(worker_poll_name) = v8::String::new(scope, "__nsWorkerPollMessages") {
+        if let Some(worker_poll_fn) = v8::Function::new(scope, handle_worker_poll_messages) {
+            global.define_own_property(scope, worker_poll_name.into(), worker_poll_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    if let Some(worker_terminate_name) = v8::String::new(scope, "__nsWorkerTerminate") {
+        if let Some(worker_terminate_fn) = v8::Function::new(scope, handle_worker_terminate) {
+            global.define_own_property(scope, worker_terminate_name.into(), worker_terminate_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    if let Some(worker_poll_blocking_name) = v8::String::new(scope, "__nsWorkerPollMessagesBlocking") {
+        if let Some(worker_poll_blocking_fn) = v8::Function::new(scope, handle_worker_poll_messages_blocking) {
+            global.define_own_property(scope, worker_poll_blocking_name.into(), worker_poll_blocking_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    if let Some(livesync_copy_name) = v8::String::new(scope, "__nsLiveSyncCopyFile") {
+        if let Some(livesync_copy_fn) = v8::Function::new(scope, handle_livesync_copy_file) {
+            global.define_own_property(scope, livesync_copy_name.into(), livesync_copy_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
         let helper_source = r#"
         (function () {
+            if (typeof globalThis.queueMicrotask !== 'function') {
+                globalThis.queueMicrotask = function (callback) {
+                    if (typeof callback !== 'function') {
+                        throw new TypeError('queueMicrotask callback must be a function');
+                    }
+
+                    if (typeof globalThis.__nsEnqueueMicrotask === 'function') {
+                        globalThis.__nsEnqueueMicrotask(callback);
+                        return;
+                    }
+
+                    Promise.resolve().then(callback).catch(function (err) {
+                        if (typeof globalThis.setTimeout === 'function') {
+                            globalThis.setTimeout(function () {
+                                throw err;
+                            }, 0);
+                        } else {
+                            throw err;
+                        }
+                    });
+                };
+            }
+
             var defaultTimeoutMs = 0;
             var statusEnum =
                 (globalThis.Windows &&
@@ -2106,6 +2556,7 @@ fn init_async_helpers(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>
                     'const $1 = (function(m){ return (m && Object.prototype.hasOwnProperty.call(m, "default")) ? m.default : m; })(__nsImport("$2", __filename));');
                 transformed = transformed.replace(/^[ \t]*import\s+['\"]([^'\"]+)['\"];?[ \t]*$/gm,
                     '__nsImport("$1", __filename);');
+                transformed = transformed.replace(/\bimport\s*\(/g, '__nsDynamicImport(');
 
                 transformed = transformed.replace(/\bexport\s+default\s+/g, 'exports.default = ');
                 transformed = transformed.replace(/^[ \t]*export\s+\{\s*([^}]+)\s*\};?[ \t]*$/gm, function (_, list) {
@@ -2149,8 +2600,8 @@ fn init_async_helpers(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>
 
                 var transformed = transformEsmToRuntimeModule(source);
                 var dirname = modulePath.replace(/[\\/][^\\/]*$/, '');
-                var executor = new Function('exports', 'module', '__nsImport', '__filename', '__dirname', transformed);
-                executor(module.exports, module, __nsImport, modulePath, dirname);
+                var executor = new Function('exports', 'module', '__nsImport', '__nsDynamicImport', '__filename', '__dirname', transformed);
+                executor(module.exports, module, __nsImport, __nsDynamicImport, modulePath, dirname);
                 moduleCache.set(modulePath, module.exports);
                 return module.exports;
             }
@@ -2179,10 +2630,26 @@ fn init_async_helpers(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>
                 return executeRuntimeModule(source, resolved);
             }
 
+            function __nsDynamicImport(specifier, parentPath) {
+                return Promise.resolve().then(function () {
+                    return __nsImport(specifier, parentPath);
+                });
+            }
+
+            globalThis.__nsInvalidateModuleCacheEntry = function (resolvedPath) {
+                moduleCache.delete(String(resolvedPath || ''));
+            };
+
+            globalThis.__nsClearModuleCache = function () {
+                moduleCache.clear();
+            };
+
             globalThis.__nsEvalAsModule = function (source, filename) {
                 return executeRuntimeModule(source, filename);
             };
             globalThis.NSWinRT.import = __nsImport;
+            globalThis.__nsDynamicImport = __nsDynamicImport;
+            globalThis.NSWinRT.dynamicImport = __nsDynamicImport;
         })();
         "#;
 
@@ -2190,6 +2657,11 @@ fn init_async_helpers(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>
         if let Some(script) = v8::Script::compile(scope, source, None) {
                 script.run(scope);
         }
+
+        message_port::install_message_port_runtime(scope);
+        worker_support::install_worker_runtime(scope);
+        hmr_support::install_hmr_support(scope);
+        livesync::install_livesync_support(scope);
 }
 
 fn create_ns_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, scope: &mut v8::PinScope<'a, '_>) -> Local<'a, v8::Value> {
@@ -2296,7 +2768,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
     let class_name = v8::String::new(scope, name).unwrap();
 
     let tmpl = FunctionTemplate::new(scope, handle_ns_func);
-    let object_tmpl = v8::ObjectTemplate::new(scope);
+    let object_tmpl = tmpl.instance_template(scope);
 
     object_tmpl.set_internal_field_count(1);
 
@@ -2328,16 +2800,16 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     return v8::Intercepted::kNo;
                 };
 
-                for property in collect_class_properties(clazz) {
-                    if property.name() != name {
-                        continue;
-                    }
-
-                    let mut property_call = PropertyCall::new(&property, false, dec.instance.clone().unwrap(), false);
+                if let Some(property) = find_class_property(clazz, &name) {
+                    let Some(mut property_call) = PropertyCall::new(&property, false, dec.instance.clone().unwrap(), false) else {
+                        return v8::Intercepted::kNo;
+                    };
                     let (ret, result) = property_call.call_with_values(scope, &[]);
 
                     if ret.is_err() {
-                        let message = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                        let detail = format!("Property get '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
+                        debug_output(&format!("[NativeScript] {}\n", detail));
+                        let message = v8::String::new(scope, &detail).unwrap();
                         let error = v8::Exception::error(scope, message);
                         scope.throw_exception(error);
                         return v8::Intercepted::kYes;
@@ -2351,17 +2823,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     let return_sig = property_call.return_type().to_string();
                     if return_sig.contains('.') {
                         let instance = unsafe { IUnknown::from_raw(result) };
-                        let declaration = if return_sig.contains('`') {
-                            let mut generic_name = return_sig.clone();
-                            if let Some(backtick_index) = generic_name.rfind('<') {
-                                generic_name.truncate(backtick_index);
-                            }
-                            MetadataReader::find_by_name(generic_name.as_str())
-                        } else {
-                            MetadataReader::find_by_name(return_sig.as_str())
-                        };
-
-                        if let Some(declaration) = declaration {
+                        let lookup = helpers::strip_generic_suffix(return_sig.as_str());
+                        if let Some(declaration) = MetadataReader::find_by_name(lookup) {
                             let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into();
                             rv.set(ret);
                             return v8::Intercepted::kYes;
@@ -2376,16 +2839,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     return v8::Intercepted::kNo;
                 }
 
-                for method in collect_class_methods(clazz) {
-                    let mut method_name = method.overload_name();
-                    if method_name.is_empty() {
-                        method_name = method.name();
-                    }
-
-                    if method_name != name {
-                        continue;
-                    }
-
+                if let Some(method) = find_class_method(clazz, &name) {
                     let declaration = Arc::new(RwLock::new(method.clone()));
                     let declaration = Box::into_raw(Box::new(DeclarationFFI::new_with_instance(declaration, dec.instance.clone())));
                     let ext = v8::External::new(scope, declaration as _);
@@ -2416,17 +2870,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let return_sig = method.return_type().to_string();
                         if return_sig.contains('.') {
                             let instance = unsafe { IUnknown::from_raw(result) };
-                            let declaration = if return_sig.contains('`') {
-                                let mut generic_name = return_sig.clone();
-                                if let Some(backtick_index) = generic_name.rfind('<') {
-                                    generic_name.truncate(backtick_index);
-                                }
-                                MetadataReader::find_by_name(generic_name.as_str())
-                            } else {
-                                MetadataReader::find_by_name(return_sig.as_str())
-                            };
-
-                            if let Some(declaration) = declaration {
+                            let lookup = helpers::strip_generic_suffix(return_sig.as_str());
+                            if let Some(declaration) = MetadataReader::find_by_name(lookup) {
                                 let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, dec.parent.clone(), declaration, Some(instance), scope).into();
                                 retval.set(ret);
                                 return;
@@ -2459,29 +2904,64 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                 let name = key.to_rust_string_lossy(scope);
                 let dec = unsafe { args.data().cast::<v8::External>() };
                 let dec = dec.value() as *mut DeclarationFFI;
-                let dec = unsafe { &*dec };
+                let dec = unsafe { &mut *dec };
                 let lock = dec.read();
 
                 let Some(clazz) = lock.as_any().downcast_ref::<ClassDeclaration>() else {
                     return v8::Intercepted::kNo;
                 };
 
-                for property in collect_class_properties(clazz) {
-                    if property.name() != name {
-                        continue;
-                    }
-
+                if let Some(property) = find_class_property(clazz, &name) {
                     if property.setter().is_none() {
                         return v8::Intercepted::kNo;
                     }
 
-                    let mut property_call = PropertyCall::new(&property, true, dec.instance.clone().unwrap(), false);
+                    let Some(mut property_call) = PropertyCall::new(&property, true, dec.instance.clone().unwrap(), false) else {
+                        return v8::Intercepted::kNo;
+                    };
                     let (ret, _) = property_call.call_with_values(scope, &[value]);
                     if ret.is_err() {
-                        let message = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                        let detail = format!("Property set '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
+                        debug_output(&format!("[NativeScript] {}\n", detail));
+                        let message = v8::String::new(scope, &detail).unwrap();
                         let error = v8::Exception::error(scope, message);
                         scope.throw_exception(error);
                     }
+                    return v8::Intercepted::kYes;
+                }
+
+                // Try WinRT events: `instance.EventName = new DelegateType({ Invoke: fn })`.
+                if let Some((add_method, remove_method)) = find_event_methods(clazz, &name) {
+                    let instance = dec.instance.clone();
+                    drop(lock);
+
+                    if let Some(&old_token) = dec.event_tokens.get(&name) {
+                        if let Some(inst) = instance.clone() {
+                            let mut mc = MethodCall::new(&remove_method, remove_method.is_sealed(), inst, false);
+                            let _ = mc.call_with_event_token(old_token);
+                        }
+                        dec.event_tokens.remove(&name);
+                    }
+
+                    if value.is_object() {
+                        if let Some(obj) = value.to_object(scope) {
+                            if let Some(handle_key) = v8::String::new(scope, "handle") {
+                                if let Some(handle_val) = obj.get(scope, handle_key.into()) {
+                                    if let Ok(ext) = v8::Local::<v8::External>::try_from(handle_val) {
+                                        let delegate_ptr = ext.value();
+                                        if let Some(inst) = instance {
+                                            let mut mc = MethodCall::new(&add_method, add_method.is_sealed(), inst, false);
+                                            let (ret, token) = mc.call_with_raw_ptr(delegate_ptr);
+                                            if ret.is_ok() {
+                                                dec.event_tokens.insert(name, token);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     return v8::Intercepted::kYes;
                 }
 
@@ -2489,10 +2969,6 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
             })
             .data(ext.into())
     );
-
-            let object = object_tmpl.new_instance(scope).unwrap();
-            object.set_internal_field(0, ext.into());
-            return object.into();
 
     tmpl.set_class_name(class_name);
 
@@ -2509,15 +2985,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                 let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
                 let class_methods = collect_class_methods(clazz);
                 let class_properties = collect_class_properties(clazz);
-
-                if matches!(name, "StackPanel" | "ListView" | "ComboBox" | "ScrollViewer" | "Border") {
-                    eprintln!(
-                        "[runtime] class {} resolved {} methods and {} properties",
-                        name,
-                        class_methods.len(),
-                        class_properties.len()
-                    );
-                }
+                let mut seen_member_names: HashSet<String> = HashSet::new();
 
 
                 let to_string_func = FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
@@ -2533,9 +3001,20 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                 object_tmpl.set(to_string.into(), to_string_func.into());
 
                 for method in class_methods.iter() {
-                    let name = v8::String::new(scope, method.name());
+                    let method_name = if method.overload_name().is_empty() {
+                        method.name().to_string()
+                    } else {
+                        method.overload_name().to_string()
+                    };
 
                     let is_static = method.is_static();
+
+                    let key = format!("{}:{}", method_name, if is_static { "static" } else { "instance" });
+                    if !seen_member_names.insert(key) {
+                        continue;
+                    }
+
+                    let name = v8::String::new(scope, method_name.as_str());
 
                     let declaration = DeclarationFFI::new_with_instance(
                         Arc::new(
@@ -2606,15 +3085,9 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                         // .Status, .ErrorCode, .GetResults, .Completed, .Cancel,
                                         // .Close — the dev wraps it in a JS Promise if they want
                                         // (matching the iOS & Android NativeScript runtimes).
-                                        let declaration = if return_sig.contains('`') {
-                                            let mut name = return_sig.to_string();
-                                            if let Some(backtick_index) = name.rfind('<') {
-                                                name.truncate(backtick_index);
-                                            }
-                                            MetadataReader::find_by_name(name.as_str()).unwrap()
-                                        } else {
-                                            dec.inner.clone()
-                                        };
+                                        let lookup = helpers::strip_generic_suffix(return_sig.as_str());
+                                        let declaration = MetadataReader::find_by_name(lookup)
+                                            .unwrap_or_else(|| dec.inner.clone());
 
                                         let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, dec.parent.clone(), declaration, Some(instance), scope).into();
                                         retval.set(ret.into());
@@ -2644,8 +3117,15 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                 }
 
                 for property in class_properties.iter() {
-                    let name = v8::String::new(scope, property.name());
+                    let property_name = property.name().to_string();
                     let is_static = property.is_static();
+
+                    let key = format!("{}:{}", property_name, if is_static { "static" } else { "instance" });
+                    if !seen_member_names.insert(key) {
+                        continue;
+                    }
+
+                    let name = v8::String::new(scope, property_name.as_str());
 
                     let declaration = DeclarationFFI::new_with_instance(
                         Arc::new(
@@ -2677,9 +3157,9 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                         let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
 
-                        let mut method = PropertyCall::new(
+                        let Some(mut method) = PropertyCall::new(
                             method, false, dec.instance.clone().unwrap(), false,
-                        );
+                        ) else { return; };
 
                         let (ret, result) = method.call(scope, &args);
 
@@ -2689,17 +3169,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             let return_sig = method.return_type().to_string();
                             if return_sig.contains('.') {
                                 let instance = unsafe { IUnknown::from_raw(result) };
-                                let declaration = if return_sig.contains('`') {
-                                    let mut name = return_sig.clone();
-                                    if let Some(backtick_index) = name.rfind('<') {
-                                        name.truncate(backtick_index);
-                                    }
-                                    MetadataReader::find_by_name(name.as_str())
-                                } else {
-                                    MetadataReader::find_by_name(return_sig.as_str())
-                                };
-
-                                if let Some(declaration) = declaration {
+                                let lookup = helpers::strip_generic_suffix(return_sig.as_str());
+                                if let Some(declaration) = MetadataReader::find_by_name(lookup) {
                                     let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into();
                                     retval.set(ret.into());
                                     return;
@@ -2739,7 +3210,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             let dec = unsafe { &*dec };
                             let lock = dec.read();
                             let prop = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
-                            let mut method = PropertyCall::new(prop, true, dec.instance.clone().unwrap(), false);
+                            let Some(mut method) = PropertyCall::new(prop, true, dec.instance.clone().unwrap(), false) else { return; };
                             let (ret, _) = method.call(scope, &args);
                             if ret.is_err() {
                                 let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
@@ -2765,11 +3236,12 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
             DeclarationKind::Interface
             | DeclarationKind::GenericInterface
             | DeclarationKind::GenericInterfaceInstance => {
+                // SAFETY: outer match arm filtered to exactly these three kinds.
                 let clazz: &dyn BaseClassDeclarationImpl = match kind {
                     DeclarationKind::Interface => lock.as_any().downcast_ref::<InterfaceDeclaration>().unwrap(),
                     DeclarationKind::GenericInterface => lock.as_any().downcast_ref::<GenericInterfaceDeclaration>().unwrap(),
                     DeclarationKind::GenericInterfaceInstance => lock.as_any().downcast_ref::<GenericInterfaceInstanceDeclaration>().unwrap(),
-                    _ => unreachable!(),
+                    _ => unsafe { std::hint::unreachable_unchecked() },
                 };
 
 
@@ -2887,10 +3359,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                                     let kind = lock.kind();
 
-                                    let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
+                                    let property = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
 
-                                    let mut method = PropertyCall::new(
-                                        method, false, dec.instance.clone().unwrap(), false,
+                                    let mut method = MethodCall::new(
+                                        property.getter(), false, dec.instance.clone().unwrap(), false,
                                     );
 
 
@@ -2944,11 +3416,12 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         DeclarationKind::Interface
                         | DeclarationKind::GenericInterface
                         | DeclarationKind::GenericInterfaceInstance => {
+                            // SAFETY: outer match arm filtered to exactly these three kinds.
                             let clazz: &dyn BaseClassDeclarationImpl = match kind {
                                 DeclarationKind::Interface => clazz.as_any().downcast_ref::<InterfaceDeclaration>().unwrap(),
                                 DeclarationKind::GenericInterface => clazz.as_any().downcast_ref::<GenericInterfaceDeclaration>().unwrap(),
                                 DeclarationKind::GenericInterfaceInstance => clazz.as_any().downcast_ref::<GenericInterfaceInstanceDeclaration>().unwrap(),
-                                _ => unreachable!(),
+                                _ => unsafe { std::hint::unreachable_unchecked() },
                             };
 
                             for method in clazz.methods().iter() {
@@ -3049,9 +3522,9 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                                     let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
 
-                                    let mut method = PropertyCall::new(
+                                    let Some(mut method) = PropertyCall::new(
                                         method, false, dec.instance.clone().unwrap(), false,
-                                    );
+                                    ) else { return; };
 
 
                                     let (ret, result) = method.call(scope, &args);
@@ -3267,9 +3740,9 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                         let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
 
-                        let mut method = PropertyCall::new(
+                        let Some(mut method) = PropertyCall::new(
                             method, false, dec.instance.clone().unwrap(), false,
-                        );
+                        ) else { return; };
 
 
                         let (ret, result) = method.call(scope, &args);
@@ -3310,7 +3783,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             let dec = unsafe { &*dec };
                             let lock = dec.read();
                             let prop = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
-                            let mut method = PropertyCall::new(prop, true, dec.instance.clone().unwrap(), false);
+                            let setter = prop.setter().unwrap();
+                            let mut method = MethodCall::new(setter, false, dec.instance.clone().unwrap(), false);
                             let (ret, _) = method.call(scope, &args);
                             if ret.is_err() {
                                 let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
@@ -3407,26 +3881,12 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             let return_sig = method.return_type();
                             match NativeType::try_from(return_sig) {
                                 Ok(return_type) => {
-                                    if return_sig.contains(".") {
+                                    if return_sig.contains('.') {
                                         let instance = unsafe { IUnknown::from_raw(*(result as *mut *mut c_void)) };
-
-                                        if return_sig.contains('`') {
-                                            let mut name = return_sig.to_string();
-
-                                            if let Some(backtick_index) = name.rfind('<') {
-                                                name.truncate(backtick_index);
-                                            }
-
-                                            // use the generic name
-                                            let declaration = MetadataReader::find_by_name(name.as_str()).unwrap();
-
-
-                                            let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig, None, dec.parent.clone(), declaration, Some(instance), scope).into();
-                                            retval.set(ret.into());
-
-                                            return;
-                                        }
-                                        let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig, None, dec.parent.clone(), dec.inner.clone(), Some(instance), scope).into();
+                                        let lookup = helpers::strip_generic_suffix(return_sig);
+                                        let declaration = MetadataReader::find_by_name(lookup)
+                                            .unwrap_or_else(|| dec.inner.clone());
+                                        let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig, None, dec.parent.clone(), declaration, Some(instance), scope).into();
                                         retval.set(ret.into());
                                         return;
                                     }
@@ -3455,13 +3915,133 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
         }
     }
 
-    let object = object_tmpl.new_instance(scope).unwrap();
+    debug_output("[NativeScript] create_ns_ctor_instance_object: calling new_instance\n");
+    let object = match object_tmpl.new_instance(scope) {
+        Some(o) => o,
+        None => {
+            debug_output("[NativeScript] create_ns_ctor_instance_object: new_instance returned None!\n");
+            panic!("object_tmpl.new_instance returned None");
+        }
+    };
+    debug_output("[NativeScript] create_ns_ctor_instance_object: new_instance OK\n");
 
     object.set_internal_field(0, ext.into());
+
+    if let Some(handle_key) = v8::String::new(scope, "handle") {
+        let handle_value: Local<v8::Value> = if let Some(instance) = instance.as_ref() {
+            v8::External::new(scope, instance.as_raw() as *mut c_void).into()
+        } else {
+            v8::null(scope).into()
+        };
+        object.set(scope, handle_key.into(), handle_value);
+    }
 
     let ret = object;
 
     ret.into()
+}
+
+/// Converts a raw WinRT out-parameter result pointer to a `Local<v8::Value>`.
+/// Returns `None` for void returns, null COM pointers, or unrecognised types.
+/// The `parent_decl` is forwarded to `create_ns_ctor_instance_object` for COM returns.
+unsafe fn raw_result_to_local<'s>(
+    result: *mut c_void,
+    signature: &str,
+    parent_decl: Option<Arc<RwLock<dyn Declaration>>>,
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<Local<'s, v8::Value>> {
+    debug_output(&format!("[NativeScript] raw_result_to_local: sig={} result={:p}\n", signature, result));
+    let raw = result as usize;
+    match signature {
+        "Void" => None,
+        "Guid" => Some(guid_ptr_to_js_object(result, scope).into()),
+        _ if !signature.contains('.') => {
+            let native_type = NativeType::try_from(signature).ok()?;
+            let v: Local<v8::Value> = match native_type {
+                NativeType::Void => return None,
+                NativeType::Bool  => v8::Boolean::new(scope, (raw as u8) != 0).into(),
+                NativeType::U8    => v8::Number::new(scope, raw as u8 as f64).into(),
+                NativeType::I8    => v8::Number::new(scope, (raw as u8 as i8) as f64).into(),
+                NativeType::U16   => v8::Number::new(scope, raw as u16 as f64).into(),
+                NativeType::I16   => v8::Number::new(scope, (raw as u16 as i16) as f64).into(),
+                NativeType::U32   => v8::Number::new(scope, raw as u32 as f64).into(),
+                NativeType::I32   => v8::Number::new(scope, (raw as u32 as i32) as f64).into(),
+                NativeType::U64 => {
+                    let v = raw as u64;
+                    if v > MAX_SAFE_INTEGER as u64 { v8::BigInt::new_from_u64(scope, v).into() }
+                    else { v8::Number::new(scope, v as f64).into() }
+                }
+                NativeType::I64 => {
+                    let v = raw as u64 as i64;
+                    if v > MAX_SAFE_INTEGER as i64 || v < MIN_SAFE_INTEGER as i64 {
+                        v8::BigInt::new_from_i64(scope, v).into()
+                    } else {
+                        v8::Number::new(scope, v as f64).into()
+                    }
+                }
+                NativeType::USize => {
+                    if raw > MAX_SAFE_INTEGER as usize { v8::BigInt::new_from_u64(scope, raw as u64).into() }
+                    else { v8::Number::new(scope, raw as f64).into() }
+                }
+                NativeType::ISize => {
+                    let v = raw as isize;
+                    if !(MIN_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&v) {
+                        v8::BigInt::new_from_i64(scope, v as i64).into()
+                    } else {
+                        v8::Number::new(scope, v as f64).into()
+                    }
+                }
+                NativeType::F32 => v8::Number::new(scope, f32::from_bits(raw as u32) as f64).into(),
+                NativeType::F64 => v8::Number::new(scope, f64::from_bits(raw as u64)).into(),
+                NativeType::String => {
+                    let hstring: HSTRING = std::mem::transmute(result);
+                    let s = hstring.to_string();
+                    v8::String::new(scope, s.as_str())?.into()
+                }
+                // "Object" in WinRT metadata maps to NativeType::Pointer and means
+                // IInspectable* — try to resolve the concrete runtime class name so
+                // we can hand back a typed wrapper instead of an opaque External.
+                NativeType::Pointer => {
+                    if result.is_null() { return None; }
+                    let unknown = IUnknown::from_raw(result);
+                    if let Ok(inspectable) = unknown.cast::<IInspectable>() {
+                        if let Ok(class_name) = inspectable.GetRuntimeClassName() {
+                            let name_str = class_name.to_string();
+                            if let Some(decl) = MetadataReader::find_by_name(&name_str) {
+                                let instance = unknown.clone();
+                                return Some(create_ns_ctor_instance_object(
+                                    &name_str,
+                                    None,
+                                    parent_decl,
+                                    decl,
+                                    Some(instance),
+                                    scope,
+                                ).into());
+                            }
+                        }
+                    }
+                    // Could not resolve type — expose as opaque External so the
+                    // property is at least present rather than silently missing.
+                    v8::External::new(scope, result).into()
+                }
+                _ => return None,
+            };
+            Some(v)
+        }
+        _ => {
+            if result.is_null() { return None; }
+            let com_instance = IUnknown::from_raw(result);
+            let decl = MetadataReader::find_by_name(signature)?;
+            Some(create_ns_ctor_instance_object(
+                signature,
+                None,
+                parent_decl,
+                decl,
+                Some(com_instance),
+                scope,
+            ).into())
+        }
+    }
 }
 
 fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declaration>>>, declaration: Arc<RwLock<dyn Declaration>>, scope: &mut v8::PinScope<'a, '_>) -> Local<'a, v8::Value> {
@@ -3497,6 +4077,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
         match kind {
             DeclarationKind::Class => {
                 let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
+                debug_output(&format!("[NativeScript] ctor-callback: new {}\n", clazz.full_name()));
 
                 let clazz_factory = match class_activation_factory(clazz.full_name()) {
                     Ok(factory) => factory,
@@ -3513,6 +4094,66 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                         return;
                     }
                 };
+
+                if length == 0 {
+                    match clazz_factory.cast::<IActivationFactory>() {
+                        Ok(activation_factory) => {
+                            match unsafe { activation_factory.ActivateInstance() } {
+                                Ok(instance) => {
+                                    let result = match instance.cast::<IUnknown>() {
+                                        Ok(value) => value,
+                                        Err(error) => {
+                                            throw_js_error(
+                                                scope,
+                                                format!(
+                                                    "Failed to cast activated instance for {}: {}",
+                                                    clazz.full_name(),
+                                                    error.message()
+                                                )
+                                                .as_str(),
+                                            );
+                                            return;
+                                        }
+                                    };
+
+                                    if let Ok(init) = result.cast::<IInitializeWithWindow>() {
+                                        let hwnd = unsafe { GetConsoleWindow() };
+                                        if !hwnd.is_invalid() {
+                                            let _ = unsafe { init.Initialize(hwnd) };
+                                        }
+                                    }
+
+                                    let instance = create_ns_ctor_instance_object(
+                                        clazz.name(),
+                                        Some(clazz_factory.clone()),
+                                        None,
+                                        dec.inner.clone(),
+                                        Some(result),
+                                        scope,
+                                    );
+                                    retval.set(instance);
+                                    return;
+                                }
+                                Err(error) => {
+                                    throw_js_error(
+                                        scope,
+                                        format!(
+                                            "ActivateInstance failed for WinRT class {}: {}",
+                                            clazz.full_name(),
+                                            error.message()
+                                        )
+                                        .as_str(),
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // Fall through to metadata-driven constructor dispatch when
+                            // activation factory cannot be cast.
+                        }
+                    }
+                }
 
                 unsafe {
                     let is_sealed = clazz.is_sealed();
@@ -3575,6 +4216,73 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                 }
             }
             DeclarationKind::Struct => {}
+            DeclarationKind::Delegate
+            | DeclarationKind::GenericDelegate
+            | DeclarationKind::GenericDelegateInstance => {
+                // Accept a plain JS function or an Android-style { Invoke(){} } object.
+                if length >= 1 {
+                    let arg0 = args.get(0);
+                    let maybe_func: Option<v8::Local<v8::Function>> = if arg0.is_function() {
+                        v8::Local::<v8::Function>::try_from(arg0).ok()
+                    } else if arg0.is_object() {
+                        if let Some(obj) = arg0.to_object(scope) {
+                            let mut found = None;
+                            for name in &["Invoke", "invoke"] {
+                                if let Some(key) = v8::String::new(scope, name) {
+                                    if let Some(val) = obj.get(scope, key.into()) {
+                                        if let Ok(f) = v8::Local::<v8::Function>::try_from(val) {
+                                            found = Some(f);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            found
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(func) = maybe_func {
+                        if let Some((guid, param_types)) =
+                            js_delegate_params_from_declaration(&*lock, kind)
+                        {
+                            debug_output(&format!("[NativeScript] delegate ctor: created JsDelegate for {} guid={:?} params={}\n",
+                                lock.full_name(), guid, param_types.len()));
+                            let global_func = v8::Global::new(scope, func);
+                            let data = Box::new(JsDelegateData {
+                                js_func: global_func,
+                                param_types,
+                            });
+                            let delegate = Box::new(JsDelegate {
+                                vtable: &JS_DELEGATE_VTBL as *const _,
+                                ref_count: AtomicU32::new(1),
+                                guid,
+                                data: Box::into_raw(data),
+                            });
+                            let raw = Box::into_raw(delegate) as *mut c_void;
+
+                            let result_obj = v8::Object::new(scope);
+                            if let Some(key) = v8::String::new(scope, "handle") {
+                                result_obj.set(
+                                    scope,
+                                    key.into(),
+                                    v8::External::new(scope, raw).into(),
+                                );
+                            }
+                            retval.set(result_obj.into());
+                            return;
+                        } else {
+                            debug_output(&format!("[NativeScript] delegate ctor: js_delegate_params_from_declaration FAILED for {} (kind={:?})\n",
+                                lock.full_name(), kind));
+                        }
+                    } else {
+                        debug_output(&format!("[NativeScript] delegate ctor: no callable in arg0 for {} (kind={:?})\n",
+                            lock.full_name(), kind));
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -3633,6 +4341,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
         }
 
         let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
+        debug_output(&format!("[NativeScript] create_ns_ctor_object: building methods for {}\n", clazz.full_name()));
 
         for method in clazz.methods().iter() {
             let name = v8::String::new(scope, method.name());
@@ -3726,35 +4435,16 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                             _ => {
                                 let instance = IUnknown::from_raw(result);
 
-                                let declaration = method.declaration.clone().unwrap();
-
-                                let lock = declaration.read();
-
-                                let declaration: Arc<RwLock<dyn Declaration>> = {
-                                    let lock = lock;
-
-                                    match lock.base().kind() {
-                                        DeclarationKind::Interface => {
-                                            let dec = lock.as_declaration().as_any().downcast_ref::<InterfaceDeclaration>();
-                                            Arc::new(RwLock::new(dec.unwrap().clone()))
-                                        }
-                                        DeclarationKind::Class => {
-                                            let dec = lock.as_declaration().as_any().downcast_ref::<ClassDeclaration>();
-                                            Arc::new(RwLock::new(dec.unwrap().clone()))
-                                        }
-                                        other => {
-                                            let message = format!(
-                                                "Unsupported declaration kind for return object wrapping: {}",
-                                                other
-                                            );
-                                            let message = v8::String::new(scope, message.as_str()).unwrap();
-                                            let error = v8::Exception::error(scope, message.into());
-                                            scope.throw_exception(error);
-                                            return;
-                                        }
-                                    }
+                                let Some(declaration) = MetadataReader::find_by_name(signature.as_str()) else {
+                                    let message = format!(
+                                        "Unable to resolve return declaration for WinRT type '{}'",
+                                        signature
+                                    );
+                                    let message = v8::String::new(scope, message.as_str()).unwrap();
+                                    let error = v8::Exception::error(scope, message.into());
+                                    scope.throw_exception(error);
+                                    return;
                                 };
-
 
                                 let ret: Local<v8::Value> = create_ns_ctor_instance_object(signature.as_str(), dec.instance.clone(), dec.parent.clone(), declaration, Some(instance), scope).into();
                                 retval.set(ret.into());
@@ -3773,9 +4463,105 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
             tmpl.set(name.unwrap().into(), func.into());
         }
+
+        // Register lazy accessor properties for each static property.
+        // The WinRT getter is only invoked when JS actually reads the property,
+        // avoiding eager FFI calls at class-lookup time that crash for types
+        // with many static DependencyProperty members (e.g. ScrollViewer).
+        for property in clazz.properties().iter() {
+            if !property.is_static() {
+                continue;
+            }
+
+            let Some(prop_name) = v8::String::new(scope, property.name()) else { continue };
+
+            let parent = Arc::clone(&declaration);
+            let mut prop_dec = DeclarationFFI::new_with_instance(
+                Arc::new(RwLock::new(property.clone())),
+                None,
+            );
+            prop_dec.parent = Some(parent);
+            let prop_ext = Box::into_raw(Box::new(prop_dec));
+            let prop_ext = v8::External::new(scope, prop_ext as _);
+
+            let getter = v8::FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
+                                                        args: v8::FunctionCallbackArguments,
+                                                        mut retval: v8::ReturnValue| {
+                let dec = unsafe { args.data().cast::<v8::External>() };
+                let dec = dec.value() as *mut DeclarationFFI;
+                let dec = unsafe { &*dec };
+
+                let lock = dec.read();
+                let Some(property) = lock.as_any().downcast_ref::<PropertyDeclaration>() else { return };
+
+                let signature = {
+                    let sig = property.getter().return_type();
+                    match property.getter().metadata() {
+                        Some(md) => Signature::to_string(md, &sig),
+                        None => return,
+                    }
+                };
+
+                let factory = match resolve_class_factory_from_parent(dec) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        throw_js_error(scope, &format!("Failed to resolve static property factory: {}", e.message()));
+                        return;
+                    }
+                };
+
+                let Some(mut prop_call) = PropertyCall::new(property, false, factory, false) else { return };
+
+                let (hresult, result) = prop_call.call_with_values(scope, &[]);
+
+                if hresult.is_ok() {
+                    unsafe {
+                        match signature.as_str() {
+                            "Boolean" => {
+                                retval.set_bool(*(result as *mut bool));
+                            }
+                            "Guid" => {
+                                let obj = guid_ptr_to_js_object(result, scope);
+                                retval.set(obj.into());
+                            }
+                            _ if !signature.contains('.') => {
+                                match NativeType::try_from(signature.as_str()) {
+                                    Ok(return_type) => { set_ret_val(result, scope, retval, return_type); }
+                                    Err(_) => { retval.set_undefined(); }
+                                }
+                            }
+                            _ => {
+                                let instance = IUnknown::from_raw(result);
+                                let Some(ret_decl) = MetadataReader::find_by_name(signature.as_str()) else { return };
+                                let ret: Local<v8::Value> = create_ns_ctor_instance_object(
+                                    signature.as_str(),
+                                    dec.instance.clone(),
+                                    dec.parent.clone(),
+                                    ret_decl,
+                                    Some(instance),
+                                    scope,
+                                ).into();
+                                retval.set(ret.into());
+                            }
+                        }
+                    }
+                }
+            })
+                .data(prop_ext.into())
+                .build(scope);
+
+            tmpl.set_accessor_property(
+                prop_name.into(),
+                Some(getter),
+                None,
+                v8::PropertyAttribute::DONT_DELETE,
+            );
+        }
+
     }
 
     let func = tmpl.get_function(scope).unwrap();
+
     {
         let lock = declaration.read();
         if let Some(full_name) = match lock.kind() {
@@ -3819,6 +4605,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
         let ext = args.data();
 
         let object_tmpl = v8::ObjectTemplate::new(scope);
+        object_tmpl.set_internal_field_count(1);
 
         let mut field_args: Vec<NativeValue> = Vec::new();
 
@@ -4265,7 +5052,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
 
         let object = object_tmpl.new_instance(scope).unwrap();
 
-        // object.set_internal_field(0, ext);
+        object.set_internal_field(0, unsafe { ext.cast::<v8::Data>() });
 
         retval.set(object.into());
     })
@@ -4360,6 +5147,63 @@ fn handle_named_property_setter(scope: &mut v8::PinScope<'_, '_>,
         // assignment can be stored verbatim.
         _ => false,
     };
+
+    // For class instances: wire WinRT event handlers via the add/remove ABI methods.
+    // `button.Click = delegate` calls add_Click; replacing removes the prior handler first.
+    if kind == DeclarationKind::Class && !is_reserved {
+        if let Some(class) = lock.as_any().downcast_ref::<ClassDeclaration>() {
+            if let Some((add_method, remove_method)) = find_event_methods(class, &name) {
+                let instance = dec.instance.clone();
+                drop(lock);
+
+                // Remove existing handler if there is one.
+                let token_key = format!("__tok_{}__", name);
+                if let Some(tok_key_str) = v8::String::new(scope, &token_key) {
+                    if let Some(tok_val) = store.get(scope, tok_key_str.into()) {
+                        if let Ok(tok_ext) = v8::Local::<v8::External>::try_from(tok_val) {
+                            let token = tok_ext.value() as i64;
+                            if let Some(instance) = instance.clone() {
+                                let mut mc = MethodCall::new(
+                                    &remove_method, remove_method.is_sealed(), instance, false,
+                                );
+                                mc.call_with_event_token(token);
+                            }
+                            // Clear the stored token.
+                            let undef = v8::undefined(scope);
+                            store.set(scope, tok_key_str.into(), undef.into());
+                        }
+                    }
+                }
+
+                // Register the new delegate (if it carries a JsDelegate handle).
+                if value.is_object() {
+                    if let Some(obj) = value.to_object(scope) {
+                        if let Some(handle_key) = v8::String::new(scope, "handle") {
+                            if let Some(handle_val) = obj.get(scope, handle_key.into()) {
+                                if let Ok(ext) = v8::Local::<v8::External>::try_from(handle_val) {
+                                    let delegate_ptr = ext.value();
+                                    if let Some(instance) = instance {
+                                        let mut mc = MethodCall::new(
+                                            &add_method, add_method.is_sealed(), instance, false,
+                                        );
+                                        let (_, token) = mc.call_with_raw_ptr(delegate_ptr);
+                                        // Store the token so we can remove this handler later.
+                                        if let Some(tok_key_str) = v8::String::new(scope, &token_key) {
+                                            let tok_ptr = token as *mut c_void;
+                                            store.set(scope, tok_key_str.into(), v8::External::new(scope, tok_ptr).into());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                store.set(scope, key.into(), value);
+                return v8::Intercepted::kYes;
+            }
+        }
+    }
 
     if !is_reserved {
         store.set(scope, key.into(), value);
@@ -4457,54 +5301,47 @@ fn handle_named_property_getter(scope: &mut v8::PinScope<'_, '_>,
                 let clazz_dec = lock.as_any().downcast_ref::<ClassDeclaration>();
 
                 if let Some(clazz_dec) = clazz_dec {
-                    for method in collect_class_methods(clazz_dec) {
-                        let mut method_name = method.overload_name();
-                        if method_name.is_empty() {
-                            method_name = method.name();
-                        }
+                    if let Some(method) = find_class_method(clazz_dec, name.as_str()) {
+                        let declaration = Arc::new(RwLock::new(method));
 
-                        if method_name == name {
-                            let mut declaration = Arc::new(RwLock::new(method.clone()));
+                        let declaration = Box::into_raw(Box::new(DeclarationFFI::new_with_instance(declaration, dec.instance.clone())));
 
-                            let declaration = Box::into_raw(Box::new(DeclarationFFI::new_with_instance(declaration, dec.instance.clone())));
+                        let ext = v8::External::new(scope, declaration as _);
 
-                            let ext = v8::External::new(scope, declaration as _);
+                        let builder = v8::Function::builder(|scope: &mut v8::PinScope<'_, '_>,
+                                                             args: v8::FunctionCallbackArguments,
+                                                             mut retval: v8::ReturnValue| {
+                            let length = args.length();
 
-                            let builder = v8::Function::builder(|scope: &mut v8::PinScope<'_, '_>,
-                                                                 args: v8::FunctionCallbackArguments,
-                                                                 mut retval: v8::ReturnValue| {
-                                let length = args.length();
+                            let dec = unsafe { args.data().cast::<v8::External>() };
 
-                                let dec = unsafe { args.data().cast::<v8::External>() };
+                            let dec = dec.value() as *mut DeclarationFFI;
 
-                                let dec = dec.value() as *mut DeclarationFFI;
+                            let dec = unsafe { &*dec };
 
-                                let dec = unsafe { &*dec };
+                            let lock = dec.read();
 
-                                let lock = dec.read();
+                            let method = lock.as_any().downcast_ref::<MethodDeclaration>();
 
-                                let method = lock.as_any().downcast_ref::<MethodDeclaration>();
+                            let method = method.unwrap();
 
-                                let method = method.unwrap();
+                            let instance = dec.instance.clone().unwrap();
 
-                                let instance = dec.instance.clone().unwrap();
+                            let mut method = MethodCall::new(
+                                method, method.is_sealed(), instance, false,
+                            );
 
-                                let mut method = MethodCall::new(
-                                    method, method.is_sealed(), instance, false,
-                                );
-
-                                let (ret, result) = method.call(scope, &args);
-                            })
-                                .data(ext.into()).build(scope);
+                            let (ret, result) = method.call(scope, &args);
+                        })
+                            .data(ext.into()).build(scope);
 
 
-                            let func = builder.unwrap();
+                        let func = builder.unwrap();
 
-                            let func: Local<v8::Value> = func.into();
-                            store.set(scope, key.into(), func);
-                            rv.set(func);
-                            return v8::Intercepted::kYes;
-                        }
+                        let func: Local<v8::Value> = func.into();
+                        store.set(scope, key.into(), func);
+                        rv.set(func);
+                        return v8::Intercepted::kYes;
                     }
                 }
             }
@@ -4536,13 +5373,15 @@ fn handle_named_property_getter(scope: &mut v8::PinScope<'_, '_>,
                         match value.value() {
                             Value::Int32(value) => {
                                 rv.set_int32(value);
-                                let ret = v8::Number::new(scope, value as f64).into();
+                                // Store as v8::Integer (Smi) so the cached value passes
+                                // v8::Local::<v8::Int32>::try_from when used as a setter arg.
+                                let ret: Local<v8::Value> = v8::Integer::new(scope, value).into();
                                 store.set(scope, key.into(), ret);
                                 return v8::Intercepted::kYes;
                             }
                             Value::Uint32(value) => {
                                 rv.set_uint32(value);
-                                let ret = v8::Number::new(scope, value as f64).into();
+                                let ret: Local<v8::Value> = v8::Integer::new_from_unsigned(scope, value).into();
                                 store.set(scope, key.into(), ret);
                                 return v8::Intercepted::kYes;
                             }
@@ -4645,6 +5484,176 @@ fn handle_ns_func(scope: &mut v8::PinScope<'_, '_>,
     // scope.throw_exception(v8::Exception::error(scope, v8::String::new("")))
 }
 
+// ── WinRT JS Delegate COM bridge ─────────────────────────────────────────────
+//
+// A JsDelegate wraps a `v8::Global<v8::Function>` inside a minimal COM object
+// so it can be passed directly to WinRT event-add methods.  Every delegate
+// type shares a single vtable; the per-instance GUID stored in the struct
+// makes QueryInterface work correctly for each concrete type.
+
+#[repr(C)]
+struct JsDelegateVtbl {
+    query_interface: unsafe extern "system" fn(*mut JsDelegate, *const GUID, *mut *mut c_void) -> HRESULT,
+    add_ref:         unsafe extern "system" fn(*mut JsDelegate) -> u32,
+    release:         unsafe extern "system" fn(*mut JsDelegate) -> u32,
+    // Declared with 4 usize params so the same slot works for delegates with
+    // 0–4 pointer-sized arguments.  Callers pass only what they need; extras
+    // land in dead registers and are never read (guarded by param_types.len()).
+    invoke:          unsafe extern "system" fn(*mut JsDelegate, usize, usize, usize, usize) -> HRESULT,
+}
+
+pub(crate) static JS_DELEGATE_VTBL: JsDelegateVtbl = JsDelegateVtbl {
+    query_interface: js_delegate_query_interface,
+    add_ref:         js_delegate_add_ref,
+    release:         js_delegate_release,
+    invoke:          js_delegate_invoke,
+};
+
+pub(crate) struct JsDelegateData {
+    pub(crate) js_func:     v8::Global<v8::Function>,
+    pub(crate) param_types: Vec<NativeType>,
+}
+
+#[repr(C)]
+pub(crate) struct JsDelegate {
+    pub(crate) vtable:    *const JsDelegateVtbl,
+    pub(crate) ref_count: AtomicU32,
+    pub(crate) guid:      GUID,
+    pub(crate) data:      *mut JsDelegateData,
+}
+
+unsafe impl Send for JsDelegate {}
+unsafe impl Sync for JsDelegate {}
+
+unsafe extern "system" fn js_delegate_query_interface(
+    this: *mut JsDelegate,
+    iid:  *const GUID,
+    out:  *mut *mut c_void,
+) -> HRESULT {
+    let d = &*this;
+    if *iid == IUnknown::IID || *iid == d.guid {
+        *out = this as *mut c_void;
+        js_delegate_add_ref(this);
+        HRESULT(0)
+    } else {
+        *out = std::ptr::null_mut();
+        HRESULT(0x80004002u32 as i32) // E_NOINTERFACE
+    }
+}
+
+unsafe extern "system" fn js_delegate_add_ref(this: *mut JsDelegate) -> u32 {
+    (*this).ref_count.fetch_add(1, AtomicOrdering::Relaxed) + 1
+}
+
+unsafe extern "system" fn js_delegate_release(this: *mut JsDelegate) -> u32 {
+    let prev = (*this).ref_count.fetch_sub(1, AtomicOrdering::Release);
+    if prev == 1 {
+        std::sync::atomic::fence(AtomicOrdering::Acquire);
+        let b = Box::from_raw(this);
+        drop(Box::from_raw(b.data));
+        // b (JsDelegate) dropped here
+    }
+    prev - 1
+}
+
+unsafe extern "system" fn js_delegate_invoke(
+    this: *mut JsDelegate,
+    p0: usize, p1: usize, p2: usize, _p3: usize,
+) -> HRESULT {
+    if this.is_null() { return HRESULT(0x80004005u32 as i32); }
+    let data_ptr = (*this).data;
+    if data_ptr.is_null() { return HRESULT(0x80004005u32 as i32); }
+    let data = &*data_ptr;
+
+    let isolate_ptr = DELEGATE_ISOLATE_PTR.with(|c| c.get());
+    if isolate_ptr.is_null() { return HRESULT(0x80004005u32 as i32); }
+
+    let isolate: &mut v8::Isolate = &mut *isolate_ptr;
+    v8::scope!(scope, isolate);
+    let ctx_global = {
+        let Some(g) = scope.get_slot::<v8::Global<v8::Context>>() else {
+            return HRESULT(0x80004005u32 as i32);
+        };
+        g.clone()
+    };
+    let context = v8::Local::new(scope, &ctx_global);
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let func = v8::Local::new(scope, &data.js_func);
+    let recv = v8::undefined(scope);
+
+    let params_raw = [p0, p1, p2];
+    let n = data.param_types.len().min(3);
+    let mut js_args: Vec<v8::Local<v8::Value>> = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let raw = params_raw[i] as *mut c_void;
+        let val: v8::Local<v8::Value> = match data.param_types[i] {
+            NativeType::Pointer => {
+                if raw.is_null() {
+                    v8::null(scope).into()
+                } else {
+                    let obj = v8::Object::new(scope);
+                    if let Some(key) = v8::String::new(scope, "handle") {
+                        let ext = v8::External::new(scope, raw);
+                        obj.set(scope, key.into(), ext.into());
+                    }
+                    obj.into()
+                }
+            }
+            NativeType::Bool  => v8::Boolean::new(scope, (raw as u8) != 0).into(),
+            NativeType::U8    => v8::Integer::new_from_unsigned(scope, raw as u8 as u32).into(),
+            NativeType::I8    => v8::Integer::new(scope, raw as i8 as i32).into(),
+            NativeType::U16   => v8::Integer::new_from_unsigned(scope, raw as u16 as u32).into(),
+            NativeType::I16   => v8::Integer::new(scope, raw as i16 as i32).into(),
+            NativeType::U32   => v8::Integer::new_from_unsigned(scope, raw as u32).into(),
+            NativeType::I32   => v8::Integer::new(scope, raw as i32).into(),
+            NativeType::U64   => v8::Number::new(scope, raw as u64 as f64).into(),
+            NativeType::I64   => v8::Number::new(scope, raw as i64 as f64).into(),
+            _                 => v8::undefined(scope).into(),
+        };
+        js_args.push(val);
+    }
+
+    func.call(scope, recv.into(), &js_args);
+    HRESULT(0)
+}
+
+/// Extract the GUID and input-parameter NativeTypes from a delegate declaration.
+pub(crate) fn js_delegate_params_from_declaration(
+    lock: &dyn Declaration,
+    kind: DeclarationKind,
+) -> Option<(GUID, Vec<NativeType>)> {
+    let build = |method: &MethodDeclaration, guid: GUID| -> (GUID, Vec<NativeType>) {
+        let params = method
+            .parameters()
+            .iter()
+            .filter(|p| !p.is_out())
+            .map(|p| {
+                let sig = Signature::to_string(p.metadata().unwrap(), &p.type_());
+                crate::helpers::ffi_native_type_from_signature(&sig)
+            })
+            .collect();
+        (guid, params)
+    };
+
+    Some(match kind {
+        DeclarationKind::Delegate => {
+            let d = lock.as_any().downcast_ref::<DelegateDeclaration>()?;
+            build(d.invoke_method(), d.id())
+        }
+        DeclarationKind::GenericDelegate => {
+            let d = lock.as_any().downcast_ref::<GenericDelegateDeclaration>()?;
+            build(d.invoke_method(), d.id())
+        }
+        DeclarationKind::GenericDelegateInstance => {
+            let d = lock.as_any().downcast_ref::<GenericDelegateInstanceDeclaration>()?;
+            build(d.invoke_method(), d.id())
+        }
+        _ => return None,
+    })
+}
+
 impl Runtime {
     pub fn new(app_root: &str) -> Self {
         INIT.call_once(|| {
@@ -4694,6 +5703,16 @@ impl Runtime {
             }
         }
 
+        // Store the global context in the isolate slot so the JS delegate
+        // Invoke trampoline can enter V8 without an existing scope on the stack.
+        {
+            let ctx_clone = global_context.clone();
+            isolate.set_slot(ctx_clone);
+        }
+        // Don't capture `&mut *isolate as *mut v8::Isolate` here: the wrapper's
+        // address moves with the `OwnedIsolate` into `Self`, dangling our pointer.
+        // The caller must invoke `register_delegate_isolate_ptr` after boxing.
+
         Self {
             isolate,
             global_context,
@@ -4702,7 +5721,26 @@ impl Runtime {
         }
     }
 
-    pub fn run_script(&mut self, script: &str) {
+    /// Must be called after the Runtime is at a stable address (e.g. boxed),
+    /// so the captured isolate pointer doesn't dangle.
+    pub fn register_delegate_isolate_ptr(&mut self) {
+        let raw_isolate: *mut v8::Isolate = &mut *self.isolate as *mut v8::Isolate;
+        DELEGATE_ISOLATE_PTR.with(|cell| cell.set(raw_isolate));
+    }
+
+    /// Provides mutable access to the underlying V8 isolate.
+    /// Used by the devtools integration to attach a `V8Inspector`.
+    pub fn isolate_mut(&mut self) -> &mut v8::Isolate {
+        &mut self.isolate
+    }
+
+    /// Returns the persistent context handle.
+    /// Used by the devtools integration to register the context with the inspector.
+    pub fn global_context(&self) -> &v8::Global<v8::Context> {
+        &self.global_context
+    }
+
+    pub fn run_script(&mut self, script: &str, filename: &str) {
         v8::scope!(scope, &mut self.isolate);
         let context = v8::Local::new(scope, &self.global_context);
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -4719,16 +5757,22 @@ impl Runtime {
         };
 
         let Some(code) = v8::String::new(tc, source_to_run.as_str()) else { return };
-        if let Some(compiled) = v8::Script::compile(tc, code, None) {
+        let origin = v8::String::new(tc, filename).map(|name| {
+            v8::ScriptOrigin::new(tc, name.into(), 0, 0, false, -1, None, false, false, false, None)
+        });
+        if let Some(compiled) = v8::Script::compile(tc, code, origin.as_ref()) {
             compiled.run(tc);
         }
 
-        // Log and rethrow any JS exception back into V8 (mirrors NativeScript behaviour).
+        // Log any uncaught JS exception. Do NOT call tc.rethrow() here: run_script is
+        // invoked from FFI (runtime_runscript) where there is no outer V8 TryCatch.
+        // Rethrowing into an empty V8 scope causes V8 to call its fatal-error handler
+        // → abort() → System.ExecutionEngineException in the CLR.
         if tc.has_caught() {
             if let Some(msg) = tc.message() {
                 let text = msg.get(tc).to_rust_string_lossy(tc);
                 let line = msg.get_line_number(tc).unwrap_or(0);
-                eprintln!("[NativeScript] Uncaught exception at line {}: {}", line, text);
+                debug_output(&format!("[NativeScript] JS error at line {}: {}\n", line, text));
                 if let Some(stack) = msg.get_stack_trace(tc) {
                     for i in 0..stack.get_frame_count() {
                         if let Some(frame) = stack.get_frame(tc, i) {
@@ -4738,18 +5782,47 @@ impl Runtime {
                             let file = frame.get_script_name(tc)
                                 .map(|s| s.to_rust_string_lossy(tc))
                                 .unwrap_or_else(|| "<unknown>".to_string());
-                            eprintln!("    at {} ({}:{}:{})", fn_name, file,
-                                frame.get_line_number(), frame.get_column());
+                            debug_output(&format!("    at {} ({}:{}:{})\n", fn_name, file,
+                                frame.get_line_number(), frame.get_column()));
                         }
                     }
                 }
+            } else if let Some(exc) = tc.exception() {
+                let text = exc.to_rust_string_lossy(tc);
+                debug_output(&format!("[NativeScript] JS exception: {}\n", text));
             }
-            tc.rethrow();
             return;
         }
 
         // Drain any synchronous Promise microtasks that the script may have queued.
         tc.perform_microtask_checkpoint();
+    }
+
+    pub fn eval_script_to_string(&mut self, script: &str) -> Option<String> {
+        v8::scope!(scope, &mut self.isolate);
+        let context = v8::Local::new(scope, &self.global_context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        v8::tc_scope!(tc, scope);
+
+        let code = v8::String::new(tc, script)?;
+        let compiled = v8::Script::compile(tc, code, None)?;
+        let value = compiled.run(tc)?;
+
+        if tc.has_caught() {
+            if let Some(msg) = tc.message() {
+                let text = msg.get(tc).to_rust_string_lossy(tc);
+                let line = msg.get_line_number(tc).unwrap_or(0);
+                eprintln!("[NativeScript] Worker eval exception at line {}: {}", line, text);
+            }
+            tc.rethrow();
+            return None;
+        }
+
+        tc.perform_microtask_checkpoint();
+
+        value
+            .to_string(tc)
+            .map(|s| s.to_rust_string_lossy(tc))
     }
 
     pub fn dispose(&self) {}
@@ -4759,6 +5832,241 @@ impl Drop for Runtime {
     fn drop(&mut self) {
         if self.winrt_initialized {
             unsafe { RoUninitialize() };
+        }
+    }
+}
+
+// ── Structured-clone helpers ─────────────────────────────────────────────────
+
+struct WorkerValueSerializer;
+
+impl v8::ValueSerializerImpl for WorkerValueSerializer {
+    fn throw_data_clone_error<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        message: v8::Local<'s, v8::String>,
+    ) {
+        let error = v8::Exception::error(scope, message);
+        scope.throw_exception(error);
+    }
+}
+
+struct WorkerValueDeserializer;
+
+impl v8::ValueDeserializerImpl for WorkerValueDeserializer {}
+
+impl Runtime {
+    /// Serialize a single V8 value to structured-clone bytes using V8's own
+    /// `ValueSerializer`.  Returns `None` if the value is not cloneable (e.g.
+    /// a function or a circular object); in that case an exception has already
+    /// been thrown into `scope`.
+    pub fn serialize_value<'s, 'v>(
+        scope: &mut v8::PinScope<'s, '_>,
+        value: v8::Local<'v, v8::Value>,
+    ) -> Option<Vec<u8>> {
+        use v8::ValueSerializerHelper;
+        let context = scope.get_current_context();
+        let ser = v8::ValueSerializer::new(scope, Box::new(WorkerValueSerializer));
+        ser.write_header();
+        if ser.write_value(context, value).unwrap_or(false) {
+            Some(ser.release())
+        } else {
+            None
+        }
+    }
+
+    /// Deserialize structured-clone bytes produced by `serialize_value` back
+    /// into a V8 value in the current context.
+    pub fn deserialize_value<'s>(
+        scope: &mut v8::PinScope<'s, '_>,
+        bytes: &[u8],
+    ) -> Option<v8::Local<'s, v8::Value>> {
+        use v8::ValueDeserializerHelper;
+        let context = scope.get_current_context();
+        let de = v8::ValueDeserializer::new(scope, Box::new(WorkerValueDeserializer), bytes);
+        if !de.read_header(context).unwrap_or(false) {
+            return None;
+        }
+        de.read_value(context)
+    }
+
+    /// Drain `globalThis.__nsWorkerOutbox`, serialize every item with V8's
+    /// structured-clone algorithm, and return the resulting byte blobs.
+    pub fn drain_outbox_bytes(&mut self) -> Vec<Result<Vec<u8>, String>> {
+        v8::scope!(scope, &mut self.isolate);
+        let context = v8::Local::new(scope, &self.global_context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        v8::tc_scope!(tc, scope);
+
+        let script_src = "(function(){var o=globalThis.__nsWorkerOutbox||[];return o.splice(0);})()";
+        let Some(src) = v8::String::new(tc, script_src) else { return Vec::new() };
+        let Some(script) = v8::Script::compile(tc, src, None) else { return Vec::new() };
+        let Some(result) = script.run(tc) else { return Vec::new() };
+        let Ok(array) = v8::Local::<v8::Array>::try_from(result) else { return Vec::new() };
+
+        let len = array.length();
+        let mut out = Vec::with_capacity(len as usize);
+
+        for i in 0..len {
+            let Some(item) = array.get_index(tc, i) else { continue };
+            match Self::serialize_value(tc, item) {
+                Some(bytes) => out.push(Ok(bytes)),
+                None => {
+                    let msg = if tc.has_caught() {
+                        let s = tc.message()
+                            .and_then(|m| Some(m.get(tc).to_rust_string_lossy(tc)))
+                            .unwrap_or_else(|| "DataCloneError".to_string());
+                        tc.reset();
+                        s
+                    } else {
+                        "DataCloneError: value could not be cloned".to_string()
+                    };
+                    out.push(Err(msg));
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Deserialize `payload_bytes` and deliver them to the worker's
+    /// `__nsDispatchToWorker` JS function.
+    pub fn dispatch_to_worker(&mut self, payload_bytes: &[u8]) {
+        v8::scope!(scope, &mut self.isolate);
+        let context = v8::Local::new(scope, &self.global_context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        v8::tc_scope!(tc, scope);
+
+        let data_value = match Self::deserialize_value(tc, payload_bytes) {
+            Some(v) => v,
+            None => {
+                eprintln!("[NativeScript] Worker dispatch: failed to deserialize message");
+                return;
+            }
+        };
+
+        let ctx = tc.get_current_context();
+        let global = ctx.global(tc);
+        let Some(fn_name) = v8::String::new(tc, "__nsDispatchToWorker") else { return };
+        let Some(fn_val) = global.get(tc, fn_name.into()) else { return };
+        let Ok(dispatch_fn) = v8::Local::<v8::Function>::try_from(fn_val) else { return };
+        let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+        dispatch_fn.call(tc, recv, &[data_value]);
+
+        tc.perform_microtask_checkpoint();
+    }
+}
+
+#[cfg(test)]
+mod error_handling_test;
+
+#[cfg(test)]
+mod interop_test;
+
+#[cfg(test)]
+mod js_delegate_tests {
+    use super::{
+        JsDelegate, JS_DELEGATE_VTBL,
+        js_delegate_add_ref, js_delegate_release, js_delegate_query_interface,
+    };
+    use std::sync::atomic::AtomicU32;
+    use windows::core::{GUID, IUnknown, Interface, HRESULT};
+    use std::ffi::c_void;
+
+    /// Build a JsDelegate with a null data pointer for reference-count-only tests.
+    /// Callers must ensure the delegate's ref_count never reaches 0 (which would
+    /// try to free the null data pointer).
+    unsafe fn make_test_delegate(guid: GUID) -> *mut JsDelegate {
+        Box::into_raw(Box::new(JsDelegate {
+            vtable:    &JS_DELEGATE_VTBL as *const _,
+            ref_count: AtomicU32::new(1),
+            guid,
+            data:      std::ptr::null_mut(),
+        }))
+    }
+
+    #[test]
+    fn js_delegate_add_ref_increments_count() {
+        unsafe {
+            let ptr = make_test_delegate(GUID::zeroed());
+            assert_eq!(js_delegate_add_ref(ptr), 2);
+            assert_eq!(js_delegate_add_ref(ptr), 3);
+            // Release back to 1 so the destructor is not triggered.
+            js_delegate_release(ptr);
+            js_delegate_release(ptr);
+            // At ref_count=1 we stop (one more release would trigger Box::from_raw on null data).
+            // Leak intentionally to avoid UB in a test-only stub.
+            let _ = Box::from_raw(ptr); // free only the JsDelegate; data is null but not accessed
+        }
+    }
+
+    #[test]
+    fn js_delegate_release_decrements_count() {
+        unsafe {
+            let ptr = make_test_delegate(GUID::zeroed());
+            js_delegate_add_ref(ptr);  // -> 2
+            js_delegate_add_ref(ptr);  // -> 3
+            assert_eq!(js_delegate_release(ptr), 2);
+            assert_eq!(js_delegate_release(ptr), 1);
+            // Leave at 1 and free manually.
+            let _ = Box::from_raw(ptr);
+        }
+    }
+
+    #[test]
+    fn js_delegate_query_interface_iunknown_succeeds() {
+        unsafe {
+            let guid = GUID::zeroed();
+            let ptr = make_test_delegate(guid);
+            let mut out: *mut c_void = std::ptr::null_mut();
+            let hr = js_delegate_query_interface(ptr, &IUnknown::IID, &mut out);
+            assert_eq!(hr, HRESULT(0), "QI for IUnknown should return S_OK");
+            assert_eq!(out, ptr as *mut c_void);
+            // QI called AddRef internally; balance it.
+            js_delegate_release(ptr);
+            // Now ref_count is back to 1; free manually.
+            let _ = Box::from_raw(ptr);
+        }
+    }
+
+    #[test]
+    fn js_delegate_query_interface_matching_guid_succeeds() {
+        let test_guid = GUID {
+            data1: 0xDEAD_BEEF,
+            data2: 0xCAFE,
+            data3: 0xBABE,
+            data4: [1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        unsafe {
+            let ptr = make_test_delegate(test_guid);
+            let mut out: *mut c_void = std::ptr::null_mut();
+            let hr = js_delegate_query_interface(ptr, &test_guid, &mut out);
+            assert_eq!(hr, HRESULT(0), "QI for the delegate's own GUID should return S_OK");
+            assert_eq!(out, ptr as *mut c_void);
+            js_delegate_release(ptr);
+            let _ = Box::from_raw(ptr);
+        }
+    }
+
+    #[test]
+    fn js_delegate_query_interface_unknown_guid_returns_e_nointerface() {
+        let other_guid = GUID {
+            data1: 0x1111_1111,
+            data2: 0x2222,
+            data3: 0x3333,
+            data4: [0; 8],
+        };
+        unsafe {
+            let ptr = make_test_delegate(GUID::zeroed());
+            let mut out: *mut c_void = std::ptr::null_mut();
+            let hr = js_delegate_query_interface(ptr, &other_guid, &mut out);
+            assert_eq!(
+                hr,
+                HRESULT(0x80004002u32 as i32),
+                "QI for unknown GUID should return E_NOINTERFACE"
+            );
+            assert!(out.is_null(), "out pointer should be null on E_NOINTERFACE");
+            let _ = Box::from_raw(ptr);
         }
     }
 }

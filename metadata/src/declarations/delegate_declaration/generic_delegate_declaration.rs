@@ -43,7 +43,7 @@ impl GenericDelegateDeclaration {
             assert!(result.is_ok());
             unsafe { metadata.CloseEnum(enumerator)};
         }
-        return count as usize;
+        count as usize
     }
 }
 

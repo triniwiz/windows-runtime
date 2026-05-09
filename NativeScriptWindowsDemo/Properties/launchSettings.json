@@ -1,7 +1,8 @@
 {
   "profiles": {
     "NativeScriptWindowsDemo": {
-      "commandName": "MsixPackage"
+      "commandName": "MsixPackage",
+      "nativeDebugging": true
     }
   }
 }
