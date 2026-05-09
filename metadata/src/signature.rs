@@ -127,31 +127,35 @@ impl Signature {
             ELEMENT_TYPE_R8 => "Double".to_string(),
             ELEMENT_TYPE_STRING => "String".to_string(),
             ELEMENT_TYPE_VALUETYPE => {
-                assert!(metadata.is_some());
-
                 let token = cor_sig_uncompress_token(&mut signature);
-                let metadata_ref = metadata.unwrap();
-                let token_type = CorTokenType(token as i32);
+                if let Some(metadata_ref) = metadata {
+                    let token_type = CorTokenType(token as i32);
 
-                // WinRT enums are ELEMENT_TYPE_VALUETYPE but must be passed as
-                // Int32 on the ABI — not as a COM pointer.  Identify them early
-                // so downstream NativeType mapping never mistakes them for Pointer.
-                if is_enum_type(metadata_ref, token_type) {
-                    return "Int32".to_string();
-                }
+                    // WinRT enums are ELEMENT_TYPE_VALUETYPE but must be passed as
+                    // Int32 on the ABI — not as a COM pointer.
+                    if is_enum_type(metadata_ref, token_type) {
+                        return "Int32".to_string();
+                    }
 
-                let class_name = get_type_name(metadata_ref, token_type);
-                if class_name.eq("System.Guid") {
-                    Guid.to_string()
+                    let class_name = get_type_name(metadata_ref, token_type);
+                    if class_name.eq("System.Guid") {
+                        Guid.to_string()
+                    } else {
+                        class_name
+                    }
                 } else {
-                    class_name
+                    // Fallback when metadata is not available (e.g. for as_string debug output)
+                    format!("ValueType(0x{:08X})", token)
                 }
             }
             ELEMENT_TYPE_CLASS => {
-                assert!(metadata.is_some());
-
                 let token = cor_sig_uncompress_token(&mut signature);
-                get_type_name(metadata.unwrap(), CorTokenType(token as i32))
+                if let Some(metadata_ref) = metadata {
+                    get_type_name(metadata_ref, CorTokenType(token as i32))
+                } else {
+                    // Fallback when metadata is not available
+                    "Object".to_string()
+                }
             }
             ELEMENT_TYPE_OBJECT => "Object".to_string(),
             ELEMENT_TYPE_SZARRAY => {
@@ -167,11 +171,18 @@ impl Signature {
 
                 assert_eq!(generic_type, ELEMENT_TYPE_CLASS);
 
-                assert!(metadata.is_some());
-
                 let token = cor_sig_uncompress_token(&mut signature);
 
-                let mut result = get_type_name(metadata.unwrap(), CorTokenType(token as i32));
+                let mut result = if let Some(metadata_ref) = metadata {
+                    let mut name = get_type_name(metadata_ref, CorTokenType(token as i32));
+                    // Strip generic backtick suffix (e.g. `1, `2) for cleaner output in typings and proxies
+                    if let Some(pos) = name.find('`') {
+                        name.truncate(pos);
+                    }
+                    name
+                } else {
+                    "Object".to_string()
+                };
 
                 result += "<";
 
