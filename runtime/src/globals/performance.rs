@@ -11,7 +11,7 @@ pub fn init_performance(scope: &mut v8::PinScope<'_, '_, ()>, global: &mut v8::L
     );
 }
 
-fn handle_now(scope: &mut v8::PinScope<'_, '_>,
+fn handle_now(_scope: &mut v8::PinScope<'_, '_>,
               _args: v8::FunctionCallbackArguments,
               mut retval: v8::ReturnValue) {
     let now = chrono::Utc::now();

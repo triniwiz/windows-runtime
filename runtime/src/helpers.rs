@@ -31,7 +31,7 @@ impl GenericReturnTypes<'_> {
     }
 }
 
-pub fn get_generic_return_types(name: &str) -> GenericReturnTypes {
+pub fn get_generic_return_types(name: &str) -> GenericReturnTypes<'_> {
     let types = match Regex::new(r"`(\d+)") {
         Ok(types) => {
             if let Some(captures) = types.captures(name) {

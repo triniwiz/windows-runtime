@@ -5,8 +5,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PeekMessageW, PM_REMOVE, TranslateMessage};
 use runtime_binding_gen::{RuntimeExtensionMetadata, RuntimeExtensionRegistry};
 
-use crate::{throw_js_error, Runtime, ASYNC_PUMP_HOOK, proxy_manifests, manifest_hashes, content_hash};
-use crate::proxy_manifest_loader::SbgManifestLoader;
+use crate::{throw_js_error, Runtime, ASYNC_PUMP_HOOK, proxy_manifests};
 use crate::type_description::build_runtime_type_descriptor;
 
 // ── Private helpers ───────────────────────────────────────────────────────────

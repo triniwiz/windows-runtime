@@ -1,39 +1,13 @@
-use std::borrow::Cow;
 use std::ffi::c_void;
-use std::fmt::{Display, Formatter};
-use std::{fmt, mem};
-use std::mem::{ManuallyDrop, MaybeUninit};
-use std::os::raw::c_ushort;
-use std::ptr::{addr_of, addr_of_mut};
+use std::mem;
+use std::mem::ManuallyDrop;
 
 use crate::DeclarationFFI;
 use libffi::low::*;
-use libffi::raw::ffi_call;
-use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
-use metadata::declarations::declaration::{Declaration, DeclarationKind};
-use metadata::declarations::delegate_declaration::generic_delegate_declaration::GenericDelegateDeclaration;
-use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
-use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
-use metadata::declarations::interface_declaration::InterfaceDeclaration;
-use metadata::declarations::method_declaration::MethodDeclaration;
-use metadata::declarations::parameter_declaration::ParameterDeclaration;
-use metadata::declarations::property_declaration::PropertyDeclaration;
-use metadata::declaring_interface_for_method::Metadata;
-use metadata::prelude::cor_sig_uncompress_element_type;
-use metadata::signature::Signature;
-use parking_lot::RwLock;
-use std::sync::Arc;
-use byteorder::ByteOrder;
-use libffi::middle::{Arg, Cif};
-use v8::FunctionCallbackArguments;
-use windows::core::{IInspectable, IUnknown, Interface, GUID, HRESULT, HSTRING, IUnknown_Vtbl, IInspectable_Vtbl};
+use libffi::middle::Arg;
+use windows::core::{IUnknown, Interface, GUID, HSTRING};
 use windows::Foundation::PropertyValue;
-use windows::Win32::System::Com::IDispatch;
-use windows::Win32::System::WinRT::IActivationFactory;
-use windows::Win32::System::WinRT::Metadata::{CorElementType, ELEMENT_TYPE_CLASS};
-use metadata::{get_method, print_vtable_names};
 use crate::error::*;
-use chrono::Local;
 
 pub(crate) const MAX_SAFE_INTEGER: isize = 9007199254740991;
 pub(crate) const MIN_SAFE_INTEGER: isize = -9007199254740991;
@@ -236,7 +210,7 @@ pub union NativeValue {
 
 impl NativeValue {
 
-    pub unsafe fn as_arg(&self, native_type: &NativeType) -> Arg {
+    pub unsafe fn as_arg(&self, native_type: &NativeType) -> Arg<'_> {
         match native_type {
             // Void should never be marshalled as an argument, but return a stable
             // placeholder to avoid process aborts in malformed metadata scenarios.
@@ -271,7 +245,7 @@ impl NativeValue {
         &'a self,
         scope: &mut v8::PinScope<'a, '_>,
         native_type: NativeType,
-    ) -> v8::Local<v8::Value> {
+    ) -> v8::Local<'a, v8::Value> {
         let value = match native_type {
             NativeType::Void => {
                 let local_value: v8::Local<v8::Value> = v8::undefined(scope).into();

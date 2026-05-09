@@ -1,4 +1,4 @@
-fn handle_time(scope: &mut v8::PinScope<'_, '_>,
+fn handle_time(_scope: &mut v8::PinScope<'_, '_>,
                _args: v8::FunctionCallbackArguments,
                mut retval: v8::ReturnValue) {
     let now = chrono::Utc::now();

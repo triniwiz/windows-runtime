@@ -337,7 +337,7 @@ impl MethodCall {
         }
 
         // Snapshot fields before the mutable borrow of argument_buf begins.
-        let number_of_abi_parameters = self.number_of_abi_parameters;
+        let _number_of_abi_parameters = self.number_of_abi_parameters;
         let is_initializer = self.is_initializer;
         let is_sealed = self.is_sealed;
         let is_void = self.is_void;

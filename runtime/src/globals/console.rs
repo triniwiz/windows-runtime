@@ -1,8 +1,6 @@
-use std::env::var;
 use std::ffi::{c_int, CString};
 use std::sync::OnceLock;
-use v8::{Local, Value};
-use windows::core::{HSTRING, PCSTR, PCWSTR};
+use windows::core::PCSTR;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::{Console};
 use windows::Win32::System::Console::{CONSOLE_MODE, GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE};
@@ -27,7 +25,7 @@ pub fn init_console(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, 
         dir.into(),
     );
 
-    let mut global = context.global(scope);
+    let global = context.global(scope);
     let value = v8::String::new(
         scope, "console",
     ).unwrap().into();

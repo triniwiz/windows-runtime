@@ -1,11 +1,8 @@
 use std::collections::HashSet;
-use std::sync::Arc;
-use parking_lot::RwLock;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration::Declaration;
 use metadata::declarations::event_declaration::EventDeclaration;
-use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::declarations::method_declaration::MethodDeclaration;
 use metadata::declarations::property_declaration::PropertyDeclaration;
 use metadata::meta_data_reader::MetadataReader;

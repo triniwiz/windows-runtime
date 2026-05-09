@@ -24,37 +24,27 @@ mod ns_proxy;
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{c_void, CString};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use ahash::AHasher;
-use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::ptr::{addr_of, addr_of_mut, NonNull};
 use std::process::Command;
-use std::result;
 use std::sync::{Arc, Once, OnceLock};
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
-use libffi::high::arg;
-use libffi::low::{CodePtr, ffi_type};
-use libffi::middle::Cif;
 use parking_lot::{Mutex, RawRwLock, RwLock};
 use parking_lot::lock_api::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLockReadGuard, RwLockWriteGuard};
-use v8::{FunctionTemplate, Global, Local, Number, Object};
-use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, IUnknown_Vtbl, PCSTR, PCWSTR, IInspectable, Error};
-use windows::Foundation::GuidHelper;
-use windows::Win32::System::Com::{IDispatch, IDispatch_Vtbl};
+use v8::{FunctionTemplate, Local};
+use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, PCSTR, IInspectable, Error};
 use windows::Win32::System::Console::GetConsoleWindow;
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringA;
-use windows::Win32::System::WinRT::{IActivationFactory, RoActivateInstance, RoGetActivationFactory, RoInitialize, RoUninitialize, RO_INIT_SINGLETHREADED};
-use windows::Win32::System::WinRT::Metadata::ELEMENT_TYPE_CHAR;
+use windows::Win32::System::WinRT::{IActivationFactory, RoGetActivationFactory, RoInitialize, RoUninitialize, RO_INIT_SINGLETHREADED};
 use windows::Win32::UI::Shell::IInitializeWithWindow;
 use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PeekMessageW, PM_REMOVE, TranslateMessage};
-use metadata::declarations::base_class_declaration::{BaseClassDeclaration, BaseClassDeclarationImpl};
+use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use metadata::declarations::class_declaration::ClassDeclaration;
-use metadata::declarations::declaration;
 use metadata::declarations::declaration::{
     DeclarationKind,
     Declaration,
@@ -66,19 +56,14 @@ use metadata::declarations::delegate_declaration::generic_delegate_instance_decl
 use metadata::declarations::enum_declaration::EnumDeclaration;
 use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::declarations::namespace_declaration::NamespaceDeclaration;
-use metadata::declarations::type_declaration::TypeDeclaration;
-use metadata::declaring_interface_for_method::Metadata;
 use metadata::meta_data_reader::MetadataReader;
-use metadata::prelude::{get_guid_attribute_value, get_string_value_from_blob, get_type_name, LOCALE_SYSTEM_DEFAULT};
-use metadata::{guid_to_string, query_interface, signature};
 use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
 use metadata::declarations::event_declaration::EventDeclaration;
 use metadata::declarations::method_declaration::MethodDeclaration;
 use metadata::declarations::property_declaration::PropertyDeclaration;
 use metadata::declarations::struct_declaration::StructDeclaration;
-use metadata::declarations::struct_field_declaration::StructFieldDeclaration;
 use metadata::signature::Signature;
-use metadata::value::{Value, Variant};
+use metadata::value::Value;
 use runtime_binding_gen::{RuntimeExtensionMetadata, RuntimeExtensionRegistry, RuntimeMethodMetadata, RuntimeParameterMetadata, RuntimePropertyMetadata};
 use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, MAX_SAFE_INTEGER, MIN_SAFE_INTEGER, NativeType, NativeValue, set_ret_val};
 use crate::proxy_manifest_loader::SbgManifestLoader;
@@ -578,14 +563,13 @@ impl Deref for DeclarationFFI {
     }
 }
 
-use regex::Regex;
 use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
 use crate::generic_method_call::GenericMethodCall;
 use crate::method_call::MethodCall;
 use crate::property_call::PropertyCall;
 
 fn init_global(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, context: v8::Local<v8::Context>) {
-    let mut global = context.global(scope);
+    let global = context.global(scope);
     let value = v8::String::new(
         scope, "global",
     ).unwrap().into();
@@ -1177,7 +1161,7 @@ fn normalize_js_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn try_resolve_with_known_extensions(mut candidate: PathBuf) -> PathBuf {
+fn try_resolve_with_known_extensions(candidate: PathBuf) -> PathBuf {
     if candidate.exists() {
         return candidate;
     }
@@ -2741,7 +2725,7 @@ unsafe fn guid_ptr_to_js_object<'a>(
     // toString() / valueOf() both return the GUID string
     let guid_v8 = v8::String::new(scope, &guid_str).unwrap();
     let to_string_fn = v8::FunctionTemplate::builder(
-        |scope: &mut v8::PinScope<'_, '_>,
+        |_scope: &mut v8::PinScope<'_, '_>,
          args: v8::FunctionCallbackArguments,
          mut retval: v8::ReturnValue| {
             let s = unsafe { args.data().cast::<v8::String>() };
@@ -2988,7 +2972,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                 let mut seen_member_names: HashSet<String> = HashSet::new();
 
 
-                let to_string_func = FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
+                let to_string_func = FunctionTemplate::builder(|_scope: &mut v8::PinScope<'_, '_>,
                                                                 args: v8::FunctionCallbackArguments,
                                                                 mut retval: v8::ReturnValue| {
                     retval.set(args.data());
@@ -3058,7 +3042,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                         let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
 
-                        let nam = method.name();
+                        let _nam = method.name();
                         let mut method = MethodCall::new(
                             method, method.is_sealed(), dec.instance.clone().unwrap(), false,
                         );
@@ -3204,7 +3188,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                         setter = Some(FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                                  args: v8::FunctionCallbackArguments,
-                                                                 mut retval: v8::ReturnValue| {
+                                                                 _retval: v8::ReturnValue| {
                             let dec = unsafe { args.data().cast::<v8::External>() };
                             let dec = dec.value() as *mut DeclarationFFI;
                             let dec = unsafe { &*dec };
@@ -3245,7 +3229,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                 };
 
 
-                let to_string_func = FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
+                let to_string_func = FunctionTemplate::builder(|_scope: &mut v8::PinScope<'_, '_>,
                                                                 args: v8::FunctionCallbackArguments,
                                                                 mut retval: v8::ReturnValue| {
                     retval.set(args.data());
@@ -3357,7 +3341,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                                     let lock = dec.read();
 
-                                    let kind = lock.kind();
+                                    let _kind = lock.kind();
 
                                     let property = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
 
@@ -3396,9 +3380,9 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let setter_declaration_ext = v8::External::new(scope, setter_declaration as _);
 
 
-                                    setter = Some(FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
-                                                                             args: v8::FunctionCallbackArguments,
-                                                                             mut retval: v8::ReturnValue| {})
+                                    setter = Some(FunctionTemplate::builder(|_scope: &mut v8::PinScope<'_, '_>,
+                                                                             _args: v8::FunctionCallbackArguments,
+                                                                             _retval: v8::ReturnValue| {})
                                         .data(setter_declaration_ext.into())
                                         .build(scope));
                                 }
@@ -3518,7 +3502,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                                     let lock = dec.read();
 
-                                    let kind = lock.kind();
+                                    let _kind = lock.kind();
 
                                     let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
 
@@ -3557,9 +3541,9 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let setter_declaration_ext = v8::External::new(scope, setter_declaration as _);
 
 
-                                    setter = Some(FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
-                                                                             args: v8::FunctionCallbackArguments,
-                                                                             mut retval: v8::ReturnValue| {})
+                                    setter = Some(FunctionTemplate::builder(|_scope: &mut v8::PinScope<'_, '_>,
+                                                                             _args: v8::FunctionCallbackArguments,
+                                                                             _retval: v8::ReturnValue| {})
                                         .data(setter_declaration_ext.into())
                                         .build(scope));
                                 }
@@ -3736,7 +3720,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                         let lock = dec.read();
 
-                        let kind = lock.kind();
+                        let _kind = lock.kind();
 
                         let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
 
@@ -3777,7 +3761,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                         setter = Some(FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                                  args: v8::FunctionCallbackArguments,
-                                                                 mut retval: v8::ReturnValue| {
+                                                                 _retval: v8::ReturnValue| {
                             let dec = unsafe { args.data().cast::<v8::External>() };
                             let dec = dec.value() as *mut DeclarationFFI;
                             let dec = unsafe { &*dec };
@@ -4585,7 +4569,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
 
     let name = v8::String::new(scope, name).unwrap();
 
-    let mut ext = DeclarationFFI::new(Arc::clone(&declaration));
+    let ext = DeclarationFFI::new(Arc::clone(&declaration));
 
     let ext = Box::into_raw(Box::new(ext));
 
@@ -4751,7 +4735,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
 
         dec.struct_instance = Some((struct_buf, field_types));
 
-        let name = v8::String::new(scope, name.as_str()).unwrap();
+        let _name = v8::String::new(scope, name.as_str()).unwrap();
 
         let getter = |scope: &mut v8::PinScope<'_, '_>,
                       key: Local<v8::Name>,
@@ -4773,7 +4757,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                 let name = lock.name();
 
                 let name = v8::String::new(scope, name).unwrap();
-                let func = v8::Function::builder(|scope: &mut v8::PinScope<'_, '_>,
+                let func = v8::Function::builder(|_scope: &mut v8::PinScope<'_, '_>,
                                                   args: v8::FunctionCallbackArguments,
                                                   mut retval: v8::ReturnValue| {
                     retval.set(args.data());
@@ -4919,7 +4903,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                       key: Local<v8::Name>,
                       value: Local<v8::Value>,
                       args: v8::PropertyCallbackArguments,
-                      mut rv: v8::ReturnValue<()>| -> v8::Intercepted {
+                      _rv: v8::ReturnValue<()>| -> v8::Intercepted {
             let key = key.to_rust_string_lossy(scope);
 
             let this = args.data();
@@ -4930,9 +4914,9 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
 
             let instance = unsafe { (&mut *dec).struct_instance.as_mut() };
 
-            let mut dec = unsafe { &mut *dec };
+            let dec = unsafe { &mut *dec };
 
-            let mut lock = dec.write();
+            let lock = dec.write();
 
             let struct_dec = lock.as_any().downcast_ref::<StructDeclaration>().unwrap();
 
@@ -5067,7 +5051,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
 }
 
 fn init_meta(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, context: Local<v8::Context>) {
-    let mut global = context.global(scope);
+    let global = context.global(scope);
     let global_metadata = MetadataReader::find_by_name("").unwrap();
     let data = global_metadata.read();
     let ns = data.as_any().downcast_ref::<NamespaceDeclaration>();
@@ -5310,8 +5294,8 @@ fn handle_named_property_getter(scope: &mut v8::PinScope<'_, '_>,
 
                         let builder = v8::Function::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                              args: v8::FunctionCallbackArguments,
-                                                             mut retval: v8::ReturnValue| {
-                            let length = args.length();
+                                                             _retval: v8::ReturnValue| {
+                            let _length = args.length();
 
                             let dec = unsafe { args.data().cast::<v8::External>() };
 
@@ -5331,7 +5315,7 @@ fn handle_named_property_getter(scope: &mut v8::PinScope<'_, '_>,
                                 method, method.is_sealed(), instance, false,
                             );
 
-                            let (ret, result) = method.call(scope, &args);
+                            let (_ret, _result) = method.call(scope, &args);
                         })
                             .data(ext.into()).build(scope);
 
@@ -5478,7 +5462,7 @@ fn handle_indexed_property_getter(_scope: &mut v8::PinScope<'_, '_>,
 }
 
 
-fn handle_ns_func(scope: &mut v8::PinScope<'_, '_>,
+fn handle_ns_func(_scope: &mut v8::PinScope<'_, '_>,
                   _args: v8::FunctionCallbackArguments,
                   mut _retval: v8::ReturnValue) {
     // scope.throw_exception(v8::Exception::error(scope, v8::String::new("")))

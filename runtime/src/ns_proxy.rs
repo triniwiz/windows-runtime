@@ -178,7 +178,7 @@ pub(crate) fn handle_named_property_getter(
 
                             let builder = v8::Function::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                                  args: v8::FunctionCallbackArguments,
-                                                                 mut retval: v8::ReturnValue| {
+                                                                 _retval: v8::ReturnValue| {
                                 let dec = unsafe { args.data().cast::<v8::External>() };
                                 let dec = dec.value() as *mut DeclarationFFI;
                                 let dec = unsafe { &*dec };
@@ -186,7 +186,7 @@ pub(crate) fn handle_named_property_getter(
                                 let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
                                 let instance = dec.instance.clone().unwrap();
                                 let mut method = MethodCall::new(method, method.is_sealed(), instance, false);
-                                let (ret, result) = method.call(scope, &args);
+                                let (_ret, _result) = method.call(scope, &args);
                             })
                             .data(ext.into())
                             .build(scope);
@@ -651,7 +651,7 @@ pub(crate) unsafe fn guid_ptr_to_js_object<'a>(
 
     let guid_v8 = v8::String::new(scope, &guid_str).unwrap();
     let to_string_fn = v8::FunctionTemplate::builder(
-        |scope: &mut v8::PinScope<'_, '_>,
+        |_scope: &mut v8::PinScope<'_, '_>,
          args: v8::FunctionCallbackArguments,
          mut retval: v8::ReturnValue| {
             let s = unsafe { args.data().cast::<v8::String>() };
@@ -833,7 +833,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                 let class_properties = collect_class_properties(clazz);
                 let mut seen_member_names: HashSet<String> = HashSet::new();
 
-                let to_string_func = FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
+                let to_string_func = FunctionTemplate::builder(|_scope: &mut v8::PinScope<'_, '_>,
                                                                 args: v8::FunctionCallbackArguments,
                                                                 mut retval: v8::ReturnValue| {
                     retval.set(args.data());
@@ -977,7 +977,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let setter_declaration_ext = v8::External::new(scope, setter_declaration as _);
                         setter = Some(FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                                  args: v8::FunctionCallbackArguments,
-                                                                 mut retval: v8::ReturnValue| {
+                                                                 _retval: v8::ReturnValue| {
                             let dec = unsafe { args.data().cast::<v8::External>() };
                             let dec = dec.value() as *mut DeclarationFFI;
                             let dec = unsafe { &*dec };
@@ -1014,7 +1014,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                     _ => unreachable!(),
                 };
 
-                let to_string_func = FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
+                let to_string_func = FunctionTemplate::builder(|_scope: &mut v8::PinScope<'_, '_>,
                                                                 args: v8::FunctionCallbackArguments,
                                                                 mut retval: v8::ReturnValue| {
                     retval.set(args.data());
@@ -1115,9 +1115,9 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let setter_declaration = declaration;
                                     let setter_declaration = Box::into_raw(Box::new(setter_declaration));
                                     let setter_declaration_ext = v8::External::new(scope, setter_declaration as _);
-                                    setter = Some(FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
-                                                                             args: v8::FunctionCallbackArguments,
-                                                                             mut retval: v8::ReturnValue| {})
+                                    setter = Some(FunctionTemplate::builder(|_scope: &mut v8::PinScope<'_, '_>,
+                                                                             _args: v8::FunctionCallbackArguments,
+                                                                             _retval: v8::ReturnValue| {})
                                         .data(setter_declaration_ext.into())
                                         .build(scope));
                                 }
@@ -1224,9 +1224,9 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let setter_declaration = declaration;
                                     let setter_declaration = Box::into_raw(Box::new(setter_declaration));
                                     let setter_declaration_ext = v8::External::new(scope, setter_declaration as _);
-                                    setter = Some(FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
-                                                                             args: v8::FunctionCallbackArguments,
-                                                                             mut retval: v8::ReturnValue| {})
+                                    setter = Some(FunctionTemplate::builder(|_scope: &mut v8::PinScope<'_, '_>,
+                                                                             _args: v8::FunctionCallbackArguments,
+                                                                             _retval: v8::ReturnValue| {})
                                         .data(setter_declaration_ext.into())
                                         .build(scope));
                                 }
@@ -1384,7 +1384,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let setter_declaration_ext = v8::External::new(scope, setter_declaration as _);
                         setter = Some(FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                                  args: v8::FunctionCallbackArguments,
-                                                                 mut retval: v8::ReturnValue| {
+                                                                 _retval: v8::ReturnValue| {
                             let dec = unsafe { args.data().cast::<v8::External>() };
                             let dec = dec.value() as *mut DeclarationFFI;
                             let dec = unsafe { &*dec };
@@ -2048,7 +2048,7 @@ pub(crate) fn create_ns_struct_ctor_object<'a>(
         drop(lock);
         dec.struct_instance = Some((struct_buf, field_types));
 
-        let name = v8::String::new(scope, name.as_str()).unwrap();
+        let _name = v8::String::new(scope, name.as_str()).unwrap();
 
         let getter = |scope: &mut v8::PinScope<'_, '_>,
                       key: Local<v8::Name>,
@@ -2064,7 +2064,7 @@ pub(crate) fn create_ns_struct_ctor_object<'a>(
             if key == "toString" {
                 let name = lock.name();
                 let name = v8::String::new(scope, name).unwrap();
-                let func = v8::Function::builder(|scope: &mut v8::PinScope<'_, '_>,
+                let func = v8::Function::builder(|_scope: &mut v8::PinScope<'_, '_>,
                                                   args: v8::FunctionCallbackArguments,
                                                   mut retval: v8::ReturnValue| {
                     retval.set(args.data());
@@ -2175,7 +2175,7 @@ pub(crate) fn create_ns_struct_ctor_object<'a>(
                       key: Local<v8::Name>,
                       value: Local<v8::Value>,
                       args: v8::PropertyCallbackArguments,
-                      mut rv: v8::ReturnValue<()>| -> v8::Intercepted {
+                      _rv: v8::ReturnValue<()>| -> v8::Intercepted {
             let key = key.to_rust_string_lossy(scope);
             let this = args.data();
             let dec = unsafe { this.cast::<v8::External>() };
@@ -2270,7 +2270,7 @@ pub(crate) fn init_meta(
     context: Local<v8::Context>,
 ) {
     use metadata::declarations::namespace_declaration::NamespaceDeclaration;
-    let mut global = context.global(scope);
+    let global = context.global(scope);
     let global_metadata = MetadataReader::find_by_name("").unwrap();
     let data = global_metadata.read();
     let ns = data.as_any().downcast_ref::<NamespaceDeclaration>();
