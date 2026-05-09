@@ -116,6 +116,8 @@ fn map_type_to_ts_with_generics(value: &str, generic_params: &[String]) -> Strin
 
     // Strip generic arguments to get the base type name for matching
     let base = if let Some(idx) = value.find('<') { &value[..idx] } else { value };
+    // Strip arity for matching (e.g. "IVector`1" -> "IVector")
+    let base_no_arity = if let Some(idx) = base.find('`') { &base[..idx] } else { base };
 
     if let Some(index) = value.strip_prefix("Var!").and_then(|rest| rest.parse::<usize>().ok()) {
         if let Some(name) = generic_params.get(index) {
@@ -124,7 +126,7 @@ fn map_type_to_ts_with_generics(value: &str, generic_params: &[String]) -> Strin
     }
 
     // Primitives
-    match base {
+    match base_no_arity {
         "Void" => return "void".to_string(),
         "Boolean" => return "boolean".to_string(),
         "DateTime" => return "Date".to_string(),
@@ -149,7 +151,8 @@ fn map_type_to_ts_with_generics(value: &str, generic_params: &[String]) -> Strin
     }
 
     // IAsyncOperation<T> / IAsyncAction<T> -> Promise<T>
-    if base.starts_with("IAsyncOperation") || base.starts_with("IAsyncAction") {
+    if base_no_arity == "IAsyncOperation" || base_no_arity.ends_with(".IAsyncOperation") || 
+       base_no_arity == "IAsyncAction" || base_no_arity.ends_with(".IAsyncAction") {
         if let Some(inner) = value.find('<').and_then(|s| {
             let inner = &value[s + 1..value.len().saturating_sub(1)];
             if inner.is_empty() { None } else { Some(inner) }
@@ -160,7 +163,9 @@ fn map_type_to_ts_with_generics(value: &str, generic_params: &[String]) -> Strin
     }
 
     // IVector<T> / IReadOnlyList<T> / IIterable<T> -> T[]
-    if base.starts_with("IVector") || base.starts_with("IReadOnlyList") || base.starts_with("IIterable") {
+    if base_no_arity == "IVector" || base_no_arity.ends_with(".IVector") || 
+       base_no_arity == "IReadOnlyList" || base_no_arity.ends_with(".IReadOnlyList") || 
+       base_no_arity == "IIterable" || base_no_arity.ends_with(".IIterable") {
         if let Some(inner) = value.find('<').and_then(|s| {
             let inner = &value[s + 1..value.len().saturating_sub(1)];
             if inner.is_empty() { None } else { Some(inner) }
@@ -171,7 +176,8 @@ fn map_type_to_ts_with_generics(value: &str, generic_params: &[String]) -> Strin
     }
 
     // IMap<K,V> / IReadOnlyDictionary<K,V> -> Record<K, V>
-    if base.starts_with("IMap") || base.starts_with("IReadOnlyDictionary") {
+    if base_no_arity == "IMap" || base_no_arity.ends_with(".IMap") || 
+       base_no_arity == "IReadOnlyDictionary" || base_no_arity.ends_with(".IReadOnlyDictionary") {
         if let Some(inner) = value.find('<').map(|s| &value[s + 1..value.len().saturating_sub(1)]) {
             let mut depth = 0usize;
             let mut split = None;
@@ -193,41 +199,37 @@ fn map_type_to_ts_with_generics(value: &str, generic_params: &[String]) -> Strin
     }
 
     if value.contains('<') {
-        let short = declaration_display_name(base);
+        let name = if let Some(idx) = base.find('`') { &base[..idx] } else { base };
         if let Some(args) = split_generic_arguments(value) {
             let rendered = args
                 .iter()
                 .map(|arg| map_type_to_ts_with_generics(arg, generic_params))
                 .collect::<Vec<_>>()
                 .join(", ");
-            return format!("{}<{}>", short, rendered);
+            return format!("{}<{}>", name, rendered);
         }
     }
 
-    // Fully-qualified WinRT reference type (e.g. "Windows.Foundation.Uri") — use the short name.
-    // The type will be declared in its own namespace block in the generated output.
-    if value.contains('.') {
-        let short = value.rsplit('.').next().unwrap_or(value);
-        // Strip generic arity suffix (e.g. "IFoo`1" -> "IFoo")
-        let short = if let Some(idx) = short.find('`') { &short[..idx] } else { short };
-        return short.to_string();
-    }
-
-    // Strip generic arity from bare names (e.g. "IFoo`1")
+    // Fully-qualified WinRT reference type usage: return the name with arity stripped.
     if let Some(idx) = value.find('`') {
         return value[..idx].to_string();
+    }
+
+    if !value.is_empty() && value.chars().next().unwrap().is_alphabetic() {
+        return value.to_string();
     }
 
     "unknown".to_string()
 }
 
-fn method_signature(method: &metadata::declarations::method_declaration::MethodDeclaration) -> String {
-    method_signature_with_generics(method, &[])
+fn method_signature(method: &metadata::declarations::method_declaration::MethodDeclaration, use_arrow: bool) -> String {
+    method_signature_with_generics(method, &[], use_arrow)
 }
 
 fn method_signature_with_generics(
     method: &metadata::declarations::method_declaration::MethodDeclaration,
     generic_params: &[String],
+    use_arrow: bool,
 ) -> String {
     let method_name = method.name();
     let total_params = method.parameters().len();
@@ -269,30 +271,11 @@ fn method_signature_with_generics(
         .map(|m| Signature::to_string(m, &method.return_type()))
         .unwrap_or_else(|| "Void".to_string());
 
+    let sep = if use_arrow { " => " } else { ": " };
     format!(
-        "({params}) => {}",
+        "({params}){sep}{}",
         map_type_to_ts_with_generics(ret_ty.as_str(), generic_params)
     )
-}
-
-fn method_display_name(
-    method: &metadata::declarations::method_declaration::MethodDeclaration,
-    duplicate_count: usize,
-    duplicate_index: usize,
-) -> String {
-    if duplicate_count <= 1 {
-        return method.name().to_string();
-    }
-
-    if method.is_default_overload() {
-        return method.name().to_string();
-    }
-
-    if !method.overload_name().is_empty() {
-        return method.overload_name().to_string();
-    }
-
-    format!("{}_overload{}", method.name(), duplicate_index)
 }
 
 fn interface_extends_clause(
@@ -327,22 +310,17 @@ fn render_interface(name: &str, interface: &InterfaceDeclaration) -> String {
     let extends = interface_extends_clause(interface.implemented_interfaces(), &[]);
     out.push_str(&format!("interface {}{} {{\n", name, extends));
 
-    let methods = interface.methods().iter().filter(|m| m.is_exported()).collect::<Vec<_>>();
-    let mut method_counts: BTreeMap<String, usize> = BTreeMap::new();
-    for method in &methods {
-        *method_counts.entry(method.name().to_string()).or_insert(0) += 1;
-    }
-    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut methods = interface.methods().iter().filter(|m| m.is_exported()).collect::<Vec<_>>();
+    methods.sort_by_key(|m| m.name());
 
     for method in methods {
-        let base_name = method.name().to_string();
-        let entry = seen.entry(base_name.clone()).or_insert(0);
-        *entry += 1;
-        let method_name = method_display_name(method, *method_counts.get(&base_name).unwrap_or(&1), *entry);
-        out.push_str(&format!("  {}: {};\n", method_name, method_signature(method)));
+        out.push_str(&format!("  {}{};\n", method.name(), method_signature(method, false)));
     }
 
-    for prop in interface.properties().iter().filter(|p| p.is_exported()) {
+    let mut properties = interface.properties().iter().filter(|p| p.is_exported()).collect::<Vec<_>>();
+    properties.sort_by_key(|p| p.name());
+
+    for prop in properties {
         let return_ty = Signature::to_string(prop.getter().metadata().unwrap(), &prop.getter().return_type());
         out.push_str(&format!("  {}: {};\n", prop.name(), map_type_to_ts(return_ty.as_str())));
     }
@@ -384,26 +362,22 @@ fn render_class(name: &str, class_decl: &ClassDeclaration) -> String {
     }
 
     let methods = class_decl.methods().iter().filter(|m| m.is_exported()).collect::<Vec<_>>();
-    let mut method_counts: BTreeMap<String, usize> = BTreeMap::new();
-    for method in &methods {
-        *method_counts.entry(method.name().to_string()).or_insert(0) += 1;
-    }
-    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut methods = class_decl.methods().iter().filter(|m| m.is_exported()).collect::<Vec<_>>();
+    methods.sort_by_key(|m| m.name());
 
     for method in methods {
-        let base_name = method.name().to_string();
-        let entry = seen.entry(base_name.clone()).or_insert(0);
-        *entry += 1;
-        let method_name = method_display_name(method, *method_counts.get(&base_name).unwrap_or(&1), *entry);
-        let sig = method_signature(method);
+        let sig = method_signature(method, false);
         if method.is_static() {
-            out.push_str(&format!("  static {}: {};\n", method_name, sig));
+            out.push_str(&format!("  static {}{};\n", method.name(), sig));
         } else {
-            out.push_str(&format!("  {}: {};\n", method_name, sig));
+            out.push_str(&format!("  {}{};\n", method.name(), sig));
         }
     }
 
-    for prop in class_decl.properties().iter().filter(|p| p.is_exported()) {
+    let mut properties = class_decl.properties().iter().filter(|p| p.is_exported()).collect::<Vec<_>>();
+    properties.sort_by_key(|p| p.name());
+
+    for prop in properties {
         let return_ty = Signature::to_string(prop.getter().metadata().unwrap(), &prop.getter().return_type());
         if prop.is_static() {
             out.push_str(&format!("  static {}: {};\n", prop.name(), map_type_to_ts(return_ty.as_str())));
@@ -467,7 +441,7 @@ fn render_struct(name: &str, struct_decl: &StructDeclaration) -> String {
 fn render_delegate(name: &str, delegate: &DelegateDeclaration) -> String {
     let mut out = String::new();
     let invoke = delegate.invoke_method();
-    out.push_str(&format!("type {} = {};\n\n", name, method_signature(invoke)));
+    out.push_str(&format!("type {} = {};\n\n", name, method_signature(invoke, true)));
     out
 }
 
@@ -487,25 +461,21 @@ fn render_generic_interface(interface: &GenericInterfaceDeclaration) -> String {
     out.push_str(&format!("interface {}{}{} {{\n", name, generic_suffix, extends));
 
     let methods = interface.methods().iter().filter(|m| m.is_exported()).collect::<Vec<_>>();
-    let mut method_counts: BTreeMap<String, usize> = BTreeMap::new();
-    for method in &methods {
-        *method_counts.entry(method.name().to_string()).or_insert(0) += 1;
-    }
-    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut methods = interface.methods().iter().filter(|m| m.is_exported()).collect::<Vec<_>>();
+    methods.sort_by_key(|m| m.name());
 
     for method in methods {
-        let base_name = method.name().to_string();
-        let entry = seen.entry(base_name.clone()).or_insert(0);
-        *entry += 1;
-        let method_name = method_display_name(method, *method_counts.get(&base_name).unwrap_or(&1), *entry);
         out.push_str(&format!(
-            "  {}: {};\n",
-            method_name,
-            method_signature_with_generics(method, &generic_params)
+            "  {}{};\n",
+            method.name(),
+            method_signature_with_generics(method, &generic_params, false)
         ));
     }
 
-    for prop in interface.properties().iter().filter(|p| p.is_exported()) {
+    let mut properties = interface.properties().iter().filter(|p| p.is_exported()).collect::<Vec<_>>();
+    properties.sort_by_key(|p| p.name());
+
+    for prop in properties {
         let return_ty = Signature::to_string(prop.getter().metadata().unwrap(), &prop.getter().return_type());
         out.push_str(&format!(
             "  {}: {};\n",
@@ -539,7 +509,7 @@ fn render_generic_delegate(delegate: &GenericDelegateDeclaration) -> String {
         "type {}{} = {};\n\n",
         name,
         generic_suffix,
-        method_signature_with_generics(invoke, &generic_params)
+        method_signature_with_generics(invoke, &generic_params, true)
     ));
     out
 }
