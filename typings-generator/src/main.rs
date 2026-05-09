@@ -278,6 +278,41 @@ fn method_signature_with_generics(
     )
 }
 
+fn collect_all_interface_methods(interface: &InterfaceDeclaration, methods: &mut Vec<metadata::declarations::method_declaration::MethodDeclaration>, seen: &mut BTreeSet<String>) {
+    for method in interface.methods().iter().filter(|m| m.is_exported()) {
+        // We use a combination of name and param count to distinguish overloads for the 'seen' check
+        // but TypeScript allows grouped overloads with the same name.
+        let sig_key = format!("{}:{}", method.name(), method.parameters().len());
+        if seen.insert(sig_key) {
+            methods.push(method.clone());
+        }
+    }
+    for base in interface.implemented_interfaces() {
+        collect_all_interface_methods(base, methods, seen);
+    }
+}
+
+fn collect_all_class_methods(class_decl: &ClassDeclaration, methods: &mut Vec<metadata::declarations::method_declaration::MethodDeclaration>, seen: &mut BTreeSet<String>) {
+    for method in class_decl.methods().iter().filter(|m| m.is_exported()) {
+        let sig_key = format!("{}:{}", method.name(), method.parameters().len());
+        if seen.insert(sig_key) {
+            methods.push(method.clone());
+        }
+    }
+    for interface in class_decl.implemented_interfaces() {
+        collect_all_interface_methods(interface, methods, seen);
+    }
+    let base_name = class_decl.base_full_name();
+    if !base_name.is_empty() && base_name != "System.Object" {
+        if let Some(base_dec) = MetadataReader::find_by_name(base_name) {
+            let lock = base_dec.read();
+            if let Some(base_class) = lock.as_any().downcast_ref::<ClassDeclaration>() {
+                collect_all_class_methods(base_class, methods, seen);
+            }
+        }
+    }
+}
+
 fn interface_extends_clause(
     implemented: Vec<&InterfaceDeclaration>,
     generic_params: &[String],
@@ -310,7 +345,10 @@ fn render_interface(name: &str, interface: &InterfaceDeclaration) -> String {
     let extends = interface_extends_clause(interface.implemented_interfaces(), &[]);
     out.push_str(&format!("interface {}{} {{\n", name, extends));
 
-    let mut methods = interface.methods().iter().filter(|m| m.is_exported()).collect::<Vec<_>>();
+    let mut methods = Vec::new();
+    let mut seen = BTreeSet::new();
+    collect_all_interface_methods(interface, &mut methods, &mut seen);
+    
     methods.sort_by_key(|m| m.name());
 
     for method in methods {
@@ -361,8 +399,10 @@ fn render_class(name: &str, class_decl: &ClassDeclaration) -> String {
         out.push_str("  constructor(...args: unknown[]);\n");
     }
 
-    let methods = class_decl.methods().iter().filter(|m| m.is_exported()).collect::<Vec<_>>();
-    let mut methods = class_decl.methods().iter().filter(|m| m.is_exported()).collect::<Vec<_>>();
+    let mut methods = Vec::new();
+    let mut seen = BTreeSet::new();
+    collect_all_class_methods(class_decl, &mut methods, &mut seen);
+
     methods.sort_by_key(|m| m.name());
 
     for method in methods {
