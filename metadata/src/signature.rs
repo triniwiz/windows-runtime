@@ -12,6 +12,18 @@ const Guid: &str = "Guid";
 /// WinRT enums are always backed by a 32-bit integer on the ABI wire.
 fn is_enum_type(metadata: &IMetaDataImport2, token: CorTokenType) -> bool {
     let token_kind = CorTokenType(type_from_token(token));
+    
+    // For TypeRef tokens, resolve to the TypeDef in the external metadata scope first.
+    if token_kind == mdtTypeRef {
+        // resolve_type_ref opens the metadata file that owns the referenced type and
+        // returns both the external IMetaDataImport2 scope and the TypeDef token within it.
+        let mut ext_metadata: MaybeUninit<IMetaDataImport2> = MaybeUninit::zeroed();
+        let mut ext_token = token;
+        if resolve_type_ref(Some(metadata), token, unsafe { ext_metadata.assume_init_mut() }, &mut ext_token) {
+            return is_enum_type(unsafe { ext_metadata.assume_init_ref() }, ext_token);
+        }
+        return false;
+    }
 
     // For TypeRef tokens, resolve to the TypeDef in the external metadata scope first.
     if token_kind == mdtTypeRef {
@@ -44,6 +56,19 @@ fn is_enum_type(metadata: &IMetaDataImport2, token: CorTokenType) -> bool {
         return false;
     }
     get_type_name(metadata, CorTokenType(extends as i32)) == SYSTEM_ENUM
+}
+
+/// Returns the fully qualified name (namespace + type name) for the given token.
+fn get_fully_qualified_type_name(metadata: &IMetaDataImport2, token: CorTokenType) -> String {
+    let token_kind = CorTokenType(type_from_token(token));
+    if token_kind == mdtTypeRef {
+        let mut ext_metadata: MaybeUninit<IMetaDataImport2> = MaybeUninit::zeroed();
+        let mut ext_token = token;
+        if resolve_type_ref(Some(metadata), token, unsafe { ext_metadata.assume_init_mut() }, &mut ext_token) {
+            return get_type_name(unsafe { ext_metadata.assume_init_ref() }, ext_token);
+        }
+    }
+    get_type_name(metadata, token)
 }
 
 pub struct Signature {}
@@ -137,7 +162,7 @@ impl Signature {
                         return "Int32".to_string();
                     }
 
-                    let class_name = get_type_name(metadata_ref, token_type);
+                    let class_name = get_fully_qualified_type_name(metadata_ref, token_type);
                     if class_name.eq("System.Guid") {
                         Guid.to_string()
                     } else {
@@ -151,7 +176,7 @@ impl Signature {
             ELEMENT_TYPE_CLASS => {
                 let token = cor_sig_uncompress_token(&mut signature);
                 if let Some(metadata_ref) = metadata {
-                    get_type_name(metadata_ref, CorTokenType(token as i32))
+                    get_fully_qualified_type_name(metadata_ref, CorTokenType(token as i32))
                 } else {
                     // Fallback when metadata is not available
                     "Object".to_string()
@@ -174,7 +199,7 @@ impl Signature {
                 let token = cor_sig_uncompress_token(&mut signature);
 
                 let mut result = if let Some(metadata_ref) = metadata {
-                    let mut name = get_type_name(metadata_ref, CorTokenType(token as i32));
+                    let mut name = get_fully_qualified_type_name(metadata_ref, CorTokenType(token as i32));
                     // Strip generic backtick suffix (e.g. `1, `2) for cleaner output in typings and proxies
                     if let Some(pos) = name.find('`') {
                         name.truncate(pos);
