@@ -25,18 +25,6 @@ fn is_enum_type(metadata: &IMetaDataImport2, token: CorTokenType) -> bool {
         return false;
     }
 
-    // For TypeRef tokens, resolve to the TypeDef in the external metadata scope first.
-    if token_kind == mdtTypeRef {
-        // resolve_type_ref opens the metadata file that owns the referenced type and
-        // returns both the external IMetaDataImport2 scope and the TypeDef token within it.
-        let mut ext_metadata: MaybeUninit<IMetaDataImport2> = MaybeUninit::zeroed();
-        let mut ext_token = token;
-        if resolve_type_ref(Some(metadata), token, unsafe { ext_metadata.assume_init_mut() }, &mut ext_token) {
-            return is_enum_type(unsafe { ext_metadata.assume_init_ref() }, ext_token);
-        }
-        return false;
-    }
-
     if token_kind != mdtTypeDef {
         return false;
     }
@@ -55,7 +43,11 @@ fn is_enum_type(metadata: &IMetaDataImport2, token: CorTokenType) -> bool {
     if extends_kind != mdtTypeDef && extends_kind != mdtTypeRef {
         return false;
     }
-    get_type_name(metadata, CorTokenType(extends as i32)) == SYSTEM_ENUM
+    let mut name = get_fully_qualified_type_name(metadata, CorTokenType(extends as i32));
+    if let Some(pos) = name.find('`') {
+        name.truncate(pos);
+    }
+    name == SYSTEM_ENUM
 }
 
 /// Returns the fully qualified name (namespace + type name) for the given token.
