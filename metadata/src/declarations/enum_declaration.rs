@@ -49,6 +49,10 @@ impl EnumDeclaration {
         }
     }
 
+    pub fn metadata(&self) -> Option<&IMetaDataImport2> {
+        self.base.metadata()
+    }
+
     pub fn size(&self) -> isize {
         let mut size: u32 = 0;
 

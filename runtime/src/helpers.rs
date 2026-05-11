@@ -1,5 +1,9 @@
+use std::sync::OnceLock;
 use regex::Regex;
 use crate::value::NativeType;
+
+static RE_GENERIC_COUNT: OnceLock<Regex> = OnceLock::new();
+static RE_GENERIC_PARAMS: OnceLock<Regex> = OnceLock::new();
 
 /// Strip the generic instantiation suffix from a WinRT type name.
 ///
@@ -9,7 +13,6 @@ use crate::value::NativeType;
 #[inline]
 pub fn strip_generic_suffix(name: &str) -> &str {
     if let Some(angle) = name.find('<') {
-        // Prefer cutting at the backtick count marker just before '<'.
         let backtick_pos = name[..angle].rfind('`').unwrap_or(angle);
         return &name[..backtick_pos];
     }
@@ -32,27 +35,20 @@ impl GenericReturnTypes<'_> {
 }
 
 pub fn get_generic_return_types(name: &str) -> GenericReturnTypes<'_> {
-    let types = match Regex::new(r"`(\d+)") {
-        Ok(types) => {
-            if let Some(captures) = types.captures(name) {
-                captures.get(1).unwrap().as_str().parse::<usize>().unwrap()
-            } else {
-                0
-            }
-        }
-        Err(_) => 0,
-    };
+    let re_count = RE_GENERIC_COUNT.get_or_init(|| Regex::new(r"`(\d+)").unwrap());
+    let re_params = RE_GENERIC_PARAMS.get_or_init(|| Regex::new(r"<(.*?)>").unwrap());
 
-    let names = match Regex::new(r"<(.*?)>") {
-        Ok(names) => {
-            if let Some(captures) = names.captures(name) {
-                captures.get(1).unwrap().as_str().split(", ").collect::<Vec<_>>()
-            } else {
-                vec![]
-            }
-        }
-        Err(_) => vec![],
-    };
+    let types = re_count
+        .captures(name)
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse::<usize>().ok())
+        .unwrap_or(0);
+
+    let names = re_params
+        .captures(name)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().split(", ").collect::<Vec<_>>())
+        .unwrap_or_default();
 
     GenericReturnTypes { names, types }
 }

@@ -23,7 +23,10 @@ pub struct DevtoolsServerConfig {
 
 impl Default for DevtoolsServerConfig {
     fn default() -> Self {
-        Self { host: "127.0.0.1".to_string(), port: 9229 }
+        // Port 42000: Windows runtime inspector.
+        // NativeScript iOS runtime uses 40000, Android uses 41000 — Windows takes
+        // the next slot so the CLI can auto-discover all three on the same host.
+        Self { host: "127.0.0.1".to_string(), port: 42000 }
     }
 }
 
@@ -70,15 +73,15 @@ struct DevtoolsClient {
 
 impl V8InspectorClientImpl for DevtoolsClient {
     fn run_message_loop_on_pause(&self, _ctx_group_id: i32) {
-        self.paused.store(true, Ordering::SeqCst);
-        while self.paused.load(Ordering::SeqCst) {
+        self.paused.store(true, Ordering::Release);
+        while self.paused.load(Ordering::Acquire) {
             if let Ok(msg) = self.inbound_rx.lock().try_recv() {
-                let ptr = self.session_ptr.load(Ordering::SeqCst);
+                let ptr = self.session_ptr.load(Ordering::Acquire);
                 if ptr != 0 {
-                    // SAFETY: session_ptr is set from a stable Box<V8InspectorSession>
-                    // on the V8 thread and zeroed in DevtoolsServer::drop before the
-                    // Box is released.  This callback also runs on the V8 thread, so
-                    // there is no concurrent access to the session.
+                    // SAFETY: session_ptr is published via Release from the V8 thread
+                    // and zeroed in DevtoolsServer::drop before the Box is released.
+                    // This callback also runs on the V8 thread, so there is no
+                    // concurrent access to the session.
                     unsafe {
                         let view = StringView::from(msg.as_bytes());
                         (*(ptr as *const V8InspectorSession)).dispatch_protocol_message(view);
@@ -91,7 +94,7 @@ impl V8InspectorClientImpl for DevtoolsClient {
     }
 
     fn quit_message_loop_on_pause(&self) {
-        self.paused.store(false, Ordering::SeqCst);
+        self.paused.store(false, Ordering::Release);
     }
 }
 
@@ -158,9 +161,11 @@ impl DevtoolsServer {
         ));
 
         // The session is heap-allocated (Box), so its address is stable after this.
+        // Release so any subsequent Acquire load on another thread sees the fully
+        // initialized session.
         session_ptr.store(
             session.as_ref() as *const V8InspectorSession as usize,
-            Ordering::SeqCst,
+            Ordering::Release,
         );
 
         let ws_url = websocket_url.clone();
@@ -184,7 +189,7 @@ impl DevtoolsServer {
     /// Dispatch any pending CDP messages that arrived from a connected DevTools
     /// client to V8.  Call this periodically from the V8 thread.
     pub fn pump_messages(&mut self) {
-        let ptr = self.session_ptr.load(Ordering::SeqCst);
+        let ptr = self.session_ptr.load(Ordering::Acquire);
         if ptr == 0 {
             return;
         }
@@ -200,8 +205,8 @@ impl DevtoolsServer {
 
 impl Drop for DevtoolsServer {
     fn drop(&mut self) {
-        // Zero the pointer before the session is freed by the field destructor.
-        self.session_ptr.store(0, Ordering::SeqCst);
+        // Zero before field destructors free the session (LIFO field drop order).
+        self.session_ptr.store(0, Ordering::Release);
     }
 }
 
@@ -334,7 +339,7 @@ mod tests {
     fn default_config() {
         let cfg = DevtoolsServerConfig::default();
         assert_eq!(cfg.host, "127.0.0.1");
-        assert_eq!(cfg.port, 9229);
+        assert_eq!(cfg.port, 42000);
     }
 
     #[test]
@@ -346,7 +351,7 @@ mod tests {
 
     #[test]
     fn list_json_contains_ws_url() {
-        let ws = "ws://127.0.0.1:9229/devtools/page/runtime";
+        let ws = "ws://127.0.0.1:42000/devtools/page/runtime";
         let v: serde_json::Value = serde_json::from_str(&build_list_json(ws)).unwrap();
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 1);

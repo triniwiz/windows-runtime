@@ -356,15 +356,13 @@ impl NativeValue {
             }
         };
 
-        // v8 147 lifetime tracking on Local handles makes the explicit
-        // EscapableHandleScope unnecessary here — the local already lives
-        // in the parent scope's lifetime.
         value
     }
 }
 
 
-// SAFETY: unsafe trait must have unsafe implementation
+// SAFETY: NativeValue is only used on the V8 thread; raw pointer fields are not
+// accessed concurrently.
 unsafe impl Send for NativeValue {}
 
 
@@ -972,10 +970,10 @@ pub unsafe fn set_ret_val(value:*mut c_void, scope: &mut v8::PinScope<'_, '_>, m
             rv.set(external_or_null(scope, value));
         }
         NativeType::String => {
-            let string: HSTRING = unsafe { mem::transmute(value) };
-            let string = string.to_string();
-            let string = v8::String::new(scope, string.as_str()).unwrap();
-            rv.set(string.into());
+            let hstring: HSTRING = unsafe { mem::transmute(value) };
+            let v = v8::String::new(scope, &hstring.to_string_lossy())
+                .unwrap_or_else(|| v8::String::empty(scope));
+            rv.set(v.into());
         }
     }
 }

@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>__PROJECT_NAME__</RootNamespace>
+    <AssemblyName>__PROJECT_NAME__</AssemblyName>
+    <UseUwp>true</UseUwp>
+    <Platforms>x64;arm64</Platforms>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+    <DefaultLanguage>en-US</DefaultLanguage>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <Nullable>disable</Nullable>
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
+    <!-- Parent of the project directory — contains the pre-built libs/ folder from the npm package -->
+    <NSWindowsRoot>$(MSBuildProjectDirectory)\..</NSWindowsRoot>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <AppxManifest Include="Package.appxmanifest" />
+    <Content Include="Properties\Default.rd.xml" />
+
+    <!-- App JS/resource files — copied to the output directory on every build -->
+    <Content Include="App\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+
+    <!-- App_Resources: platform-specific assets (images, fonts, etc.) -->
+    <Content Include="App_Resources\**\*" Condition="Exists('App_Resources')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+
+    <!-- Debug: devtools-enabled runtime DLL -->
+    <Content Include="$(NSWindowsRoot)\libs\devtools\$(Platform)\nativescript.dll"
+             Condition="'$(Configuration)' == 'Debug'">
+      <Link>nativescript.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+
+    <!-- Release: production runtime DLL -->
+    <Content Include="$(NSWindowsRoot)\libs\$(Platform)\nativescript.dll"
+             Condition="'$(Configuration)' != 'Debug'">
+      <Link>nativescript.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+</Project>

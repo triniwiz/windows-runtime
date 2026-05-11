@@ -5,32 +5,16 @@
 #include "bindings.h"
 
 
-void PrintVtableNames(IUnknown * iface){
-    // Get the pointer to the vtable
-    void** vtable = *reinterpret_cast<void***>(iface);
-
-    // Calculate the number of function pointers in the vtable
-    int numFunctions = 0;
-    while (vtable[numFunctions] != nullptr) {
-        numFunctions++;
-    }
-
-    // Print the vtable as text
-    for (int i = 0; i < numFunctions; i++) {
-        FARPROC functionPtr = reinterpret_cast<FARPROC>(vtable[i]);
-        std::cout << "Function " << i << ": " << functionPtr << std::endl;
-    }
-}
-void GetMethod(IUnknown * iface, size_t index, c_void **method) {
-    Microsoft::WRL::ComPtr <IInspectable> factory;
-    factory.Attach(reinterpret_cast<IInspectable*>(iface));
+void GetMethod(IUnknown *iface, size_t index, c_void **method) {
+    Microsoft::WRL::ComPtr<IInspectable> factory;
+    factory.Attach(reinterpret_cast<IInspectable *>(iface));
 
     void **vtable = *reinterpret_cast<void ***>(factory.Get());
-    void *fn = vtable[index];
-    *method = fn;
+    *method = vtable[index];
 }
 
-rust::String GUIDToString(uint32_t Data1, uint16_t Data2, uint16_t Data3, rust::Slice<const uint8_t> Data4) {
+rust::String GUIDToString(uint32_t Data1, uint16_t Data2, uint16_t Data3,
+                           rust::Slice<const uint8_t> Data4) {
     GUID guid;
     guid.Data1 = Data1;
     guid.Data2 = Data2;
@@ -41,82 +25,57 @@ rust::String GUIDToString(uint32_t Data1, uint16_t Data2, uint16_t Data3, rust::
     StringFromGUID2(guid, guidString, sizeof(guidString) / sizeof(guidString[0]));
 
     std::wstring buf(guidString);
-    auto data = (char16_t *) buf.c_str();
-    auto size = buf.size();
-    return rust::String(data, size);
+    auto data = reinterpret_cast<const char16_t *>(buf.c_str());
+    return rust::String(data, buf.size());
 }
 
 void QueryInterface(size_t index, c_void *factory, uint32_t Data1, uint16_t Data2, uint16_t Data3,
                     rust::Slice<const uint8_t> Data4, c_void *activation_factory, c_void **func) {
-    Microsoft::WRL::ComPtr <IUnknown> classFactory(static_cast<IUnknown *>(factory));
-    Microsoft::WRL::ComPtr <IUnknown> activationFactory(static_cast<IUnknown *>(activation_factory));
+    Microsoft::WRL::ComPtr<IUnknown> classFactory(static_cast<IUnknown *>(factory));
+    Microsoft::WRL::ComPtr<IUnknown> activationFactory(static_cast<IUnknown *>(activation_factory));
 
     GUID guid;
     guid.Data1 = Data1;
     guid.Data2 = Data2;
     guid.Data3 = Data3;
-
     std::memcpy(&guid.Data4, Data4.data(), 8);
 
-    classFactory->QueryInterface(guid, reinterpret_cast<void **>(activationFactory.GetAddressOf()));
+    classFactory->QueryInterface(guid,
+                                 reinterpret_cast<void **>(activationFactory.GetAddressOf()));
 
     void **vtable = *reinterpret_cast<void ***>(activationFactory.Get());
-
-    void *fun = vtable[index];
-
-    *func = fun;
+    *func = vtable[index];
 }
 
-std::unique_ptr <GUID> GetGUID(const uint8_t *data) {
-    GUID guid(*reinterpret_cast<const GUID *>(data));
-
-    return std::make_unique<GUID>(guid);
-}
-
-uint32_t GetData1(const GUID &guid) {
-    return guid.Data1;
-}
-
-uint16_t GetData2(const GUID &guid) {
-    return guid.Data2;
-}
-
-uint16_t GetData3(const GUID &guid) {
-    return guid.Data3;
-}
-
-rust::Slice<const uint8_t> GetData4(const GUID &guid) {
-    auto data = guid.Data4;
-    return rust::Slice<const uint8_t>(data, 8);
-}
-
-std::unique_ptr <GUID> GetGUIDForClassName(rust::Str data) {
-    CLSID clsid;
-
-    std::string name(data.data(), data.size());
-
-
-    const wchar_t *wideStr = _com_util::ConvertStringToBSTR(name.c_str());
-
-    const wchar_t *className = L"Windows.Data.Json.JsonObject";
-
-
-    auto hr = CLSIDFromProgID(className, &clsid);
-
-
-    SysFreeString(const_cast<wchar_t *>(wideStr));
-
-    if (SUCCEEDED(hr)) {
-        // GUID obtained successfully
-        // Access clsid as needed
-        // ...
-
-        // Print the GUID as a string
-        wchar_t guidString[40];
-        StringFromGUID2(clsid, guidString, sizeof(guidString) / sizeof(guidString[0]));
-        std::wcout << L"GUID: " << guidString << std::endl;
+void *OpenMetadataScope(rust::Str path_utf8) {
+    // Create a metadata dispenser from mscoree.dll.
+    // This works for any PE/COFF file carrying CLI metadata (.dll, .winmd, .exe).
+    IMetaDataDispenserEx *pDispenser = nullptr;
+    HRESULT hr = CoCreateInstance(
+            CLSID_CorMetaDataDispenser,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_IMetaDataDispenserEx,
+            reinterpret_cast<void **>(&pDispenser)
+    );
+    if (FAILED(hr) || !pDispenser) {
+        return nullptr;
     }
 
+    // Convert UTF-8 path to wide string for the Win32 API.
+    std::string narrow(path_utf8.data(), path_utf8.size());
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, narrow.c_str(), -1, nullptr, 0);
+    if (wlen <= 0) {
+        pDispenser->Release();
+        return nullptr;
+    }
+    std::wstring wide(static_cast<size_t>(wlen), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, narrow.c_str(), -1, &wide[0], wlen);
 
-    return std::make_unique<GUID>(static_cast<GUID>(clsid));
+    IMetaDataImport2 *pImport = nullptr;
+    hr = pDispenser->OpenScope(wide.c_str(), ofRead, IID_IMetaDataImport2,
+                               reinterpret_cast<IUnknown **>(&pImport));
+    pDispenser->Release();
+
+    return FAILED(hr) ? nullptr : static_cast<void *>(pImport);
 }

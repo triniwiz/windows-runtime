@@ -48,6 +48,10 @@ impl StructDeclaration {
         }
     }
 
+    pub fn metadata(&self) -> Option<&IMetaDataImport2> {
+        self.base.metadata()
+    }
+
     pub fn size(&self) -> usize {
         self.fields.len()
     }

@@ -20,6 +20,8 @@ mod class_helpers;
 mod type_description;
 mod global_fns;
 mod ns_proxy;
+pub(crate) mod dotnet;
+pub(crate) mod win32;
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -78,6 +80,14 @@ thread_local!(static DELEGATE_ISOLATE_PTR: Cell<*mut v8::Isolate> = Cell::new(st
 /// (e.g. the devtools server) can pump their own messages without the runtime
 /// needing to depend on those crates directly.
 thread_local!(pub static ASYNC_PUMP_HOOK: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None));
+
+/// Native ESM module registry: resolved absolute path → compiled V8 Module handle.
+/// Pre-populated by `compile_module_graph` before `instantiate_module` is called.
+thread_local!(static ESM_MODULE_REGISTRY: RefCell<HashMap<String, v8::Global<v8::Module>>> = RefCell::new(HashMap::new()));
+
+/// Maps a V8 Module identity hash (i32) to its resolved absolute path.
+/// Used by `resolve_module_callback` to locate the referrer's directory for relative imports.
+thread_local!(static ESM_HASH_TO_PATH: RefCell<HashMap<i32, String>> = RefCell::new(HashMap::new()));
 
 pub struct Runtime {
     isolate: v8::OwnedIsolate,
@@ -728,9 +738,8 @@ fn handle_host_wait_for_async(
         0
     };
 
-    // Fast-path: already completed before we enter the loop.
     match try_get_async_status(scope, op_value) {
-        Ok(0) => {} // still running — proceed to wait
+        Ok(0) => {}
         Ok(_) => { retval.set(op_value); return; }
         Err(msg) => { throw_js_error(scope, msg.as_str()); return; }
     }
@@ -755,9 +764,6 @@ fn handle_host_wait_for_async(
 
         match try_get_async_status(scope, op_value) {
             Ok(0) => {
-                // Still running: drain the message queue then block for 5 ms.
-                // Using 5 ms instead of 1 ms reduces CPU burn 5× while keeping
-                // perceived latency well below a UI frame budget.
                 while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.into() {
                     unsafe {
                         TranslateMessage(&message);
@@ -1186,6 +1192,101 @@ fn try_resolve_with_known_extensions(candidate: PathBuf) -> PathBuf {
 
     candidate
 }
+
+/// Resolve a module specifier to an absolute path given the referrer's absolute path.
+/// Only handles relative (`./`, `../`) and absolute specifiers — bare specifiers are
+/// treated as already-absolute paths (webpack bundles only emit relative imports).
+fn resolve_esm_path(specifier: &str, referrer_path: Option<&str>) -> String {
+    let candidate = if specifier.starts_with("./") || specifier.starts_with("../") {
+        let parent = referrer_path
+            .map(normalize_js_path)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let base = if parent.is_file() {
+            parent.parent().map(Path::to_path_buf).unwrap_or(parent)
+        } else {
+            parent
+        };
+        base.join(specifier)
+    } else {
+        normalize_js_path(specifier)
+    };
+    let candidate = try_resolve_with_known_extensions(candidate);
+    candidate.canonicalize().unwrap_or(candidate).to_string_lossy().into_owned()
+}
+
+/// Stateless V8 resolve-module callback used during `instantiate_module`.
+/// All modules must have been pre-compiled by `compile_module_graph` and stored
+/// in `ESM_MODULE_REGISTRY` / `ESM_HASH_TO_PATH` before this is called.
+fn resolve_module_callback<'s>(
+    context: v8::Local<'s, v8::Context>,
+    specifier: v8::Local<'s, v8::String>,
+    _import_attributes: v8::Local<'s, v8::FixedArray>,
+    referrer: v8::Local<'s, v8::Module>,
+) -> Option<v8::Local<'s, v8::Module>> {
+    v8::callback_scope!(unsafe scope, context);
+
+    let spec = specifier.to_rust_string_lossy(scope);
+    let referrer_hash = referrer.get_identity_hash().get();
+    let referrer_path = ESM_HASH_TO_PATH.with(|m| m.borrow().get(&referrer_hash).cloned());
+    let resolved = resolve_esm_path(&spec, referrer_path.as_deref());
+
+    ESM_MODULE_REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        registry.get(&resolved).map(|global| v8::Local::new(scope, global))
+    })
+}
+
+/// Walk and pre-compile the entire transitive module graph starting from `path`.
+/// Compiled modules are stored in `ESM_MODULE_REGISTRY` and `ESM_HASH_TO_PATH`.
+/// Must be called before `instantiate_module`.
+fn compile_module_graph(scope: &mut v8::PinScope<'_, '_>, source: &str, path: &str) {
+    if ESM_MODULE_REGISTRY.with(|r| r.borrow().contains_key(path)) {
+        return;
+    }
+
+    let Some(source_str) = v8::String::new(scope, source) else { return };
+    let Some(name_str) = v8::String::new(scope, path) else { return };
+    let name_val: v8::Local<v8::Value> = name_str.into();
+    let origin = v8::ScriptOrigin::new(
+        scope, name_val, 0, 0, false, -1, None, false, false, true, None,
+    );
+    let mut compiler_source = v8::script_compiler::Source::new(source_str, Some(&origin));
+    let Some(module) = v8::script_compiler::compile_module(scope, &mut compiler_source) else {
+        return;
+    };
+
+    let identity_hash = module.get_identity_hash().get();
+
+    // Collect child specifiers as Rust strings before any mutable borrow of scope.
+    let requests = module.get_module_requests();
+    let child_specifiers: Vec<String> = (0..requests.length())
+        .filter_map(|i| {
+            let data = requests.get(scope, i)?;
+            let request: v8::Local<v8::ModuleRequest> = data.try_into().ok()?;
+            Some(request.get_specifier().to_rust_string_lossy(scope))
+        })
+        .collect();
+
+    // Store the compiled module (breaks import cycles on re-entry).
+    let global = v8::Global::new(scope, module);
+    ESM_MODULE_REGISTRY.with(|r| r.borrow_mut().insert(path.to_string(), global));
+    ESM_HASH_TO_PATH.with(|m| m.borrow_mut().insert(identity_hash, path.to_string()));
+
+    // Recurse into each dependency.
+    for spec in child_specifiers {
+        let child_path = resolve_esm_path(&spec, Some(path));
+        if ESM_MODULE_REGISTRY.with(|r| r.borrow().contains_key(&child_path)) {
+            continue;
+        }
+        match fs::read_to_string(&child_path) {
+            Ok(content) => compile_module_graph(scope, &content, &child_path),
+            Err(e) => debug_output(&format!(
+                "[NativeScript] ESM: cannot read dependency {child_path}: {e}\n"
+            )),
+        }
+    }
+}
+
 
 fn handle_resolve_module_path(
     scope: &mut v8::PinScope<'_, '_>,
@@ -5641,6 +5742,9 @@ pub(crate) fn js_delegate_params_from_declaration(
 impl Runtime {
     pub fn new(app_root: &str) -> Self {
         INIT.call_once(|| {
+            // --expose-gc makes gc() available as a global JS function so callers
+            // can trigger a full GC sweep (useful for debugging and test harnesses).
+            v8::V8::set_flags_from_string("--expose-gc");
             let platform = v8::new_default_platform(0, false).make_shared();
             v8::V8::initialize_platform(platform);
             v8::V8::initialize();
@@ -5682,7 +5786,7 @@ impl Runtime {
                 init_global(scope, context);
                 globals::console::init_console(scope, context);
                 init_meta(scope, context);
-                init_async_helpers(scope, app_root);
+                crate::global_fns::init_async_helpers(scope, app_root);
                 global_context = v8::Global::new(scope, context);
             }
         }
@@ -5724,23 +5828,85 @@ impl Runtime {
         &self.global_context
     }
 
-    pub fn run_script(&mut self, script: &str, filename: &str) {
+    pub fn run_module(&mut self, script: &str, filename: &str) {
         v8::scope!(scope, &mut self.isolate);
         let context = v8::Local::new(scope, &self.global_context);
         let scope = &mut v8::ContextScope::new(scope, context);
         v8::tc_scope!(tc, scope);
 
-        let looks_like_module = script.contains("import ") || script.contains("export ");
-        let source_to_run = if looks_like_module {
-            let entry = PathBuf::from(self.app_root.as_str()).join("App").join("main.js");
-            let entry_json = serde_json::to_string(entry.to_string_lossy().as_ref()).unwrap_or_else(|_| "\"main.js\"".to_string());
-            let source_json = serde_json::to_string(script).unwrap_or_else(|_| "\"\"".to_string());
-            format!("globalThis.__nsEvalAsModule({}, {});", source_json, entry_json)
-        } else {
-            script.to_string()
+        let resolved_path = {
+            let p = normalize_js_path(filename);
+            let p = try_resolve_with_known_extensions(p);
+            p.canonicalize().unwrap_or(p).to_string_lossy().into_owned()
         };
 
-        let Some(code) = v8::String::new(tc, source_to_run.as_str()) else { return };
+        macro_rules! check_exception {
+            ($tc:ident) => {
+                if $tc.has_caught() {
+                    if let Some(msg) = $tc.message() {
+                        let text = msg.get($tc).to_rust_string_lossy($tc);
+                        let line = msg.get_line_number($tc).unwrap_or(0);
+                        debug_output(&format!("[NativeScript] ESM error at line {line}: {text}\n"));
+                        if let Some(stack) = msg.get_stack_trace($tc) {
+                            for i in 0..stack.get_frame_count() {
+                                if let Some(frame) = stack.get_frame($tc, i) {
+                                    let fn_name = frame.get_function_name($tc)
+                                        .map(|s| s.to_rust_string_lossy($tc))
+                                        .unwrap_or_else(|| "<anonymous>".to_string());
+                                    let file = frame.get_script_name($tc)
+                                        .map(|s| s.to_rust_string_lossy($tc))
+                                        .unwrap_or_else(|| "<unknown>".to_string());
+                                    debug_output(&format!("    at {} ({}:{}:{})\n", fn_name, file,
+                                        frame.get_line_number(), frame.get_column()));
+                                }
+                            }
+                        }
+                    } else if let Some(exc) = $tc.exception() {
+                        debug_output(&format!("[NativeScript] ESM exception: {}\n",
+                            exc.to_rust_string_lossy($tc)));
+                    }
+                    return;
+                }
+            };
+        }
+
+        compile_module_graph(tc, script, &resolved_path);
+        check_exception!(tc);
+
+        let root_global = ESM_MODULE_REGISTRY.with(|r| r.borrow().get(&resolved_path).cloned());
+        let Some(root_global) = root_global else {
+            debug_output("[NativeScript] ESM: root module was not compiled\n");
+            return;
+        };
+        let module = v8::Local::new(tc, &root_global);
+
+        if module.instantiate_module(tc, resolve_module_callback).is_none() {
+            check_exception!(tc);
+            return;
+        }
+
+        if module.evaluate(tc).is_none() {
+            check_exception!(tc);
+            return;
+        }
+
+        check_exception!(tc);
+        tc.perform_microtask_checkpoint();
+    }
+
+    pub fn run_script(&mut self, script: &str, filename: &str) {
+        // Delegate ESM bundles to the native V8 module loader.
+        if script.contains("import ") || script.contains("export ") {
+            self.run_module(script, filename);
+            return;
+        }
+
+        v8::scope!(scope, &mut self.isolate);
+        let context = v8::Local::new(scope, &self.global_context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        v8::tc_scope!(tc, scope);
+
+        let Some(code) = v8::String::new(tc, script) else { return };
         let origin = v8::String::new(tc, filename).map(|name| {
             v8::ScriptOrigin::new(tc, name.into(), 0, 0, false, -1, None, false, false, false, None)
         });

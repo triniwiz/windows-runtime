@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <AssemblyName>DotNetBridge</AssemblyName>
+    <RootNamespace>NativeScriptBridge</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>enable</Nullable>
+    <Optimize>true</Optimize>
+    <!-- Regular class library — hostfxr loads it at runtime; no NativeAOT needed. -->
+    <OutputType>Library</OutputType>
+  </PropertyGroup>
+
+</Project>

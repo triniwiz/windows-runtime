@@ -64,7 +64,7 @@ pub extern "C" fn runtime_runscript(runtime: i64, script: *const c_char, filenam
 /// Start the Chrome DevTools Protocol server on `port` for the given runtime.
 ///
 /// Returns a null-terminated WebSocket URL on success (e.g.
-/// `ws://127.0.0.1:9229/devtools/page/runtime\0`), or NULL on failure.
+/// `ws://127.0.0.1:42000/devtools/page/runtime\0`), or NULL on failure.
 /// The caller must free the returned string with `runtime_free_string`.
 ///
 /// Only available in builds compiled with the `devtools` feature.

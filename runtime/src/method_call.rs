@@ -47,7 +47,6 @@ pub struct MethodCall {
 
 #[inline]
 fn call_failure() -> HRESULT {
-    // E_FAIL
     HRESULT(0x8000_4005u32 as i32)
 }
 
@@ -166,9 +165,7 @@ impl MethodCall {
             }
         };
 
-        index = index.saturating_add(6); // account for IInspectable vtable overhead
-
-        // let mut interface_ptr: *mut c_void = std::ptr::null_mut(); // IActivationFactory
+        index = index.saturating_add(6); // IInspectable adds 6 vtable slots before any interface methods
 
         let vtable = interface.vtable();
 

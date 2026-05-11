@@ -17,7 +17,6 @@
 #include <string>
 #include <memory>
 #include <comdef.h>
-#include <Rometadataresolution.h>
 #include <cor.h>
 #include "rust/cxx.h"
 
@@ -26,24 +25,16 @@
 
 using c_void = void;
 
-void PrintVtableNames(IUnknown * iface);
-
+// Vtable helpers — cannot be cleanly expressed in safe Rust without UB.
 void GetMethod(IUnknown *iface, size_t index, c_void **method);
-
-std::unique_ptr <GUID> GetGUID(const uint8_t *data);
-
-uint32_t GetData1(const GUID &guid);
-
-uint16_t GetData2(const GUID &guid);
-
-uint16_t GetData3(const GUID &guid);
-
-rust::Slice<const uint8_t> GetData4(const GUID &guid);
-
-std::unique_ptr <GUID> GetGUIDForClassName(rust::Str data);
 
 void QueryInterface(size_t index, c_void *factory, uint32_t Data1, uint16_t Data2, uint16_t Data3,
                     rust::Slice<const uint8_t> Data4, c_void *activation_factory, c_void **func);
+
+// Opens a metadata scope from a file path using IMetaDataDispenserEx::OpenScope.
+// Returns an AddRef'd IMetaDataImport2* cast to void*, or nullptr on failure.
+// The caller is responsible for Release().
+void *OpenMetadataScope(rust::Str path_utf8);
 
 rust::String GUIDToString(uint32_t Data1, uint16_t Data2, uint16_t Data3, rust::Slice<const uint8_t> Data4);
 

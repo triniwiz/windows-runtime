@@ -224,6 +224,90 @@ function buildDemoLayout() {
 	traceLayoutStep("append list card to content");
 	content.Children.Append(listCard.border);
 
+	// ── WinRT APIs ────────────────────────────────────────────────────────────
+	// Demonstrates three built-in WinRT namespaces callable directly from JS:
+	//   1. Windows.Globalization.Calendar  – read current local date/time
+	//   2. Windows.Web.Http.HttpClient     – async HTTP GET with NSWinRT.wait()
+	//   3. Windows.ApplicationModel.DataTransfer.Clipboard – write to clipboard
+
+	traceLayoutStep("append WinRT APIs section title");
+	content.Children.Append(createSectionTitle("WinRT APIs"));
+	traceLayoutStep("create WinRT APIs card");
+	const apiCard = createControlCard();
+
+	// 1. Calendar — current local date/time (no async, pure value getters)
+	const calendar = new Windows.Globalization.Calendar();
+	const nowBlock = new Windows.UI.Xaml.Controls.TextBlock();
+	nowBlock.Text = "Local time: "
+		+ calendar.MonthAsNumericString() + "/"
+		+ calendar.DayAsString() + "/"
+		+ calendar.YearAsString()
+		+ "  "
+		+ calendar.HourAsPaddedString(2) + ":"
+		+ calendar.MinuteAsPaddedString(2);
+	apiCard.stack.Children.Append(nowBlock);
+
+	// 2. HttpClient — async GET, result shown on click
+	const httpRow = new Windows.UI.Xaml.Controls.StackPanel();
+	httpRow.Orientation = Windows.UI.Xaml.Controls.Orientation.Horizontal;
+	httpRow.Spacing = 10;
+
+	const fetchButton = new Windows.UI.Xaml.Controls.Button();
+	fetchButton.Content = "HTTP GET httpbin.org";
+
+	const httpStatus = new Windows.UI.Xaml.Controls.TextBlock();
+	httpStatus.Text = "Press to fetch";
+	httpStatus.VerticalAlignment = Windows.UI.Xaml.VerticalAlignment.Center;
+
+	httpRow.Children.Append(fetchButton);
+	httpRow.Children.Append(httpStatus);
+	apiCard.stack.Children.Append(httpRow);
+
+	const httpBody = new Windows.UI.Xaml.Controls.TextBlock();
+	httpBody.TextWrapping = Windows.UI.Xaml.TextWrapping.Wrap;
+	httpBody.FontSize = 12;
+	apiCard.stack.Children.Append(httpBody);
+
+	fetchButton.Click = new Windows.UI.Xaml.RoutedEventHandler(function(sender, args) {
+		try {
+			httpStatus.Text = "Fetching…";
+			const client = new Windows.Web.Http.HttpClient();
+			const uri = new Windows.Foundation.Uri("https://httpbin.org/get");
+			const response = NSWinRT.wait(client.GetAsync(uri));
+			const body = NSWinRT.wait(response.Content.ReadAsStringAsync());
+			httpStatus.Text = "HTTP " + response.StatusCode;
+			httpBody.Text = body.length > 300 ? body.substring(0, 300) + "…" : body;
+		} catch (e) {
+			httpStatus.Text = "Error: " + (e && e.message ? e.message : String(e));
+		}
+	});
+
+	// 3. Clipboard — write a string via DataPackage
+	const clipRow = new Windows.UI.Xaml.Controls.StackPanel();
+	clipRow.Orientation = Windows.UI.Xaml.Controls.Orientation.Horizontal;
+	clipRow.Spacing = 10;
+
+	const copyButton = new Windows.UI.Xaml.Controls.Button();
+	copyButton.Content = "Copy to Clipboard";
+
+	const clipStatus = new Windows.UI.Xaml.Controls.TextBlock();
+	clipStatus.Text = "Nothing copied yet";
+	clipStatus.VerticalAlignment = Windows.UI.Xaml.VerticalAlignment.Center;
+
+	clipRow.Children.Append(copyButton);
+	clipRow.Children.Append(clipStatus);
+	apiCard.stack.Children.Append(clipRow);
+
+	copyButton.Click = new Windows.UI.Xaml.RoutedEventHandler(function(sender, args) {
+		const pkg = new Windows.ApplicationModel.DataTransfer.DataPackage();
+		pkg.SetText("Hello from NativeScript Windows!");
+		Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(pkg);
+		clipStatus.Text = "Copied!";
+	});
+
+	traceLayoutStep("append WinRT APIs card to content");
+	content.Children.Append(apiCard.border);
+
 	traceLayoutStep("return root scroll viewer");
 	return rootScroll;
 }

@@ -164,7 +164,7 @@ pub(crate) fn handle_host_wait_for_async(
         match try_get_async_status(scope, op_value) {
             Ok(0) => {
                 while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.into() {
-                    unsafe { TranslateMessage(&message); DispatchMessageW(&message); }
+                    unsafe { let _ = TranslateMessage(&message); DispatchMessageW(&message); }
                 }
                 ASYNC_PUMP_HOOK.with(|hook| {
                     if let Ok(mut guard) = hook.try_borrow_mut() {
@@ -1715,9 +1715,54 @@ const HELPER_SOURCE: &str = r#"
             }
 
             function __nsDynamicImport(specifier, parentPath) {
-                return Promise.resolve().then(function () {
-                    return __nsImport(specifier, parentPath);
-                });
+                if (typeof specifier !== 'string' ||
+                    (!specifier.startsWith('https://') && !specifier.startsWith('http://'))) {
+                    return Promise.resolve().then(function () {
+                        return __nsImport(specifier, parentPath);
+                    });
+                }
+
+                try {
+                    var sec = {};
+                    try {
+                        var pkgText = globalThis.__nsReadTextFile(
+                            (globalThis.__nsAppRoot || '') + '/package.json'
+                        );
+                        sec = ((JSON.parse(pkgText) || {}).nativescript || {}).security || {};
+                    } catch (_) {}
+
+                    if (!sec.allowRemoteModules) {
+                        return Promise.reject(new Error(
+                            'Remote module imports are disabled. ' +
+                            'Set nativescript.security.allowRemoteModules=true in package.json'
+                        ));
+                    }
+
+                    var allowlist = sec.remoteModuleAllowlist;
+                    if (Array.isArray(allowlist) && allowlist.length > 0) {
+                        var isAllowed = allowlist.some(function (p) {
+                            return typeof p === 'string' && specifier.startsWith(p);
+                        });
+                        if (!isAllowed) {
+                            return Promise.reject(new Error(
+                                'Remote module URL is not in the allowlist: ' + specifier
+                            ));
+                        }
+                    }
+
+                    if (moduleCache.has(specifier)) {
+                        return Promise.resolve(moduleCache.get(specifier));
+                    }
+
+                    var uri    = new Windows.Foundation.Uri(specifier);
+                    var client = new Windows.Web.Http.HttpClient();
+
+                    return NSWinRT.toPromise(client.getStringAsync(uri)).then(function (source) {
+                        return executeRuntimeModule(String(source), specifier);
+                    });
+                } catch (e) {
+                    return Promise.reject(e instanceof Error ? e : new Error(String(e)));
+                }
             }
 
             globalThis.__nsInvalidateModuleCacheEntry = function (resolvedPath) {
@@ -1735,7 +1780,748 @@ const HELPER_SOURCE: &str = r#"
             globalThis.__nsDynamicImport = __nsDynamicImport;
             globalThis.NSWinRT.dynamicImport = __nsDynamicImport;
         })();
+
+        // ── runtime metadata ──────────────────────────────────────────────────
+        globalThis.__runtimeVersion = "1.0.0";
+
+        // ── setTimeout / clearTimeout / setInterval / clearInterval ───────────
+        // Implemented on top of Windows.UI.Xaml.DispatcherTimer which fires on
+        // the UI thread, making it safe to invoke JS callbacks directly.
+        (function () {
+            var _nextId = 0;
+            var _timers = new Map();
+
+            function _span(ms) {
+                // TimeSpan.Duration is in 100-ns ticks; 1 ms = 10 000 ticks.
+                return new Windows.Foundation.TimeSpan({
+                    Duration: Math.max(1, Math.floor(ms || 0)) * 10000
+                });
+            }
+
+            globalThis.setTimeout = function setTimeout(fn, delay) {
+                if (typeof fn !== 'function') return 0;
+                var id = ++_nextId;
+                var extra = Array.prototype.slice.call(arguments, 2);
+                var t = new Windows.UI.Xaml.DispatcherTimer();
+                t.Interval = _span(delay);
+                t.Tick = NSWinRT.asDelegate(function () {
+                    t.Stop();
+                    _timers.delete(id);
+                    try { fn.apply(undefined, extra); } catch (e) {
+                        console.log('setTimeout error:', e && e.message || e);
+                    }
+                });
+                _timers.set(id, t);
+                t.Start();
+                return id;
+            };
+
+            globalThis.clearTimeout = function clearTimeout(id) {
+                var t = _timers.get(id);
+                if (t) { t.Stop(); _timers.delete(id); }
+            };
+
+            globalThis.setInterval = function setInterval(fn, delay) {
+                if (typeof fn !== 'function') return 0;
+                var id = ++_nextId;
+                var extra = Array.prototype.slice.call(arguments, 2);
+                var ms = Math.max(1, Math.floor(delay || 1));
+                var t = new Windows.UI.Xaml.DispatcherTimer();
+                t.Interval = _span(ms);
+                t.Tick = NSWinRT.asDelegate(function () {
+                    if (!_timers.has(id)) return;
+                    try { fn.apply(undefined, extra); } catch (e) {
+                        console.log('setInterval error:', e && e.message || e);
+                    }
+                });
+                _timers.set(id, t);
+                t.Start();
+                return id;
+            };
+
+            globalThis.clearInterval = function clearInterval(id) {
+                var t = _timers.get(id);
+                if (t) { t.Stop(); _timers.delete(id); }
+            };
+        })();
+
+        // ── requestAnimationFrame / cancelAnimationFrame ──────────────────────
+        // Uses __nsDwmFlush() — the Windows equivalent of Choreographer /
+        // CADisplayLink.  DwmFlush() blocks the calling thread until the next
+        // monitor VSync, giving frame-perfect timing at any refresh rate
+        // (60 / 120 / 144 / 240 Hz) with no timer overhead.
+        //
+        // On headless systems DwmFlush() returns immediately (composition
+        // disabled), so rAF callbacks fire as fast as microtasks drain —
+        // ideal for tests and headless rendering scenarios.
+        (function () {
+            var _nextId  = 0;
+            var _pending = new Map();
+            var _running = false;
+
+            function _flush() {
+                if (_pending.size === 0) { _running = false; return; }
+                // Block until next VSync; returns ms timestamp.
+                var ts = (typeof __nsDwmFlush === 'function')
+                    ? __nsDwmFlush()
+                    : performance.now();
+                var cbs = Array.from(_pending);
+                _pending.clear();
+                for (var i = 0; i < cbs.length; i++) {
+                    try { cbs[i][1](ts); } catch (e) {
+                        console.log('rAF error:', e && e.message || e);
+                    }
+                }
+                if (_pending.size > 0) queueMicrotask(_flush);
+                else _running = false;
+            }
+
+            globalThis.requestAnimationFrame = function requestAnimationFrame(callback) {
+                if (typeof callback !== 'function') return 0;
+                var id = ++_nextId;
+                _pending.set(id, callback);
+                if (!_running) { _running = true; queueMicrotask(_flush); }
+                return id;
+            };
+
+            globalThis.cancelAnimationFrame = function cancelAnimationFrame(id) {
+                _pending.delete(id);
+            };
+        })();
+
+        // ── Blob / File ───────────────────────────────────────────────────────
+        (function () {
+            // Minimal UTF-8 encoder (covers BMP + surrogates) for string parts.
+            function _utf8(str) {
+                var out = [];
+                for (var i = 0; i < str.length; ) {
+                    var c = str.codePointAt(i);
+                    if      (c < 0x80)    { out.push(c); i += 1; }
+                    else if (c < 0x800)   { out.push(0xC0|(c>>6), 0x80|(c&0x3F)); i += 1; }
+                    else if (c < 0x10000) { out.push(0xE0|(c>>12), 0x80|((c>>6)&0x3F), 0x80|(c&0x3F)); i += 1; }
+                    else                  { out.push(0xF0|(c>>18), 0x80|((c>>12)&0x3F), 0x80|((c>>6)&0x3F), 0x80|(c&0x3F)); i += 2; }
+                }
+                return new Uint8Array(out).buffer;
+            }
+
+            function _toAb(part) {
+                if (typeof part === 'string') return _utf8(part);
+                if (part instanceof globalThis.Blob) return part._buf;
+                if (part instanceof ArrayBuffer) return part;
+                if (ArrayBuffer.isView(part))
+                    return part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength);
+                return new ArrayBuffer(0);
+            }
+
+            function _concat(parts) {
+                var total = 0;
+                var bufs = (parts || []).map(function (p) { var ab = _toAb(p); total += ab.byteLength; return ab; });
+                var out = new Uint8Array(total);
+                var off = 0;
+                for (var i = 0; i < bufs.length; i++) { out.set(new Uint8Array(bufs[i]), off); off += bufs[i].byteLength; }
+                return out.buffer;
+            }
+
+            function Blob(blobParts, options) {
+                this._buf = _concat(blobParts);
+                this.type = (options && options.type) ? String(options.type).toLowerCase() : '';
+                this.size = this._buf.byteLength;
+            }
+            Blob.prototype.arrayBuffer = function () { return Promise.resolve(this._buf.slice(0)); };
+            Blob.prototype.text = function () {
+                // Simple Latin-1 decode; good enough for ASCII/binary; a real
+                // TextDecoder (if polyfilled later) would be more correct.
+                var b = new Uint8Array(this._buf), s = '';
+                for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+                return Promise.resolve(s);
+            };
+            Blob.prototype.slice = function (start, end, type) {
+                var sz = this.size;
+                var s = start == null ? 0 : (start < 0 ? Math.max(0, sz + start) : Math.min(start, sz));
+                var e = end   == null ? sz : (end   < 0 ? Math.max(0, sz + end)  : Math.min(end, sz));
+                return new Blob([this._buf.slice(s, e)], { type: type || '' });
+            };
+            Blob.prototype.stream = function () {
+                var buf = this._buf, done = false;
+                return {
+                    getReader: function () {
+                        return {
+                            read:        function () { if (done) return Promise.resolve({ done: true, value: undefined }); done = true; return Promise.resolve({ done: false, value: new Uint8Array(buf.slice(0)) }); },
+                            cancel:      function () { done = true; return Promise.resolve(); },
+                            releaseLock: function () {}
+                        };
+                    }
+                };
+            };
+            globalThis.Blob = Blob;
+
+            function File(fileBits, fileName, options) {
+                Blob.call(this, fileBits, options);
+                this.name = String(fileName);
+                this.lastModified = (options && options.lastModified != null)
+                    ? Number(options.lastModified) : Date.now();
+            }
+            File.prototype = Object.create(Blob.prototype);
+            File.prototype.constructor = File;
+            globalThis.File = File;
+        })();
+
+        // ── URL / URLSearchParams / URLPattern post-install wiring ────────────
+        // The native classes are installed by install_url_globals() before this
+        // script runs.  This block adds the JS-layer searchParams accessor
+        // (mutation propagation + caching), Symbol.iterator, and the blob-URL API.
+        (function () {
+            // searchParams: lazily created, mutations propagate back to URL.search
+            Object.defineProperty(URL.prototype, 'searchParams', {
+                get: function () {
+                    if (this._searchParams == null) {
+                        var self = this;
+                        var sp = new URLSearchParams(this.search);
+                        Object.defineProperty(sp, '_url', { enumerable: false, writable: false, value: self });
+                        var _append = sp.append.bind(sp);
+                        sp.append = function (name, value) { _append(name, value); self.search = sp.toString(); };
+                        var _delete = sp.delete.bind(sp);
+                        sp.delete = function (name, value) { _delete(name, value); self.search = sp.toString(); };
+                        var _set = sp.set.bind(sp);
+                        sp.set = function (name, value) { _set(name, value); self.search = sp.toString(); };
+                        var _sort = sp.sort.bind(sp);
+                        sp.sort = function () { _sort(); self.search = sp.toString(); };
+                        this._searchParams = sp;
+                    }
+                    return this._searchParams;
+                },
+                configurable: true,
+            });
+
+            // Make URLSearchParams iterable (entries by default)
+            URLSearchParams.prototype[Symbol.iterator] = URLSearchParams.prototype.entries;
+
+            // ── URL.createObjectURL / revokeObjectURL ─────────────────────────
+            var BLOB_STORE = new Map();
+            var _blobSeq = 0;
+            URL.createObjectURL = function (object, options) {
+                if (!(object instanceof globalThis.Blob)) return null;
+                var id = (++_blobSeq).toString(16).padStart(8, '0') + '-'
+                    + Math.floor(Math.random() * 0x10000).toString(16).padStart(4, '0') + '-4'
+                    + Math.floor(Math.random() * 0x1000).toString(16).padStart(3, '0') + '-'
+                    + (Math.floor(Math.random() * 4) + 8).toString(16)
+                    + Math.floor(Math.random() * 0x1000).toString(16).padStart(3, '0') + '-'
+                    + Math.floor(Math.random() * 0x1000000000000).toString(16).padStart(12, '0');
+                var url = 'blob:nativescript/' + id;
+                BLOB_STORE.set(url, { blob: object, type: object.type, ext: options && options.ext });
+                return url;
+            };
+            URL.revokeObjectURL = function (url) { BLOB_STORE.delete(url); };
+            URL.InternalAccessor = {
+                getData: function (url) { return BLOB_STORE.get(url) || null; },
+            };
+        })();
+
+        // ── URLPattern polyfill ───────────────────────────────────────────────
+        // ada-url (C++) doesn't expose URLPattern; this JS polyfill covers the
+        // common cases: :name capture groups, * / ** wildcards, literal segments.
+        (function () {
+            if (typeof URLPattern !== 'undefined') return;
+
+            function _esc(s) {
+                return s.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
+            }
+
+            function _compile(pat) {
+                if (pat === undefined || pat === null) pat = '*';
+                var s = String(pat);
+                var groups = [];
+                var re = '';
+                var i = 0;
+                while (i < s.length) {
+                    var c = s[i];
+                    if (c === ':') {
+                        var j = i + 1;
+                        while (j < s.length && /\w/.test(s[j])) j++;
+                        var name = s.slice(i + 1, j);
+                        groups.push(name);
+                        re += '([^/?#]+?)';
+                        i = j;
+                    } else if (c === '*' && s[i + 1] === '*') {
+                        groups.push('0');
+                        re += '(.*)';
+                        i += 2;
+                    } else if (c === '*') {
+                        groups.push('0');
+                        re += '([^/?#]*)';
+                        i++;
+                    } else {
+                        re += _esc(c);
+                        i++;
+                    }
+                }
+                return { re: new RegExp('^' + re + '$'), groups: groups };
+            }
+
+            function _match(compiled, value) {
+                var m = String(value || '').match(compiled.re);
+                if (!m) return null;
+                var groups = {};
+                for (var i = 0; i < compiled.groups.length; i++) {
+                    groups[compiled.groups[i]] = m[i + 1] !== undefined ? m[i + 1] : undefined;
+                }
+                return { input: String(value || ''), groups: groups };
+            }
+
+            function URLPattern(init, baseURL) {
+                if (typeof init === 'string') {
+                    try {
+                        var u = new URL(init, baseURL || 'http://_placeholder_');
+                        init = {
+                            protocol: u.protocol.slice(0, -1),
+                            hostname: u.hostname,
+                            port: u.port,
+                            pathname: u.pathname,
+                            search: u.search ? u.search.slice(1) : '',
+                            hash: u.hash ? u.hash.slice(1) : '',
+                        };
+                    } catch (e) {
+                        init = { pathname: init };
+                    }
+                }
+                init = init || {};
+                var opt = function (v, d) { return v !== undefined && v !== null ? String(v) : (d !== undefined ? d : '*'); };
+                this.protocol = opt(init.protocol);
+                this.username  = opt(init.username);
+                this.password  = opt(init.password);
+                this.hostname  = opt(init.hostname);
+                this.port      = opt(init.port);
+                this.pathname  = opt(init.pathname, '/*');
+                this.search    = opt(init.search);
+                this.hash      = opt(init.hash);
+                this._pc = _compile(this.protocol);
+                this._uc = _compile(this.username);
+                this._pw = _compile(this.password);
+                this._hc = _compile(this.hostname);
+                this._oc = _compile(this.port);
+                this._ac = _compile(this.pathname);
+                this._sc = _compile(this.search);
+                this._xc = _compile(this.hash);
+            }
+
+            URLPattern.prototype.test = function (input, baseURL) {
+                return this.exec(input, baseURL) !== null;
+            };
+
+            URLPattern.prototype.exec = function (input, baseURL) {
+                var url;
+                try {
+                    if (typeof input === 'string') {
+                        url = new URL(input, baseURL || undefined);
+                    } else if (input && input.href) {
+                        url = new URL(input.href);
+                    } else {
+                        url = input || {};
+                    }
+                } catch (e) { return null; }
+
+                var rm = _match(this._pc, url.protocol ? url.protocol.slice(0, -1) : '');
+                var um = _match(this._uc, url.username || '');
+                var pm = _match(this._pw, url.password || '');
+                var hm = _match(this._hc, url.hostname || '');
+                var om = _match(this._oc, url.port || '');
+                var am = _match(this._ac, url.pathname || '/');
+                var sm = _match(this._sc, url.search ? url.search.slice(1) : '');
+                var xm = _match(this._xc, url.hash ? url.hash.slice(1) : '');
+
+                if (!rm || !um || !pm || !hm || !om || !am || !sm || !xm) return null;
+                return {
+                    inputs:   [input],
+                    protocol: rm, username: um, password: pm,
+                    hostname: hm, port: om,     pathname: am,
+                    search:   sm, hash: xm,
+                };
+            };
+
+            globalThis.URLPattern = URLPattern;
+        })();
+
+        // ── NSWinRT.dotnet — BCL / arbitrary .NET dispatch ───────────────────
+        // Requires the dotnet-bridge project to be published into
+        //   <app-root>/dotnet-bridge/publish/DotNetBridge.dll
+        (function () {
+            if (typeof globalThis.__nsDotNetInvoke !== 'function') return;
+
+            function _invoke(req) {
+                var json = globalThis.__nsDotNetInvoke(JSON.stringify(req));
+                var res  = JSON.parse(json);
+                if (res.error) throw new Error(res.error);
+                return res.result;
+            }
+
+            // ── Type-metadata cache ──────────────────────────────────────────
+            // Populated lazily on first access; avoids repeated bridge round-trips.
+            var _typeInfoCache = {};
+            var _emptyInfo = { methods: [], properties: [], staticMethods: [], staticProperties: [] };
+
+            // ── Auto-release via FinalizationRegistry ────────────────────────
+            // When the JS GC collects a DotNet proxy the registry fires the
+            // callback with the managed handle id, releasing the CLR reference.
+            // Explicit sw.release() still works for deterministic teardown.
+            var _dotNetFinalizers = typeof FinalizationRegistry === 'function'
+                ? new FinalizationRegistry(function (handle) {
+                    try { _invoke({ handle: handle, method: '__release', args: [] }); } catch (e) {}
+                  })
+                : null;
+
+            function _getTypeInfo(assembly, typeName) {
+                if (!typeName) return _emptyInfo;
+                var cached = _typeInfoCache[typeName];
+                if (cached !== undefined) return cached;
+                try {
+                    var info = _invoke({ assembly: assembly || typeName.split('.')[0], typeName: typeName, method: '__members__', args: [] });
+                    _typeInfoCache[typeName] = (info && typeof info === 'object') ? info : _emptyInfo;
+                } catch (e) {
+                    _typeInfoCache[typeName] = _emptyInfo;
+                }
+                return _typeInfoCache[typeName];
+            }
+
+            function _unwrap(v) {
+                if (v && typeof v === 'object' && typeof v.__handle === 'number') return { __handle: v.__handle };
+                return v;
+            }
+
+            // ── Instance Proxy ───────────────────────────────────────────────
+            // Makes sw.Stop() and sw.Elapsed both work naturally.
+            // The proxy is registered with _dotNetFinalizers so the CLR reference
+            // is released automatically when JS GC collects the proxy.
+            function _makeDotNetInstance(handle, assembly, typeName) {
+                var info = _getTypeInfo(assembly, typeName);
+                var proxy = new Proxy({}, {
+                    get: function (_, prop) {
+                        if (typeof prop === 'symbol') return undefined;
+                        if (prop === '__handle') return handle;
+                        if (prop === '__type')   return typeName;
+                        if (prop === 'release') return function () {
+                            _invoke({ handle: handle, method: '__release', args: [] });
+                        };
+                        if (prop === 'toString') return function () {
+                            return '[DotNetObject ' + typeName + ' #' + handle + ']';
+                        };
+                        // Re-read info in case it was populated after construction.
+                        var i = _typeInfoCache[typeName] || _emptyInfo;
+                        if (i.properties && i.properties.indexOf(prop) >= 0) {
+                            // Property: resolve value immediately.
+                            return _wrap(_invoke({ handle: handle, method: 'get_' + prop, args: [] }));
+                        }
+                        // Method (or unknown): return a callable.
+                        return function () {
+                            var args = Array.prototype.slice.call(arguments).map(_unwrap);
+                            return _wrap(_invoke({ handle: handle, method: prop, args: args }));
+                        };
+                    },
+                    set: function (_, prop, value) {
+                        var i = _typeInfoCache[typeName] || _emptyInfo;
+                        if (i.properties && i.properties.indexOf(prop) >= 0) {
+                            _invoke({ handle: handle, method: 'set_' + prop, args: [_unwrap(value)] });
+                        }
+                        return true;
+                    },
+                });
+                if (_dotNetFinalizers) _dotNetFinalizers.register(proxy, handle);
+                return proxy;
+            }
+
+            function _wrap(value) {
+                if (value == null) return null;
+                if (Array.isArray(value)) return value.map(_wrap);
+                if (typeof value === 'object' && typeof value.__handle === 'number') {
+                    var typeName = value.__type || '';
+                    var assembly = typeName.split('.')[0] || '';
+                    return _makeDotNetInstance(value.__handle, assembly, typeName);
+                }
+                return value;
+            }
+
+            globalThis.NSWinRT.dotnet = {
+                invoke: function (assembly, typeName, method, args) {
+                    return _wrap(_invoke({ assembly: assembly, typeName: typeName, method: method, args: (args || []).map(_unwrap) }));
+                },
+                get: function (assembly, typeName, prop) {
+                    return _wrap(_invoke({ assembly: assembly, typeName: typeName, method: 'get_' + prop, args: [] }));
+                },
+                fromHandle: function (handle, typeName) {
+                    var assembly = (typeName || '').split('.')[0] || '';
+                    return _makeDotNetInstance(handle, assembly, typeName || '');
+                },
+            };
+
+            // ── Natural namespace proxies ────────────────────────────────────
+            // System.Diagnostics.Stopwatch.StartNew()    →  static method call
+            // System.Environment.MachineName             →  static property get
+            // new System.Text.StringBuilder(64)          →  constructor
+            // sw.Stop()                                  →  instance method
+            // sw.Elapsed                                 →  instance property
+            function _makeNamespaceProxy(path) {
+                function _node() {}
+                return new Proxy(_node, {
+                    get: function (_, prop) {
+                        if (typeof prop === 'symbol') return undefined;
+                        var assembly = path.split('.')[0];
+                        var info = _getTypeInfo(assembly, path);
+                        // Static property: resolve value immediately.
+                        if (info.staticProperties && info.staticProperties.indexOf(prop) >= 0) {
+                            return _wrap(_invoke({ assembly: assembly, typeName: path, method: 'get_' + prop, args: [] }));
+                        }
+                        // Static method: return a callable.
+                        if (info.staticMethods && info.staticMethods.indexOf(prop) >= 0) {
+                            return function () {
+                                var args = Array.prototype.slice.call(arguments).map(_unwrap);
+                                return _wrap(_invoke({ assembly: assembly, typeName: path, method: prop, args: args }));
+                            };
+                        }
+                        // Namespace / sub-type: keep descending.
+                        return _makeNamespaceProxy(path + '.' + prop);
+                    },
+                    apply: function (_, _this, args) {
+                        var lastDot  = path.lastIndexOf('.');
+                        var typeName = path.substring(0, lastDot);
+                        var method   = path.substring(lastDot + 1);
+                        var assembly = typeName.split('.')[0];
+                        return _wrap(_invoke({ assembly: assembly, typeName: typeName, method: method, args: args.map(_unwrap) }));
+                    },
+                    construct: function (_, args) {
+                        var assembly = path.split('.')[0];
+                        return _wrap(_invoke({ assembly: assembly, typeName: path, method: '.ctor', args: args.map(_unwrap) }));
+                    },
+                });
+            }
+            globalThis.System    = _makeNamespaceProxy('System');
+            globalThis.Microsoft = _makeNamespaceProxy('Microsoft');
+        })();
+
+        // ── NSWinRT.win32 — dynamic Win32 FFI via libffi ────────────────────
+        (function () {
+            if (typeof globalThis.__nsWin32Call !== 'function') return;
+
+            // Auto-type a bare JS value to a {type, value} descriptor.
+            function _autoType(v) {
+                if (v === null || v === undefined) return { type: 'pointer', value: 0 };
+                if (typeof v === 'object' && typeof v.type === 'string') return v;
+                if (typeof v === 'string')  return { type: 'wstr', value: v };
+                if (typeof v === 'boolean') return { type: 'bool', value: v };
+                if (typeof v === 'number')
+                    return { type: Number.isInteger(v) ? 'i32' : 'f64', value: v };
+                return { type: 'i32', value: Number(v) };
+            }
+
+            globalThis.NSWinRT.win32 = {
+                /**
+                 * Low-level call with explicit typed args.
+                 *   NSWinRT.win32.call('user32.dll', 'MessageBoxW', 'i32',
+                 *     {type:'pointer',value:0}, {type:'wstr',value:'Hello'}, ...)
+                 */
+                call: function (dll, fn_name, returnType) {
+                    var args = Array.prototype.slice.call(arguments, 3);
+                    var json = JSON.stringify({ dll: dll, fn: fn_name, returnType: returnType, args: args });
+                    return JSON.parse(globalThis.__nsWin32Call(json)).value;
+                },
+
+                /**
+                 * Returns a Proxy where every property is a callable Win32 function.
+                 * Args are auto-typed from their JS values; strings become wstr,
+                 * numbers become i32 (or f64 if non-integer), null becomes pointer(0).
+                 *
+                 *   const user32 = NSWinRT.win32.bind('user32.dll');
+                 *   const { MessageBoxW } = NSWinRT.win32.bind('user32.dll');
+                 *   MessageBoxW(null, 'Hello!', 'Title', 0);
+                 */
+                bind: function (dll, returnType) {
+                    var ret = returnType || 'i32';
+                    var win32 = globalThis.NSWinRT.win32;
+                    return new Proxy({}, {
+                        get: function (_, name) {
+                            if (typeof name !== 'string') return undefined;
+                            return function () {
+                                var args = Array.prototype.slice.call(arguments).map(_autoType);
+                                return win32.call.apply(win32, [dll, name, ret].concat(args));
+                            };
+                        },
+                    });
+                },
+
+                /**
+                 * Returns an object with typed function wrappers from explicit signatures.
+                 *
+                 *   const api = NSWinRT.win32.define('user32.dll', {
+                 *       MessageBoxW:      ['pointer','wstr','wstr','u32'],
+                 *       GetSystemMetrics: ['i32'],
+                 *   }, 'i32');
+                 *   api.MessageBoxW(null, 'Hello', 'Title', 0);
+                 */
+                define: function (dll, signatures, defaultReturnType) {
+                    var ret = defaultReturnType || 'i32';
+                    var win32 = globalThis.NSWinRT.win32;
+                    var obj = {};
+                    Object.keys(signatures).forEach(function (name) {
+                        var argTypes = signatures[name];
+                        obj[name] = function () {
+                            var jsArgs = Array.prototype.slice.call(arguments);
+                            var typedArgs = jsArgs.map(function (v, i) {
+                                var ty = argTypes[i];
+                                return ty ? { type: ty, value: v } : _autoType(v);
+                            });
+                            return win32.call.apply(win32, [dll, name, ret].concat(typedArgs));
+                        };
+                    });
+                    return obj;
+                },
+
+                /**
+                 * Enumerates all exports of a DLL and installs each one as a global
+                 * function on `globalThis`, auto-typing args.
+                 *
+                 *   NSWinRT.win32.import('user32.dll');
+                 *   MessageBoxW(null, 'Hello!', 'Title', 0); // ← now a plain global
+                 */
+                import: function (dll, returnType) {
+                    if (typeof globalThis.__nsWin32Exports !== 'function') return;
+                    var exports = JSON.parse(globalThis.__nsWin32Exports(dll));
+                    var bound   = globalThis.NSWinRT.win32.bind(dll, returnType || 'i32');
+                    exports.forEach(function (name) {
+                        if (!(name in globalThis))
+                            Object.defineProperty(globalThis, name, {
+                                value: bound[name], writable: true, configurable: true,
+                            });
+                    });
+                },
+            };
+        })();
         "#;
+
+// ── __nsDotNetInvoke ──────────────────────────────────────────────────────────
+
+/// Calls the .NET bridge with a JSON request string and returns the JSON
+/// response string.  Throws a JS error if the host is not initialised or the
+/// call fails at the hosting layer (application-level errors are returned as
+/// `{"error":"…"}` inside the JSON, matching the bridge contract).
+pub(crate) fn handle_dotnet_invoke(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 1 {
+        throw_js_error(scope, "__nsDotNetInvoke: expected a JSON string argument");
+        return;
+    }
+    let Some(json_v) = args.get(0).to_string(scope) else {
+        throw_js_error(scope, "__nsDotNetInvoke: argument must be a string");
+        return;
+    };
+    let json = json_v.to_rust_string_lossy(scope);
+    match crate::dotnet::call_dotnet(&json) {
+        Ok(result) => {
+            if let Some(s) = v8::String::new(scope, &result) {
+                retval.set(s.into());
+            }
+        }
+        Err(e) => throw_js_error(scope, &e),
+    }
+}
+
+// ── __nsWin32Exports ──────────────────────────────────────────────────────────
+
+/// Returns a JSON array of exported function names for the given DLL, e.g.
+/// `["MessageBoxW","CreateWindowExW",…]`.  Used by `NSWinRT.win32.import()`.
+pub(crate) fn handle_win32_exports(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let Some(dll_v) = args.get(0).to_string(scope) else { return };
+    let dll = dll_v.to_rust_string_lossy(scope);
+    let names = match crate::win32::list_exports(&dll) {
+        Ok(v) => v,
+        Err(_) => vec![],
+    };
+    let json = serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_string());
+    if let Some(s) = v8::String::new(scope, &json) {
+        retval.set(s.into());
+    }
+}
+
+// ── __nsDwmFlush ──────────────────────────────────────────────────────────────
+
+/// Blocks the calling thread until the next DWM VSync (monitor refresh), then
+/// returns the elapsed milliseconds since process start as a `f64`.
+///
+/// This is the Windows equivalent of Android's `Choreographer` / iOS's
+/// `CADisplayLink`: it yields exactly at the display's refresh boundary,
+/// giving requestAnimationFrame perfect frame timing at any Hz (60/120/144/240).
+///
+/// On headless systems where DWM composition is disabled, `DwmFlush` returns
+/// immediately with an error, so this call is non-blocking in that case.
+pub(crate) fn handle_dwm_flush(
+    _scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    use windows::Win32::Graphics::Dwm::DwmFlush;
+    // Best-effort: ignore DWM_E_COMPOSITIONDISABLED on headless systems.
+    let _ = unsafe { DwmFlush() };
+    let ts = crate::globals::time::PROCESS_START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as f64 / 1_000_000.0;
+    retval.set_double(ts);
+}
+
+// ── __nsUUID ──────────────────────────────────────────────────────────────────
+
+pub(crate) fn handle_ns_uuid(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    match windows::core::GUID::new() {
+        Ok(g) => {
+            let s = format!(
+                "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                g.data1, g.data2, g.data3,
+                g.data4[0], g.data4[1], g.data4[2], g.data4[3],
+                g.data4[4], g.data4[5], g.data4[6], g.data4[7],
+            );
+            if let Some(v) = v8::String::new(scope, &s) {
+                retval.set(v.into());
+            }
+        }
+        Err(_) => retval.set(v8::undefined(scope).into()),
+    }
+}
+
+// ── __nsWin32Call ─────────────────────────────────────────────────────────────
+
+/// Calls an arbitrary Win32 function via libffi dynamic dispatch.
+/// Accepts a JSON string `{dll, fn, returnType, args:[{type,value}…]}` and
+/// returns `{"value": <result>}` or `{"error": "…"}`.
+pub(crate) fn handle_win32_call(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 1 {
+        throw_js_error(scope, "__nsWin32Call: expected a JSON string argument");
+        return;
+    }
+    let Some(json_v) = args.get(0).to_string(scope) else {
+        throw_js_error(scope, "__nsWin32Call: argument must be a string");
+        return;
+    };
+    let json = json_v.to_rust_string_lossy(scope);
+    let result_json = match crate::win32::call_win32_json(&json) {
+        Ok(v)  => v,
+        Err(e) => format!(r#"{{"error":{}}}"#, serde_json::to_string(&e).unwrap()),
+    };
+    if let Some(s) = v8::String::new(scope, &result_json) {
+        retval.set(s.into());
+    }
+}
 
 // ── Context initialisation ────────────────────────────────────────────────────
 
@@ -1773,10 +2559,28 @@ pub(crate) fn init_async_helpers(
     register!("__nsWorkerTerminate",            handle_worker_terminate);
     register!("__nsWorkerPollMessagesBlocking", handle_worker_poll_messages_blocking);
     register!("__nsLiveSyncCopyFile",           handle_livesync_copy_file);
+    register!("__nsDotNetInvoke",               handle_dotnet_invoke);
+    register!("__nsWin32Call",                  handle_win32_call);
+    register!("__nsWin32Exports",               handle_win32_exports);
+    register!("__nsDwmFlush",                   handle_dwm_flush);
+    register!("__nsUUID",                       handle_ns_uuid);
 
     if let (Some(k), Some(v)) = (v8::String::new(scope, "__nsAppRoot"), v8::String::new(scope, app_root)) {
         global.define_own_property(scope, k.into(), v.into(), v8::PropertyAttribute::READ_ONLY);
     }
+
+    // Improve Windows timer resolution from the default ~15 ms to ~1 ms.
+    // This benefits all DispatcherTimer-based setTimeout/setInterval calls.
+    // Ignored on failure (e.g., sandboxed environments).
+    let _ = crate::win32::call_win32_json(
+        r#"{"dll":"winmm.dll","fn":"timeBeginPeriod","returnType":"u32","args":[{"type":"u32","value":1}]}"#,
+    );
+
+    // Attempt to initialise the .NET BCL host in the background; failures are
+    // deferred so the runtime still starts without .NET installed.
+    crate::dotnet::try_init_dotnet(app_root);
+
+    crate::globals::url::install_url_globals(scope);
 
     if let Some(src) = v8::String::new(scope, HELPER_SOURCE) {
         if let Some(script) = v8::Script::compile(scope, src, None) {

@@ -61,7 +61,7 @@ namespace NativeScriptWindowsDemo
 
             try
             {
-                urlPtr = runtime_devtools_start(_runtime, 9229);
+                urlPtr = runtime_devtools_start(_runtime, 42000);
                 if (urlPtr == IntPtr.Zero)
                 {
                     System.Diagnostics.Debug.WriteLine("[NativeScript DevTools] runtime_devtools_start returned null (devtools disabled).");

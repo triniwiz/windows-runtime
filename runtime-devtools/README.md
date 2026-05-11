@@ -9,7 +9,7 @@ use runtime_devtools::{DevtoolsServer, DevtoolsServerConfig};
 
 // On the V8 thread, after creating the isolate and context:
 let mut server = DevtoolsServer::attach(
-    &DevtoolsServerConfig::default(), // host: 127.0.0.1, port: 9229
+    &DevtoolsServerConfig::default(), // host: 127.0.0.1, port: 42000
     isolate,
     context,
 )?;
@@ -33,5 +33,5 @@ server.pump_messages(); // dispatches pending CDP messages to V8
 Open the `frontend_url` from `DevtoolsEndpoint` in Chrome, or use:
 
 ```
-chrome://inspect  →  Configure  →  add 127.0.0.1:9229
+chrome://inspect  →  Configure  →  add 127.0.0.1:42000
 ```

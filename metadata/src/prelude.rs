@@ -200,7 +200,7 @@ pub fn get_guid_attribute_value(metadata: Option<&IMetaDataImport2>, token: CorT
             // Skip the 2-byte custom-attribute prolog (0x01 0x00).
             let os_data = unsafe { data.add(2) };
 
-            guid = crate::get_guid(os_data);
+            guid = unsafe { crate::get_guid(os_data) };
         }
     }
     guid

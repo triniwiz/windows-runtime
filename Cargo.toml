@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["metadata", "playground", "runtime", "runtime-binding-gen", "sbg", "nativescript", "typings-generator", "integration-tests", "runtime-devtools"]
+members = ["metadata", "playground", "runtime", "runtime-binding-gen", "sbg", "nativescript", "typings-generator", "integration-tests", "runtime-devtools", "metadata-generator"]
 
 [workspace.dependencies]
 windows = "0.62.2"

@@ -61,7 +61,7 @@ namespace TestApp
             _runtime = runtime_init(AppContext.BaseDirectory);
 
 #if DEBUG
-            var urlPtr = runtime_devtools_start(_runtime, 9229);
+            var urlPtr = runtime_devtools_start(_runtime, 42000);
             if (urlPtr != IntPtr.Zero)
             {
                 var wsUrl = Marshal.PtrToStringUTF8(urlPtr);
