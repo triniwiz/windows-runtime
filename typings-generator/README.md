@@ -1,44 +1,63 @@
 # typings-generator
 
-Experimental WinRT typings generator for the Windows runtime workspace.
+WinRT and .NET typings generator for the Windows runtime workspace.
 
 ## What it does
 
 - Traverses metadata namespaces from a root (default: `Windows`)
-- Emits a `.d.ts` file with initial declarations for:
+- Emits a `.d.ts` file with declarations for:
   - classes
   - interfaces
   - enums
   - structs
   - delegates
 
-## Usage
+## WinRT typings
 
-From workspace root:
+Generate TypeScript declarations from WinRT metadata (`.winmd`):
 
-- `cargo run -p typings-generator -- --root Windows --out windows-runtime.generated.d.ts`
-- `cargo run -p typings-generator -- --roots Windows,Windows.Foundation --out windows-runtime.generated.d.ts`
-- `cargo run -p typings-generator -- --input path\\to\\MyComponent.winmd --out windows-runtime.generated.d.ts`
+```powershell
+# All Windows APIs (Windows.*)
+cargo run -p typings-generator -- --root Windows --out windows.d.ts
+
+# Specific namespaces
+cargo run -p typings-generator -- --roots Windows.Foundation,Windows.UI --out windows.d.ts
+
+# From a custom WinMD or DLL
+cargo run -p typings-generator -- --input path\to\MyComponent.winmd --out my-component.d.ts
+```
 
 Options:
 
-- `--root <namespace>`: root namespace to traverse
-- `--roots <ns1,ns2,...>`: comma-separated root namespaces
-- `--out <path>`: output file path
-- `--input <path>`: optional discovery source (`.dll`, `.winmd`, `.cs`, `.csproj`)
+| Flag | Description |
+|------|-------------|
+| `--root <namespace>` | Single root namespace to traverse |
+| `--roots <ns1,ns2,...>` | Comma-separated root namespaces |
+| `--out <path>` | Output `.d.ts` file path (single file) |
+| `--out-dir <path>` | Output directory — one `.d.ts` per top-level namespace |
+| `--input <path>` | Discovery source (`.dll`, `.winmd`, `.cs`, `.csproj`) |
 
-Output format:
+Split output writes one file per second-level namespace group, e.g. `Windows.Foundation.d.ts`, `Windows.Graphics.d.ts`, etc.
 
-- Declarations are grouped by namespace as `declare namespace ...` blocks.
+## .NET BCL typings
 
-Validation:
+Generate TypeScript declarations directly from any .NET assembly or WinMD:
 
-- `pwsh typings-generator\scripts\validate-projection.ps1`
+```powershell
+cargo run -p typings-generator -- --input path\to\MyLibrary.dll --out my-library.d.ts
+```
+
+No bridge process required — the generator reads assembly metadata directly.
+
+## Validation (WinRT only)
+
+```powershell
+pwsh typings-generator\scripts\validate-projection.ps1
+```
 
 ## Notes
 
-- This is an initial generator and not yet feature-complete.
-- Some common WinRT generic interfaces now project to TypeScript generics, but many advanced WinRT metadata constructs still degrade to simplified types or `any`.
-- Generic-heavy namespaces such as `Windows.Foundation.Collections` and parts of `Windows.Foundation` use metadata type-definition enumeration as a fallback when namespace traversal alone does not surface concrete types.
-- Intended as a base package to evolve into full NativeScript runtime typings generation.
-- If namespace traversal does not enumerate concrete types, the generator falls back to scanning WinMD payload strings (for example `Windows.winmd`) and validates candidates through `MetadataReader` before emitting declarations.
+- Some WinRT generic interfaces project to TypeScript generics; advanced
+  constructs may degrade to `any`.
+- Generic-heavy namespaces (`Windows.Foundation.Collections`) fall back to
+  WinMD payload scanning when namespace traversal alone is insufficient.
