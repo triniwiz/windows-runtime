@@ -46,5 +46,30 @@
       <Link>nativescript.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+
+    <!-- .NET bridge — published on first build by the target below; enables ns.dotnet.*
+         APIs from JavaScript. Must land at dotnet-bridge\publish\ relative to the
+         executable so the Rust runtime can locate DotNetBridge.dll via
+         AppContext.BaseDirectory. Condition guards against a missing source tree. -->
+    <Content Include="$(NSWindowsRoot)\dotnet-bridge\publish\**\*"
+             Condition="Exists('$(NSWindowsRoot)\dotnet-bridge\publish')">
+      <Link>dotnet-bridge\publish\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
+
+  <!--
+    Publishes DotNetBridge.dll before the app build so the Content glob above has
+    something to pick up.  Inputs/Outputs make this incremental: MSBuild skips the
+    Exec entirely when DotNetBridge.dll is newer than both source files.
+  -->
+  <Target Name="PublishDotNetBridge"
+          BeforeTargets="Build"
+          Inputs="$(NSWindowsRoot)\dotnet-bridge\DotNetBridge.csproj;
+                  $(NSWindowsRoot)\dotnet-bridge\Bridge.cs"
+          Outputs="$(NSWindowsRoot)\dotnet-bridge\publish\DotNetBridge.dll"
+          Condition="Exists('$(NSWindowsRoot)\dotnet-bridge\DotNetBridge.csproj')">
+    <Message Text="[NativeScript] Publishing DotNetBridge..." Importance="high" />
+    <Exec Command="dotnet publish &quot;$(NSWindowsRoot)\dotnet-bridge\DotNetBridge.csproj&quot; -c Release -o &quot;$(NSWindowsRoot)\dotnet-bridge\publish&quot; --no-self-contained /nologo" />
+  </Target>
 </Project>

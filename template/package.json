@@ -1,6 +1,6 @@
 {
   "name": "@nativescript/windows",
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-alpha.2",
   "description": "NativeScript for using Windows v8",
   "repository": {
         "type": "git",
@@ -8,7 +8,8 @@
   },
   "scripts": {
     "build": "pwsh -File build.ps1",
-    "build:x64": "pwsh -File build.ps1 -SkipArm64"
+    "build:x64": "pwsh -File build.ps1 -SkipArm64",
+    "build:nodotnet": "pwsh -File build.ps1 -SkipDotnet"
   },
   "keywords": ["nativescript", "windows", "winrt", "uwp"],
   "license": "Apache-2.0",

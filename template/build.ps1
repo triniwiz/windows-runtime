@@ -27,7 +27,8 @@
 param(
     [switch]$SkipArm64,
     [switch]$SkipRelease,
-    [switch]$SkipDevtools
+    [switch]$SkipDevtools,
+    [switch]$SkipDotnet
 )
 
 Set-StrictMode -Version Latest
@@ -67,6 +68,38 @@ function Build-Crate {
     } finally {
         Pop-Location
     }
+}
+
+# ── DotNet Bridge ─────────────────────────────────────────────────────────────
+# Copies the dotnet-bridge source (csproj + .cs files) into
+# template/framework/dotnet-bridge/ so it ships inside the npm package.
+# The actual `dotnet publish` is deferred to the app's MSBuild process —
+# see the PublishDotNetBridge target in __PROJECT_NAME__.csproj.
+
+if (-not $SkipDotnet) {
+    Write-Host "`n=== DotNet Bridge (source copy) ===" -ForegroundColor Cyan
+    $BridgeSrc  = Join-Path $RepoRoot "dotnet-bridge"
+    $BridgeDest = Join-Path $ScriptDir "framework\dotnet-bridge"
+
+    # Wipe the destination so stale files don't linger between runs.
+    if (Test-Path $BridgeDest) { Remove-Item -Recurse -Force $BridgeDest }
+    $null = New-Item -ItemType Directory -Force -Path $BridgeDest
+
+    # Copy only source files; exclude build/publish artefacts.
+    Get-ChildItem -Path $BridgeSrc -Recurse |
+        Where-Object {
+            $rel = $_.FullName.Substring($BridgeSrc.Length + 1)
+            $rel -notmatch '^(bin|obj|publish)(\\|$)'
+        } |
+        ForEach-Object {
+            $dest = Join-Path $BridgeDest $_.FullName.Substring($BridgeSrc.Length + 1)
+            if ($_.PSIsContainer) {
+                $null = New-Item -ItemType Directory -Force -Path $dest
+            } else {
+                Copy-Item -Force $_.FullName $dest
+                Write-Host "  copied  $($_.FullName.Substring($BridgeSrc.Length + 1))"
+            }
+        }
 }
 
 # ── Targets ───────────────────────────────────────────────────────────────────
