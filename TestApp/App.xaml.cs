@@ -1,4 +1,6 @@
 ﻿using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
 using Windows.ApplicationModel;
 using Windows.ApplicationModel.Activation;
 using Windows.Storage;
@@ -15,6 +17,9 @@ namespace TestApp
 
     sealed partial class App : Application
     {
+        [DllImport("kernel32.dll")]
+        private static extern bool AttachConsole(int dwProcessId);
+        private const int ATTACH_PARENT_PROCESS = -1;
         private const string LastLaunchArgsKey = "LastLaunchArgs";
         private readonly RuntimeHost _runtimeHost = new RuntimeHost();
         private string _lastLaunchArgs = string.Empty;
@@ -34,8 +39,23 @@ namespace TestApp
         {
             _lastLaunchArgs = e.Arguments ?? string.Empty;
 
-            _runtimeHost.Initialize();
-            _runtimeHost.RunMainScript();
+            // Attach to parent console (if any) so early logs go to console when
+            // the app is launched from a terminal. Runtime must start on the
+            // main thread; perform synchronous startup and keep best-effort logging.
+            AttachConsole(ATTACH_PARENT_PROCESS);
+            LogSync("[TestApp] OnLaunched: starting runtime initialization");
+            try
+            {
+                _runtimeHost.Initialize();
+                LogSync("[TestApp] Runtime initialized");
+
+                _runtimeHost.RunMainScript();
+                LogSync("[TestApp] RunMainScript completed");
+            }
+            catch (Exception ex)
+            {
+                LogSync($"[TestApp] Runtime startup failed: {ex}");
+            }
 
 #if DEBUG
             Windows.UI.Xaml.Media.CompositionTarget.Rendering += OnRenderFrame;
@@ -50,6 +70,44 @@ namespace TestApp
             if (!e.PrelaunchActivated)
             {
                 Window.Current.Activate();
+            }
+        }
+
+        private static void LogSync(string message)
+        {
+            try
+            {
+                var timestamped = $"{DateTime.UtcNow:O} {message}\r\n";
+
+                // Best-effort: try app LocalFolder path, then temp folder, then Debug.
+                try
+                {
+                    var localFolder = ApplicationData.Current.LocalFolder;
+                    var localPath = localFolder.Path; // best-effort synchronous write
+                    var localFile = System.IO.Path.Combine(localPath, "ns_testapp.log");
+                    System.IO.File.AppendAllText(localFile, timestamped);
+                }
+                catch
+                {
+                    // Ignore failures to write to LocalFolder.
+                }
+
+                try
+                {
+                    var tmp = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "ns_testapp_host.log");
+                    System.IO.File.AppendAllText(tmp, timestamped);
+                }
+                catch
+                {
+                }
+
+                Debug.WriteLine(message);
+
+                try { Console.WriteLine(timestamped); } catch { }
+            }
+            catch
+            {
+                // Swallow any logging exceptions.
             }
         }
 

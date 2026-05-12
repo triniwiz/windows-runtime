@@ -40,6 +40,15 @@ function runRuntimeConformanceTests() {
 			},
 		});
 		const instance = new Extended();
+		// Debug: inspect instance and prototype to see why override may not be applied
+		console.log("[DEBUG] Named extend instance:", instance);
+		try {
+			console.log("[DEBUG] Named instance.ToString():", instance.ToString && instance.ToString());
+		} catch (e) {
+			console.log("[DEBUG] Named ToString() threw:", e && e.message ? e.message : e);
+		}
+		console.log("[DEBUG] Named instance.ToString typeof:", typeof instance.ToString);
+		console.log("[DEBUG] Named prototype ToString typeof:", typeof Object.getPrototypeOf(instance).ToString);
 		expect(instance.ToString() === "TemplateNamedJsonObject", "override ToString was not used");
 	});
 
@@ -50,6 +59,15 @@ function runRuntimeConformanceTests() {
 			},
 		});
 		const instance = new Extended();
+		// Debug: inspect instance and prototype to see why override may not be applied
+		console.log("[DEBUG] Unnamed extend instance:", instance);
+		try {
+			console.log("[DEBUG] Unnamed instance.ToString():", instance.ToString && instance.ToString());
+		} catch (e) {
+			console.log("[DEBUG] Unnamed ToString() threw:", e && e.message ? e.message : e);
+		}
+		console.log("[DEBUG] Unnamed instance.ToString typeof:", typeof instance.ToString);
+		console.log("[DEBUG] Unnamed prototype ToString typeof:", typeof Object.getPrototypeOf(instance).ToString);
 		expect(instance.ToString() === "TemplateUnnamedJsonObject", "unnamed extend override failed");
 	});
 
@@ -109,9 +127,21 @@ function runRuntimeConformanceTests() {
 	console.log(`[TEST SUMMARY] passed=${passed}, failed=${failed}`);
 }
 
-runRuntimeConformanceTests();
+try {
+	runRuntimeConformanceTests();
+}catch (error) {
+	console.log("[ERROR] Test execution threw an error:", error && error.message ? error.message : error);
+}
+
+try {
+	const data = new Windows.Data.Json.JsonObject();
+	console.dir("??", data);
+}catch (error) {
+	console.log("[ERROR] console.dir threw an error:", error && error.message ? error.message : error);
+}
 
 // Optional async sample:
+// const dialog = new Windows.UI.Popups.MessageDialog("Hello from NativeScript Windows template");
 // const dialog = new Windows.UI.Popups.MessageDialog("Hello from NativeScript Windows template");
 // NSWinRT.toPromise(dialog.ShowAsync(), { timeoutMs: 10000 })
 //   .then((result) => console.log("Dialog result:", result))

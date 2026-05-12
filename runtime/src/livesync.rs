@@ -24,7 +24,7 @@ pub fn copy_file(source_path: &str, dest_path: &str) -> Result<(), String> {
 ///
 /// ```js
 /// // Copy a source file into the app bundle and reload it:
-/// NSWinRT.LiveSync.sync('/build/app/main.js', 'C:/App/main.js');
+/// NSWinRT.LiveSync.sync('/build/app/main.js', 'C:/app/main.js');
 ///
 /// // Just reload an already-present file (no copy needed):
 /// NSWinRT.LiveSync.reload('main.js');

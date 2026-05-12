@@ -210,10 +210,16 @@ fn discover_csproj_files(root: &Path, output: &mut Vec<PathBuf>) {
 fn discover_app_source_dirs(workspace_root: &Path) -> Vec<PathBuf> {
     let mut discovered = BTreeSet::new();
 
-    let conventional = workspace_root.join("App").join("CSharp");
-    if conventional.exists() {
-        let path = conventional.canonicalize().unwrap_or(conventional);
+    let conventional_lower = workspace_root.join("app").join("CSharp");
+    if conventional_lower.exists() {
+        let path = conventional_lower.canonicalize().unwrap_or(conventional_lower);
         discovered.insert(path);
+    } else {
+        let conventional = workspace_root.join("App").join("CSharp");
+        if conventional.exists() {
+            let path = conventional.canonicalize().unwrap_or(conventional);
+            discovered.insert(path);
+        }
     }
 
     let mut csproj_files = Vec::new();

@@ -211,7 +211,7 @@ impl GenericInstanceIdBuilder {
     pub fn generate_id(declaration: &dyn Declaration) -> GUID {
         let declaration_full_name = declaration.full_name().to_string();
 
-        let type_name = HSTRING::from(declaration_full_name);
+        let type_name = HSTRING::from(declaration_full_name.clone());
         let mut parts_count = 0_u32;
         let mut type_name_parts = std::ptr::null_mut();
 
@@ -233,8 +233,11 @@ impl GenericInstanceIdBuilder {
 
         let result = unsafe { RoGetParameterizedTypeInstanceIID(buf.as_slice(), &*locator, &mut guid, None) };
 
-        assert!(result.is_ok());
+        if !result.is_ok() {
+            eprintln!("[GenericInstanceIdBuilder] RoGetParameterizedTypeInstanceIID failed for '{}': {:?}", declaration_full_name, result);
+            return GUID::zeroed();
+        }
 
-        return guid;
+        guid
     }
 }

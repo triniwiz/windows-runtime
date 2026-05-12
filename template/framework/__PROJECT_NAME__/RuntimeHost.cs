@@ -139,10 +139,12 @@ namespace __PROJECT_NAME__
         private static string ResolveEntryScriptPath()
         {
             var baseDir = AppContext.BaseDirectory;
-            var defaultPath = Path.Combine(baseDir, "App", "main.js");
+            var defaultLower = Path.Combine(baseDir, "app", "main.js");
+            var defaultUpper = Path.Combine(baseDir, "App", "main.js");
             var packageJsonPath = Path.Combine(baseDir, "package.json");
 
-            if (!File.Exists(packageJsonPath)) return defaultPath;
+            if (!File.Exists(packageJsonPath))
+                return File.Exists(defaultLower) ? defaultLower : defaultUpper;
 
             try
             {
@@ -160,7 +162,7 @@ namespace __PROJECT_NAME__
             }
             catch { }
 
-            return defaultPath;
+            return File.Exists(defaultLower) ? defaultLower : defaultUpper;
         }
 
         private static RuntimePackageConfig ParsePackageConfig(string packageJsonPath)
@@ -181,8 +183,10 @@ namespace __PROJECT_NAME__
             var normalized = scriptPath.Replace('/', Path.DirectorySeparatorChar);
             var direct = Path.IsPathRooted(normalized) ? normalized : Path.Combine(baseDir, normalized);
             if (File.Exists(direct)) return direct;
-            var appPath = Path.Combine(baseDir, "App", normalized);
-            return File.Exists(appPath) ? appPath : null;
+            var appLower = Path.Combine(baseDir, "app", normalized);
+            if (File.Exists(appLower)) return appLower;
+            var appUpper = Path.Combine(baseDir, "App", normalized);
+            return File.Exists(appUpper) ? appUpper : null;
         }
 
         public void Dispose()

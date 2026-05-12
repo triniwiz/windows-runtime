@@ -1,5 +1,6 @@
 use std::ffi::{c_char, CStr, CString};
 use std::sync::Once;
+use std::sync::Arc;
 use runtime::Runtime;
 
 // ─── Devtools (compiled only with the `devtools` feature) ────────────────────
@@ -77,7 +78,12 @@ pub extern "C" fn runtime_devtools_start(runtime: i64, port: u16) -> *mut c_char
     let config = DevtoolsServerConfig { host: "127.0.0.1".to_string(), port };
     // Split borrows: copy the Global handle first, then take the mutable isolate borrow.
     let global_ctx = rt.global_context().clone();
-    match DevtoolsServer::attach(&config, rt.isolate_mut(), &global_ctx) {
+    let forwarder: Option<Arc<dyn Fn(&str) + Send + Sync>> = Some(Arc::new(|s: &str| {
+        // Forward devtools console messages into the runtime's debug log.
+        runtime::debug_output(s);
+    }));
+
+    match DevtoolsServer::attach(&config, rt.isolate_mut(), &global_ctx, forwarder) {
         Err(_) => std::ptr::null_mut(),
         Ok(server) => {
             let ws_url = server.endpoint().websocket_url.clone();

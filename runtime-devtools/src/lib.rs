@@ -5,6 +5,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
+use serde_json::Value as JsonValue;
 use std::thread;
 use tungstenite::Message;
 use v8::inspector::{
@@ -40,6 +41,7 @@ pub struct DevtoolsEndpoint {
 
 struct DevtoolsChannel {
     tx: SyncSender<String>,
+    forwarder: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 fn string_buffer_to_string(buf: &StringBuffer) -> String {
@@ -49,15 +51,156 @@ fn string_buffer_to_string(buf: &StringBuffer) -> String {
     }
 }
 
+fn format_remote_object(arg: &JsonValue, depth: usize) -> String {
+    // Avoid deep recursion; increase if you need more detail
+    if depth > 2 {
+        if let Some(d) = arg.get("description").and_then(|d| d.as_str()) {
+            return d.to_string();
+        }
+        return "[Object]".to_string();
+    }
+
+    if arg.is_null() {
+        return "null".to_string();
+    }
+
+    if let Some(v) = arg.get("value") {
+        if v.is_string() {
+            return v.as_str().unwrap().to_string();
+        } else if v.is_array() {
+            let mut items = Vec::new();
+            for it in v.as_array().unwrap().iter() {
+                if it.is_string() { items.push(it.as_str().unwrap().to_string()) }
+                else { items.push(it.to_string()) }
+            }
+            return format!("[{}]", items.join(", "));
+        } else {
+            return v.to_string();
+        }
+    }
+
+    if let Some(desc) = arg.get("description").and_then(|d| d.as_str()) {
+        return desc.to_string();
+    }
+
+    if let Some(preview) = arg.get("preview") {
+        if let Some(items) = preview.get("items").and_then(|i| i.as_array()) {
+            let mut elems = Vec::new();
+            for it in items.iter() {
+                if let Some(vv) = it.get("value") {
+                    elems.push(format_remote_object(vv, depth + 1));
+                } else if let Some(desc) = it.get("description").and_then(|d| d.as_str()) {
+                    elems.push(desc.to_string());
+                } else {
+                    elems.push(it.to_string());
+                }
+            }
+            return format!("[{}]", elems.join(", "));
+        }
+
+        if let Some(props) = preview.get("properties").and_then(|p| p.as_array()) {
+            let mut pairs = Vec::new();
+            for p in props.iter() {
+                let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                let val = if let Some(vv) = p.get("value") {
+                    format_remote_object(vv, depth + 1)
+                } else if let Some(dv) = p.get("description").and_then(|d| d.as_str()) { dv.to_string() }
+                else { p.to_string() };
+                pairs.push(format!("{}: {}", name, val));
+            }
+            return format!("{{{}}}", pairs.join(", "));
+        }
+
+        return preview.to_string();
+    }
+
+    arg.to_string()
+}
+
+fn format_stack_trace(stack: &JsonValue) -> String {
+    // stack: { callFrames: [ { functionName, url, lineNumber, columnNumber }, ... ] }
+    if let Some(frames) = stack.get("callFrames").and_then(|f| f.as_array()) {
+        let mut out = String::new();
+        for f in frames.iter() {
+            let fn_name = f.get("functionName").and_then(|s| s.as_str()).unwrap_or("(anonymous)");
+            let url = f.get("url").and_then(|s| s.as_str()).unwrap_or("");
+            let line = f.get("lineNumber").and_then(|n| n.as_i64()).unwrap_or(0);
+            let col = f.get("columnNumber").and_then(|n| n.as_i64()).unwrap_or(0);
+            if url.is_empty() {
+                out.push_str(&format!("    at {}\n", fn_name));
+            } else {
+                out.push_str(&format!("    at {} ({}:{}:{})\n", fn_name, url, line, col));
+            }
+        }
+        return out;
+    }
+    String::new()
+}
+
+fn try_format_inspector_message(s: &str) -> Option<String> {
+    if let Ok(json) = serde_json::from_str::<JsonValue>(s) {
+        if let Some(method) = json.get("method").and_then(|m| m.as_str()) {
+            match method {
+                "Runtime.consoleAPICalled" => {
+                    if let Some(params) = json.get("params") {
+                        let typ = params.get("type").and_then(|t| t.as_str()).unwrap_or("log");
+                        let mut parts: Vec<String> = Vec::new();
+                        if let Some(args) = params.get("args").and_then(|a| a.as_array()) {
+                            for arg in args.iter() { parts.push(format_remote_object(arg, 0)); }
+                        }
+                        let mut out = format!("[DEVTOOLS] [{}] {}", typ.to_uppercase(), parts.join(" "));
+                        if let Some(stack) = params.get("stackTrace") { out.push_str("\n"); out.push_str(&format_stack_trace(stack)); }
+                        out.push('\n');
+                        return Some(out);
+                    }
+                }
+                "Console.messageAdded" => {
+                    if let Some(msg) = json.get("params").and_then(|p| p.get("message")) {
+                        let level = msg.get("level").and_then(|l| l.as_str()).unwrap_or("info");
+                        let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                        let out = format!("[DEVTOOLS] [{}] {}\n", level.to_uppercase(), text);
+                        return Some(out);
+                    }
+                }
+                "Runtime.exceptionThrown" => {
+                    if let Some(params) = json.get("params") {
+                        if let Some(details) = params.get("exceptionDetails") {
+                            let text = details.get("text").and_then(|t| t.as_str()).unwrap_or("(exception)");
+                            let mut out = format!("[DEVTOOLS] [EXCEPTION] {}\n", text);
+                            if let Some(stack) = details.get("stackTrace") { out.push_str(&format_stack_trace(stack)); }
+                            out.push('\n');
+                            return Some(out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 impl ChannelImpl for DevtoolsChannel {
     fn send_response(&self, _call_id: i32, message: UniquePtr<StringBuffer>) {
         if let Some(buf) = message.as_ref() {
-            let _ = self.tx.try_send(string_buffer_to_string(buf));
+            let s = string_buffer_to_string(buf);
+            if let Some(fwd) = &self.forwarder {
+                if let Some(out) = try_format_inspector_message(&s) {
+                    fwd(&out);
+                }
+            }
+            let _ = self.tx.try_send(s);
         }
     }
     fn send_notification(&self, message: UniquePtr<StringBuffer>) {
         if let Some(buf) = message.as_ref() {
-            let _ = self.tx.try_send(string_buffer_to_string(buf));
+            let s = string_buffer_to_string(buf);
+            if let Some(fwd) = &self.forwarder {
+                if let Some(out) = try_format_inspector_message(&s) {
+                    fwd(&out);
+                }
+            }
+            let _ = self.tx.try_send(s);
         }
     }
     fn flush_protocol_notifications(&self) {}
@@ -119,6 +262,7 @@ impl DevtoolsServer {
         config: &DevtoolsServerConfig,
         isolate: &mut v8::Isolate,
         global_context: &v8::Global<v8::Context>,
+        console_forwarder: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     ) -> Result<Self> {
         let listener = TcpListener::bind(format!("{}:{}", config.host, config.port))?;
         let addr = listener.local_addr()?;
@@ -155,7 +299,7 @@ impl DevtoolsServer {
 
         let session = Box::new(inspector.connect(
             1,
-            Channel::new(Box::new(DevtoolsChannel { tx: outbound_tx })),
+            Channel::new(Box::new(DevtoolsChannel { tx: outbound_tx, forwarder: console_forwarder.clone() })),
             StringView::empty(),
             V8InspectorClientTrustLevel::FullyTrusted,
         ));
@@ -356,5 +500,47 @@ mod tests {
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["webSocketDebuggerUrl"], ws);
+    }
+
+    #[test]
+    fn format_console_api_called_simple() {
+        let json = serde_json::json!({
+            "method": "Runtime.consoleAPICalled",
+            "params": {
+                "type": "log",
+                "args": [ { "type": "string", "value": "hello" } ]
+            }
+        })
+        .to_string();
+        let out = try_format_inspector_message(&json).unwrap();
+        assert_eq!(out, "[DEVTOOLS] [LOG] hello\n");
+    }
+
+    #[test]
+    fn format_console_message_added_error() {
+        let json = serde_json::json!({
+            "method": "Console.messageAdded",
+            "params": { "message": { "level": "error", "text": "oops" } }
+        })
+        .to_string();
+        let out = try_format_inspector_message(&json).unwrap();
+        assert_eq!(out, "[DEVTOOLS] [ERROR] oops\n");
+    }
+
+    #[test]
+    fn format_exception_thrown_with_stack() {
+        let json = serde_json::json!({
+            "method": "Runtime.exceptionThrown",
+            "params": {
+                "exceptionDetails": {
+                    "text": "TypeError: x is not a function",
+                    "stackTrace": { "callFrames": [ { "functionName": "foo", "url": "file.js", "lineNumber": 10, "columnNumber": 5 } ] }
+                }
+            }
+        })
+        .to_string();
+        let out = try_format_inspector_message(&json).unwrap();
+        assert!(out.contains("[DEVTOOLS] [EXCEPTION] TypeError"));
+        assert!(out.contains("at foo (file.js:10:5)") || out.contains("at foo"));
     }
 }

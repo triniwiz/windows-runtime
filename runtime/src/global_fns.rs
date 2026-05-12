@@ -491,7 +491,12 @@ pub(crate) fn handle_resolve_module_path(
             let app_base = if app_root.is_empty() {
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
             } else {
-                PathBuf::from(&app_root).join("App")
+                let lower = PathBuf::from(&app_root).join("app");
+                if lower.exists() {
+                    lower
+                } else {
+                    PathBuf::from(&app_root).join("App")
+                }
             };
             app_base.join(direct)
         }

@@ -19,12 +19,20 @@
     <NSWindowsRoot>$(MSBuildProjectDirectory)\..</NSWindowsRoot>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <!-- Derived library platform for selecting prebuilt native libs.
+         Prefer $(Platform); fall back to trimming 'win-' from $(RuntimeIdentifier); default to x64. -->
+    <NSLibPlatform Condition="'$(Platform)' != ''">$(Platform)</NSLibPlatform>
+    <NSLibPlatform Condition="'$(NSLibPlatform)' == '' and '$(RuntimeIdentifier)' != ''">$([System.Text.RegularExpressions.Regex]::Replace('$(RuntimeIdentifier)','^win-',''))</NSLibPlatform>
+    <NSLibPlatform Condition="'$(NSLibPlatform)' == ''">x64</NSLibPlatform>
+  </PropertyGroup>
+
   <ItemGroup>
     <AppxManifest Include="Package.appxmanifest" />
     <Content Include="Properties\Default.rd.xml" />
 
     <!-- App JS/resource files — copied to the output directory on every build -->
-    <Content Include="App\**\*">
+    <Content Include="app\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
 
@@ -33,16 +41,16 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
 
-    <!-- Debug: devtools-enabled runtime DLL -->
-    <Content Include="$(NSWindowsRoot)\libs\devtools\$(Platform)\nativescript.dll"
-             Condition="'$(Configuration)' == 'Debug'">
+    <!-- Debug: devtools-enabled runtime DLL (platform fallback via NSLibPlatform) -->
+    <Content Include="$(NSWindowsRoot)\libs\devtools\$(NSLibPlatform)\nativescript.dll"
+             Condition="'$(Configuration)' == 'Debug' and Exists('$(NSWindowsRoot)\libs\devtools\$(NSLibPlatform)\nativescript.dll')">
       <Link>nativescript.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
 
-    <!-- Release: production runtime DLL -->
-    <Content Include="$(NSWindowsRoot)\libs\$(Platform)\nativescript.dll"
-             Condition="'$(Configuration)' != 'Debug'">
+    <!-- Release: production runtime DLL (platform fallback via NSLibPlatform) -->
+    <Content Include="$(NSWindowsRoot)\libs\$(NSLibPlatform)\nativescript.dll"
+             Condition="'$(Configuration)' != 'Debug' and Exists('$(NSWindowsRoot)\libs\$(NSLibPlatform)\nativescript.dll')">
       <Link>nativescript.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
@@ -72,4 +80,11 @@
     <Message Text="[NativeScript] Publishing DotNetBridge..." Importance="high" />
     <Exec Command="dotnet publish &quot;$(NSWindowsRoot)\dotnet-bridge\DotNetBridge.csproj&quot; -c Release -o &quot;$(NSWindowsRoot)\dotnet-bridge\publish&quot; --no-self-contained /nologo" />
   </Target>
+
+  <!-- Allow project-level Windows overrides: place App_Resources\Windows\app.csproj to extend/override generated settings -->
+  <Import Project="App_Resources\Windows\app.csproj" Condition="Exists('App_Resources\Windows\app.csproj')" />
+
+  <!-- CLI-generated plugin imports (managed by the CLI during prepare) -->
+  <Import Project="plugins\Plugins.props" Condition="Exists('plugins\Plugins.props')" />
+  <Import Project="plugins\Plugins.targets" Condition="Exists('plugins\Plugins.targets')" />
 </Project>

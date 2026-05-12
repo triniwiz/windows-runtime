@@ -39,9 +39,9 @@ use std::time::{Duration, Instant};
 use parking_lot::{Mutex, RawRwLock, RwLock};
 use parking_lot::lock_api::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLockReadGuard, RwLockWriteGuard};
 use v8::{FunctionTemplate, Local};
-use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, PCSTR, IInspectable, Error};
+use windows::core::{HSTRING, IUnknown, GUID, HRESULT, Interface, PCWSTR, IInspectable, Error};
 use windows::Win32::System::Console::GetConsoleWindow;
-use windows::Win32::System::Diagnostics::Debug::OutputDebugStringA;
+use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::System::WinRT::{IActivationFactory, RoGetActivationFactory, RoInitialize, RoUninitialize, RO_INIT_SINGLETHREADED};
 use windows::Win32::UI::Shell::IInitializeWithWindow;
 use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PeekMessageW, PM_REMOVE, TranslateMessage};
@@ -586,10 +586,10 @@ fn init_global(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, conte
     global.define_own_property(scope, value, global.into(), v8::PropertyAttribute::READ_ONLY);
 }
 
-pub(crate) fn debug_output(msg: &str) {
-    if let Ok(c) = CString::new(msg) {
-        unsafe { OutputDebugStringA(PCSTR::from_raw(c.as_ptr() as _)) };
-    }
+pub fn debug_output(msg: &str) {
+    // Send UTF-16 string to debugger for reliable Unicode output
+    let mut wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe { OutputDebugStringW(PCWSTR::from_raw(wide.as_ptr())) };
     eprint!("{}", msg);
     use std::io::Write;
     LOG_FILE.with(|cell| {
@@ -607,9 +607,8 @@ pub(crate) fn debug_output(msg: &str) {
                     format!("{}\\ns_trace.log", base)
                 };
                 let banner = format!("[NativeScript] log file: {}\n", chosen);
-                if let Ok(c) = CString::new(banner) {
-                    unsafe { OutputDebugStringA(PCSTR::from_raw(c.as_ptr() as _)) };
-                }
+                let mut wide_banner: Vec<u16> = banner.encode_utf16().chain(std::iter::once(0)).collect();
+                unsafe { OutputDebugStringW(PCWSTR::from_raw(wide_banner.as_ptr())) };
                 chosen
             });
             *slot = std::fs::OpenOptions::new().create(true).append(true).open(path).ok();
@@ -618,6 +617,25 @@ pub(crate) fn debug_output(msg: &str) {
             let _ = f.write_all(msg.as_bytes());
         }
     });
+
+    // If this message came from the DevTools forwarder, map severity to
+    // Windows Event Log so administrators can see important errors/warnings.
+    if msg.starts_with("[DEVTOOLS]") {
+        if let Some(rest) = msg.strip_prefix("[DEVTOOLS] ") {
+            if rest.starts_with('[') {
+                if let Some(end) = rest.find(']') {
+                    let level = &rest[1..end];
+                    use windows::Win32::System::EventLog::{EVENTLOG_ERROR_TYPE, EVENTLOG_WARNING_TYPE, EVENTLOG_INFORMATION_TYPE};
+                    let event_type = match level {
+                        "ERROR" | "EXCEPTION" => EVENTLOG_ERROR_TYPE,
+                        "WARN" | "WARNING" => EVENTLOG_WARNING_TYPE,
+                        _ => EVENTLOG_INFORMATION_TYPE,
+                    };
+                    crate::globals::console::report_event(msg, event_type);
+                }
+            }
+        }
+    }
 }
 
 thread_local!(static LOG_FILE: RefCell<Option<fs::File>> = RefCell::new(None));
@@ -1333,7 +1351,12 @@ fn handle_resolve_module_path(
             let app_base = if app_root.is_empty() {
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
             } else {
-                PathBuf::from(app_root).join("App")
+                let lower = PathBuf::from(&app_root).join("app");
+                if lower.exists() {
+                    lower
+                } else {
+                    PathBuf::from(&app_root).join("App")
+                }
             };
             app_base.join(direct)
         }
@@ -2885,6 +2908,21 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     return v8::Intercepted::kNo;
                 };
 
+                // If a JS-assigned override exists in the per-instance store, return it.
+                let this = args.holder();
+                let Some(store_field) = this.get_internal_field(scope, 1) else { return v8::Intercepted::kNo };
+                let store = unsafe { store_field.cast::<v8::Map>() };
+                if let Some(cache) = store.get(scope, key.into()) {
+                    if !cache.is_null_or_undefined() {
+                        rv.set(cache);
+                        return v8::Intercepted::kYes;
+                    }
+                }
+
+                
+
+                
+
                 if let Some(property) = find_class_property(clazz, &name) {
                     let Some(mut property_call) = PropertyCall::new(&property, false, dec.instance.clone().unwrap(), false) else {
                         return v8::Intercepted::kNo;
@@ -2979,7 +3017,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
             })
             .setter(|scope: &mut v8::PinScope<'_, '_>,
                      key: Local<v8::Name>,
-                     value: Local<v8::Value>,
+                     val: Local<v8::Value>,
                      args: v8::PropertyCallbackArguments,
                      mut _rv: v8::ReturnValue<()>| -> v8::Intercepted {
                 if !key.is_string() {
@@ -3004,7 +3042,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     let Some(mut property_call) = PropertyCall::new(&property, true, dec.instance.clone().unwrap(), false) else {
                         return v8::Intercepted::kNo;
                     };
-                    let (ret, _) = property_call.call_with_values(scope, &[value]);
+                    let (ret, _) = property_call.call_with_values(scope, &[val]);
                     if ret.is_err() {
                         let detail = format!("Property set '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
                         debug_output(&format!("[NativeScript] {}\n", detail));
@@ -3028,24 +3066,24 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         dec.event_tokens.remove(&name);
                     }
 
-                    if value.is_object() {
-                        if let Some(obj) = value.to_object(scope) {
-                            if let Some(handle_key) = v8::String::new(scope, "handle") {
-                                if let Some(handle_val) = obj.get(scope, handle_key.into()) {
-                                    if let Ok(ext) = v8::Local::<v8::External>::try_from(handle_val) {
-                                        let delegate_ptr = ext.value();
-                                        if let Some(inst) = instance {
-                                            let mut mc = MethodCall::new(&add_method, add_method.is_sealed(), inst, false);
-                                            let (ret, token) = mc.call_with_raw_ptr(delegate_ptr);
-                                            if ret.is_ok() {
-                                                dec.event_tokens.insert(name, token);
+                        if val.is_object() {
+                            if let Some(obj) = val.to_object(scope) {
+                                if let Some(handle_key) = v8::String::new(scope, "handle") {
+                                    if let Some(handle_val) = obj.get(scope, handle_key.into()) {
+                                        if let Ok(ext) = v8::Local::<v8::External>::try_from(handle_val) {
+                                            let delegate_ptr = ext.value();
+                                            if let Some(inst) = instance {
+                                                let mut mc = MethodCall::new(&add_method, add_method.is_sealed(), inst, false);
+                                                let (ret, token) = mc.call_with_raw_ptr(delegate_ptr);
+                                                if ret.is_ok() {
+                                                    dec.event_tokens.insert(name, token);
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
 
                     return v8::Intercepted::kYes;
                 }
@@ -3151,7 +3189,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            eprintln!("[runtime] {}", ret.message())
+                            let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                            let err = v8::Exception::error(scope, msg.into());
+                            scope.throw_exception(err);
+                            return;
                         } else if !method.is_void() {
                             let return_sig = method.return_type().to_string();
                             if return_sig == "Guid" {
@@ -3249,7 +3290,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            eprintln!("[runtime] {}", ret.message())
+                            let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                            let err = v8::Exception::error(scope, msg.into());
+                            scope.throw_exception(err);
+                            return;
                         } else if !method.is_void() {
                             let return_sig = method.return_type().to_string();
                             if return_sig.contains('.') {
@@ -3386,7 +3430,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let (ret, result) = method.call(scope, &args);
 
                                     if ret.is_err() {
-                                        eprintln!("[runtime] {}", ret.message())
+                                        let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                        let err = v8::Exception::error(scope, msg.into());
+                                        scope.throw_exception(err);
+                                        return;
                                     } else if !method.is_void() {
                                         match NativeType::try_from(method.return_type()) {
                                             Ok(return_type) => {
@@ -3454,7 +3501,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let (ret, result) = method.call(scope, &args);
 
                                     if ret.is_err() {
-                                        eprintln!("[runtime] {}", ret.message())
+                                        let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                        let err = v8::Exception::error(scope, msg.into());
+                                        scope.throw_exception(err);
+                                        return;
                                     } else if !method.is_void() {
                                         match NativeType::try_from(method.return_type()) {
                                             Ok(return_type) => {
@@ -3546,7 +3596,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let (ret, result) = method.call(scope, &args);
 
                                     if ret.is_err() {
-                                        eprintln!("[runtime] {}", ret.message())
+                                        let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                        let err = v8::Exception::error(scope, msg.into());
+                                        scope.throw_exception(err);
+                                        return;
                                     } else if !method.is_void() {
                                         match NativeType::try_from(method.return_type()) {
                                             Ok(return_type) => {
@@ -3615,7 +3668,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let (ret, result) = method.call(scope, &args);
 
                                     if ret.is_err() {
-                                        eprintln!("[runtime] {}", ret.message())
+                                        let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                        let err = v8::Exception::error(scope, msg.into());
+                                        scope.throw_exception(err);
+                                        return;
                                     } else if !method.is_void() {
                                         match NativeType::try_from(method.return_type()) {
                                             Ok(return_type) => {
@@ -3705,7 +3761,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                                     let (ret, result) = method.call(scope, &args);
                                     if ret.is_err() {
-                                        eprintln!("[runtime] {}", ret.message())
+                                        let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                        let err = v8::Exception::error(scope, msg.into());
+                                        scope.throw_exception(err);
+                                        return;
                                     } else if !method.is_void() {
                                         if let Ok(return_type) = NativeType::try_from(method.return_type()) {
                                             unsafe { set_ret_val(result, scope, retval, return_type); }
@@ -3764,7 +3823,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            eprintln!("[runtime] {}", ret.message())
+                            let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                            let err = v8::Exception::error(scope, msg.into());
+                            scope.throw_exception(err);
+                            return;
                         } else if !method.is_void() {
                             match NativeType::try_from(method.return_type()) {
                                 Ok(return_type) => {
@@ -3832,9 +3894,12 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                         let (ret, result) = method.call(scope, &args);
 
-                        if ret.is_err() {
-                            eprintln!("[runtime] {}", ret.message())
-                        } else if !method.is_void() {
+                                    if ret.is_err() {
+                                        let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                        let err = v8::Exception::error(scope, msg.into());
+                                        scope.throw_exception(err);
+                                        return;
+                                    } else if !method.is_void() {
                             match NativeType::try_from(method.return_type()) {
                                 Ok(return_type) => {
                                     unsafe { set_ret_val(result, scope, retval, return_type); }
@@ -3961,7 +4026,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            eprintln!("[runtime] {}", ret.message())
+                            let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                            let err = v8::Exception::error(scope, msg.into());
+                            scope.throw_exception(err);
+                            return;
                         } else if !method.is_void() {
                             let return_sig = method.return_type();
                             match NativeType::try_from(return_sig) {
@@ -4005,7 +4073,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
         Some(o) => o,
         None => {
             debug_output("[NativeScript] create_ns_ctor_instance_object: new_instance returned None!\n");
-            panic!("object_tmpl.new_instance returned None");
+            let msg = v8::String::new(scope, "Failed to create instance object").unwrap();
+            let err = v8::Exception::error(scope, msg.into());
+            scope.throw_exception(err);
+            return v8::null(scope).into();
         }
     };
     debug_output("[NativeScript] create_ns_ctor_instance_object: new_instance OK\n");

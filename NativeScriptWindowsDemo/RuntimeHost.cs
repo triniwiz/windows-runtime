@@ -147,12 +147,13 @@ namespace NativeScriptWindowsDemo
         private static string ResolveEntryScriptPath()
         {
             var baseDir = AppContext.BaseDirectory;
-            var defaultPath = Path.Combine(baseDir, "App", "main.js");
+            var defaultLower = Path.Combine(baseDir, "app", "main.js");
+            var defaultUpper = Path.Combine(baseDir, "App", "main.js");
             var packageJsonPath = Path.Combine(baseDir, "package.json");
 
             if (!File.Exists(packageJsonPath))
             {
-                return defaultPath;
+                return File.Exists(defaultLower) ? defaultLower : defaultUpper;
             }
 
             try
@@ -161,7 +162,7 @@ namespace NativeScriptWindowsDemo
                 if (!string.IsNullOrWhiteSpace(packageConfig.WindowsMain))
                 {
                     var windowsMainPath = ResolveScriptPath(baseDir, packageConfig.WindowsMain);
-                    if (windowsMainPath != null)
+                    if (!string.IsNullOrWhiteSpace(windowsMainPath))
                     {
                         return windowsMainPath;
                     }
@@ -170,7 +171,7 @@ namespace NativeScriptWindowsDemo
                 if (!string.IsNullOrWhiteSpace(packageConfig.Main))
                 {
                     var mainPath = ResolveScriptPath(baseDir, packageConfig.Main);
-                    if (mainPath != null)
+                    if (!string.IsNullOrWhiteSpace(mainPath))
                     {
                         return mainPath;
                     }
@@ -181,7 +182,7 @@ namespace NativeScriptWindowsDemo
                 // Ignore malformed package.json and keep the default entrypoint.
             }
 
-            return defaultPath;
+            return File.Exists(defaultLower) ? defaultLower : defaultUpper;
         }
 
         private static RuntimePackageConfig ParsePackageConfig(string packageJsonPath)
@@ -223,8 +224,14 @@ namespace NativeScriptWindowsDemo
                 return directCandidate;
             }
 
-            var appCandidate = Path.Combine(baseDir, "App", normalizedPath);
-            return File.Exists(appCandidate) ? appCandidate : string.Empty;
+            var appCandidateLower = Path.Combine(baseDir, "app", normalizedPath);
+            if (File.Exists(appCandidateLower))
+            {
+                return appCandidateLower;
+            }
+
+            var appCandidateUpper = Path.Combine(baseDir, "App", normalizedPath);
+            return File.Exists(appCandidateUpper) ? appCandidateUpper : string.Empty;
         }
 
         public void Dispose()

@@ -379,9 +379,9 @@ fn instance_method_dispatch(
     let (ret, result) = method.call(scope, &args);
 
     if ret.is_err() {
-        let message = v8::String::new(scope, &ret.message().to_string()).unwrap();
-        let error = v8::Exception::error(scope, message);
-        scope.throw_exception(error);
+        let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+        let err = v8::Exception::error(scope, msg);
+        scope.throw_exception(err);
         return;
     }
 
@@ -879,7 +879,10 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let (ret, result) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            eprintln!("[runtime] {}", ret.message())
+                            let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                            let err = v8::Exception::error(scope, msg.into());
+                            scope.throw_exception(err);
+                            return;
                         } else if !method.is_void() {
                             let return_sig = method.return_type().to_string();
                             if return_sig == "Guid" {
@@ -947,7 +950,10 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let Some(mut method) = PropertyCall::new(method, false, dec.instance.clone().unwrap(), false) else { return; };
                         let (ret, result) = method.call(scope, &args);
                         if ret.is_err() {
-                            eprintln!("[runtime] {}", ret.message())
+                            let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                            let err = v8::Exception::error(scope, msg.into());
+                            scope.throw_exception(err);
+                            return;
                         } else if !method.is_void() {
                             let return_sig = method.return_type().to_string();
                             if return_sig.contains('.') {
@@ -1054,7 +1060,10 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let mut method = MethodCall::new(method, method.is_sealed(), dec.instance.clone().unwrap(), false);
                                     let (ret, result) = method.call(scope, &args);
                                     if ret.is_err() {
-                                        eprintln!("[runtime] {}", ret.message())
+                                        let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                        let err = v8::Exception::error(scope, msg.into());
+                                        scope.throw_exception(err);
+                                        return;
                                     } else if !method.is_void() {
                                         match NativeType::try_from(method.return_type()) {
                                             Ok(return_type) => { unsafe { set_ret_val(result, scope, retval, return_type); } }
@@ -1097,7 +1106,10 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let mut method = MethodCall::new(method.getter(), false, dec.instance.clone().unwrap(), false);
                                     let (ret, result) = method.call(scope, &args);
                                     if ret.is_err() {
-                                        eprintln!("[runtime] {}", ret.message())
+                                        let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                        let err = v8::Exception::error(scope, msg.into());
+                                        scope.throw_exception(err);
+                                        return;
                                     } else if !method.is_void() {
                                         match NativeType::try_from(method.return_type()) {
                                             Ok(return_type) => { unsafe { set_ret_val(result, scope, retval, return_type); } }
@@ -1163,7 +1175,10 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let mut method = MethodCall::new(method, method.is_sealed(), dec.instance.clone().unwrap(), false);
                                     let (ret, result) = method.call(scope, &args);
                                     if ret.is_err() {
-                                        eprintln!("[runtime] {}", ret.message())
+                                        let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                        let err = v8::Exception::error(scope, msg.into());
+                                        scope.throw_exception(err);
+                                        return;
                                     } else if !method.is_void() {
                                         match NativeType::try_from(method.return_type()) {
                                             Ok(return_type) => { unsafe { set_ret_val(result, scope, retval, return_type); } }
@@ -1206,7 +1221,10 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let Some(mut method) = PropertyCall::new(method, false, dec.instance.clone().unwrap(), false) else { return; };
                                     let (ret, result) = method.call(scope, &args);
                                     if ret.is_err() {
-                                        eprintln!("[runtime] {}", ret.message())
+                                        let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                        let err = v8::Exception::error(scope, msg.into());
+                                        scope.throw_exception(err);
+                                        return;
                                     } else if !method.is_void() {
                                         match NativeType::try_from(method.return_type()) {
                                             Ok(return_type) => { unsafe { set_ret_val(result, scope, retval, return_type); } }
@@ -1279,7 +1297,10 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let mut method = MethodCall::new(method, method.is_sealed(), dec.instance.clone().unwrap(), false);
                                     let (ret, result) = method.call(scope, &args);
                                     if ret.is_err() {
-                                        eprintln!("[runtime] {}", ret.message())
+                                        let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                        let err = v8::Exception::error(scope, msg.into());
+                                        scope.throw_exception(err);
+                                        return;
                                     } else if !method.is_void() {
                                         if let Ok(return_type) = NativeType::try_from(method.return_type()) {
                                             unsafe { set_ret_val(result, scope, retval, return_type); }
@@ -1321,7 +1342,10 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let mut method = MethodCall::new(method, method.is_sealed(), dec.instance.clone().unwrap(), false);
                         let (ret, result) = method.call(scope, &args);
                         if ret.is_err() {
-                            eprintln!("[runtime] {}", ret.message())
+                            let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                            let err = v8::Exception::error(scope, msg.into());
+                            scope.throw_exception(err);
+                            return;
                         } else if !method.is_void() {
                             match NativeType::try_from(method.return_type()) {
                                 Ok(return_type) => { unsafe { set_ret_val(result, scope, retval, return_type); } }
@@ -1364,7 +1388,10 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let Some(mut method) = PropertyCall::new(method, false, dec.instance.clone().unwrap(), false) else { return; };
                         let (ret, result) = method.call(scope, &args);
                         if ret.is_err() {
-                            eprintln!("[runtime] {}", ret.message())
+                            let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                            let err = v8::Exception::error(scope, msg.into());
+                            scope.throw_exception(err);
+                            return;
                         } else if !method.is_void() {
                             match NativeType::try_from(method.return_type()) {
                                 Ok(return_type) => { unsafe { set_ret_val(result, scope, retval, return_type); } }
@@ -1453,7 +1480,10 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         );
                         let (ret, result) = method.call(scope, &args);
                         if ret.is_err() {
-                            eprintln!("[runtime] {}", ret.message())
+                            let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                            let err = v8::Exception::error(scope, msg.into());
+                            scope.throw_exception(err);
+                            return;
                         } else if !method.is_void() {
                             let return_sig = method.return_type();
                             match NativeType::try_from(return_sig) {
@@ -1496,7 +1526,10 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
         Some(o) => o,
         None => {
             debug_output("[NativeScript] create_ns_ctor_instance_object: new_instance returned None!\n");
-            panic!("object_tmpl.new_instance returned None");
+            let msg = v8::String::new(scope, "Failed to create instance object").unwrap();
+            let err = v8::Exception::error(scope, msg.into());
+            scope.throw_exception(err);
+            return v8::null(scope).into();
         }
     };
     debug_output("[NativeScript] create_ns_ctor_instance_object: new_instance OK\n");

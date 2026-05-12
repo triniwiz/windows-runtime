@@ -2,6 +2,10 @@ using System;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Diagnostics;
 
 namespace TestApp
 {
@@ -21,7 +25,7 @@ namespace TestApp
         private static extern void runtime_deinit(long runtime);
 
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_runscript))]
-        private static extern void runtime_runscript(long runtime, [MarshalAs(UnmanagedType.LPUTF8Str)] string script);
+        private static extern void runtime_runscript(long runtime, [MarshalAs(UnmanagedType.LPUTF8Str)] string script, [MarshalAs(UnmanagedType.LPUTF8Str)] string filename);
 
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_install_ctrlc_handler))]
         private static extern void runtime_install_ctrlc_handler(int exitCode);
@@ -74,6 +78,7 @@ namespace TestApp
 #endif
 
             _initialized = true;
+                // DevTools forwarding handles runtime logs; no tailer needed.
         }
 
         public void RunMainScript()
@@ -85,7 +90,7 @@ namespace TestApp
 
             var entryPath = ResolveEntryScriptPath();
             var script = File.ReadAllText(Path.GetFullPath(entryPath));
-            runtime_runscript(_runtime, script);
+            runtime_runscript(_runtime, script, Path.GetFileName(entryPath));
         }
 
         private sealed class RuntimePackageConfig
@@ -98,12 +103,13 @@ namespace TestApp
         private static string ResolveEntryScriptPath()
         {
             var baseDir = AppContext.BaseDirectory;
-            var defaultPath = Path.Combine(baseDir, "App", "main.js");
+            var defaultLower = Path.Combine(baseDir, "app", "main.js");
+            var defaultUpper = Path.Combine(baseDir, "App", "main.js");
             var packageJsonPath = Path.Combine(baseDir, "package.json");
 
             if (!File.Exists(packageJsonPath))
             {
-                return defaultPath;
+                return File.Exists(defaultLower) ? defaultLower : defaultUpper;
             }
 
             try
@@ -112,7 +118,7 @@ namespace TestApp
                 if (!string.IsNullOrWhiteSpace(packageConfig.WindowsMain))
                 {
                     var windowsMainPath = ResolveScriptPath(baseDir, packageConfig.WindowsMain);
-                    if (windowsMainPath != null)
+                    if (!string.IsNullOrWhiteSpace(windowsMainPath))
                     {
                         return windowsMainPath;
                     }
@@ -121,7 +127,7 @@ namespace TestApp
                 if (!string.IsNullOrWhiteSpace(packageConfig.Main))
                 {
                     var mainPath = ResolveScriptPath(baseDir, packageConfig.Main);
-                    if (mainPath != null)
+                    if (!string.IsNullOrWhiteSpace(mainPath))
                     {
                         return mainPath;
                     }
@@ -132,7 +138,7 @@ namespace TestApp
                 // Ignore malformed package.json and keep the default entrypoint.
             }
 
-            return defaultPath;
+            return File.Exists(defaultLower) ? defaultLower : defaultUpper;
         }
 
         private static RuntimePackageConfig ParsePackageConfig(string packageJsonPath)
@@ -174,8 +180,14 @@ namespace TestApp
                 return directCandidate;
             }
 
-            var appCandidate = Path.Combine(baseDir, "App", normalizedPath);
-            return File.Exists(appCandidate) ? appCandidate : string.Empty;
+            var appCandidateLower = Path.Combine(baseDir, "app", normalizedPath);
+            if (File.Exists(appCandidateLower))
+            {
+                return appCandidateLower;
+            }
+
+            var appCandidateUpper = Path.Combine(baseDir, "App", normalizedPath);
+            return File.Exists(appCandidateUpper) ? appCandidateUpper : string.Empty;
         }
 
         public void Dispose()
@@ -189,5 +201,6 @@ namespace TestApp
             _runtime = 0;
             _initialized = false;
         }
+        
     }
 }
