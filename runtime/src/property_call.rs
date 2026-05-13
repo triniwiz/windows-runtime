@@ -8,6 +8,7 @@ use windows::Win32::System::WinRT::Metadata::CorTokenType;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use metadata::declarations::declaration::DeclarationKind;
 use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
+use metadata::declarations::declaration::Declaration;
 use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::declarations::parameter_declaration::ParameterDeclaration;
 use metadata::declarations::property_declaration::PropertyDeclaration;
@@ -15,6 +16,7 @@ use metadata::declaring_interface_for_method::Metadata;
 use metadata::signature::Signature;
 use crate::error::AnyError;
 use crate::helpers::ffi_native_type_from_signature;
+use crate::debug_output;
 use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue};
 
 pub struct PropertyCall {
@@ -149,6 +151,12 @@ impl PropertyCall {
         };
 
         if result.is_err() || interface_ptr.is_null() {
+            let _ = std::panic::catch_unwind(|| {
+                debug_output(&format!(
+                    "[DIAG] PropertyCall::new: QueryInterface failed for method '{}' iid={:?} hr={:?} interface_ptr_null={}\n",
+                    method.name(), iid, result, interface_ptr.is_null()
+                ));
+            });
             return None;
         }
 

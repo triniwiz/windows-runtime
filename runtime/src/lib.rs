@@ -90,6 +90,12 @@ thread_local!(static ESM_MODULE_REGISTRY: RefCell<HashMap<String, v8::Global<v8:
 /// Used by `resolve_module_callback` to locate the referrer's directory for relative imports.
 thread_local!(static ESM_HASH_TO_PATH: RefCell<HashMap<i32, String>> = RefCell::new(HashMap::new()));
 
+// Tracks constructors currently being built on this thread to avoid
+// re-entrant template/property mutations that can corrupt V8 descriptor
+// arrays when a constructor build recursively triggers building the same
+// constructor (observed as a V8 internal DescriptorArray append failure).
+thread_local!(static CREATING_CTORS: RefCell<Vec<String>> = RefCell::new(Vec::new()));
+
 pub struct Runtime {
     isolate: v8::OwnedIsolate,
     global_context: v8::Global<v8::Context>,
@@ -1392,6 +1398,7 @@ fn value_to_json_string(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::V
     let json = v8::json::stringify(scope, value)?;
     Some(json.to_rust_string_lossy(scope))
 }
+
 
 fn handle_worker_create_threaded(
     scope: &mut v8::PinScope<'_, '_>,
@@ -2980,7 +2987,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            let message = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                            let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                            let message = v8::String::new(scope, &detail).unwrap();
                             let error = v8::Exception::error(scope, message);
                             scope.throw_exception(error);
                             return;
@@ -3185,7 +3193,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                            let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                            let msg = v8::String::new(scope, &detail).unwrap();
                             let err = v8::Exception::error(scope, msg.into());
                             scope.throw_exception(err);
                             return;
@@ -3286,7 +3295,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                            let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                            let msg = v8::String::new(scope, &detail).unwrap();
                             let err = v8::Exception::error(scope, msg.into());
                             scope.throw_exception(err);
                             return;
@@ -3338,7 +3348,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             let Some(mut method) = PropertyCall::new(prop, true, dec.instance.clone().unwrap(), false) else { return; };
                             let (ret, _) = method.call(scope, &args);
                             if ret.is_err() {
-                                let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                let msg = v8::String::new(scope, &detail).unwrap();
                                 let err = v8::Exception::error(scope, msg);
                                 scope.throw_exception(err);
                             }
@@ -3426,7 +3437,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let (ret, result) = method.call(scope, &args);
 
                                     if ret.is_err() {
-                                        let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                        let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                        let msg = v8::String::new(scope, &detail).unwrap();
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
                                         return;
@@ -3497,7 +3509,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let (ret, result) = method.call(scope, &args);
 
                                     if ret.is_err() {
-                                        let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                        let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                        let msg = v8::String::new(scope, &detail).unwrap();
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
                                         return;
@@ -3592,7 +3605,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let (ret, result) = method.call(scope, &args);
 
                                     if ret.is_err() {
-                                        let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                        let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                        let msg = v8::String::new(scope, &detail).unwrap();
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
                                         return;
@@ -3664,7 +3678,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let (ret, result) = method.call(scope, &args);
 
                                     if ret.is_err() {
-                                        let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                        let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                        let msg = v8::String::new(scope, &detail).unwrap();
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
                                         return;
@@ -3757,7 +3772,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                                     let (ret, result) = method.call(scope, &args);
                                     if ret.is_err() {
-                                        let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                        let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                        let msg = v8::String::new(scope, &detail).unwrap();
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
                                         return;
@@ -3819,7 +3835,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                            let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                            let msg = v8::String::new(scope, &detail).unwrap();
                             let err = v8::Exception::error(scope, msg.into());
                             scope.throw_exception(err);
                             return;
@@ -3891,11 +3908,12 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result) = method.call(scope, &args);
 
                                     if ret.is_err() {
-                                        let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
-                                        let err = v8::Exception::error(scope, msg.into());
-                                        scope.throw_exception(err);
-                                        return;
-                                    } else if !method.is_void() {
+                                                let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                                let msg = v8::String::new(scope, &detail).unwrap();
+                                                let err = v8::Exception::error(scope, msg.into());
+                                                scope.throw_exception(err);
+                                                return;
+                                            } else if !method.is_void() {
                             match NativeType::try_from(method.return_type()) {
                                 Ok(return_type) => {
                                     unsafe { set_ret_val(result, scope, retval, return_type); }
@@ -3933,7 +3951,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             let mut method = MethodCall::new(setter, false, dec.instance.clone().unwrap(), false);
                             let (ret, _) = method.call(scope, &args);
                             if ret.is_err() {
-                                let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
+                                let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                let msg = v8::String::new(scope, &detail).unwrap();
                                 let err = v8::Exception::error(scope, msg);
                                 scope.throw_exception(err);
                             }
@@ -4021,12 +4040,13 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                         let (ret, result) = method.call(scope, &args);
 
-                        if ret.is_err() {
-                            let msg = v8::String::new(scope, &ret.message().to_string()).unwrap();
-                            let err = v8::Exception::error(scope, msg.into());
-                            scope.throw_exception(err);
-                            return;
-                        } else if !method.is_void() {
+                                if ret.is_err() {
+                                    let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                    let msg = v8::String::new(scope, &detail).unwrap();
+                                    let err = v8::Exception::error(scope, msg.into());
+                                    scope.throw_exception(err);
+                                    return;
+                                } else if !method.is_void() {
                             let return_sig = method.return_type();
                             match NativeType::try_from(return_sig) {
                                 Ok(return_type) => {
@@ -4196,8 +4216,31 @@ unsafe fn raw_result_to_local<'s>(
     }
 }
 
+
 fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declaration>>>, declaration: Arc<RwLock<dyn Declaration>>, scope: &mut v8::PinScope<'a, '_>) -> Local<'a, v8::Value> {
-    
+
+    // Re-entrancy guard: if we're already building this constructor on this
+    // thread, return a lightweight stub function to avoid mutating V8
+    // templates/descriptors twice (which can trigger internal V8 assertions).
+    let name_str = name;
+    let already_building = CREATING_CTORS.with(|set| {
+        let mut set = set.borrow_mut();
+        if set.iter().any(|s| s == name_str) {
+            true
+        } else {
+            set.push(name_str.to_string());
+            false
+        }
+    });
+
+    if already_building {
+        let stub = v8::FunctionTemplate::builder(|_scope: &mut v8::PinScope<'_, '_>, _args: v8::FunctionCallbackArguments, mut _retval: v8::ReturnValue| {} ).build(scope);
+        let func = stub.get_function(scope).unwrap();
+        let key = v8::String::new(scope, "__typeName__").unwrap();
+        let val = v8::String::new(scope, name_str).unwrap();
+        func.set(scope, key.into(), val.into());
+        return func.into();
+    }
 
     let name = v8::String::new(scope, name).unwrap();
 
@@ -4359,8 +4402,8 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
                             return;
                         } else {
-                            let message = ret.message().to_string();
-                            let message = v8::String::new(scope, message.as_str()).unwrap();
+                            let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                            let message = v8::String::new(scope, detail.as_str()).unwrap();
                             let error = v8::Exception::error(scope, message.into());
                             scope.throw_exception(error);
                         }
@@ -4489,11 +4532,14 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
         if lock.kind() != DeclarationKind::Class {
             let func = tmpl.get_function(scope).unwrap();
+            CREATING_CTORS.with(|set| { set.borrow_mut().retain(|s| s != name_str); });
             return func.into();
         }
 
         let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
         debug_output(&format!("[NativeScript] create_ns_ctor_object: building methods for {}\n", clazz.full_name()));
+
+        let mut added_names: HashSet<String> = HashSet::new();
 
         for method in clazz.methods().iter() {
             let name = v8::String::new(scope, method.name());
@@ -4502,6 +4548,13 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
             if !is_static {
                 continue;
             }
+
+            // Skip duplicate method/property names to avoid adding the same
+            // descriptor multiple times to the FunctionTemplate which can
+            // corrupt V8 internal descriptor arrays.
+            let m_name = method.name();
+            if added_names.contains(m_name) { continue; }
+            added_names.insert(m_name.to_string());
 
             let parent = Arc::clone(&declaration);
 
@@ -4604,8 +4657,8 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                         } // end match signature
                     } // end unsafe
                 } else {
-                    let message = ret.message().to_string();
-                    let message = v8::String::new(scope, message.as_str()).unwrap();
+                    let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                    let message = v8::String::new(scope, detail.as_str()).unwrap();
                     let error = v8::Exception::error(scope, message.into());
                     scope.throw_exception(error);
                 }
@@ -4624,6 +4677,10 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
             if !property.is_static() {
                 continue;
             }
+
+            let prop_name_str = property.name();
+            if added_names.contains(prop_name_str) { continue; }
+            added_names.insert(prop_name_str.to_string());
 
             let Some(prop_name) = v8::String::new(scope, property.name()) else { continue };
 
@@ -4662,9 +4719,43 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                     }
                 };
 
-                let Some(mut prop_call) = PropertyCall::new(property, false, factory, false) else { return };
+                let mut prop_call_opt = PropertyCall::new(property, false, factory, false);
+                if prop_call_opt.is_none() {
+                    debug_output(&format!(
+                        "[DIAG] PropertyCall::new returned None for property '{}' signature='{}'\n",
+                        property.name(), signature
+                    ));
+                    return;
+                }
+
+                let mut prop_call = prop_call_opt.unwrap();
 
                 let (hresult, result) = prop_call.call_with_values(scope, &[]);
+
+                debug_output(&format!(
+                    "[DIAG] static getter '{}' signature='{}' -> hresult={:?} message='{}' hrcode={:#x} result_ptr_null={}\n",
+                    property.name(), signature, hresult, hresult.message().to_string(), hresult.0 as u32, result.is_null()
+                ));
+
+                // If the call failed because the process is unpackaged, do not provide a runtime shim.
+                // HRESULT 0x80073D54 = "The process has no package identity." — let callers/tests handle fallback.
+                if !hresult.is_ok() && (hresult.0 as u32) == 0x80073D54u32 {
+                    debug_output(&format!(
+                        "[DIAG] static getter '{}' signature='{}' -> missing package identity, returning undefined\n",
+                        property.name(), signature
+                    ));
+
+                    // Expose a small, non-invasive diagnostic on the JS constructor/object
+                    // so code running in V8 can inspect why the value was absent.
+                    if let Some(obj) = args.this().to_object(scope) {
+                        let key = v8::String::new(scope, "__missingPackageIdentity__").unwrap();
+                        let val = v8::String::new(scope, &hresult.message().to_string()).unwrap();
+                        let _ = obj.set(scope, key.into(), val.into());
+                    }
+
+                    retval.set_undefined();
+                    return;
+                }
 
                 if hresult.is_ok() {
                     unsafe {
@@ -4729,6 +4820,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
         }
     }
     let ret = func;
+    CREATING_CTORS.with(|set| { set.borrow_mut().retain(|s| s != name_str); });
     ret.into()
 }
 

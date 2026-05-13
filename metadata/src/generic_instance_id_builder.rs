@@ -215,7 +215,17 @@ impl GenericInstanceIdBuilder {
         let mut parts_count = 0_u32;
         let mut type_name_parts = std::ptr::null_mut();
 
-        let _ = unsafe { RoParseTypeName(&type_name, &mut parts_count, addr_of_mut!(type_name_parts)) };
+        let parse_result = unsafe { RoParseTypeName(&type_name, &mut parts_count, addr_of_mut!(type_name_parts)) };
+
+        if !parse_result.is_ok() {
+            eprintln!("[GenericInstanceIdBuilder] RoParseTypeName failed for '{}': {:?}", declaration_full_name, parse_result);
+            return GUID::zeroed();
+        }
+
+        if parts_count == 0 || type_name_parts.is_null() {
+            // Nothing to parse — return zero GUID.
+            return GUID::zeroed();
+        }
 
         let mut buf: Vec<PCWSTR> = Vec::with_capacity(parts_count as usize);
 

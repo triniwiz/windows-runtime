@@ -239,10 +239,33 @@ fn map_type_to_ts_with_generics(value: &str, generic_params: &[String]) -> Strin
             if let Some(split) = split {
                 let k = map_type_to_ts_with_generics(inner[..split].trim(), generic_params);
                 let v = map_type_to_ts_with_generics(inner[split + 1..].trim(), generic_params);
-                return format!("Record<{}, {}>", k, v);
+                // Prefer emitting the concrete WinRT interface rather than a TS Record.
+                let iface = if base_no_arity.contains('.') {
+                    base_no_arity.to_string()
+                } else {
+                    format!("Windows.Foundation.Collections.{}", base_no_arity)
+                };
+                return format!("{}<{}, {}>", iface, k, v);
             }
         }
-        return "Record<unknown, unknown>".to_string();
+        return "Windows.Foundation.Collections.IMap<unknown, unknown>".to_string();
+    }
+
+    // Common non-generic map-like types (PropertySet / ValueSet / StringMap)
+    // should behave like a string-keyed dictionary in TypeScript.
+    if base_no_arity == "IPropertySet" || base_no_arity.ends_with(".IPropertySet") ||
+       base_no_arity == "PropertySet" || base_no_arity.ends_with(".PropertySet") ||
+       base_no_arity == "ValueSet" || base_no_arity.ends_with(".ValueSet") ||
+       base_no_arity == "StringMap" || base_no_arity.ends_with(".StringMap") {
+        // Emit the real WinRT interface so consumers see the concrete API shape
+        // instead of an anonymous TS index signature.
+        let iface = if base_no_arity.contains('.') {
+            // Already fully-qualified in metadata
+            base_no_arity.to_string()
+        } else {
+            "Windows.Foundation.Collections.IPropertySet".to_string()
+        };
+        return iface;
     }
 
     if value.contains('<') {
@@ -395,8 +418,57 @@ fn interface_extends_clause(
     }
 }
 
+// Collect an interface and all transitive base interfaces (full names).
+fn collect_interface_hierarchy(
+    iface: &InterfaceDeclaration,
+    out: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+) {
+    for base in iface.implemented_interfaces() {
+        let full = base.full_name().to_string();
+        if seen.insert(full.clone()) {
+            out.push(full);
+            collect_interface_hierarchy(base, out, seen);
+        }
+    }
+}
+
+fn interface_extends_clause_recursive(interface: &InterfaceDeclaration, generic_params: &[String]) -> String {
+    let mut bases: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    collect_interface_hierarchy(interface, &mut bases, &mut seen);
+    let mut mapped = bases
+        .into_iter()
+        .map(|f| map_type_to_ts_with_generics(f.as_str(), generic_params))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    mapped.sort();
+    mapped.dedup();
+    if mapped.is_empty() { String::new() } else { format!(" extends {}", mapped.join(", ")) }
+}
+
+// Collect all interfaces implemented by a class, including transitive interfaces
+// inherited through implemented interfaces.
+fn collect_all_class_interfaces(class_decl: &ClassDeclaration) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+
+    for iface in class_decl.implemented_interfaces() {
+        let full = iface.full_name().to_string();
+        if seen.insert(full.clone()) {
+            out.push(full.clone());
+            collect_interface_hierarchy(iface, &mut out, &mut seen);
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn event_type_name(
     event: &metadata::declarations::event_declaration::EventDeclaration,
+    generic_params: &[String],
 ) -> String {
     // If the event's delegate is available, try to render it. Prefer
     // namespace-qualified aliases so references resolve from any module.
@@ -418,7 +490,7 @@ fn event_type_name(
             if let Some(args) = split_generic_arguments(full) {
                 let mapped = args
                     .iter()
-                    .map(|a| map_type_to_ts_with_generics(a.trim(), &[]))
+                    .map(|a| map_type_to_ts_with_generics(a.trim(), generic_params))
                     .collect::<Vec<_>>()
                     .join(", ");
                 if ns.is_empty() {
@@ -435,7 +507,7 @@ fn event_type_name(
     // and produce an inline signature when we can't render the delegate alias.
     if let Some(md) = event.add_method().metadata() {
         let params = event.add_method().parameters();
-        if let Some(param) = params.iter().find(|p| !p.is_out()) {
+                if let Some(param) = params.iter().find(|p| !p.is_out()) {
             let param_ty = Signature::to_string(md, &param.type_());
             let base = if let Some(idx) = param_ty.find('<') { &param_ty[..idx] } else { param_ty.as_str() };
             let base_no_arity = if let Some(idx) = base.find('`') { &base[..idx] } else { base };
@@ -445,8 +517,8 @@ fn event_type_name(
                 "TypedEventHandler" => {
                     if let Some(args) = split_generic_arguments(&param_ty) {
                         if args.len() == 2 {
-                            let sender_ts = map_type_to_ts_with_generics(args[0].trim(), &[]);
-                            let args_ts = map_type_to_ts_with_generics(args[1].trim(), &[]);
+                            let sender_ts = map_type_to_ts_with_generics(args[0].trim(), generic_params);
+                            let args_ts = map_type_to_ts_with_generics(args[1].trim(), generic_params);
                             return format!("(sender: {}, args: {}) => void", sender_ts, args_ts);
                         }
                     }
@@ -455,7 +527,7 @@ fn event_type_name(
                 "EventHandler" => {
                     if let Some(args) = split_generic_arguments(&param_ty) {
                         if args.len() == 1 {
-                            let args_ts = map_type_to_ts_with_generics(args[0].trim(), &[]);
+                            let args_ts = map_type_to_ts_with_generics(args[0].trim(), generic_params);
                             return format!("(sender: Object, args: {}) => void", args_ts);
                         }
                     }
@@ -465,13 +537,13 @@ fn event_type_name(
                 "RoutedEventHandler" => {
                     if let Some(args) = split_generic_arguments(&param_ty) {
                         if args.len() == 1 {
-                            let args_ts = map_type_to_ts_with_generics(args[0].trim(), &[]);
+                            let args_ts = map_type_to_ts_with_generics(args[0].trim(), generic_params);
                             return format!("(sender: Object, args: {}) => void", args_ts);
                         }
                     }
                     return "(sender: Object, args: any) => void".to_string();
                 }
-                _ => return map_type_to_ts_with_generics(param_ty.as_str(), &[]),
+                _ => return map_type_to_ts_with_generics(param_ty.as_str(), generic_params),
             }
         }
     }
@@ -485,7 +557,7 @@ fn event_type_name(
 
 fn render_interface(name: &str, interface: &InterfaceDeclaration) -> String {
     let mut out = String::new();
-    let extends = interface_extends_clause(interface.implemented_interfaces(), &[]);
+    let extends = interface_extends_clause_recursive(interface, &[]);
     out.push_str(&format!("interface {}{} {{\n", name, extends));
 
     let mut methods = Vec::new();
@@ -517,7 +589,23 @@ fn render_interface(name: &str, interface: &InterfaceDeclaration) -> String {
 
     for event in interface.events().iter().filter(|e| e.is_exported()) {
         out.push_str(&format!("  {}: {};\n",
-            sanitize_member(event.name()), event_type_name(event)));
+            sanitize_member(event.name()), event_type_name(event, &[])));
+    }
+
+    // Emit an indexer for well-known map-like interfaces so TS consumers can
+    // access members with bracket notation (e.g. `ps["name"]`). We prefer
+    // the concrete WinRT method surface but provide the indexer for ergonomics.
+    if name.contains("PropertySet") || name.contains("StringMap") || name.contains("ValueSet") {
+        println!("typings-generator: render_interface saw: {}", name);
+    }
+    match name {
+        "IPropertySet" | "ValueSet" => {
+            out.push_str("  [key: string]: Object;\n");
+        }
+        "StringMap" => {
+            out.push_str("  [key: string]: string;\n");
+        }
+        _ => {}
     }
 
     out.push_str("}\n\n");
@@ -532,10 +620,9 @@ fn render_class(name: &str, class_decl: &ClassDeclaration) -> String {
     } else {
         format!(" extends {}", map_type_to_ts(base))
     };
-    let mut interfaces = class_decl
-        .implemented_interfaces()
-        .iter()
-        .map(|iface| map_type_to_ts(iface.full_name()))
+    let mut interfaces = collect_all_class_interfaces(class_decl)
+        .into_iter()
+        .map(|full| map_type_to_ts(full.as_str()))
         .filter(|name| !name.is_empty())
         .collect::<Vec<_>>();
     interfaces.sort();
@@ -602,12 +689,20 @@ fn render_class(name: &str, class_decl: &ClassDeclaration) -> String {
 
     for event in class_decl.events().iter().filter(|e| e.is_exported()) {
         let ename = sanitize_member(event.name());
-        let ety   = event_type_name(event);
+        let ety   = event_type_name(event, &[]);
         if event.is_static() {
             out.push_str(&format!("  static {ename}: {ety};\n"));
         } else {
             out.push_str(&format!("  {ename}: {ety};\n"));
         }
+    }
+
+    // Emit an indexer on concrete map-like classes for ergonomics so
+    // consumers can do `new Windows.Foundation.Collections.PropertySet()['key']`.
+    match name {
+        "PropertySet" | "ValueSet" => out.push_str("  [key: string]: Object;\n"),
+        "StringMap" => out.push_str("  [key: string]: string;\n"),
+        _ => {}
     }
 
     out.push_str("}\n\n");
@@ -718,7 +813,16 @@ fn render_generic_interface(interface: &GenericInterfaceDeclaration) -> String {
     }
 
     for event in interface.events().iter().filter(|e| e.is_exported()) {
-        out.push_str(&format!("  {}: {};\n", event.name(), event_type_name(event)));
+        out.push_str(&format!("  {}: {};\n", event.name(), event_type_name(event, &generic_params)));
+    }
+
+    // Emit an indexer for well-known map-like interfaces so TS consumers can
+    // access members with bracket notation (e.g. `ps["name"]`). We prefer
+    // the concrete WinRT method surface but provide the indexer for ergonomics.
+    match name.as_str() {
+        "IPropertySet" | "ValueSet" => out.push_str("  [key: string]: Object;\n"),
+        "StringMap" => out.push_str("  [key: string]: string;\n"),
+        _ => {}
     }
 
     out.push_str("}\n\n");
@@ -1740,7 +1844,68 @@ fn write_single_output(
     let mut body = String::from(PREAMBLE);
     body.push_str(&build_file_header(config));
 
-    let rendered = render_modules(modules);
+    // Augment known map-like interfaces with an indexer and IMap extends clause
+    // so developers can use `thing['key']` in TypeScript while still exposing
+    // the concrete WinRT API surface (Insert/Lookup/etc).
+    let mut modules2 = modules.clone();
+    if let Some(decls) = modules2.get_mut("Windows.Foundation.Collections") {
+        let map_like = vec![
+            (
+                "IPropertySet",
+                "Windows.Foundation.Collections.IMap<string, Object>",
+                Some("Windows.Foundation.Collections.IIterable<Windows.Foundation.Collections.IKeyValuePair<string, Object>>"),
+                "Object",
+            ),
+            (
+                "ValueSet",
+                "Windows.Foundation.Collections.IMap<string, Object>",
+                Some("Windows.Foundation.Collections.IIterable<Windows.Foundation.Collections.IKeyValuePair<string, Object>>"),
+                "Object",
+            ),
+            (
+                "StringMap",
+                "Windows.Foundation.Collections.IMap<string, string>",
+                Some("Windows.Foundation.Collections.IIterable<Windows.Foundation.Collections.IKeyValuePair<string, string>>"),
+                "string",
+            ),
+        ];
+        for decl in decls.iter_mut() {
+            let s = decl.trim_start().to_string();
+            for (name, extends_iface, iterable_iface, _index_ty) in &map_like {
+                if s.starts_with(&format!("interface {}", name)) {
+                    // If an 'extends' clause already exists, append missing interfaces.
+                    if decl.contains(&format!("interface {} extends", name)) {
+                        if !decl.contains(extends_iface) {
+                            if let Some(pos) = decl.find('{') {
+                                decl.insert_str(pos, &format!(", {}", extends_iface));
+                            }
+                        }
+                        if let Some(iter_iface) = iterable_iface {
+                            if !decl.contains(iter_iface) {
+                                if let Some(pos) = decl.find('{') {
+                                    decl.insert_str(pos, &format!(", {}", iter_iface));
+                                }
+                            }
+                        }
+                    } else {
+                        // No extends clause — add one (possibly with the iterable).
+                        let mut ext_list = extends_iface.to_string();
+                        if let Some(iter_iface) = iterable_iface {
+                            ext_list.push_str(", ");
+                            ext_list.push_str(iter_iface);
+                        }
+                        *decl = decl.replacen(
+                            &format!("interface {}", name),
+                            &format!("interface {} extends {}", name, ext_list),
+                            1,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let rendered = render_modules(&modules2);
     body.push_str(&rendered);
     if rendered.is_empty() {
         body.push_str("// No declarations were generated for the selected root namespace.\n");
@@ -1785,7 +1950,71 @@ fn write_split_output(
         let mut body = String::from(PREAMBLE);
         body.push_str(&header);
 
-        let rendered = render_modules(group_modules);
+        // Allow per-group augmentation similar to the single-file path.
+        let mut group_copy = group_modules.clone();
+        if let Some(decls) = group_copy.get_mut("Windows.Foundation.Collections") {
+            let map_like = vec![
+                (
+                    "IPropertySet",
+                    "Windows.Foundation.Collections.IMap<string, Object>",
+                    Some("Windows.Foundation.Collections.IIterable<Windows.Foundation.Collections.IKeyValuePair<string, Object>>"),
+                    "Object",
+                ),
+                (
+                    "ValueSet",
+                    "Windows.Foundation.Collections.IMap<string, Object>",
+                    Some("Windows.Foundation.Collections.IIterable<Windows.Foundation.Collections.IKeyValuePair<string, Object>>"),
+                    "Object",
+                ),
+                (
+                    "StringMap",
+                    "Windows.Foundation.Collections.IMap<string, string>",
+                    Some("Windows.Foundation.Collections.IIterable<Windows.Foundation.Collections.IKeyValuePair<string, string>>"),
+                    "string",
+                ),
+            ];
+            for decl in decls.iter_mut() {
+                let s = decl.trim_start().to_string();
+                for (name, extends_iface, iterable_iface, index_ty) in &map_like {
+                    if s.starts_with(&format!("interface {}", name)) {
+                        if decl.contains(&format!("interface {} extends", name)) {
+                            if !decl.contains(extends_iface) {
+                                if let Some(pos) = decl.find('{') {
+                                    decl.insert_str(pos, &format!(", {}", extends_iface));
+                                }
+                            }
+                            if let Some(iter_iface) = iterable_iface {
+                                if !decl.contains(iter_iface) {
+                                    if let Some(pos) = decl.find('{') {
+                                        decl.insert_str(pos, &format!(", {}", iter_iface));
+                                    }
+                                }
+                            }
+                        } else {
+                            let mut ext_list = extends_iface.to_string();
+                            if let Some(iter_iface) = iterable_iface {
+                                ext_list.push_str(", ");
+                                ext_list.push_str(iter_iface);
+                            }
+                            *decl = decl.replacen(
+                                &format!("interface {}", name),
+                                &format!("interface {} extends {}", name, ext_list),
+                                1,
+                            );
+                        }
+                        if !decl.contains("[key: string]") {
+                            if let Some(pos) = decl.find('{') {
+                                let insert_pos = pos + 1;
+                                let ins = format!("\n  [key: string]: {};", index_ty);
+                                decl.insert_str(insert_pos, &ins);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let rendered = render_modules(&group_copy);
         body.push_str(&rendered);
         if rendered.is_empty() {
             continue;
