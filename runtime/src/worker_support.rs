@@ -221,6 +221,8 @@ pub fn install_worker_runtime(scope: &mut ContextScope<HandleScope>) {
                             target: mainPort,
                             currentTarget: mainPort
                         });
+                    } else if (typeof globalThis.__ns__setTimeout === 'function') {
+                        globalThis.__ns__setTimeout(function () { throw err; }, 0);
                     } else if (typeof globalThis.setTimeout === 'function') {
                         globalThis.setTimeout(function () { throw err; }, 0);
                     } else {

@@ -19,6 +19,7 @@ mod livesync;
 mod class_helpers;
 mod type_description;
 mod global_fns;
+mod timers;
 mod ns_proxy;
 pub(crate) mod dotnet;
 pub(crate) mod win32;
@@ -74,7 +75,7 @@ thread_local!(static ISOLATE: RefCell<Option<&'static mut v8::Isolate>> = RefCel
 
 /// Raw pointer to the V8 isolate, set once during Runtime::new so that
 /// JS delegate Invoke trampolines can enter V8 without a scope on the stack.
-thread_local!(static DELEGATE_ISOLATE_PTR: Cell<*mut v8::Isolate> = Cell::new(std::ptr::null_mut()));
+thread_local!(pub(crate) static DELEGATE_ISOLATE_PTR: Cell<*mut v8::Isolate> = Cell::new(std::ptr::null_mut()));
 
 /// Optional hook called from the async-wait message loop so external tools
 /// (e.g. the devtools server) can pump their own messages without the runtime
@@ -1699,10 +1700,10 @@ fn init_async_helpers(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>
                     }
 
                     Promise.resolve().then(callback).catch(function (err) {
-                        if (typeof globalThis.setTimeout === 'function') {
-                            globalThis.setTimeout(function () {
-                                throw err;
-                            }, 0);
+                        if (typeof globalThis.__ns__setTimeout === 'function') {
+                            globalThis.__ns__setTimeout(function () { throw err; }, 0);
+                        } else if (typeof globalThis.setTimeout === 'function') {
+                            globalThis.setTimeout(function () { throw err; }, 0);
                         } else {
                             throw err;
                         }
@@ -3161,11 +3162,6 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     extern "C" fn callback(callback: *const v8::FunctionCallbackInfo) {
                         let info = unsafe { &*callback };
 
-                        // v8 147: use the official `callback_scope!` macro,
-                        // which stores the storage in one binding and the
-                        // initialized PinScope in another. Hand-rolling the
-                        // pin here is a use-after-free trap because `init()`
-                        // returns a value that must outlive the borrow.
                         v8::callback_scope!(unsafe scope, info);
                         let args = unsafe { v8::FunctionCallbackArguments::from_function_callback_info(info) };
                         let mut retval = v8::ReturnValue::from_function_callback_info(info);
@@ -5607,11 +5603,6 @@ fn handle_named_property_getter(scope: &mut v8::PinScope<'_, '_>,
         return v8::Intercepted::kNo;
     }
 
-    // Non-string key (a Symbol like Symbol.toPrimitive). We don't expose
-    // any Symbol-keyed WinRT properties, so let V8 fall back to defaults.
-    // Returning `args.holder()` here was a v8 0.73-era bug that v8 147
-    // treats as "I handled it, here's a value", causing TypeError when V8
-    // tries to invoke the result for primitive coercion.
     v8::Intercepted::kNo
 }
 
@@ -5831,14 +5822,69 @@ impl Runtime {
         let mut isolate = v8::Isolate::new(params);
         isolate.set_capture_stack_trace_for_uncaught_exceptions(true, 100);
 
+        // Provide a host callback for dynamic `import()` so embedders and
+        // tests that use `import(modulePath)` work. The callback compiles
+        // the requested module (and its transitive graph), instantiates
+        // and evaluates it, then resolves the returned Promise with the
+        // module namespace object.
+        isolate.set_host_import_module_dynamically_callback(
+            |scope: &mut v8::PinScope<'_, '_>, _host_defined_options: v8::Local<v8::Data>, resource_name: v8::Local<v8::Value>, specifier: v8::Local<v8::String>, _import_attributes: v8::Local<v8::FixedArray>| -> Option<v8::Local<v8::Promise>> {
+                // Create a promise resolver to return to JS.
+                let resolver = match v8::PromiseResolver::new(scope) {
+                    Some(r) => r,
+                    None => return None,
+                };
+
+                let spec = specifier.to_rust_string_lossy(scope);
+                let referrer_path = value_to_string(scope, resource_name);
+                let resolved = resolve_esm_path(&spec, referrer_path.as_deref());
+
+                match std::fs::read_to_string(&resolved) {
+                    Ok(content) => compile_module_graph(scope, &content, &resolved),
+                    Err(e) => {
+                        if let Some(err_str) = v8::String::new(scope, &format!("ESM: cannot read {resolved}: {e}")) {
+                            resolver.reject(scope, err_str.into());
+                        }
+                        return Some(resolver.get_promise(scope));
+                    }
+                }
+
+                let root_global = ESM_MODULE_REGISTRY.with(|r| r.borrow().get(&resolved).cloned());
+                let Some(root_global) = root_global else {
+                    if let Some(err_str) = v8::String::new(scope, "ESM: root module was not compiled") {
+                        resolver.reject(scope, err_str.into());
+                    }
+                    return Some(resolver.get_promise(scope));
+                };
+
+                let module = v8::Local::new(scope, &root_global);
+
+                if module.instantiate_module(scope, resolve_module_callback).is_none() {
+                    if let Some(err_str) = v8::String::new(scope, "ESM: module instantiation failed") {
+                        resolver.reject(scope, err_str.into());
+                    }
+                    return Some(resolver.get_promise(scope));
+                }
+
+                if module.evaluate(scope).is_none() {
+                    if let Some(err_str) = v8::String::new(scope, "ESM: module evaluation failed") {
+                        resolver.reject(scope, err_str.into());
+                    }
+                    return Some(resolver.get_promise(scope));
+                }
+
+                scope.perform_microtask_checkpoint();
+
+                let ns = module.get_module_namespace();
+                resolver.resolve(scope, ns);
+                Some(resolver.get_promise(scope))
+            },
+        );
+
         let global_context;
         {
             v8::scope!(scope, &mut isolate);
 
-            // v8 147: build a plain ObjectTemplate for the global. The previous
-            // FunctionTemplate-based approach (used in v8 0.73 to give the
-            // global a class name) crashes Context::new in 147 — the tests in
-            // rusty_v8 itself construct globals via ObjectTemplate::new only.
             let mut global_template = v8::ObjectTemplate::new(scope);
 
             globals::performance::init_performance(scope, &mut global_template);

@@ -14,8 +14,65 @@ fn unique_result_file(name: &str) -> String {
     path.to_string_lossy().to_string()
 }
 
+// ── Timer integration tests ──────────────────────────────────────────────────
+
+#[test]
+fn timers_set_timeout_fires() {
+    run_js_assert(
+        "timers_set_timeout_fires",
+        r#"
+            return new Promise(function(resolve, reject) {
+                __ns__setTimeout(function() { resolve(); }, 20);
+            });
+        "#,
+    );
+}
+
+#[test]
+fn timers_clear_timeout_prevents_fire() {
+    run_js_assert(
+        "timers_clear_timeout_prevents_fire",
+        r#"
+            return new Promise(function(resolve, reject) {
+                let fired = false;
+                let id = __ns__setTimeout(function() { fired = true; reject('timer fired'); }, 30);
+                __ns__clearTimeout(id);
+                __ns__setTimeout(function() {
+                    if (!fired) resolve(); else reject('fired unexpectedly');
+                }, 80);
+            });
+        "#,
+    );
+}
+
+#[test]
+fn timers_set_interval_repeats_and_clears() {
+    run_js_assert(
+        "timers_set_interval_repeats_and_clears",
+        r#"
+            return new Promise(function(resolve, reject) {
+                let count = 0;
+                let id = __ns__setInterval(function() {
+                    count++;
+                    if (count === 2) {
+                        __ns__clearInterval(id);
+                        __ns__setTimeout(function() {
+                            if (count === 2) resolve(); else reject('unexpected tick count: ' + count);
+                        }, 60);
+                    } else if (count > 2) {
+                        reject('too many ticks: ' + count);
+                    }
+                }, 15);
+            });
+        "#,
+    );
+}
+
 fn run_js_assert(name: &str, body: &str) {
-    let mut runtime = Runtime::new(".");
+    let mut runtime = Box::new(Runtime::new("."));
+    // Register the isolate pointer for Delegate/timer callbacks so they can
+    // enter V8 from other threads. Box the runtime so its address is stable.
+    runtime.register_delegate_isolate_ptr();
     let result_file = unique_result_file(name);
     let result_file_json = serde_json::to_string(&result_file).unwrap();
     let temp_dir_json = serde_json::to_string(&std::env::temp_dir().to_string_lossy().to_string()).unwrap();
@@ -75,6 +132,8 @@ fn run_js_assert(name: &str, body: &str) {
             found = true;
             break;
         }
+        // Pump native timers while waiting so timer callbacks can run on the main thread.
+        crate::timers::pump();
         thread::sleep(Duration::from_millis(10));
     }
 

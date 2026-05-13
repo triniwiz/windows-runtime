@@ -165,10 +165,10 @@ fn cancel_raf_prevents_callback() {
 #[test]
 fn settimeout_exists_and_returns_id() {
     let mut rt = Runtime::new(".");
-    assert_js(&mut rt, "typeof setTimeout === 'function'",   "setTimeout not a function");
-    assert_js(&mut rt, "typeof clearTimeout === 'function'", "clearTimeout not a function");
-    assert_js(&mut rt, "typeof setInterval === 'function'",   "setInterval not a function");
-    assert_js(&mut rt, "typeof clearInterval === 'function'", "clearInterval not a function");
+    assert_js(&mut rt, "typeof __ns__setTimeout === 'function' || typeof setTimeout === 'function'",   "setTimeout not a function");
+    assert_js(&mut rt, "typeof __ns__clearTimeout === 'function' || typeof clearTimeout === 'function'", "clearTimeout not a function");
+    assert_js(&mut rt, "typeof __ns__setInterval === 'function' || typeof setInterval === 'function'",   "setInterval not a function");
+    assert_js(&mut rt, "typeof __ns__clearInterval === 'function' || typeof clearInterval === 'function'", "clearInterval not a function");
 }
 
 // ── Win32 FFI ─────────────────────────────────────────────────────────────────

@@ -684,10 +684,10 @@ const HELPER_SOURCE: &str = r#"
                     }
 
                     Promise.resolve().then(callback).catch(function (err) {
-                        if (typeof globalThis.setTimeout === 'function') {
-                            globalThis.setTimeout(function () {
-                                throw err;
-                            }, 0);
+                        if (typeof globalThis.__ns__setTimeout === 'function') {
+                            globalThis.__ns__setTimeout(function () { throw err; }, 0);
+                        } else if (typeof globalThis.setTimeout === 'function') {
+                            globalThis.setTimeout(function () { throw err; }, 0);
                         } else {
                             throw err;
                         }
@@ -1797,65 +1797,33 @@ const HELPER_SOURCE: &str = r#"
         // ── runtime metadata ──────────────────────────────────────────────────
         globalThis.__runtimeVersion = "1.0.0";
 
-        // ── setTimeout / clearTimeout / setInterval / clearInterval ───────────
-        // Implemented on top of Windows.UI.Xaml.DispatcherTimer which fires on
-        // the UI thread, making it safe to invoke JS callbacks directly.
+        // ── Timers bootstrap (runtime-registered defaults, embedders may override) ─
+        // The runtime registers host-facing timer entrypoints into the JS global:
+        //   global.__ns__setTimeout
+        //   global.__ns__setInterval
+        //   global.__ns__clearTimeout
+        //   global.__ns__clearInterval
+        // Embedders may replace these with
+        // platform-specific implementations. When no host implementation is
+        // available, the bootstrap provides default behaviors (throws for
+        // setTimeout/setInterval and no-op for clearTimeout/clearInterval).
         (function () {
-            var _nextId = 0;
-            var _timers = new Map();
-
-            function _span(ms) {
-                // TimeSpan.Duration is in 100-ns ticks; 1 ms = 10 000 ticks.
-                return new Windows.Foundation.TimeSpan({
-                    Duration: Math.max(1, Math.floor(ms || 0)) * 10000
-                });
+            if (typeof globalThis.__ns__setTimeout !== 'function') {
+                globalThis.__ns__setTimeout = function () {
+                    throw new Error('Timers are not available: embedder must provide global.__ns__setTimeout');
+                };
             }
-
-            globalThis.setTimeout = function setTimeout(fn, delay) {
-                if (typeof fn !== 'function') return 0;
-                var id = ++_nextId;
-                var extra = Array.prototype.slice.call(arguments, 2);
-                var t = new Windows.UI.Xaml.DispatcherTimer();
-                t.Interval = _span(delay);
-                t.Tick = NSWinRT.asDelegate(function () {
-                    t.Stop();
-                    _timers.delete(id);
-                    try { fn.apply(undefined, extra); } catch (e) {
-                        console.log('setTimeout error:', e && e.message || e);
-                    }
-                });
-                _timers.set(id, t);
-                t.Start();
-                return id;
-            };
-
-            globalThis.clearTimeout = function clearTimeout(id) {
-                var t = _timers.get(id);
-                if (t) { t.Stop(); _timers.delete(id); }
-            };
-
-            globalThis.setInterval = function setInterval(fn, delay) {
-                if (typeof fn !== 'function') return 0;
-                var id = ++_nextId;
-                var extra = Array.prototype.slice.call(arguments, 2);
-                var ms = Math.max(1, Math.floor(delay || 1));
-                var t = new Windows.UI.Xaml.DispatcherTimer();
-                t.Interval = _span(ms);
-                t.Tick = NSWinRT.asDelegate(function () {
-                    if (!_timers.has(id)) return;
-                    try { fn.apply(undefined, extra); } catch (e) {
-                        console.log('setInterval error:', e && e.message || e);
-                    }
-                });
-                _timers.set(id, t);
-                t.Start();
-                return id;
-            };
-
-            globalThis.clearInterval = function clearInterval(id) {
-                var t = _timers.get(id);
-                if (t) { t.Stop(); _timers.delete(id); }
-            };
+            if (typeof globalThis.__ns__setInterval !== 'function') {
+                globalThis.__ns__setInterval = function () {
+                    throw new Error('Timers are not available: embedder must provide global.__ns__setInterval');
+                };
+            }
+            if (typeof globalThis.__ns__clearTimeout !== 'function') {
+                globalThis.__ns__clearTimeout = function () { };
+            }
+            if (typeof globalThis.__ns__clearInterval !== 'function') {
+                globalThis.__ns__clearInterval = function () { };
+            }
         })();
 
         // ── requestAnimationFrame / cancelAnimationFrame ──────────────────────
@@ -2575,15 +2543,22 @@ pub(crate) fn init_async_helpers(
     register!("__nsDotNetInvoke",               handle_dotnet_invoke);
     register!("__nsWin32Call",                  handle_win32_call);
     register!("__nsWin32Exports",               handle_win32_exports);
+    register!("__ns__setTimeout",               crate::timers::handle_ns_set_timeout);
+    register!("__ns__setInterval",              crate::timers::handle_ns_set_interval);
+    register!("__ns__clearTimeout",             crate::timers::handle_ns_clear_timeout);
+    register!("__ns__clearInterval",            crate::timers::handle_ns_clear_interval);
     register!("__nsDwmFlush",                   handle_dwm_flush);
     register!("__nsUUID",                       handle_ns_uuid);
+
+    // Initialize native timers scheduler (non-blocking). This registers a
+    // pump into `ASYNC_PUMP_HOOK` so blocking waits will also process timers.
+    crate::timers::init();
 
     if let (Some(k), Some(v)) = (v8::String::new(scope, "__nsAppRoot"), v8::String::new(scope, app_root)) {
         global.define_own_property(scope, k.into(), v.into(), v8::PropertyAttribute::READ_ONLY);
     }
 
-    // Improve Windows timer resolution from the default ~15 ms to ~1 ms.
-    // This benefits all DispatcherTimer-based setTimeout/setInterval calls.
+    // This benefits host-provided timers that rely on system timer resolution.
     // Ignored on failure (e.g., sandboxed environments).
     let _ = crate::win32::call_win32_json(
         r#"{"dll":"winmm.dll","fn":"timeBeginPeriod","returnType":"u32","args":[{"type":"u32","value":1}]}"#,

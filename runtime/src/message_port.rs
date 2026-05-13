@@ -42,7 +42,9 @@ pub fn install_message_port_runtime(scope: &mut ContextScope<HandleScope>) {
                     try {
                         state.onmessage.call(targetPort, evt);
                     } catch (err) {
-                        if (typeof globalThis.setTimeout === 'function') {
+                        if (typeof globalThis.__ns__setTimeout === 'function') {
+                            globalThis.__ns__setTimeout(function () { throw err; }, 0);
+                        } else if (typeof globalThis.setTimeout === 'function') {
                             globalThis.setTimeout(function () { throw err; }, 0);
                         } else {
                             throw err;
@@ -54,7 +56,9 @@ pub fn install_message_port_runtime(scope: &mut ContextScope<HandleScope>) {
                     try {
                         listener.call(targetPort, evt);
                     } catch (err) {
-                        if (typeof globalThis.setTimeout === 'function') {
+                        if (typeof globalThis.__ns__setTimeout === 'function') {
+                            globalThis.__ns__setTimeout(function () { throw err; }, 0);
+                        } else if (typeof globalThis.setTimeout === 'function') {
                             globalThis.setTimeout(function () { throw err; }, 0);
                         } else {
                             throw err;
