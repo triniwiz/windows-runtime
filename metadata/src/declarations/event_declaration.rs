@@ -201,6 +201,14 @@ impl EventDeclaration {
             .flatten()
     }
 
+    /// Returns the underlying delegate declaration implementation as a trait
+    /// object. This exposes generic delegate instances (e.g. closed
+    /// `TypedEventHandler<TSender, TArgs>`) which cannot be downcast to the
+    /// concrete `DelegateDeclaration` type.
+    pub fn delegate_impl(&self) -> Option<&dyn DelegateDeclarationImpl> {
+        self.type_.as_ref().map(|b| b.as_ref())
+    }
+
     pub fn add_method(&self) -> &MethodDeclaration {
         &self.add_method
     }

@@ -1050,6 +1050,14 @@ const HELPER_SOURCE: &str = r#"
                 },
             };
 
+            // Expose top-level `interop` alias for consistency with other runtimes (e.g. iOS).
+            // This lets code reference `globalThis.interop` while keeping backwards
+            // compatibility with `globalThis.NSWinRT`.
+            globalThis.interop = globalThis.interop || globalThis.NSWinRT.interop;
+            // Ensure NSWinRT.interop is populated when `interop` was already present.
+            globalThis.NSWinRT = globalThis.NSWinRT || {};
+            globalThis.NSWinRT.interop = globalThis.NSWinRT.interop || globalThis.interop;
+
             var proxyExtensions = [];
             var proxyInstances = new Map();
             var nextProxyId = 1;

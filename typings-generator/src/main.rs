@@ -10,6 +10,7 @@ use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration::{Declaration, DeclarationKind};
 use metadata::declarations::delegate_declaration::{DelegateDeclaration, DelegateDeclarationImpl};
 use metadata::declarations::delegate_declaration::generic_delegate_declaration::GenericDelegateDeclaration;
+use metadata::declarations::delegate_declaration::generic_delegate_instance_declaration::GenericDelegateInstanceDeclaration;
 use metadata::declarations::enum_declaration::EnumDeclaration;
 use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
 use metadata::declarations::interface_declaration::InterfaceDeclaration;
@@ -196,9 +197,18 @@ fn map_type_to_ts_with_generics(value: &str, generic_params: &[String]) -> Strin
             let inner = &value[s + 1..value.len().saturating_sub(1)];
             if inner.is_empty() { None } else { Some(inner) }
         }) {
-            return format!("Promise<{}>", map_type_to_ts_with_generics(inner, generic_params));
+            let iface = if base_no_arity.contains('.') {
+                base_no_arity.to_string()
+            } else {
+                format!("Windows.Foundation.{}", base_no_arity)
+            };
+            return format!("{}<{}>", iface, map_type_to_ts_with_generics(inner, generic_params));
         }
-        return "Promise<unknown>".to_string();
+        return if base_no_arity.contains('.') {
+            base_no_arity.to_string()
+        } else {
+            format!("Windows.Foundation.{}", base_no_arity)
+        };
     }
 
     if base_no_arity == "IVector" || base_no_arity.ends_with(".IVector") ||
@@ -388,10 +398,85 @@ fn interface_extends_clause(
 fn event_type_name(
     event: &metadata::declarations::event_declaration::EventDeclaration,
 ) -> String {
-    event
-        .type_()
-        .map(|delegate| declaration_display_name(delegate.full_name()))
-        .unwrap_or_else(|| "unknown".to_string())
+    // If the event's delegate is available, try to render it. Prefer
+    // namespace-qualified aliases so references resolve from any module.
+    if let Some(dimpl) = event.delegate_impl() {
+        // Concrete non-generic delegate (named alias)
+        if let Some(delegate) = dimpl.as_declaration().as_any().downcast_ref::<DelegateDeclaration>() {
+            let full = delegate.full_name();
+            let ns = declaration_namespace(full);
+            let name = declaration_display_name(full);
+            return if ns.is_empty() { name } else { format!("{}.{}", ns, name) };
+        }
+
+        // Generic closed-instance delegate (e.g. TypedEventHandler<TSender, TArgs>)
+        if let Some(generic_instance) = dimpl.as_declaration().as_any().downcast_ref::<GenericDelegateInstanceDeclaration>() {
+            let full = generic_instance.full_name();
+            let base = if let Some(idx) = full.find('<') { &full[..idx] } else { full };
+            let ns = declaration_namespace(base);
+            let base_name = declaration_display_name(base);
+            if let Some(args) = split_generic_arguments(full) {
+                let mapped = args
+                    .iter()
+                    .map(|a| map_type_to_ts_with_generics(a.trim(), &[]))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if ns.is_empty() {
+                    return format!("{}<{}>", base_name, mapped);
+                } else {
+                    return format!("{}.{}<{}>", ns, base_name, mapped);
+                }
+            }
+            return if ns.is_empty() { base_name } else { format!("{}.{}", ns, base_name) };
+        }
+    }
+
+    // Fallback: inspect the `add` method parameter to infer the delegate shape
+    // and produce an inline signature when we can't render the delegate alias.
+    if let Some(md) = event.add_method().metadata() {
+        let params = event.add_method().parameters();
+        if let Some(param) = params.iter().find(|p| !p.is_out()) {
+            let param_ty = Signature::to_string(md, &param.type_());
+            let base = if let Some(idx) = param_ty.find('<') { &param_ty[..idx] } else { param_ty.as_str() };
+            let base_no_arity = if let Some(idx) = base.find('`') { &base[..idx] } else { base };
+            let simple = declaration_display_name(base_no_arity);
+
+            match simple.as_str() {
+                "TypedEventHandler" => {
+                    if let Some(args) = split_generic_arguments(&param_ty) {
+                        if args.len() == 2 {
+                            let sender_ts = map_type_to_ts_with_generics(args[0].trim(), &[]);
+                            let args_ts = map_type_to_ts_with_generics(args[1].trim(), &[]);
+                            return format!("(sender: {}, args: {}) => void", sender_ts, args_ts);
+                        }
+                    }
+                    return "unknown".to_string();
+                }
+                "EventHandler" => {
+                    if let Some(args) = split_generic_arguments(&param_ty) {
+                        if args.len() == 1 {
+                            let args_ts = map_type_to_ts_with_generics(args[0].trim(), &[]);
+                            return format!("(sender: Object, args: {}) => void", args_ts);
+                        }
+                    }
+                    return "(sender: Object, args: any) => void".to_string();
+                }
+                "DispatcherQueueHandler" => return "() => void".to_string(),
+                "RoutedEventHandler" => {
+                    if let Some(args) = split_generic_arguments(&param_ty) {
+                        if args.len() == 1 {
+                            let args_ts = map_type_to_ts_with_generics(args[0].trim(), &[]);
+                            return format!("(sender: Object, args: {}) => void", args_ts);
+                        }
+                    }
+                    return "(sender: Object, args: any) => void".to_string();
+                }
+                _ => return map_type_to_ts_with_generics(param_ty.as_str(), &[]),
+            }
+        }
+    }
+
+    "unknown".to_string()
 }
 
 // ---------------------------------------------------------------------------
