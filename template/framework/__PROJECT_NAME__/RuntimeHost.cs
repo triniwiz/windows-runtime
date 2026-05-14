@@ -139,30 +139,63 @@ namespace __PROJECT_NAME__
         private static string ResolveEntryScriptPath()
         {
             var baseDir = AppContext.BaseDirectory;
-            var defaultLower = Path.Combine(baseDir, "app", "main.js");
-            var defaultUpper = Path.Combine(baseDir, "App", "main.js");
-            var packageJsonPath = Path.Combine(baseDir, "package.json");
+            // EXE lives in <project>/bin/; webpack bundle lives in <project>/app/.
+            var parentDir = Path.GetDirectoryName(
+                baseDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
+                ?? baseDir;
 
-            if (!File.Exists(packageJsonPath))
-                return File.Exists(defaultLower) ? defaultLower : defaultUpper;
+            // Candidate app directories: sibling of bin/ first, then directly under baseDir.
+            var appDirCandidates = new[]
+            {
+                Path.Combine(parentDir, "app"),
+                Path.Combine(parentDir, "App"),
+                Path.Combine(baseDir, "app"),
+                Path.Combine(baseDir, "App"),
+            };
+
+            string packageJsonPath = null;
+            string resolvedBaseDir = null;
+            foreach (var dir in appDirCandidates)
+            {
+                var candidate = Path.Combine(dir, "package.json");
+                if (File.Exists(candidate))
+                {
+                    packageJsonPath = candidate;
+                    resolvedBaseDir = dir;
+                    break;
+                }
+            }
+
+            // Also accept package.json at the project root (parent of bin/).
+            if (packageJsonPath == null && File.Exists(Path.Combine(parentDir, "package.json")))
+            {
+                packageJsonPath = Path.Combine(parentDir, "package.json");
+                resolvedBaseDir = parentDir;
+            }
+
+            string Fallback() =>
+                appDirCandidates.Select(d => Path.Combine(d, "bundle.js")).FirstOrDefault(File.Exists);
+
+            if (packageJsonPath == null)
+                return Fallback();
 
             try
             {
                 var config = ParsePackageConfig(packageJsonPath);
                 if (!string.IsNullOrWhiteSpace(config.WindowsMain))
                 {
-                    var p = ResolveScriptPath(baseDir, config.WindowsMain);
+                    var p = ResolveScriptPath(resolvedBaseDir, config.WindowsMain);
                     if (p != null) return p;
                 }
                 if (!string.IsNullOrWhiteSpace(config.Main))
                 {
-                    var p = ResolveScriptPath(baseDir, config.Main);
+                    var p = ResolveScriptPath(resolvedBaseDir, config.Main);
                     if (p != null) return p;
                 }
             }
             catch { }
 
-            return File.Exists(defaultLower) ? defaultLower : defaultUpper;
+            return Fallback();
         }
 
         private static RuntimePackageConfig ParsePackageConfig(string packageJsonPath)
@@ -181,12 +214,16 @@ namespace __PROJECT_NAME__
         {
             if (string.IsNullOrWhiteSpace(scriptPath)) return null;
             var normalized = scriptPath.Replace('/', Path.DirectorySeparatorChar);
-            var direct = Path.IsPathRooted(normalized) ? normalized : Path.Combine(baseDir, normalized);
-            if (File.Exists(direct)) return direct;
-            var appLower = Path.Combine(baseDir, "app", normalized);
-            if (File.Exists(appLower)) return appLower;
-            var appUpper = Path.Combine(baseDir, "App", normalized);
-            return File.Exists(appUpper) ? appUpper : null;
+            foreach (var candidate in new[] { normalized, normalized + ".js" })
+            {
+                var direct = Path.IsPathRooted(candidate) ? candidate : Path.Combine(baseDir, candidate);
+                if (File.Exists(direct)) return direct;
+                var appLower = Path.Combine(baseDir, "app", candidate);
+                if (File.Exists(appLower)) return appLower;
+                var appUpper = Path.Combine(baseDir, "App", candidate);
+                if (File.Exists(appUpper)) return appUpper;
+            }
+            return null;
         }
 
         public void Dispose()
