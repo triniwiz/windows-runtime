@@ -55,21 +55,12 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
 
-    <!-- .NET bridge — published on first build by the target below; enables ns.dotnet.*
-         APIs from JavaScript. Must land at dotnet-bridge\publish\ relative to the
-         executable so the Rust runtime can locate DotNetBridge.dll via
-         AppContext.BaseDirectory. Condition guards against a missing source tree. -->
-    <Content Include="$(NSWindowsRoot)\dotnet-bridge\publish\**\*"
-             Condition="Exists('$(NSWindowsRoot)\dotnet-bridge\publish')">
-      <Link>dotnet-bridge\publish\%(RecursiveDir)%(Filename)%(Extension)</Link>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </Content>
   </ItemGroup>
 
   <!--
-    Publishes DotNetBridge.dll before the app build so the Content glob above has
-    something to pick up.  Inputs/Outputs make this incremental: MSBuild skips the
-    Exec entirely when DotNetBridge.dll is newer than both source files.
+    Publishes DotNetBridge.dll before the app build.
+    Inputs/Outputs make this incremental: MSBuild skips the Exec when DotNetBridge.dll
+    is already newer than both source files.
   -->
   <Target Name="PublishDotNetBridge"
           BeforeTargets="Build"
@@ -79,6 +70,25 @@
           Condition="Exists('$(NSWindowsRoot)\dotnet-bridge\DotNetBridge.csproj')">
     <Message Text="[NativeScript] Publishing DotNetBridge..." Importance="high" />
     <Exec Command="dotnet publish &quot;$(NSWindowsRoot)\dotnet-bridge\DotNetBridge.csproj&quot; -c Release -o &quot;$(NSWindowsRoot)\dotnet-bridge\publish&quot; --no-self-contained /nologo" />
+  </Target>
+
+  <!--
+    Copies the published bridge files to the output directory AFTER PublishDotNetBridge
+    runs, avoiding the MSBuild evaluation-order problem where Condition="Exists(...)"
+    on a static Content item is checked before the publish target creates the directory.
+    Must land at dotnet-bridge\publish\ relative to the EXE so the Rust runtime can
+    locate DotNetBridge.dll via AppContext.BaseDirectory.
+  -->
+  <Target Name="CopyDotNetBridge"
+          AfterTargets="PublishDotNetBridge"
+          BeforeTargets="Build"
+          Condition="Exists('$(NSWindowsRoot)\dotnet-bridge\publish')">
+    <ItemGroup>
+      <_DotNetBridgeFiles Include="$(NSWindowsRoot)\dotnet-bridge\publish\**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_DotNetBridgeFiles)"
+          DestinationFiles="@(_DotNetBridgeFiles->'$(OutDir)dotnet-bridge\publish\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
   </Target>
 
   <!-- Allow project-level Windows overrides: place App_Resources\Windows\app.csproj to extend/override generated settings -->
