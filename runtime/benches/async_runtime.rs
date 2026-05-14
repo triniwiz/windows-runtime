@@ -16,7 +16,7 @@ fn bench_async_paths(c: &mut Criterion) {
                     }
                 "#
             },
-            |script| runtime.run_script(script),
+            |script| runtime.run_script(script, "<bench>"),
             BatchSize::SmallInput,
         );
     });
@@ -35,7 +35,7 @@ fn bench_async_paths(c: &mut Criterion) {
                     })();
                 "#
             },
-            |script| runtime.run_script(script),
+            |script| runtime.run_script(script, "<bench>"),
             BatchSize::SmallInput,
         );
     });

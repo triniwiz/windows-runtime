@@ -4,8 +4,8 @@
 //! This runs at app startup and captures any extensions defined dynamically,
 //! falling back to SBG-generated proxies when available
 
+use ahash::AHashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,14 +94,14 @@ pub struct RuntimePropertyMetadata {
 /// Registry for runtime-captured extensions
 pub struct RuntimeExtensionRegistry {
     /// Map of class name -> metadata
-    extensions: HashMap<String, RuntimeExtensionMetadata>,
+    extensions: AHashMap<String, RuntimeExtensionMetadata>,
 }
 
 impl RuntimeExtensionRegistry {
     /// Create a new registry
     pub fn new() -> Self {
         Self {
-            extensions: HashMap::new(),
+            extensions: AHashMap::new(),
         }
     }
 
@@ -168,22 +168,17 @@ impl DispatchMetadataBuilder {
         }
     }
 
-    /// Add a method to dispatch table
+    /// Add a method to dispatch table; returns the assigned dispatch ID.
     pub fn add_method(
         &mut self,
         name: String,
         return_type: String,
         param_count: usize,
-    ) -> MethodDispatchInfo {
-        let info = MethodDispatchInfo {
-            name,
-            dispatch_id: self.next_id,
-            return_type,
-            param_count,
-        };
-        self.methods.push(info.clone());
+    ) -> u32 {
+        let id = self.next_id;
+        self.methods.push(MethodDispatchInfo { name, dispatch_id: id, return_type, param_count });
         self.next_id += 1;
-        info
+        id
     }
 
     /// Get all dispatch info
@@ -227,13 +222,15 @@ mod tests {
     #[test]
     fn test_dispatch_builder() {
         let mut builder = DispatchMetadataBuilder::new();
-        let method1 = builder.add_method("method1".to_string(), "void".to_string(), 0);
-        let method2 = builder.add_method("method2".to_string(), "int".to_string(), 2);
+        let id1 = builder.add_method("method1".to_string(), "void".to_string(), 0);
+        let id2 = builder.add_method("method2".to_string(), "int".to_string(), 2);
 
-        assert_eq!(method1.dispatch_id, 1);
-        assert_eq!(method2.dispatch_id, 2);
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
 
         let methods = builder.build();
         assert_eq!(methods.len(), 2);
+        assert_eq!(methods[0].dispatch_id, 1);
+        assert_eq!(methods[1].dispatch_id, 2);
     }
 }

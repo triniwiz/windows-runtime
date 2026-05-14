@@ -23,6 +23,7 @@ mod timers;
 mod ns_proxy;
 pub(crate) mod dotnet;
 pub(crate) mod win32;
+pub(crate) mod win32_known_fns;
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -30,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use ahash::AHasher;
+use ahash::{AHasher, AHashSet};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -94,7 +95,7 @@ thread_local!(static ESM_HASH_TO_PATH: RefCell<HashMap<i32, String>> = RefCell::
 // re-entrant template/property mutations that can corrupt V8 descriptor
 // arrays when a constructor build recursively triggers building the same
 // constructor (observed as a V8 internal DescriptorArray append failure).
-thread_local!(static CREATING_CTORS: RefCell<Vec<String>> = RefCell::new(Vec::new()));
+thread_local!(static CREATING_CTORS: RefCell<AHashSet<String>> = RefCell::new(AHashSet::new()));
 
 pub struct Runtime {
     isolate: v8::OwnedIsolate,
@@ -164,25 +165,21 @@ fn split_type_name(type_name: &str) -> (Option<String>, String) {
 }
 
 fn extend_class_methods(class_declaration: &ClassDeclaration, methods: &mut Vec<MethodDeclaration>, seen: &mut HashSet<String>) {
+    // Use contains() first so we only allocate a String when the method is new.
+    // HashSet<String> supports Borrow<str>, so contains(&str) does not allocate.
     for method in class_declaration.methods() {
-        let mut method_name = method.overload_name().to_string();
-        if method_name.is_empty() {
-            method_name = method.name().to_string();
-        }
-
-        if seen.insert(method_name) {
+        let key = if !method.overload_name().is_empty() { method.overload_name() } else { method.name() };
+        if !seen.contains(key) {
+            seen.insert(key.to_string());
             methods.push(method.clone());
         }
     }
 
     if let Some(default_interface) = class_declaration.default_interface() {
         for method in default_interface.methods() {
-            let mut method_name = method.overload_name().to_string();
-            if method_name.is_empty() {
-                method_name = method.name().to_string();
-            }
-
-            if seen.insert(method_name) {
+            let key = if !method.overload_name().is_empty() { method.overload_name() } else { method.name() };
+            if !seen.contains(key) {
+                seen.insert(key.to_string());
                 methods.push(method.clone());
             }
         }
@@ -190,12 +187,9 @@ fn extend_class_methods(class_declaration: &ClassDeclaration, methods: &mut Vec<
 
     for interface in class_declaration.implemented_interfaces() {
         for method in interface.methods() {
-            let mut method_name = method.overload_name().to_string();
-            if method_name.is_empty() {
-                method_name = method.name().to_string();
-            }
-
-            if seen.insert(method_name) {
+            let key = if !method.overload_name().is_empty() { method.overload_name() } else { method.name() };
+            if !seen.contains(key) {
+                seen.insert(key.to_string());
                 methods.push(method.clone());
             }
         }
@@ -213,14 +207,18 @@ fn extend_class_methods(class_declaration: &ClassDeclaration, methods: &mut Vec<
 
 fn extend_class_properties(class_declaration: &ClassDeclaration, properties: &mut Vec<PropertyDeclaration>, seen: &mut HashSet<String>) {
     for property in class_declaration.properties() {
-        if seen.insert(property.name().to_string()) {
+        let key = property.name();
+        if !seen.contains(key) {
+            seen.insert(key.to_string());
             properties.push(property.clone());
         }
     }
 
     if let Some(default_interface) = class_declaration.default_interface() {
         for property in default_interface.properties() {
-            if seen.insert(property.name().to_string()) {
+            let key = property.name();
+            if !seen.contains(key) {
+                seen.insert(key.to_string());
                 properties.push(property.clone());
             }
         }
@@ -228,7 +226,9 @@ fn extend_class_properties(class_declaration: &ClassDeclaration, properties: &mu
 
     for interface in class_declaration.implemented_interfaces() {
         for property in interface.properties() {
-            if seen.insert(property.name().to_string()) {
+            let key = property.name();
+            if !seen.contains(key) {
+                seen.insert(key.to_string());
                 properties.push(property.clone());
             }
         }
@@ -274,15 +274,23 @@ fn fill_class_members(
     properties: &mut HashMap<String, PropertyDeclaration>,
     methods: &mut HashMap<String, MethodDeclaration>,
 ) {
+    // Use contains_key() before inserting to avoid allocating the String key on every
+    // call when the entry already exists. HashMap<String,V> supports Borrow<str> for
+    // contains_key / get, so the lookup is allocation-free on the common (hit) path.
     let mut absorb_props = |list: &[PropertyDeclaration]| {
         for p in list {
-            properties.entry(p.name().to_string()).or_insert_with(|| p.clone());
+            let key = p.name();
+            if !properties.contains_key(key) {
+                properties.insert(key.to_string(), p.clone());
+            }
         }
     };
     let mut absorb_methods = |list: &[MethodDeclaration]| {
         for m in list {
             let key = if !m.overload_name().is_empty() { m.overload_name() } else { m.name() };
-            methods.entry(key.to_string()).or_insert_with(|| m.clone());
+            if !methods.contains_key(key) {
+                methods.insert(key.to_string(), m.clone());
+            }
         }
     };
     absorb_props(class_declaration.properties());
@@ -307,13 +315,27 @@ fn fill_class_members(
 
 fn with_class_members<R>(class_declaration: &ClassDeclaration, f: impl FnOnce(&ClassMembers) -> R) -> R {
     CLASS_MEMBERS_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let entry = cache.entry(class_declaration.full_name().to_string()).or_insert_with(|| {
-            let mut properties = HashMap::new();
-            let mut methods = HashMap::new();
-            fill_class_members(class_declaration, &mut properties, &mut methods);
-            ClassMembers { properties, methods }
-        });
+        let full_name = class_declaration.full_name();
+
+        // Fast path: read with a shared borrow — no String allocation for the key.
+        // HashMap<String, V> accepts &str via the Borrow<str> blanket impl.
+        {
+            let borrow = cache.borrow();
+            if let Some(entry) = borrow.get(full_name) {
+                return f(entry);
+            }
+        }
+
+        // Cache miss: build the member maps, then insert.
+        // fill_class_members calls itself recursively but never re-enters
+        // with_class_members, so the RefCell is free to borrow_mut here.
+        let mut properties = HashMap::new();
+        let mut methods = HashMap::new();
+        fill_class_members(class_declaration, &mut properties, &mut methods);
+        let mut borrow = cache.borrow_mut();
+        let entry = borrow
+            .entry(full_name.to_string())
+            .or_insert(ClassMembers { properties, methods });
         f(entry)
     })
 }
@@ -3117,7 +3139,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                 let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
                 let class_methods = collect_class_methods(clazz);
                 let class_properties = collect_class_properties(clazz);
-                let mut seen_member_names: HashSet<String> = HashSet::new();
+                let mut seen_member_names: AHashSet<String> = AHashSet::new();
 
 
                 let to_string_func = FunctionTemplate::builder(|_scope: &mut v8::PinScope<'_, '_>,
@@ -4225,10 +4247,10 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
     let name_str = name;
     let already_building = CREATING_CTORS.with(|set| {
         let mut set = set.borrow_mut();
-        if set.iter().any(|s| s == name_str) {
+        if set.contains(name_str) {
             true
         } else {
-            set.push(name_str.to_string());
+            set.insert(name_str.to_string());
             false
         }
     });
@@ -4532,14 +4554,14 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
         if lock.kind() != DeclarationKind::Class {
             let func = tmpl.get_function(scope).unwrap();
-            CREATING_CTORS.with(|set| { set.borrow_mut().retain(|s| s != name_str); });
+            CREATING_CTORS.with(|set| { set.borrow_mut().remove(name_str); });
             return func.into();
         }
 
         let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
         debug_output(&format!("[NativeScript] create_ns_ctor_object: building methods for {}\n", clazz.full_name()));
 
-        let mut added_names: HashSet<String> = HashSet::new();
+        let mut added_names: AHashSet<String> = AHashSet::new();
 
         for method in clazz.methods().iter() {
             let name = v8::String::new(scope, method.name());
@@ -4820,7 +4842,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
         }
     }
     let ret = func;
-    CREATING_CTORS.with(|set| { set.borrow_mut().retain(|s| s != name_str); });
+    CREATING_CTORS.with(|set| { set.borrow_mut().remove(name_str); });
     ret.into()
 }
 
@@ -5996,6 +6018,7 @@ impl Runtime {
                 globals::console::init_console(scope, context);
                 init_meta(scope, context);
                 crate::global_fns::init_async_helpers(scope, app_root);
+                crate::win32::prewarm_known_fns();
                 global_context = v8::Global::new(scope, context);
             }
         }

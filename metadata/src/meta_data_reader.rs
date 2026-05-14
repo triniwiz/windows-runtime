@@ -48,9 +48,7 @@ impl MetadataReader {
         let declaration = MetadataReader::find_by_name_uncached(full_name)?;
         
         DECLARATION_CACHE.with(|cache| {
-            cache.borrow_mut()
-                .entry(full_name.to_string())
-                .or_insert_with(|| Arc::clone(&declaration));
+            cache.borrow_mut().insert(full_name.to_string(), Arc::clone(&declaration));
         });
         Some(declaration)
     }

@@ -2300,6 +2300,13 @@ const HELPER_SOURCE: &str = r#"
                  */
                 call: function (dll, fn_name, returnType) {
                     var args = Array.prototype.slice.call(arguments, 3);
+                    if (typeof globalThis.__nsWin32CallRaw === 'function') {
+                        var rawArgs = [dll, fn_name, returnType];
+                        for (var i = 0; i < args.length; i++) {
+                            rawArgs.push(args[i].type, args[i].value);
+                        }
+                        return globalThis.__nsWin32CallRaw.apply(null, rawArgs);
+                    }
                     var json = JSON.stringify({ dll: dll, fn: fn_name, returnType: returnType, args: args });
                     return JSON.parse(globalThis.__nsWin32Call(json)).value;
                 },
@@ -2476,6 +2483,73 @@ pub(crate) fn handle_ns_uuid(
     }
 }
 
+// ── __nsWin32CallRaw ──────────────────────────────────────────────────────────
+
+/// Fast typed Win32 dispatch — no JSON round-trip.
+/// Args: (dll, fn_name, retType, argType₀, argVal₀, argType₁, argVal₁, …)
+/// Returns the result as a typed V8 value (number, bool, or null for void).
+pub(crate) fn handle_win32_call_raw(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 3 {
+        throw_js_error(scope, "__nsWin32CallRaw: expected (dll, fn, retType, ...)");
+        return;
+    }
+    let Some(dll_v) = args.get(0).to_string(scope) else {
+        throw_js_error(scope, "__nsWin32CallRaw: dll must be a string"); return;
+    };
+    let Some(fn_v) = args.get(1).to_string(scope) else {
+        throw_js_error(scope, "__nsWin32CallRaw: fn must be a string"); return;
+    };
+    let Some(ret_v) = args.get(2).to_string(scope) else {
+        throw_js_error(scope, "__nsWin32CallRaw: retType must be a string"); return;
+    };
+    let dll      = dll_v.to_rust_string_lossy(scope);
+    let fn_name  = fn_v.to_rust_string_lossy(scope);
+    let ret_type = ret_v.to_rust_string_lossy(scope);
+
+    let pair_count = ((args.length() - 3) / 2) as usize;
+    let mut type_strs: Vec<String>                    = Vec::with_capacity(pair_count);
+    let mut raw_vals:  Vec<crate::win32::RawArgValue> = Vec::with_capacity(pair_count);
+
+    let mut i: i32 = 3;
+    while i + 1 < args.length() {
+        let Some(ty_v) = args.get(i).to_string(scope) else { break };
+        let ty_str = ty_v.to_rust_string_lossy(scope);
+        let v8_val = args.get(i + 1);
+        let raw_val = if ty_str == "wstr" || ty_str == "str" {
+            let s = v8_val.to_string(scope)
+                .map(|sv| sv.to_rust_string_lossy(scope))
+                .unwrap_or_default();
+            crate::win32::RawArgValue::Str(s)
+        } else {
+            let n = v8_val.number_value(scope).unwrap_or(0.0);
+            crate::win32::RawArgValue::Number(n)
+        };
+        type_strs.push(ty_str);
+        raw_vals.push(raw_val);
+        i += 2;
+    }
+
+    let arg_pairs: Vec<(&str, crate::win32::RawArgValue)> = type_strs.iter()
+        .map(|s| s.as_str())
+        .zip(raw_vals)
+        .collect();
+
+    match crate::win32::call_win32_direct(&dll, &fn_name, &ret_type, &arg_pairs) {
+        Ok(result) => match result {
+            crate::win32::Win32Result::Null    => retval.set(v8::null(scope).into()),
+            crate::win32::Win32Result::Bool(b) => retval.set_bool(b),
+            crate::win32::Win32Result::I64(v)  => retval.set_double(v as f64),
+            crate::win32::Win32Result::U64(v)  => retval.set_double(v as f64),
+            crate::win32::Win32Result::F64(v)  => retval.set_double(v),
+        },
+        Err(e) => throw_js_error(scope, &e),
+    }
+}
+
 // ── __nsWin32Call ─────────────────────────────────────────────────────────────
 
 /// Calls an arbitrary Win32 function via libffi dynamic dispatch.
@@ -2542,6 +2616,7 @@ pub(crate) fn init_async_helpers(
     register!("__nsLiveSyncCopyFile",           handle_livesync_copy_file);
     register!("__nsDotNetInvoke",               handle_dotnet_invoke);
     register!("__nsWin32Call",                  handle_win32_call);
+    register!("__nsWin32CallRaw",               handle_win32_call_raw);
     register!("__nsWin32Exports",               handle_win32_exports);
     register!("__ns__setTimeout",               crate::timers::handle_ns_set_timeout);
     register!("__ns__setInterval",              crate::timers::handle_ns_set_interval);

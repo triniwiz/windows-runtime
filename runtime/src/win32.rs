@@ -1,34 +1,101 @@
 /// Dynamic Win32 FFI dispatch via libffi.
 ///
-/// JS calls `__nsWin32Call(jsonRequest)` → Rust loads the DLL, resolves the
-/// function pointer, builds a libffi CIF, marshals arguments, and invokes.
+/// Two call paths are available:
 ///
-/// Request JSON:
-///   { "dll": "user32.dll", "fn": "MessageBoxW", "returnType": "i32",
-///     "args": [{"type":"pointer","value":0}, {"type":"wstr","value":"Hi"}, …] }
+/// **JSON path** (`__nsWin32Call`) — legacy, used as fallback.
+///   JS serialises the request to JSON; Rust parses it and dispatches.
 ///
-/// Response JSON:
-///   { "value": 1 }   |   { "error": "…" }
+/// **Raw path** (`__nsWin32CallRaw`) — fast, no JSON round-trip.
+///   JS passes (dll, fn, retType, argType₀, argVal₀, …) as typed V8 args;
+///   Rust reads them directly and dispatches.  For functions listed in
+///   `win32_known_fns::KNOWN_FNS` the `Cif` and function pointer are
+///   pre-built at `Runtime::new` so the first call is also zero-overhead.
 ///
-/// Supported arg/return types:
-///   "i8","i16","i32","i64","u8","u16","u32","u64","f32","f64",
-///   "pointer","wstr","str","bool","void"
+/// Supported arg/return type strings:
+///   "void" "bool" "i8" "i16" "i32" "i64" "u8" "u16" "u32" "u64"
+///   "f32" "f64" "pointer" "wstr" "str"
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
+use ahash::AHashMap;
 use libffi::middle::{Arg, Cif, CodePtr, Type};
 use parking_lot::Mutex;
 use serde_json::Value;
 use windows::core::PCWSTR;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
-// ── DLL handle cache ──────────────────────────────────────────────────────────
+// ── DLL handle cache (global, shared across all threads) ─────────────────────
 
 static DLL_CACHE: std::sync::OnceLock<Mutex<HashMap<String, usize>>> =
     std::sync::OnceLock::new();
 
 fn dll_cache() -> &'static Mutex<HashMap<String, usize>> {
     DLL_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// ── Per-call-site Cif + fn-pointer cache (thread-local) ──────────────────────
+//
+// `Cif` contains a `*mut ffi_cif` — not `Send`.  Since all Win32 FFI calls
+// happen on the single V8 thread a thread-local is both safe and optimal:
+// no mutex needed, no atomic operations, no contention.
+//
+// Key: "<dll_lowercase>|<fn_name>" (simple; Win32 functions have fixed ABIs
+// so the same key always maps to the same calling convention).
+
+struct CachedFn {
+    fn_ptr: *mut c_void,
+    cif: Cif,
+}
+// SAFETY: CachedFn is only accessed on the single V8 thread via thread_local!.
+unsafe impl Send for CachedFn {}
+
+thread_local! {
+    static CIF_CACHE: RefCell<AHashMap<String, CachedFn>> =
+        RefCell::new(AHashMap::new());
+}
+
+fn cif_key(dll: &str, fn_name: &str) -> String {
+    // Lower-case the DLL name so "Kernel32.dll" and "kernel32.dll" hit the same entry.
+    format!("{}|{}", dll.to_ascii_lowercase(), fn_name)
+}
+
+/// Build (or retrieve) a cached `(fn_ptr, Cif)` for the given function.
+/// On first call per function: loads the DLL, resolves the symbol, builds Cif.
+/// Subsequent calls: O(1) AHashMap lookup, no allocations.
+fn get_or_build(
+    dll: &str,
+    fn_name: &str,
+    ret_type: &str,
+    param_types: &[Type],
+) -> Result<(), String> {
+    let key = cif_key(dll, fn_name);
+    CIF_CACHE.with(|cache| {
+        // Fast path: already cached.
+        if cache.borrow().contains_key(&key) {
+            return Ok(());
+        }
+        // Slow path: build once.
+        let dll_handle = load_dll(dll)?;
+        let fn_ptr     = resolve_proc(dll_handle, fn_name)?;
+        let cif        = Cif::new(param_types.to_vec(), ffi_type_for(ret_type)?);
+        cache.borrow_mut().insert(key, CachedFn { fn_ptr, cif });
+        Ok(())
+    })
+}
+
+/// Pre-build CIFs for all entries in `win32_known_fns::KNOWN_FNS`.
+/// Called once from `Runtime::new`; silently skips entries whose DLL
+/// is not installed on the current machine.
+pub(crate) fn prewarm_known_fns() {
+    use crate::win32_known_fns::KNOWN_FNS;
+    for f in KNOWN_FNS {
+        let param_types: Vec<Type> = f.params.iter()
+            .filter_map(|t| ffi_type_for(t).ok())
+            .collect();
+        // If the DLL is absent or the function is missing, just skip it.
+        let _ = get_or_build(f.dll, f.name, f.ret, &param_types);
+    }
 }
 
 fn load_dll(name: &str) -> Result<usize, String> {
@@ -165,6 +232,101 @@ fn marshal(ty: &str, val: &Value) -> Result<StoredArg, String> {
     })
 }
 
+// ── Typed raw-value dispatch (used by __nsWin32CallRaw, no JSON) ─────────────
+
+/// An argument value extracted directly from V8, before type-tagging.
+/// The caller (global_fns.rs) converts V8 locals to these plain Rust values;
+/// `marshal_raw` below converts them to `StoredArg` using the type string.
+pub(crate) enum RawArgValue {
+    /// All numeric types, pointers, and bools come in as f64 from V8.
+    Number(f64),
+    /// String-typed args (wstr / str) carry the already-decoded UTF-8 text.
+    Str(String),
+}
+
+fn marshal_raw(ty: &str, val: &RawArgValue) -> Result<StoredArg, String> {
+    let n = || match val { RawArgValue::Number(f) => *f, RawArgValue::Str(_) => 0.0 };
+    let s = || match val { RawArgValue::Str(s) => s.as_str(), RawArgValue::Number(_) => "" };
+    Ok(match ty {
+        "i8"  => StoredArg::I8 (n() as i8),
+        "i16" => StoredArg::I16(n() as i16),
+        "i32" => StoredArg::I32(n() as i32),
+        "i64" => StoredArg::I64(n() as i64),
+        "u8"  => StoredArg::U8 (n() as u8),
+        "u16" => StoredArg::U16(n() as u16),
+        "u32" => StoredArg::U32(n() as u32),
+        "u64" => StoredArg::U64(n() as u64),
+        "f32" => StoredArg::F32(n() as f32),
+        "f64" => StoredArg::F64(n()),
+        "bool" => StoredArg::I32(if n() != 0.0 { 1 } else { 0 }),
+        "pointer" => StoredArg::Ptr { ptr_val: n() as usize as *const c_void },
+        "wstr" => {
+            let buf: Vec<u16> = s().encode_utf16().chain(std::iter::once(0)).collect();
+            let ptr_val = buf.as_ptr();
+            StoredArg::WStr { ptr_val, _buf: buf }
+        }
+        "str" => {
+            let buf = CString::new(s()).unwrap_or_default();
+            let ptr_val = buf.as_ptr();
+            StoredArg::Str { ptr_val, _buf: buf }
+        }
+        other => return Err(format!("Unsupported arg type: {other}")),
+    })
+}
+
+/// The result of a Win32 call returned to the typed (non-JSON) path.
+pub(crate) enum Win32Result {
+    Null,
+    I64(i64),
+    U64(u64),
+    F64(f64),
+    Bool(bool),
+}
+
+/// Dispatch a Win32 call using pre-parsed Rust values — no JSON anywhere.
+/// Uses the per-thread Cif cache; builds and caches on first call per function.
+pub(crate) fn call_win32_direct(
+    dll: &str,
+    fn_name: &str,
+    ret_type: &str,
+    arg_pairs: &[(&str, RawArgValue)],
+) -> Result<Win32Result, String> {
+    let mut arg_types: Vec<Type>      = Vec::with_capacity(arg_pairs.len());
+    let mut stored:    Vec<StoredArg> = Vec::with_capacity(arg_pairs.len());
+
+    for (ty, val) in arg_pairs {
+        arg_types.push(ffi_type_for(ty)?);
+        stored.push(marshal_raw(ty, val)?);
+    }
+
+    get_or_build(dll, fn_name, ret_type, &arg_types)?;
+
+    let key = cif_key(dll, fn_name);
+    CIF_CACHE.with(|cache| {
+        let borrow = cache.borrow();
+        let entry  = borrow.get(&key).unwrap();
+        let code   = CodePtr(entry.fn_ptr);
+        let ffi_args: Vec<Arg<'_>> = stored.iter().map(|s| s.as_ffi_arg()).collect();
+
+        Ok(match ret_type {
+            "void"    => { unsafe { entry.cif.call::<()>(code, &ffi_args) }; Win32Result::Null }
+            "bool"    => { let v: i32 = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::Bool(v != 0) }
+            "i8"      => { let v: i8  = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::I64(v as i64) }
+            "i16"     => { let v: i16 = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::I64(v as i64) }
+            "i32"     => { let v: i32 = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::I64(v as i64) }
+            "i64"     => { let v: i64 = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::I64(v) }
+            "u8"      => { let v: u8  = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::U64(v as u64) }
+            "u16"     => { let v: u16 = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::U64(v as u64) }
+            "u32"     => { let v: u32 = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::U64(v as u64) }
+            "u64"     => { let v: u64 = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::U64(v) }
+            "f32"     => { let v: f32 = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::F64(v as f64) }
+            "f64"     => { let v: f64 = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::F64(v) }
+            "pointer" => { let v: usize = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::U64(v as u64) }
+            other     => return Err(format!("Unsupported return type: {other}")),
+        })
+    })
+}
+
 // ── PE export table enumeration ───────────────────────────────────────────────
 
 /// Returns every named export from `dll` by parsing its PE export directory.
@@ -246,6 +408,7 @@ pub(crate) fn list_exports(dll: &str) -> Result<Vec<String>, String> {
 
 /// Parse and execute a Win32 FFI call described by a JSON request string.
 /// Returns `{"value":<result>}` or `{"error":"…"}`.
+/// Uses the per-thread Cif cache; builds and caches the Cif on first call.
 pub(crate) fn call_win32_json(json: &str) -> Result<String, String> {
     let req: Value = serde_json::from_str(json)
         .map_err(|e| format!("JSON parse error: {e}"))?;
@@ -255,10 +418,7 @@ pub(crate) fn call_win32_json(json: &str) -> Result<String, String> {
     let ret_type  = req["returnType"].as_str().unwrap_or("i32");
     let args_arr  = req["args"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
 
-    let dll_handle = load_dll(dll)?;
-    let fn_ptr     = resolve_proc(dll_handle, func_name)?;
-
-    let mut arg_types: Vec<Type>     = Vec::with_capacity(args_arr.len());
+    let mut arg_types: Vec<Type>      = Vec::with_capacity(args_arr.len());
     let mut stored:    Vec<StoredArg> = Vec::with_capacity(args_arr.len());
 
     for a in args_arr {
@@ -268,29 +428,33 @@ pub(crate) fn call_win32_json(json: &str) -> Result<String, String> {
         stored.push(marshal(ty, val)?);
     }
 
-    let cif  = Cif::new(arg_types, ffi_type_for(ret_type)?);
-    let code = CodePtr(fn_ptr);
-    let ffi_args: Vec<Arg<'_>> = stored.iter().map(|s| s.as_ffi_arg()).collect();
+    get_or_build(dll, func_name, ret_type, &arg_types)?;
+    let key = cif_key(dll, func_name);
 
-    let result = match ret_type {
-        "void" => {
-            unsafe { cif.call::<()>(code, &ffi_args) };
-            r#"{"value":null}"#.to_string()
-        }
-        "i8"  => { let v: i8  = unsafe { cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-        "i16" => { let v: i16 = unsafe { cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-        "i32" => { let v: i32 = unsafe { cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-        "i64" => { let v: i64 = unsafe { cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-        "u8"  => { let v: u8  = unsafe { cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-        "u16" => { let v: u16 = unsafe { cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-        "u32" => { let v: u32 = unsafe { cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-        "u64" => { let v: u64 = unsafe { cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-        "f32" => { let v: f32 = unsafe { cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-        "f64" => { let v: f64 = unsafe { cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-        "bool"    => { let v: i32  = unsafe { cif.call(code, &ffi_args) }; format!(r#"{{"value":{}}}"#, v != 0) }
-        "pointer" => { let v: usize = unsafe { cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-        other => return Err(format!("Unsupported return type: {other}")),
-    };
+    CIF_CACHE.with(|cache| {
+        let borrow   = cache.borrow();
+        let entry    = borrow.get(&key).unwrap();
+        let code     = CodePtr(entry.fn_ptr);
+        let ffi_args: Vec<Arg<'_>> = stored.iter().map(|s| s.as_ffi_arg()).collect();
 
-    Ok(result)
+        Ok(match ret_type {
+            "void" => {
+                unsafe { entry.cif.call::<()>(code, &ffi_args) };
+                r#"{"value":null}"#.to_string()
+            }
+            "i8"      => { let v: i8    = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
+            "i16"     => { let v: i16   = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
+            "i32"     => { let v: i32   = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
+            "i64"     => { let v: i64   = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
+            "u8"      => { let v: u8    = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
+            "u16"     => { let v: u16   = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
+            "u32"     => { let v: u32   = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
+            "u64"     => { let v: u64   = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
+            "f32"     => { let v: f32   = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
+            "f64"     => { let v: f64   = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
+            "bool"    => { let v: i32   = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{}}}"#, v != 0) }
+            "pointer" => { let v: usize = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
+            other     => return Err(format!("Unsupported return type: {other}")),
+        })
+    })
 }

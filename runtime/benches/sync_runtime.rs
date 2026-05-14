@@ -250,6 +250,64 @@ fn bench_raf(c: &mut Criterion) {
     group.finish();
 }
 
+/// Class-member cache: cold (first lookup) vs hot (cached) resolution.
+///
+/// These benchmarks directly exercise the `CLASS_MEMBERS_CACHE` path touched
+/// by every WinRT property/method access.  A significant gap between cold and
+/// hot numbers indicates the cache is working correctly; the hot numbers set
+/// the floor for per-access overhead.
+fn bench_class_member_cache(c: &mut Criterion) {
+    let mut group = c.benchmark_group("class_member_cache");
+    group.sample_size(20);
+
+    // Cold: new Runtime per iteration so the thread-local cache is empty.
+    group.bench_function("cold_uri_members", |b| {
+        b.iter(|| {
+            let mut rt = Runtime::new(".");
+            // First access after construction — populates CLASS_MEMBERS_CACHE.
+            rt.run_script(
+                "void Windows.Foundation.Uri.prototype.AbsoluteUri",
+                "<bench>",
+            );
+        });
+    });
+
+    // Hot: Runtime created once; cache is warm from the second call onward.
+    group.bench_function("hot_uri_property_2K", |b| {
+        let mut rt = Runtime::new(".");
+        rt.run_script(
+            "globalThis.__u = new Windows.Foundation.Uri('http://example.com/');",
+            "<warmup>",
+        );
+        b.iter_batched(
+            || r#"(function(){ for (var i = 0; i < 2000; i++) void globalThis.__u.AbsoluteUri; })();"#,
+            |script| rt.run_script(script, "<bench>"),
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    // Hot: method dispatch (involves class-member cache + libffi round-trip).
+    group.bench_function("hot_method_dispatch_1K", |b| {
+        let mut rt = Runtime::new(".");
+        rt.run_script(
+            "Windows.Data.Json.JsonValue.CreateStringValue('warm').GetString();",
+            "<warmup>",
+        );
+        b.iter_batched(
+            || r#"
+                (function(){
+                    for (var i = 0; i < 1000; i++)
+                        Windows.Data.Json.JsonValue.CreateStringValue('x').GetString();
+                })();
+            "#,
+            |script| rt.run_script(script, "<bench>"),
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
 criterion_group!(benches,
     bench_script_eval,
     bench_marshalling,
@@ -257,5 +315,6 @@ criterion_group!(benches,
     bench_url_parse,
     bench_dotnet,
     bench_raf,
+    bench_class_member_cache,
 );
 criterion_main!(benches);
