@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -137,16 +138,38 @@ namespace __PROJECT_NAME__
                 throw new InvalidOperationException("Runtime must be initialized before running scripts.");
 
             var entryPath = ResolveEntryScriptPath();
-            var script = File.ReadAllText(Path.GetFullPath(entryPath));
-            try
+            if (entryPath == null)
             {
-                runtime_runscript(_runtime, script, Path.GetFileName(entryPath));
+                System.Diagnostics.Debug.WriteLine("[NativeScript Runtime] No entry script found — bundle missing from app directory.");
+                return;
             }
-            catch (Exception ex)
+
+            var dir = Path.GetDirectoryName(Path.GetFullPath(entryPath));
+            var chunks = new List<string>();
+            foreach (var chunkName in new[] { "runtime.js", "vendor.js" })
             {
-                CrashDiagnostics.WriteExceptionReport("RuntimeHost.RunMainScript", ex, "EntryScript=" + entryPath);
-                System.Diagnostics.Debug.WriteLine($"[NativeScript Runtime] Script execution failed ({entryPath}): {ex}");
-                throw;
+                var chunkPath = Path.Combine(dir, chunkName);
+                if (File.Exists(chunkPath) &&
+                    !string.Equals(chunkPath, Path.GetFullPath(entryPath), StringComparison.OrdinalIgnoreCase))
+                {
+                    chunks.Add(chunkPath);
+                }
+            }
+            chunks.Add(entryPath);
+
+            foreach (var scriptPath in chunks)
+            {
+                var script = File.ReadAllText(Path.GetFullPath(scriptPath));
+                try
+                {
+                    runtime_runscript(_runtime, script, Path.GetFileName(scriptPath));
+                }
+                catch (Exception ex)
+                {
+                    CrashDiagnostics.WriteExceptionReport("RuntimeHost.RunMainScript", ex, "Script=" + scriptPath);
+                    System.Diagnostics.Debug.WriteLine($"[NativeScript Runtime] Script execution failed ({scriptPath}): {ex}");
+                    throw;
+                }
             }
         }
 
@@ -194,7 +217,9 @@ namespace __PROJECT_NAME__
             }
 
             string Fallback() =>
-                appDirCandidates.Select(d => Path.Combine(d, "bundle.js")).FirstOrDefault(File.Exists);
+                appDirCandidates
+                    .SelectMany(d => new[] { Path.Combine(d, "bundle.js"), Path.Combine(d, "bundle.mjs") })
+                    .FirstOrDefault(File.Exists);
 
             if (packageJsonPath == null)
                 return Fallback();
@@ -234,7 +259,7 @@ namespace __PROJECT_NAME__
         {
             if (string.IsNullOrWhiteSpace(scriptPath)) return null;
             var normalized = scriptPath.Replace('/', Path.DirectorySeparatorChar);
-            foreach (var candidate in new[] { normalized, normalized + ".js" })
+            foreach (var candidate in new[] { normalized, normalized + ".js", normalized + ".mjs" })
             {
                 var direct = Path.IsPathRooted(candidate) ? candidate : Path.Combine(baseDir, candidate);
                 if (File.Exists(direct)) return direct;
