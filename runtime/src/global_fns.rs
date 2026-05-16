@@ -2381,6 +2381,89 @@ const HELPER_SOURCE: &str = r#"
                 },
             };
         })();
+
+        // ── CommonJS require() ────────────────────────────────────────────────
+        (function () {
+            var cjsCache = new Map();
+
+            function resolveSpecifier(specifier, callerFile) {
+                if (typeof globalThis.__nsResolveModulePath !== 'function') return null;
+                var appRoot = (globalThis.__nsAppRoot || '').replace(/[\\/]+$/, '');
+
+                // NativeScript tilde alias: ~/foo → {appRoot}/app/foo
+                if (specifier.charAt(0) === '~' && specifier.charAt(1) === '/') {
+                    var abs = appRoot + '\\app\\' + specifier.substring(2).replace(/\//g, '\\');
+                    // Pass absolute path; resolver treats it as-is and tries extensions.
+                    return globalThis.__nsResolveModulePath(abs, '', appRoot) || abs;
+                }
+
+                // Relative (./foo, ../foo) or bare name: use native resolver with caller context.
+                // Fall back to app/bundle.js as parent so top-level require('./chunk.js') works.
+                var parent = callerFile || (appRoot + '\\app\\bundle.js');
+                return globalThis.__nsResolveModulePath(specifier, parent, appRoot);
+            }
+
+            function makeRequire(callerFile) {
+                return function require(specifier) {
+                    var resolved = resolveSpecifier(specifier, callerFile);
+                    if (!resolved) throw new Error('Cannot find module: ' + specifier);
+
+                    var key = resolved.replace(/\\/g, '/').toLowerCase();
+                    if (cjsCache.has(key)) return cjsCache.get(key).exports;
+
+                    var mod = { id: resolved, filename: resolved, exports: {} };
+                    cjsCache.set(key, mod); // set before eval to break circular deps
+
+                    var isJson = key.endsWith('.json');
+                    var content = typeof globalThis.__nsReadTextFile === 'function'
+                        ? globalThis.__nsReadTextFile(resolved) : null;
+
+                    if (isJson) {
+                        try { mod.exports = JSON.parse(content || '{}'); } catch (_) { mod.exports = {}; }
+                        return mod.exports;
+                    }
+
+                    if (content === null || content === undefined)
+                        throw new Error('Failed to read module: ' + resolved);
+
+                    var dirName = resolved.replace(/\//g, '\\').replace(/\\[^\\]*$/, '');
+                    var childRequire = makeRequire(resolved);
+
+                    try {
+                        var factory = new Function('module', 'exports', 'require', '__filename', '__dirname', content);
+                        factory(mod, mod.exports, childRequire, resolved, dirName);
+                    } catch (e) {
+                        cjsCache.delete(key);
+                        throw e;
+                    }
+                    cjsCache.set(key, mod);
+                    return mod.exports;
+                };
+            }
+
+            globalThis.require = makeRequire(null);
+
+            // Top-level CJS globals for scripts executed outside a factory wrapper
+            // (e.g., when the host calls runtime_runscript directly with a CJS file).
+            if (typeof globalThis.module === 'undefined') {
+                var _topMod = { id: '<main>', exports: {} };
+                Object.defineProperty(globalThis, 'module',  { value: _topMod, writable: true, configurable: true });
+                Object.defineProperty(globalThis, 'exports', { value: _topMod.exports, writable: true, configurable: true });
+            }
+
+            // Provide __dirname / __filename globals for webpack target:'node' bundles.
+            // webpack leaves these undefined when building for node (expects Node.js to
+            // provide them via its module wrapper).  Our runtime is not Node.js, so we
+            // supply the app directory as a reasonable fallback value.  Modules that need
+            // the exact source path will still work because @nativescript/core/globals only
+            // stores the value on `global.__dirname` for downstream use.
+            if (typeof globalThis.__dirname === 'undefined') {
+                var _appRoot2 = (globalThis.__nsAppRoot || '').replace(/[\\/]+$/, '');
+                var _appDir = _appRoot2 + '\\app';
+                Object.defineProperty(globalThis, '__dirname',  { value: _appDir, writable: true, configurable: true });
+                Object.defineProperty(globalThis, '__filename', { value: _appDir + '\\bundle.js', writable: true, configurable: true });
+            }
+        })();
         "#;
 
 // ── __nsDotNetInvoke ──────────────────────────────────────────────────────────
