@@ -1,0 +1,6 @@
+{
+    "name": "NativeScriptWindowsDemo",
+    "version": "1.0.0",
+    "description": "A demo app for NativeScript Windows runtime.",
+    "main": "main.js"
+}

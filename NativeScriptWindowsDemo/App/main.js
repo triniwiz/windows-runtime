@@ -314,9 +314,11 @@ function buildDemoLayout() {
 
 try {
 	const window = Windows.UI.Xaml.Window.Current;
-	const layout = buildDemoLayout();
-	console.log("Content",window.Content, layout);
-	window.Content = layout;
+//	const layout = buildDemoLayout();
+	//console.log("Content",window.Content, layout);
+	const btn = new Windows.UI.Xaml.Controls.Button();
+	btn.Content = "Tapp Me";
+	window.Content = btn;
 	console.log(window.Content);
 	window.Activate();
 	console.log("NativeScriptWindowsDemo: layout created");
