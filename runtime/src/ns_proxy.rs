@@ -1570,6 +1570,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
             DeclarationKind::GenericInterface => {
                 let clazz = lock.as_any().downcast_ref::<GenericInterfaceDeclaration>().unwrap();
                 let return_types = crate::helpers::get_generic_return_types(name);
+                let type_args_str: String = return_types.names().join(",");
 
                 for method in clazz.methods() {
                     let signature = method.return_type();
@@ -1587,14 +1588,21 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                     declaration.parent = Some(parent);
                     let declaration = Box::into_raw(Box::new(declaration));
                     let return_type = v8::String::new(scope, return_type).unwrap();
+                    let type_args_v8 = v8::String::new(scope, &type_args_str).unwrap();
                     let ext = v8::External::new(scope, declaration as _);
-                    let data = v8::Array::new_with_elements(scope, &[ext.into(), return_type.into()]);
+                    let data = v8::Array::new_with_elements(scope, &[ext.into(), return_type.into(), type_args_v8.into()]);
 
                     let func = FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                           args: v8::FunctionCallbackArguments,
                                                           mut retval: v8::ReturnValue| {
                         let data = v8::Local::<v8::Array>::try_from(args.data()).unwrap();
                         let return_type = data.get_index(scope, 1).unwrap().to_rust_string_lossy(scope);
+                        let type_args_str = data.get_index(scope, 2).unwrap().to_rust_string_lossy(scope);
+                        let type_args: Vec<String> = if type_args_str.is_empty() {
+                            Vec::new()
+                        } else {
+                            type_args_str.split(',').map(|s| s.to_owned()).collect()
+                        };
                         let dec = unsafe { data.get_index(scope, 0).unwrap().cast::<v8::External>() };
                         let dec = dec.value() as *mut DeclarationFFI;
                         let dec = unsafe { &*dec };
@@ -1604,7 +1612,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let parent = parent.read();
                         let parent = parent.as_any().downcast_ref::<GenericInterfaceDeclaration>().unwrap();
                         let mut method = GenericMethodCall::new(
-                            parent, method, method.is_sealed(), dec.instance.clone().unwrap(), false, return_type,
+                            parent, method, method.is_sealed(), dec.instance.clone().unwrap(), false, return_type, type_args,
                         );
                         let (ret, result) = method.call(scope, &args);
                         if ret.is_err() {
@@ -1743,16 +1751,12 @@ pub(crate) fn create_ns_ctor_object<'a>(
                         Ok(activation_factory) => {
                             match unsafe { activation_factory.ActivateInstance() } {
                                 Ok(instance) => {
-                                    let result = match instance.cast::<IUnknown>() {
-                                        Ok(value) => value,
-                                        Err(error) => {
-                                            throw_js_error(scope, &format!(
-                                                "Failed to cast activated instance for {}: {}",
-                                                clazz.full_name(), error.message()
-                                            ));
-                                            return;
-                                        }
-                                    };
+                                    // Upcast IInspectable -> IUnknown WITHOUT QI.
+                                    // For WinRT composable XAML types, QI(IUnknown) returns a
+                                    // different identity pointer with a shorter vtable. Passing
+                                    // that pointer where IUIElement* is expected causes a crash
+                                    // when XAML later calls UIElement vtable slots on it.
+                                    let result: IUnknown = instance.into();
 
                                     if let Ok(init) = result.cast::<IInitializeWithWindow>() {
                                         let hwnd = unsafe { GetConsoleWindow() };
@@ -1790,24 +1794,11 @@ pub(crate) fn create_ns_ctor_object<'a>(
                         let (ret, result) = method.call(scope, &args);
 
                         if ret.is_ok() {
+                            // Wrap the raw result pointer as-is — do NOT QI to IUnknown identity.
+                            // Same reasoning as the zero-arg path: QI(IUnknown) on a composable
+                            // XAML type returns a shorter-vtable identity pointer that crashes
+                            // when XAML calls UIElement vtable slots on the stored object.
                             let result = IUnknown::from_raw(result);
-                            let vtable = result.vtable();
-                            let mut ret: *mut c_void = std::ptr::null_mut();
-                            let res = unsafe {
-                                ((*vtable).QueryInterface)(
-                                    result.as_raw(), &IUnknown::IID, std::mem::transmute(&mut ret),
-                                )
-                            };
-
-                            if res.is_err() || ret.is_null() {
-                                let message = res.message().to_string();
-                                let message = v8::String::new(scope, message.as_str()).unwrap();
-                                let error = v8::Exception::error(scope, message.into());
-                                scope.throw_exception(error);
-                                return;
-                            }
-
-                            let result = IUnknown::from_raw(ret);
 
                             if let Ok(init) = result.cast::<IInitializeWithWindow>() {
                                 let hwnd = unsafe { GetConsoleWindow() };

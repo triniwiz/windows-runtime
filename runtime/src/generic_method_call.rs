@@ -2,14 +2,19 @@ use std::ffi::c_void;
 use libffi::middle::*;
 use windows::core::{GUID, HRESULT, Interface, IUnknown};
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
+use metadata::declarations::class_declaration::ClassDeclaration;
+use metadata::declarations::declaration::DeclarationKind;
 use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
+use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
+use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::declarations::method_declaration::MethodDeclaration;
 use metadata::declarations::parameter_declaration::ParameterDeclaration;
 use metadata::declaring_interface_for_method::Metadata;
+use metadata::meta_data_reader::MetadataReader;
 use metadata::signature::Signature;
 use crate::error::AnyError;
 use crate::helpers::ffi_native_type_from_signature;
-use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue};
+use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_query_interface_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue};
 
 pub struct GenericMethodCall {
     index: usize,
@@ -26,6 +31,8 @@ pub struct GenericMethodCall {
     parse_parameter_types: Vec<NativeType>,
     parameters: Vec<ParameterDeclaration>,
     return_type: String,
+    /// Pre-computed interface IIDs for pointer-typed parameters (one per parse param, None if no QI needed).
+    parameter_arg_iids: Vec<Option<GUID>>,
     /// Scratch buffer for value-type returns (same role as in MethodCall).
     return_value_buf: [u8; 128],
 }
@@ -52,6 +59,7 @@ impl GenericMethodCall {
         interface: IUnknown,
         is_initializer: bool,
         return_type: String,
+        type_args: Vec<String>,
     ) -> Self {
         let number_of_parameters = method.number_of_parameters();
 
@@ -95,6 +103,7 @@ impl GenericMethodCall {
 
         let mut parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters + other_params + 4);
         let mut parse_parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters);
+        let mut parameter_arg_iids: Vec<Option<GUID>> = Vec::with_capacity(number_of_parameters);
         parameter_types.push(NativeType::Pointer);
 
         for parameter in method.parameters().iter() {
@@ -105,7 +114,44 @@ impl GenericMethodCall {
 
             let parse_native_type = NativeType::try_from(signature.as_str());
             assert!(parse_native_type.is_ok());
-            parse_parameter_types.push(parse_native_type.unwrap());
+            let parse_native_type = parse_native_type.unwrap();
+
+            // For pointer params, resolve the concrete type (substituting Var!N) to its interface IID.
+            let arg_iid = if matches!(parse_native_type, NativeType::Pointer) {
+                let concrete_type = if signature.starts_with("Var!") {
+                    signature["Var!".len()..]
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|idx| type_args.get(idx))
+                        .map(|s| s.as_str().to_owned())
+                } else if signature.contains('.') {
+                    Some(signature.clone())
+                } else {
+                    None
+                };
+                concrete_type.and_then(|type_name| {
+                    let lookup = crate::helpers::strip_generic_suffix(&type_name);
+                    MetadataReader::find_by_name(lookup).and_then(|decl| {
+                        let lock = decl.read();
+                        match lock.kind() {
+                            DeclarationKind::Interface => lock
+                                .as_any().downcast_ref::<InterfaceDeclaration>().map(|i| i.id()),
+                            DeclarationKind::GenericInterface => lock
+                                .as_any().downcast_ref::<GenericInterfaceDeclaration>().map(|i| i.id()),
+                            DeclarationKind::GenericInterfaceInstance => lock
+                                .as_any().downcast_ref::<GenericInterfaceInstanceDeclaration>().map(|i| i.id()),
+                            DeclarationKind::Class => lock
+                                .as_any().downcast_ref::<ClassDeclaration>()
+                                .and_then(|c| c.default_interface()).map(|i| i.id()),
+                            _ => None,
+                        }
+                    })
+                })
+            } else {
+                None
+            };
+            parameter_arg_iids.push(arg_iid);
+            parse_parameter_types.push(parse_native_type);
             let abi_native = ffi_native_type_from_signature(signature.as_str());
             if matches!(abi_native, NativeType::Buffer) {
                 parameter_types.push(NativeType::U32);
@@ -166,6 +212,7 @@ impl GenericMethodCall {
             parse_parameter_types,
             parameters: method.parameters().to_vec(),
             return_type,
+            parameter_arg_iids,
             return_value_buf: [0u8; 128],
         }
     }
@@ -180,6 +227,8 @@ impl GenericMethodCall {
         let mut arguments: Vec<NativeValue> = Vec::with_capacity(number_of_abi_parameters);
         // Track parse-level types for each ABI argument slot.
         let mut argument_parse_types: Vec<Option<NativeType>> = Vec::with_capacity(number_of_abi_parameters);
+        // Keep QI'd interfaces alive for the duration of the FFI call.
+        let mut queried_interfaces: Vec<IUnknown> = Vec::new();
 
         arguments.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
         argument_parse_types.push(None);
@@ -231,7 +280,18 @@ impl GenericMethodCall {
                     ffi_parse_f64_arg(value)
                 }
                 NativeType::Pointer => {
-                    ffi_parse_pointer_arg(scope, value)
+                    if let Some(Some(iid)) = self.parameter_arg_iids.get(i) {
+                        match ffi_parse_query_interface_arg(scope, value, iid) {
+                            Ok((pointer, Some(guard))) => {
+                                queried_interfaces.push(guard);
+                                Ok(pointer)
+                            }
+                            Ok((pointer, None)) => Ok(pointer),
+                            Err(_) => ffi_parse_pointer_arg(scope, value),
+                        }
+                    } else {
+                        ffi_parse_pointer_arg(scope, value)
+                    }
                 }
                 NativeType::Buffer => {
                     let parsed = ffi_parse_buffer_arg_with_length(scope, value);

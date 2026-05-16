@@ -12,11 +12,14 @@ use metadata::declarations::declaration::Declaration;
 use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::declarations::parameter_declaration::ParameterDeclaration;
 use metadata::declarations::property_declaration::PropertyDeclaration;
+use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declaring_interface_for_method::Metadata;
+use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
+use metadata::meta_data_reader::MetadataReader;
 use metadata::signature::Signature;
 use crate::error::AnyError;
 use crate::helpers::ffi_native_type_from_signature;
-use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue};
+use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_query_interface_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue};
 
 pub struct PropertyCall {
     index: usize,
@@ -322,6 +325,8 @@ impl PropertyCall {
         self.argument_buf.clear();
         // Track parse-level types per ABI slot to handle String->Pointer mapping.
         let mut argument_parse_types: Vec<Option<NativeType>> = Vec::with_capacity(self.number_of_abi_parameters);
+        // Keep QI'd interfaces alive for the duration of the FFI call.
+        let mut queried_interfaces: Vec<IUnknown> = Vec::new();
 
         self.argument_buf.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
         argument_parse_types.push(None);
@@ -375,7 +380,58 @@ impl PropertyCall {
                     ffi_parse_f64_arg(value)
                 }
                 NativeType::Pointer => {
-                    ffi_parse_pointer_arg(scope, value)
+                    let parameter = &self.parameters[i];
+                    let parameter_signature = Signature::to_string(
+                        parameter.metadata().unwrap(),
+                        &parameter.type_(),
+                    );
+
+                    if parameter_signature.contains('.') {
+                        let lookup_name = crate::helpers::strip_generic_suffix(parameter_signature.as_str());
+
+                        if let Some(declaration) = MetadataReader::find_by_name(lookup_name) {
+                            let iid = {
+                                let lock = declaration.read();
+                                match lock.kind() {
+                                    DeclarationKind::Interface => lock
+                                        .as_any()
+                                        .downcast_ref::<InterfaceDeclaration>()
+                                        .map(|iface| iface.id()),
+                                    DeclarationKind::GenericInterface => lock
+                                        .as_any()
+                                        .downcast_ref::<GenericInterfaceDeclaration>()
+                                        .map(|iface| iface.id()),
+                                    DeclarationKind::GenericInterfaceInstance => lock
+                                        .as_any()
+                                        .downcast_ref::<GenericInterfaceInstanceDeclaration>()
+                                        .map(|iface| iface.id()),
+                                    DeclarationKind::Class => lock
+                                        .as_any()
+                                        .downcast_ref::<ClassDeclaration>()
+                                        .and_then(|class| class.default_interface())
+                                        .map(|iface| iface.id()),
+                                    _ => None,
+                                }
+                            };
+
+                            if let Some(iid) = iid {
+                                match ffi_parse_query_interface_arg(scope, value, &iid) {
+                                    Ok((pointer, Some(interface_guard))) => {
+                                        queried_interfaces.push(interface_guard);
+                                        Ok(pointer)
+                                    }
+                                    Ok((pointer, None)) => Ok(pointer),
+                                    Err(error) => Err(error),
+                                }
+                            } else {
+                                ffi_parse_pointer_arg(scope, value)
+                            }
+                        } else {
+                            ffi_parse_pointer_arg(scope, value)
+                        }
+                    } else {
+                        ffi_parse_pointer_arg(scope, value)
+                    }
                 }
                 NativeType::Buffer => {
                     let parsed = ffi_parse_buffer_arg_with_length(scope, value);

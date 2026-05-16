@@ -18,7 +18,8 @@ pub struct GenericInterfaceInstanceDeclaration {
     base: InterfaceDeclaration,
     closed_metadata: Option<IMetaDataImport2>,
     closed_token: CorTokenType,
-    full_name: String
+    full_name: String,
+    iid_full_name: String,
 }
 
 impl GenericInterfaceInstanceDeclaration {
@@ -34,16 +35,12 @@ impl GenericInterfaceInstanceDeclaration {
         );
         debug_assert!(closed_token.0 != 0);
 
-
         let mut full_name = String::new();
+        let mut iid_full_name = String::new();
 
         if let Some(metadata) = closed_metadata {
-
             let mut signature = PCCOR_SIGNATURE::default();
-            //let mut signature = [0_u8; MAX_IDENTIFIER_LENGTH];
-            //let signature_ptr = &mut signature;
             let mut signature_size = 0;
-
 
             let result = unsafe {
                 metadata.GetTypeSpecFromToken(
@@ -54,12 +51,10 @@ impl GenericInterfaceInstanceDeclaration {
             };
             debug_assert!(result.is_ok());
             if signature_size > 0 {
-                //let mut signature = PCCOR_SIGNATURE::from_ptr(signature);
-               // let signature = unsafe { std::slice::from_raw_parts(signature, signature_size as usize) };
                 full_name = Signature::to_string(metadata, &signature);
+                iid_full_name = Signature::to_iid_string(metadata, &signature);
             }
         }
-
 
         Self {
             base: InterfaceDeclaration::new_with_kind(
@@ -69,11 +64,13 @@ impl GenericInterfaceInstanceDeclaration {
             ),
             closed_metadata: closed_metadata.map(|f| f.clone()),
             closed_token,
-            full_name
+            full_name,
+            iid_full_name,
         }
     }
+
     pub fn id(&self) -> GUID {
-        return GenericInstanceIdBuilder::generate_id(self);
+        GenericInstanceIdBuilder::generate_id_from_name(&self.iid_full_name)
     }
 }
 

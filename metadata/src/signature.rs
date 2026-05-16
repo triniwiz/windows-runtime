@@ -122,7 +122,7 @@ impl Signature {
         }
     }
 
-    fn get_string(metadata: Option<&IMetaDataImport2>, signature: &PCCOR_SIGNATURE) -> String {
+    fn get_string(metadata: Option<&IMetaDataImport2>, signature: &PCCOR_SIGNATURE, preserve_arity: bool) -> String {
         let mut signature = signature.clone();
 
         let element_type = cor_sig_uncompress_element_type(&mut signature);
@@ -175,7 +175,7 @@ impl Signature {
             }
             ELEMENT_TYPE_OBJECT => "Object".to_string(),
             ELEMENT_TYPE_SZARRAY => {
-                let result = Signature::get_string(metadata, &mut signature);
+                let result = Signature::get_string(metadata, &mut signature, preserve_arity);
                 format!("{}[]", result)
             }
             ELEMENT_TYPE_VAR => {
@@ -191,9 +191,10 @@ impl Signature {
 
                 let mut result = if let Some(metadata_ref) = metadata {
                     let mut name = get_fully_qualified_type_name(metadata_ref, CorTokenType(token as i32));
-                    // Strip generic backtick suffix (e.g. `1, `2) for cleaner output in typings and proxies
-                    if let Some(pos) = name.find('`') {
-                        name.truncate(pos);
+                    if !preserve_arity {
+                        if let Some(pos) = name.find('`') {
+                            name.truncate(pos);
+                        }
                     }
                     name
                 } else {
@@ -206,7 +207,7 @@ impl Signature {
 
                 for i in 0..generic_arguments_count {
                     let mut sig_type = Signature::consume_type(&mut signature);
-                    let data = Signature::get_string(metadata, &mut sig_type);
+                    let data = Signature::get_string(metadata, &mut sig_type, preserve_arity);
 
                     result += data.as_ref();
                     if i != generic_arguments_count.saturating_sub(1) {
@@ -220,7 +221,7 @@ impl Signature {
             }
             ELEMENT_TYPE_BYREF => {
                 let mut result = "ByRef ".to_string();
-                result += Signature::get_string(metadata, &mut signature).as_ref();
+                result += Signature::get_string(metadata, &mut signature, preserve_arity).as_ref();
                 result
             }
             _ => {
@@ -230,11 +231,16 @@ impl Signature {
     }
 
     pub fn to_string(metadata: &IMetaDataImport2, signature: &PCCOR_SIGNATURE) -> String {
-        Signature::get_string(Some(metadata), signature)
+        Signature::get_string(Some(metadata), signature, false)
+    }
+
+    /// Like `to_string` but keeps backtick+arity on generic names — required by `RoParseTypeName`.
+    pub fn to_iid_string(metadata: &IMetaDataImport2, signature: &PCCOR_SIGNATURE) -> String {
+        Signature::get_string(Some(metadata), signature, true)
     }
 
     pub fn as_string(signature: &PCCOR_SIGNATURE) -> String {
-        Signature::get_string(None, signature)
+        Signature::get_string(None, signature, false)
     }
 
     pub fn get_signature_element_type(signature: &PCCOR_SIGNATURE) -> CorElementType {

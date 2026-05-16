@@ -7,6 +7,7 @@ use windows::core::{GUID, HRESULT, Interface, IUnknown, HSTRING, IInspectable};
 use windows::Win32::System::WinRT::IActivationFactory;
 use windows::Win32::System::WinRT::Metadata::CorTokenType;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
+use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration::DeclarationKind;
 use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
 use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
@@ -484,6 +485,11 @@ impl MethodCall {
                                         .as_any()
                                         .downcast_ref::<GenericInterfaceInstanceDeclaration>()
                                         .map(|interface| interface.id()),
+                                    DeclarationKind::Class => lock
+                                        .as_any()
+                                        .downcast_ref::<ClassDeclaration>()
+                                        .and_then(|class| class.default_interface())
+                                        .map(|iface| iface.id()),
                                     _ => None,
                                 }
                             };
@@ -495,7 +501,7 @@ impl MethodCall {
                                         Ok(pointer)
                                     }
                                     Ok((pointer, None)) => Ok(pointer),
-                                    Err(error) => Err(error),
+                                    Err(_) => ffi_parse_pointer_arg(scope, value),
                                 }
                             } else {
                                 ffi_parse_pointer_arg(scope, value)
@@ -599,7 +605,6 @@ impl MethodCall {
         // crashes caused by calling the wrong vtable slot.
         let call_args = crate::ffi::build_call_args(&prep, &self.argument_buf, &argument_parse_types);
         let ret = unsafe { self.cif.call(CodePtr::from_ptr(func_to_call), &call_args) };
-
 
         if is_initializer && !is_sealed && result.is_null() {
             if !composition_inner.is_null() {

@@ -4122,6 +4122,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                 let Some(clazz) = lock.as_any().downcast_ref::<GenericInterfaceDeclaration>() else { return v8::undefined(scope).into(); };
 
                 let return_types = helpers::get_generic_return_types(name);
+                let type_args_str: String = return_types.names().join(",");
 
                 for method in clazz.methods() {
                     let signature = method.return_type();
@@ -4158,10 +4159,11 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     let declaration = Box::into_raw(Box::new(declaration));
 
                     let Some(return_type) = v8::String::new(scope, return_type) else { continue; };
+                    let Some(type_args_v8) = v8::String::new(scope, &type_args_str) else { continue; };
 
                     let ext = v8::External::new(scope, declaration as _);
 
-                    let data = v8::Array::new_with_elements(scope, &[ext.into(), return_type.into()]);
+                    let data = v8::Array::new_with_elements(scope, &[ext.into(), return_type.into(), type_args_v8.into()]);
 
                     let func = FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                           args: v8::FunctionCallbackArguments,
@@ -4170,6 +4172,13 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                         let Some(return_type_val) = data.get_index(scope, 1) else { return; };
                         let return_type = return_type_val.to_rust_string_lossy(scope);
+
+                        let type_args_str = data.get_index(scope, 2).map(|v| v.to_rust_string_lossy(scope)).unwrap_or_default();
+                        let type_args: Vec<String> = if type_args_str.is_empty() {
+                            Vec::new()
+                        } else {
+                            type_args_str.split(',').map(|s| s.to_owned()).collect()
+                        };
 
                         let Some(dec_val) = data.get_index(scope, 0) else { return; };
                         let dec = unsafe { dec_val.cast::<v8::External>() };
@@ -4188,7 +4197,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                         let Some(ns_instance) = dec.instance.clone() else { return; };
                         let mut method = GenericMethodCall::new(
-                            parent, method, method.is_sealed(), ns_instance, false, return_type,
+                            parent, method, method.is_sealed(), ns_instance, false, return_type, type_args,
                         );
 
                         let (ret, result) = method.call(scope, &args);
@@ -6443,7 +6452,12 @@ impl Runtime {
 
     pub fn run_script(&mut self, script: &str, filename: &str) {
         // Delegate ESM bundles to the native V8 module loader.
-        if script.contains("import ") || script.contains("export ") {
+        let is_esm = filename.ends_with(".mjs")
+            || {
+                let trimmed = script.trim_start();
+                trimmed.starts_with("import ") || trimmed.starts_with("export ")
+            };
+        if is_esm {
             self.run_module(script, filename);
             return;
         }

@@ -208,22 +208,14 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
 }
 
 impl GenericInstanceIdBuilder {
-    pub fn generate_id(declaration: &dyn Declaration) -> GUID {
-        let declaration_full_name = declaration.full_name().to_string();
-
-        let type_name = HSTRING::from(declaration_full_name.clone());
+    pub fn generate_id_from_name(iid_name: &str) -> GUID {
+        let type_name = HSTRING::from(iid_name);
         let mut parts_count = 0_u32;
         let mut type_name_parts = std::ptr::null_mut();
 
         let parse_result = unsafe { RoParseTypeName(&type_name, &mut parts_count, addr_of_mut!(type_name_parts)) };
 
-        if !parse_result.is_ok() {
-            eprintln!("[GenericInstanceIdBuilder] RoParseTypeName failed for '{}': {:?}", declaration_full_name, parse_result);
-            return GUID::zeroed();
-        }
-
-        if parts_count == 0 || type_name_parts.is_null() {
-            // Nothing to parse — return zero GUID.
+        if !parse_result.is_ok() || parts_count == 0 || type_name_parts.is_null() {
             return GUID::zeroed();
         }
 
@@ -238,16 +230,10 @@ impl GenericInstanceIdBuilder {
         let mut guid = GUID::zeroed();
 
         let locator = IRoMetaDataLocatorImpl {};
-
         let locator = IRoMetaDataLocator::new(&locator);
 
         let result = unsafe { RoGetParameterizedTypeInstanceIID(buf.as_slice(), &*locator, &mut guid, None) };
 
-        if !result.is_ok() {
-            eprintln!("[GenericInstanceIdBuilder] RoGetParameterizedTypeInstanceIID failed for '{}': {:?}", declaration_full_name, result);
-            return GUID::zeroed();
-        }
-
-        guid
+        if result.is_ok() { guid } else { GUID::zeroed() }
     }
 }

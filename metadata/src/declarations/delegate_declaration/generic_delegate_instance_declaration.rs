@@ -17,6 +17,7 @@ pub struct GenericDelegateInstanceDeclaration {
     closed_token: CorTokenType,
     closed_metadata: Option<IMetaDataImport2>,
     full_name: String,
+    iid_full_name: String,
 }
 
 impl GenericDelegateInstanceDeclaration {
@@ -30,8 +31,8 @@ impl GenericDelegateInstanceDeclaration {
         assert_eq!(type_from_token(closed_token), mdtTypeSpec.0);
         assert_ne!(closed_token.0, 0);
 
-        let full_name = match closed_metadata {
-            None => String::new(),
+        let (full_name, iid_full_name) = match closed_metadata {
+            None => (String::new(), String::new()),
             Some(metadata) => {
                 let mut signature = PCCOR_SIGNATURE::default();
                 let mut signature_size = 0;
@@ -43,7 +44,10 @@ impl GenericDelegateInstanceDeclaration {
                     )
                 };
                 assert!(result.is_ok());
-                Signature::to_string(metadata, &signature)
+                (
+                    Signature::to_string(metadata, &signature),
+                    Signature::to_iid_string(metadata, &signature),
+                )
             }
         };
 
@@ -56,6 +60,7 @@ impl GenericDelegateInstanceDeclaration {
             closed_token,
             closed_metadata: closed_metadata.map(|f| f.clone()),
             full_name,
+            iid_full_name,
         }
     }
 }
@@ -96,7 +101,7 @@ impl DelegateDeclarationImpl for GenericDelegateInstanceDeclaration {
     }
 
     fn id(&self) -> GUID {
-        GenericInstanceIdBuilder::generate_id(self)
+        GenericInstanceIdBuilder::generate_id_from_name(&self.iid_full_name)
     }
 
     fn invoke_method<'b>(&self) -> &MethodDeclaration {
