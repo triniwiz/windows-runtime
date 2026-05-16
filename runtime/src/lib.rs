@@ -1,14 +1,12 @@
-mod converter;
 mod value;
 mod interop;
 mod method_call;
 mod property_call;
 mod error;
-mod structure;
 mod globals;
 mod generic_method_call;
 mod helpers;
-mod class;
+mod ffi;
 mod name_space;
 mod proxy_manifest_loader;
 mod message_port;
@@ -96,6 +94,103 @@ thread_local!(static ESM_HASH_TO_PATH: RefCell<HashMap<i32, String>> = RefCell::
 // arrays when a constructor build recursively triggers building the same
 // constructor (observed as a V8 internal DescriptorArray append failure).
 thread_local!(static CREATING_CTORS: RefCell<AHashSet<String>> = RefCell::new(AHashSet::new()));
+
+/// Stores the most recent JS error (message + stack trace) captured during
+/// script execution or V8 callbacks. Retrieved by `get_last_js_error()`.
+thread_local!(pub static LAST_JS_ERROR: RefCell<Option<String>> = RefCell::new(None));
+
+/// Store a JS error string so it can be retrieved via the FFI.
+pub fn store_last_js_error(error: String) {
+    LAST_JS_ERROR.with(|e| { *e.borrow_mut() = Some(error); });
+}
+
+/// Retrieve (and clear) the last stored JS error.
+pub fn get_last_js_error() -> Option<String> {
+    LAST_JS_ERROR.with(|e| e.borrow_mut().take())
+}
+
+/// Test helper: call Windows.Data.Json.JsonValue::CreateStringValue via the
+/// typed `windows` crate and return the raw (leaked) IInspectable pointer.
+pub fn diag_direct_create_string_value(s: &str) -> *mut std::ffi::c_void {
+    use windows::Data::Json::JsonValue;
+    let h = HSTRING::from(s);
+    match JsonValue::CreateStringValue(&h) {
+        Ok(jv) => {
+            let raw = jv.as_raw();
+            std::mem::forget(jv);
+            raw as *mut std::ffi::c_void
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Diagnostic helper: call Windows.Data.Json.JsonValue::CreateStringValue
+/// via the runtime's libffi preparation path and return the created string.
+pub fn diag_libffi_create_string_value_via_runtime(s: &str) -> Option<String> {
+    use libffi::middle::{Cif, Type, Arg, CodePtr};
+    use std::mem::ManuallyDrop;
+    use windows::Data::Json::{IJsonValueStatics, IJsonValue};
+    use windows::Win32::System::WinRT::{RoGetActivationFactory, RoInitialize, RO_INIT_MULTITHREADED};
+    use windows::core::IUnknown;
+    use crate::value::{NativeValue, NativeType};
+
+    unsafe {
+        let _ = RoInitialize(RO_INIT_MULTITHREADED);
+
+        let class_name: HSTRING = HSTRING::from("Windows.Data.Json.JsonValue");
+        let statics = RoGetActivationFactory::<IJsonValueStatics>(&class_name).ok()?;
+        let statics_ptr: *mut c_void = statics.as_raw() as *mut c_void;
+        let vtable_ptr_ptr: *mut *mut c_void = std::mem::transmute(statics_ptr);
+        let vtable_ptr = *vtable_ptr_ptr as *mut *mut c_void;
+
+        // CreateStringValue is at vtable slot 10 for IJsonValueStatics.
+        let create_str_off = 10isize;
+        let func_ptr = *vtable_ptr.offset(create_str_off) as *const c_void;
+
+        // Build argument buffer matching the runtime calling convention.
+        let mut argument_buf: Vec<NativeValue> = Vec::new();
+        let mut argument_parse_types: Vec<Option<NativeType>> = Vec::new();
+
+        // `this` pointer
+        argument_buf.push(NativeValue { pointer: statics.as_raw() as *mut c_void });
+        argument_parse_types.push(None);
+
+        // HSTRING argument (stored as ManuallyDrop inside NativeValue)
+        let h = HSTRING::from(s);
+        argument_buf.push(NativeValue { string: ManuallyDrop::new(h.clone()) });
+        argument_parse_types.push(Some(NativeType::String));
+
+        // out-param for result
+        let mut result: *mut c_void = std::ptr::null_mut();
+        argument_buf.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
+        argument_parse_types.push(None);
+
+        let parameter_types = vec![NativeType::Pointer, NativeType::String, NativeType::Pointer];
+
+        // Use runtime helpers to prepare stable HSTRING storage and build args.
+        let mut prep = match crate::ffi::prepare_string_storage(&argument_buf, &parameter_types, &argument_parse_types) {
+            Ok(p) => p,
+            Err(_) => return None,
+        };
+
+        let call_args = crate::ffi::build_call_args(&prep, &argument_buf, &argument_parse_types);
+
+        let cif = Cif::new(vec![Type::usize(), Type::usize(), Type::usize()], Type::i32());
+
+        // Perform the libffi call.
+        let _ret: i32 = cif.call(CodePtr::from_ptr(func_ptr), &call_args);
+
+        if result.is_null() {
+            return None;
+        }
+
+        // Convert result pointer to IJsonValue and read the string.
+        let unknown = IUnknown::from_raw(result);
+        let ijv: IJsonValue = unknown.cast::<IJsonValue>().ok()?;
+        let h_res = ijv.GetString().ok()?;
+        Some(h_res.to_string())
+    }
+}
 
 pub struct Runtime {
     isolate: v8::OwnedIsolate,
@@ -425,7 +520,9 @@ fn find_event_methods(class_declaration: &ClassDeclaration, name: &str) -> Optio
 }
 
 fn runtime_method_metadata_from_method(method: &MethodDeclaration) -> RuntimeMethodMetadata {
-    let return_type = Signature::to_string(method.metadata().unwrap(), &method.return_type());
+    let return_type = method.metadata()
+        .map(|m| Signature::to_string(m, &method.return_type()))
+        .unwrap_or_default();
     let parameters = method
         .parameters()
         .iter()
@@ -452,10 +549,9 @@ fn runtime_method_metadata_from_method(method: &MethodDeclaration) -> RuntimeMet
 }
 
 fn runtime_property_metadata_from_property(property: &PropertyDeclaration) -> RuntimePropertyMetadata {
-    let prop_type = Signature::to_string(
-        property.getter().metadata().unwrap(),
-        &property.getter().return_type(),
-    );
+    let prop_type = property.getter().metadata()
+        .map(|m| Signature::to_string(m, &property.getter().return_type()))
+        .unwrap_or_else(|| "Object".to_string());
 
     RuntimePropertyMetadata {
         name: property.name().to_string(),
@@ -616,6 +712,7 @@ fn init_global(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, conte
 }
 
 pub fn debug_output(msg: &str) {
+    // NOTE: enable DIAG messages during test debugging.
     // Send UTF-16 string to debugger for reliable Unicode output
     let mut wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe { OutputDebugStringW(PCWSTR::from_raw(wide.as_ptr())) };
@@ -785,30 +882,11 @@ fn handle_host_wait_for_async(
         0
     };
 
-    match try_get_async_status(scope, op_value) {
-        Ok(0) => {}
-        Ok(_) => { retval.set(op_value); return; }
-        Err(msg) => { throw_js_error(scope, msg.as_str()); return; }
-    }
-
-    let deadline = if timeout_ms == 0 {
-        None
-    } else {
-        Some(Instant::now() + Duration::from_millis(timeout_ms))
-    };
+    let deadline = if timeout_ms == 0 { None } else { Some(Instant::now() + Duration::from_millis(timeout_ms)) };
 
     let mut message = MSG::default();
-    loop {
-        if let Some(deadline) = deadline {
-            if Instant::now() >= deadline {
-                throw_js_error(
-                    scope,
-                    format!("Timed out waiting for WinRT async operation after {timeout_ms}ms").as_str(),
-                );
-                return;
-            }
-        }
 
+    loop {
         match try_get_async_status(scope, op_value) {
             Ok(0) => {
                 while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.into() {
@@ -833,8 +911,15 @@ fn handle_host_wait_for_async(
                 return;
             }
         }
+
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                throw_js_error(scope, format!("Timed out waiting for WinRT async operation after {timeout_ms}ms").as_str());
+                return;
+            }
+        }
     }
-}
+    }
 
 fn handle_enqueue_microtask(
     scope: &mut v8::PinScope<'_, '_>,
@@ -2803,10 +2888,10 @@ fn init_async_helpers(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>
 }
 
 fn create_ns_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, scope: &mut v8::PinScope<'a, '_>) -> Local<'a, v8::Value> {
-    
-    let name = v8::String::new(scope, name).unwrap();
+
+    let Some(name_str) = v8::String::new(scope, name) else { return v8::undefined(scope).into(); };
     let tmpl = FunctionTemplate::new(scope, handle_ns_func);
-    tmpl.set_class_name(name);
+    tmpl.set_class_name(name_str);
     let object_tmpl = tmpl.instance_template(scope);
     object_tmpl.set_named_property_handler(
         v8::NamedPropertyHandlerConfiguration::new()
@@ -2816,7 +2901,7 @@ fn create_ns_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, s
     );
     object_tmpl.set_internal_field_count(2);
 
-    let object = object_tmpl.new_instance(scope).unwrap();
+    let Some(object) = object_tmpl.new_instance(scope) else { return v8::undefined(scope).into(); };
     let declaration = Box::new(DeclarationFFI::new(declaration));
     let ext = v8::External::new(scope, Box::into_raw(declaration) as _);
     object.set_internal_field(0, ext.into());
@@ -2908,7 +2993,8 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
     let tmpl = FunctionTemplate::new(scope, handle_ns_func);
     let object_tmpl = tmpl.instance_template(scope);
 
-    object_tmpl.set_internal_field_count(1);
+    // Two internal fields: [0] = DeclarationFFI external, [1] = per-instance side store (Map)
+    object_tmpl.set_internal_field_count(2);
 
     let declaration_ffi = Box::into_raw(Box::new(DeclarationFFI::new_with_instance(declaration.clone(), instance.clone())));
     let ext = v8::External::new(scope, declaration_ffi as _);
@@ -2929,9 +3015,26 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     rv.set(value.into());
                     return v8::Intercepted::kYes;
                 }
-                let dec = unsafe { args.data().cast::<v8::External>() };
-                let dec = dec.value() as *mut DeclarationFFI;
-                let dec = unsafe { &*dec };
+                // Prefer the DeclarationFFI stored on the instance (holder internal field[0]).
+                // If the holder doesn't have the internal field (e.g. the property
+                // lives on the prototype), prefer the `this` object's internal
+                // DeclarationFFI when available. Fall back to the callback data
+                // otherwise.
+                let holder = args.holder();
+                let dec_field_opt = holder.get_internal_field(scope, 0);
+                let dec = if let Some(dec_field) = dec_field_opt {
+                    let dec_ext = unsafe { dec_field.cast::<v8::External>() };
+                    let dec_ptr = dec_ext.value() as *mut DeclarationFFI;
+                    unsafe { &*dec_ptr }
+                } else {
+                    // If the holder doesn't have the DeclarationFFI, fall back
+                    // to the callback data. (Avoid using `args.this()` here to
+                    // remain compatible with the v8 bindings available.)
+                    let dec_ext = unsafe { args.data().cast::<v8::External>() };
+                    let dec_ptr = dec_ext.value() as *mut DeclarationFFI;
+                    unsafe { &*dec_ptr }
+                };
+
                 let lock = dec.read();
 
                 let Some(clazz) = lock.as_any().downcast_ref::<ClassDeclaration>() else {
@@ -2939,29 +3042,28 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                 };
 
                 // If a JS-assigned override exists in the per-instance store, return it.
-                let this = args.holder();
-                let Some(store_field) = this.get_internal_field(scope, 1) else { return v8::Intercepted::kNo };
-                let store = unsafe { store_field.cast::<v8::Map>() };
-                if let Some(cache) = store.get(scope, key.into()) {
-                    if !cache.is_null_or_undefined() {
-                        rv.set(cache);
-                        return v8::Intercepted::kYes;
+                // Use the holder (where the property was found) to access the side-store map.
+                let this = holder;
+                let store_field_opt = this.get_internal_field(scope, 1);
+                if let Some(store_field) = store_field_opt {
+                    let store = unsafe { store_field.cast::<v8::Map>() };
+                    if let Some(cache) = store.get(scope, key.into()) {
+                        if !cache.is_null_or_undefined() {
+                            rv.set(cache);
+                            return v8::Intercepted::kYes;
+                        }
                     }
                 }
 
-                
-
-                
-
                 if let Some(property) = find_class_property(clazz, &name) {
-                    let Some(mut property_call) = PropertyCall::new(&property, false, dec.instance.clone().unwrap(), false) else {
+                    let Some(ns_instance) = dec.instance.clone() else { return v8::Intercepted::kNo; };
+                    let Some(mut property_call) = PropertyCall::new(&property, false, ns_instance, false) else {
                         return v8::Intercepted::kNo;
                     };
                     let (ret, result) = property_call.call_with_values(scope, &[]);
 
                     if ret.is_err() {
                         let detail = format!("Property get '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
-                        debug_output(&format!("[NativeScript] {}\n", detail));
                         let message = v8::String::new(scope, &detail).unwrap();
                         let error = v8::Exception::error(scope, message);
                         scope.throw_exception(error);
@@ -3004,8 +3106,9 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let dec = dec.value() as *mut DeclarationFFI;
                         let dec = unsafe { &*dec };
                         let lock = dec.read();
-                        let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
-                        let mut method = MethodCall::new(method, method.is_sealed(), dec.instance.clone().unwrap(), false);
+                        let Some(method) = lock.as_any().downcast_ref::<MethodDeclaration>() else { return; };
+                        let Some(ns_instance) = dec.instance.clone() else { return; };
+                        let mut method = MethodCall::new(method, method.is_sealed(), ns_instance, false);
                         let (ret, result) = method.call(scope, &args);
 
                         if ret.is_err() {
@@ -3070,13 +3173,13 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         return v8::Intercepted::kNo;
                     }
 
-                    let Some(mut property_call) = PropertyCall::new(&property, true, dec.instance.clone().unwrap(), false) else {
+                    let Some(ns_instance) = dec.instance.clone() else { return v8::Intercepted::kNo; };
+                    let Some(mut property_call) = PropertyCall::new(&property, true, ns_instance, false) else {
                         return v8::Intercepted::kNo;
                     };
                     let (ret, _) = property_call.call_with_values(scope, &[val]);
                     if ret.is_err() {
                         let detail = format!("Property set '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
-                        debug_output(&format!("[NativeScript] {}\n", detail));
                         let message = v8::String::new(scope, &detail).unwrap();
                         let error = v8::Exception::error(scope, message);
                         scope.throw_exception(error);
@@ -3136,7 +3239,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
         match kind {
             DeclarationKind::Class => {
-                let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
+                let Some(clazz) = lock.as_any().downcast_ref::<ClassDeclaration>() else { return v8::undefined(scope).into(); };
                 let class_methods = collect_class_methods(clazz);
                 let class_properties = collect_class_properties(clazz);
                 let mut seen_member_names: AHashSet<String> = AHashSet::new();
@@ -3205,11 +3308,12 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                         let lock = dec.read();
 
-                        let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
+                        let Some(method) = lock.as_any().downcast_ref::<MethodDeclaration>() else { return; };
 
                         let _nam = method.name();
+                        let Some(ns_instance) = dec.instance.clone() else { return; };
                         let mut method = MethodCall::new(
-                            method, method.is_sealed(), dec.instance.clone().unwrap(), false,
+                            method, method.is_sealed(), ns_instance, false,
                         );
 
                         let (ret, result) = method.call(scope, &args);
@@ -3308,10 +3412,11 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                         let lock = dec.read();
 
-                        let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
+                        let Some(method) = lock.as_any().downcast_ref::<PropertyDeclaration>() else { return; };
 
+                        let Some(ns_instance) = dec.instance.clone() else { return; };
                         let Some(mut method) = PropertyCall::new(
-                            method, false, dec.instance.clone().unwrap(), false,
+                            method, false, ns_instance, false,
                         ) else { return; };
 
                         let (ret, result) = method.call(scope, &args);
@@ -3366,8 +3471,9 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             let dec = dec.value() as *mut DeclarationFFI;
                             let dec = unsafe { &*dec };
                             let lock = dec.read();
-                            let prop = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
-                            let Some(mut method) = PropertyCall::new(prop, true, dec.instance.clone().unwrap(), false) else { return; };
+                            let Some(prop) = lock.as_any().downcast_ref::<PropertyDeclaration>() else { return; };
+                            let Some(ns_instance) = dec.instance.clone() else { return; };
+                            let Some(mut method) = PropertyCall::new(prop, true, ns_instance, false) else { return; };
                             let (ret, _) = method.call(scope, &args);
                             if ret.is_err() {
                                 let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
@@ -3396,9 +3502,18 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
             | DeclarationKind::GenericInterfaceInstance => {
                 // SAFETY: outer match arm filtered to exactly these three kinds.
                 let clazz: &dyn BaseClassDeclarationImpl = match kind {
-                    DeclarationKind::Interface => lock.as_any().downcast_ref::<InterfaceDeclaration>().unwrap(),
-                    DeclarationKind::GenericInterface => lock.as_any().downcast_ref::<GenericInterfaceDeclaration>().unwrap(),
-                    DeclarationKind::GenericInterfaceInstance => lock.as_any().downcast_ref::<GenericInterfaceInstanceDeclaration>().unwrap(),
+                    DeclarationKind::Interface => match lock.as_any().downcast_ref::<InterfaceDeclaration>() {
+                        Some(d) => d,
+                        None => return v8::undefined(scope).into(),
+                    },
+                    DeclarationKind::GenericInterface => match lock.as_any().downcast_ref::<GenericInterfaceDeclaration>() {
+                        Some(d) => d,
+                        None => return v8::undefined(scope).into(),
+                    },
+                    DeclarationKind::GenericInterfaceInstance => match lock.as_any().downcast_ref::<GenericInterfaceInstanceDeclaration>() {
+                        Some(d) => d,
+                        None => return v8::undefined(scope).into(),
+                    },
                     _ => unsafe { std::hint::unreachable_unchecked() },
                 };
 
@@ -3420,7 +3535,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                     match kind {
                         DeclarationKind::Class => {
-                            let clazz = clazz.as_any().downcast_ref::<ClassDeclaration>().unwrap();
+                            if let Some(clazz) = clazz.as_any().downcast_ref::<ClassDeclaration>() {
 
                             for method in clazz.methods().iter() {
                                 let name = v8::String::new(scope, method.name());
@@ -3450,10 +3565,11 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                                     let lock = dec.read();
 
-                                    let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
+                                    let Some(method) = lock.as_any().downcast_ref::<MethodDeclaration>() else { return; };
 
+                                    let Some(ns_instance) = dec.instance.clone() else { return; };
                                     let mut method = MethodCall::new(
-                                        method, method.is_sealed(), dec.instance.clone().unwrap(), false,
+                                        method, method.is_sealed(), ns_instance, false,
                                     );
 
                                     let (ret, result) = method.call(scope, &args);
@@ -3521,10 +3637,11 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                                     let _kind = lock.kind();
 
-                                    let property = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
+                                    let Some(property) = lock.as_any().downcast_ref::<PropertyDeclaration>() else { return; };
 
+                                    let Some(ns_instance) = dec.instance.clone() else { return; };
                                     let mut method = MethodCall::new(
-                                        property.getter(), false, dec.instance.clone().unwrap(), false,
+                                        property.getter(), false, ns_instance, false,
                                     );
 
 
@@ -3578,17 +3695,18 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     proto.set_accessor_property(name.into(), Some(getter), setter, v8::PropertyAttribute::READ_ONLY | v8::PropertyAttribute::DONT_DELETE);
                                 }
                             }
+                            } // end if let Some(clazz) = downcast ClassDeclaration
                         }
                         DeclarationKind::Interface
                         | DeclarationKind::GenericInterface
                         | DeclarationKind::GenericInterfaceInstance => {
-                            // SAFETY: outer match arm filtered to exactly these three kinds.
-                            let clazz: &dyn BaseClassDeclarationImpl = match kind {
-                                DeclarationKind::Interface => clazz.as_any().downcast_ref::<InterfaceDeclaration>().unwrap(),
-                                DeclarationKind::GenericInterface => clazz.as_any().downcast_ref::<GenericInterfaceDeclaration>().unwrap(),
-                                DeclarationKind::GenericInterfaceInstance => clazz.as_any().downcast_ref::<GenericInterfaceInstanceDeclaration>().unwrap(),
-                                _ => unsafe { std::hint::unreachable_unchecked() },
+                            let clazz_opt: Option<&dyn BaseClassDeclarationImpl> = match kind {
+                                DeclarationKind::Interface => clazz.as_any().downcast_ref::<InterfaceDeclaration>().map(|d| d as _),
+                                DeclarationKind::GenericInterface => clazz.as_any().downcast_ref::<GenericInterfaceDeclaration>().map(|d| d as _),
+                                DeclarationKind::GenericInterfaceInstance => clazz.as_any().downcast_ref::<GenericInterfaceInstanceDeclaration>().map(|d| d as _),
+                                _ => None,
                             };
+                            if let Some(clazz) = clazz_opt {
 
                             for method in clazz.methods().iter() {
                                 let name = v8::String::new(scope, method.name());
@@ -3618,10 +3736,11 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                                     let lock = dec.read();
 
-                                    let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
+                                    let Some(method) = lock.as_any().downcast_ref::<MethodDeclaration>() else { return; };
 
+                                    let Some(ns_instance) = dec.instance.clone() else { return; };
                                     let mut method = MethodCall::new(
-                                        method, method.is_sealed(), dec.instance.clone().unwrap(), false,
+                                        method, method.is_sealed(), ns_instance, false,
                                     );
 
                                     let (ret, result) = method.call(scope, &args);
@@ -3690,10 +3809,11 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                                     let _kind = lock.kind();
 
-                                    let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
+                                    let Some(method) = lock.as_any().downcast_ref::<PropertyDeclaration>() else { return; };
 
+                                    let Some(ns_instance) = dec.instance.clone() else { return; };
                                     let Some(mut method) = PropertyCall::new(
-                                        method, false, dec.instance.clone().unwrap(), false,
+                                        method, false, ns_instance, false,
                                     ) else { return; };
 
 
@@ -3747,6 +3867,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     proto.set_accessor_property(name.into(), Some(getter), setter, v8::PropertyAttribute::READ_ONLY | v8::PropertyAttribute::DONT_DELETE);
                                 }
                             }
+                            } // end if let Some(clazz) = clazz_opt
                         }
                         DeclarationKind::Delegate
                         | DeclarationKind::GenericDelegate
@@ -3783,12 +3904,13 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let dec = dec.value() as *mut DeclarationFFI;
                                     let dec = unsafe { &*dec };
                                     let lock = dec.read();
-                                    let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
+                                    let Some(method) = lock.as_any().downcast_ref::<MethodDeclaration>() else { return; };
 
+                                    let Some(ns_instance) = dec.instance.clone() else { return; };
                                     let mut method = MethodCall::new(
                                         method,
                                         method.is_sealed(),
-                                        dec.instance.clone().unwrap(),
+                                        ns_instance,
                                         false,
                                     );
 
@@ -3848,10 +3970,11 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                         let lock = dec.read();
 
-                        let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
+                        let Some(method) = lock.as_any().downcast_ref::<MethodDeclaration>() else { return; };
 
+                        let Some(ns_instance) = dec.instance.clone() else { return; };
                         let mut method = MethodCall::new(
-                            method, method.is_sealed(), dec.instance.clone().unwrap(), false,
+                            method, method.is_sealed(), ns_instance, false,
                         );
 
                         let (ret, result) = method.call(scope, &args);
@@ -3920,10 +4043,11 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                         let _kind = lock.kind();
 
-                        let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
+                        let Some(method) = lock.as_any().downcast_ref::<PropertyDeclaration>() else { return; };
 
+                        let Some(ns_instance) = dec.instance.clone() else { return; };
                         let Some(mut method) = PropertyCall::new(
-                            method, false, dec.instance.clone().unwrap(), false,
+                            method, false, ns_instance, false,
                         ) else { return; };
 
 
@@ -3968,9 +4092,10 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             let dec = dec.value() as *mut DeclarationFFI;
                             let dec = unsafe { &*dec };
                             let lock = dec.read();
-                            let prop = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
-                            let setter = prop.setter().unwrap();
-                            let mut method = MethodCall::new(setter, false, dec.instance.clone().unwrap(), false);
+                            let Some(prop) = lock.as_any().downcast_ref::<PropertyDeclaration>() else { return; };
+                            let Some(setter) = prop.setter() else { return; };
+                            let Some(ns_instance) = dec.instance.clone() else { return; };
+                            let mut method = MethodCall::new(setter, false, ns_instance, false);
                             let (ret, _) = method.call(scope, &args);
                             if ret.is_err() {
                                 let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
@@ -3994,18 +4119,22 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                 }
             }
             DeclarationKind::GenericInterface => {
-                let clazz = lock.as_any().downcast_ref::<GenericInterfaceDeclaration>().unwrap();
+                let Some(clazz) = lock.as_any().downcast_ref::<GenericInterfaceDeclaration>() else { return v8::undefined(scope).into(); };
 
                 let return_types = helpers::get_generic_return_types(name);
 
                 for method in clazz.methods() {
                     let signature = method.return_type();
 
-                    let return_type = Signature::to_string(method.metadata().unwrap(), &signature);
+                    let Some(metadata) = method.metadata() else { continue; };
+                    let return_type_str = Signature::to_string(metadata, &signature);
 
-                    let return_type_index = usize::from_str_radix(&*return_type.as_str().replace("Var!", ""), 10).unwrap();
+                    let return_type_index = match usize::from_str_radix(&*return_type_str.as_str().replace("Var!", ""), 10) {
+                        Ok(idx) => idx,
+                        Err(_) => continue,
+                    };
 
-                    let return_type = *return_types.names().get(return_type_index).unwrap();
+                    let Some(&return_type) = return_types.names().get(return_type_index) else { continue; };
 
                     let name = v8::String::new(scope, method.name());
 
@@ -4028,7 +4157,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                     let declaration = Box::into_raw(Box::new(declaration));
 
-                    let return_type = v8::String::new(scope, return_type).unwrap();
+                    let Some(return_type) = v8::String::new(scope, return_type) else { continue; };
 
                     let ext = v8::External::new(scope, declaration as _);
 
@@ -4037,11 +4166,13 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     let func = FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                           args: v8::FunctionCallbackArguments,
                                                           mut retval: v8::ReturnValue| {
-                        let data = v8::Local::<v8::Array>::try_from(args.data()).unwrap();
+                        let Ok(data) = v8::Local::<v8::Array>::try_from(args.data()) else { return; };
 
-                        let return_type = data.get_index(scope, 1).unwrap().to_rust_string_lossy(scope);
+                        let Some(return_type_val) = data.get_index(scope, 1) else { return; };
+                        let return_type = return_type_val.to_rust_string_lossy(scope);
 
-                        let dec = unsafe { data.get_index(scope, 0).unwrap().cast::<v8::External>() };
+                        let Some(dec_val) = data.get_index(scope, 0) else { return; };
+                        let dec = unsafe { dec_val.cast::<v8::External>() };
 
                         let dec = dec.value() as *mut DeclarationFFI;
 
@@ -4049,15 +4180,15 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                         let lock = dec.read();
 
-                        let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
+                        let Some(method) = lock.as_any().downcast_ref::<MethodDeclaration>() else { return; };
 
-                        let parent = dec.parent.as_ref().unwrap();
-                        let parent = parent.read();
-                        let parent = parent.as_any().downcast_ref::<GenericInterfaceDeclaration>().unwrap();
+                        let Some(parent_arc) = dec.parent.as_ref() else { return; };
+                        let parent = parent_arc.read();
+                        let Some(parent) = parent.as_any().downcast_ref::<GenericInterfaceDeclaration>() else { return; };
 
-
+                        let Some(ns_instance) = dec.instance.clone() else { return; };
                         let mut method = GenericMethodCall::new(
-                            parent, method, method.is_sealed(), dec.instance.clone().unwrap(), false, return_type,
+                            parent, method, method.is_sealed(), ns_instance, false, return_type,
                         );
 
                         let (ret, result) = method.call(scope, &args);
@@ -4095,10 +4226,12 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         .data(data.into())
                         .build(scope);
 
-                    if is_static {
-                        tmpl.set_with_attr(name.unwrap().into(), func.into(), v8::PropertyAttribute::DONT_DELETE);
-                    } else {
-                        proto.set_with_attr(name.unwrap().into(), func.into(), v8::PropertyAttribute::DONT_DELETE);
+                    if let Some(n) = name {
+                        if is_static {
+                            tmpl.set_with_attr(n.into(), func.into(), v8::PropertyAttribute::DONT_DELETE);
+                        } else {
+                            proto.set_with_attr(n.into(), func.into(), v8::PropertyAttribute::DONT_DELETE);
+                        }
                     }
                 }
             }
@@ -4106,20 +4239,21 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
         }
     }
 
-    debug_output("[NativeScript] create_ns_ctor_instance_object: calling new_instance\n");
     let object = match object_tmpl.new_instance(scope) {
         Some(o) => o,
         None => {
-            debug_output("[NativeScript] create_ns_ctor_instance_object: new_instance returned None!\n");
             let msg = v8::String::new(scope, "Failed to create instance object").unwrap();
             let err = v8::Exception::error(scope, msg.into());
             scope.throw_exception(err);
             return v8::null(scope).into();
         }
     };
-    debug_output("[NativeScript] create_ns_ctor_instance_object: new_instance OK\n");
 
     object.set_internal_field(0, ext.into());
+
+    // Per-instance side store for JS-assigned overrides and caching
+    let object_store = v8::Map::new(scope);
+    object.set_internal_field(1, object_store.into());
 
     if let Some(handle_key) = v8::String::new(scope, "handle") {
         let handle_value: Local<v8::Value> = if let Some(instance) = instance.as_ref() {
@@ -4144,7 +4278,6 @@ unsafe fn raw_result_to_local<'s>(
     parent_decl: Option<Arc<RwLock<dyn Declaration>>>,
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Option<Local<'s, v8::Value>> {
-    debug_output(&format!("[NativeScript] raw_result_to_local: sig={} result={:p}\n", signature, result));
     let raw = result as usize;
     match signature {
         "Void" => None,
@@ -4257,7 +4390,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
     if already_building {
         let stub = v8::FunctionTemplate::builder(|_scope: &mut v8::PinScope<'_, '_>, _args: v8::FunctionCallbackArguments, mut _retval: v8::ReturnValue| {} ).build(scope);
-        let func = stub.get_function(scope).unwrap();
+        let Some(func) = stub.get_function(scope) else { return v8::undefined(scope).into(); };
         let key = v8::String::new(scope, "__typeName__").unwrap();
         let val = v8::String::new(scope, name_str).unwrap();
         func.set(scope, key.into(), val.into());
@@ -4266,13 +4399,13 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
     let name = v8::String::new(scope, name).unwrap();
 
-    let mut ext = DeclarationFFI::new(Arc::clone(&declaration));
+    let mut declaration_ffi = DeclarationFFI::new(Arc::clone(&declaration));
 
-    ext.parent = parent;
+    declaration_ffi.parent = parent;
 
-    let ext = Box::into_raw(Box::new(ext));
+    let declaration_ptr = Box::into_raw(Box::new(declaration_ffi));
 
-    let ext = v8::External::new(scope, ext as _);
+    let data_ext = v8::External::new(scope, declaration_ptr as _);
 
     let tmpl = v8::FunctionTemplate::builder(|scope: &mut v8::PinScope<'_, '_>,
                                               args: v8::FunctionCallbackArguments,
@@ -4293,20 +4426,27 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
         match kind {
             DeclarationKind::Class => {
-                let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
-                debug_output(&format!("[NativeScript] ctor-callback: new {}\n", clazz.full_name()));
+                // Collect all needed data while holding the lock, then release it so
+                // create_ns_ctor_instance_object can re-acquire without deadlocking.
+                let full_name;
+                let is_sealed;
+                let initializers: Vec<MethodDeclaration>;
+                let parent;
+                {
+                    let Some(clazz) = lock.as_any().downcast_ref::<ClassDeclaration>() else { return; };
+                    full_name = clazz.full_name().to_string();
+                    is_sealed = clazz.is_sealed();
+                    initializers = clazz.initializers().iter().cloned().collect();
+                    parent = dec.parent.clone();
+                }
+                drop(lock);
 
-                let clazz_factory = match class_activation_factory(clazz.full_name()) {
+                let clazz_factory = match class_activation_factory(&full_name) {
                     Ok(factory) => factory,
                     Err(error) => {
                         throw_js_error(
                             scope,
-                            format!(
-                                "Failed to activate WinRT class {}: {}",
-                                clazz.full_name(),
-                                error.message()
-                            )
-                            .as_str(),
+                            format!("Failed to activate WinRT class {}: {}", full_name, error.message()).as_str(),
                         );
                         return;
                     }
@@ -4322,12 +4462,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                                         Err(error) => {
                                             throw_js_error(
                                                 scope,
-                                                format!(
-                                                    "Failed to cast activated instance for {}: {}",
-                                                    clazz.full_name(),
-                                                    error.message()
-                                                )
-                                                .as_str(),
+                                                format!("Failed to cast activated instance for {}: {}", full_name, error.message()).as_str(),
                                             );
                                             return;
                                         }
@@ -4340,26 +4475,18 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                                         }
                                     }
 
-                                    let instance = create_ns_ctor_instance_object(
-                                        clazz.name(),
-                                        Some(clazz_factory.clone()),
-                                        None,
-                                        dec.inner.clone(),
-                                        Some(result),
-                                        scope,
-                                    );
-                                    retval.set(instance);
+                                    if let Some(declaration) = MetadataReader::find_by_name(&full_name) {
+                                        let instance_obj = create_ns_ctor_instance_object(
+                                            &full_name, Some(clazz_factory.clone()), parent.clone(), declaration, Some(result), scope,
+                                        );
+                                        retval.set(instance_obj);
+                                    }
                                     return;
                                 }
                                 Err(error) => {
                                     throw_js_error(
                                         scope,
-                                        format!(
-                                            "ActivateInstance failed for WinRT class {}: {}",
-                                            clazz.full_name(),
-                                            error.message()
-                                        )
-                                        .as_str(),
+                                        format!("ActivateInstance failed for WinRT class {}: {}", full_name, error.message()).as_str(),
                                     );
                                     return;
                                 }
@@ -4372,65 +4499,57 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                     }
                 }
 
-                unsafe {
-                    let is_sealed = clazz.is_sealed();
-                    for ctor in clazz.initializers() {
-                        let number_of_parameters = ctor.number_of_parameters();
-                        if number_of_parameters != length as usize {
-                            continue;
-                        }
-                        let mut method = MethodCall::new(
-                            ctor, is_sealed, clazz_factory.clone(), true,
-                        );
+                for ctor in &initializers {
+                    let number_of_parameters = ctor.number_of_parameters();
+                    if number_of_parameters != length as usize {
+                        continue;
+                    }
+                    let mut method = MethodCall::new(ctor, is_sealed, clazz_factory.clone(), true);
+                    let (ret, result) = method.call(scope, &args);
 
-                        let (ret, result) = method.call(scope, &args);
-
-                        if ret.is_ok() {
-                            let result = unsafe { IUnknown::from_raw(result) };
-
-                            let vtable = result.vtable();
-
-                            let mut ret: *mut c_void = std::ptr::null_mut();
-
-                            let res = unsafe {
-                                ((*vtable).QueryInterface)(
-                                    result.as_raw(),
-                                    &IUnknown::IID,
-                                    std::mem::transmute(&mut ret),
-                                )
-                            };
-
-                            if res.is_err() || ret.is_null() {
-                                let message = res.message().to_string();
-                                let message = v8::String::new(scope, message.as_str()).unwrap();
-                                let error = v8::Exception::error(scope, message.into());
-                                scope.throw_exception(error);
-                                return;
-                            }
-
-                            let result = unsafe { IUnknown::from_raw(ret) };
-
-                            // For console apps: attach to the console window so that
-                            // UI dialogs (e.g. MessageDialog) know which window to use.
-                            if let Ok(init) = result.cast::<IInitializeWithWindow>() {
-                                let hwnd = unsafe { GetConsoleWindow() };
-                                if !hwnd.is_invalid() {
-                                    let _ = unsafe { init.Initialize(hwnd) };
-                                }
-                            }
-
-                            let instance = create_ns_ctor_instance_object(clazz.name(), Some(clazz_factory), None, dec.inner.clone(), Some(result), scope);
-                            retval.set(instance);
-
-                            return;
-                        } else {
-                            let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
-                            let message = v8::String::new(scope, detail.as_str()).unwrap();
+                    if ret.is_ok() {
+                        let result = unsafe { IUnknown::from_raw(result) };
+                        let vtable = result.vtable();
+                        let mut qi_ptr: *mut c_void = std::ptr::null_mut();
+                        let res = unsafe {
+                            ((*vtable).QueryInterface)(
+                                result.as_raw(),
+                                &IUnknown::IID,
+                                std::mem::transmute(&mut qi_ptr),
+                            )
+                        };
+                        if res.is_err() || qi_ptr.is_null() {
+                            let message = res.message().to_string();
+                            let message = v8::String::new(scope, message.as_str()).unwrap();
                             let error = v8::Exception::error(scope, message.into());
                             scope.throw_exception(error);
+                            return;
                         }
+                        let result = unsafe { IUnknown::from_raw(qi_ptr) };
+
+                        if let Ok(init) = result.cast::<IInitializeWithWindow>() {
+                            let hwnd = unsafe { GetConsoleWindow() };
+                            if !hwnd.is_invalid() {
+                                let _ = unsafe { init.Initialize(hwnd) };
+                            }
+                        }
+
+                        if let Some(declaration) = MetadataReader::find_by_name(&full_name) {
+                            let instance_obj = create_ns_ctor_instance_object(
+                                &full_name, Some(clazz_factory.clone()), parent.clone(), declaration, Some(result), scope,
+                            );
+                            retval.set(instance_obj);
+                        }
+                        return;
+                    } else {
+                        let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                        let message = v8::String::new(scope, detail.as_str()).unwrap();
+                        let error = v8::Exception::error(scope, message.into());
+                        scope.throw_exception(error);
+                        return;
                     }
                 }
+                return;
             }
             DeclarationKind::Struct => {}
             DeclarationKind::Delegate
@@ -4516,7 +4635,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                 .getter(handle_indexed_property_getter)
         );
         object_tmpl.set_internal_field_count(2);
-        let object = object_tmpl.new_instance(scope).unwrap();
+        let Some(object) = object_tmpl.new_instance(scope) else { return; };
 
         object.set_internal_field(0, ext.into());
 
@@ -4545,7 +4664,168 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
         retval.set(object.into());
     })
-        .data(ext.into()).build(scope);
+        .data(data_ext.into()).build(scope);
+    // Ensure instances created by this constructor use the same
+    // named/indexed property handlers and internal fields as the
+    // instance-wrapper path so prototype/instance members are visible.
+    let instance_tmpl = tmpl.instance_template(scope);
+    instance_tmpl.set_named_property_handler(
+        v8::NamedPropertyHandlerConfiguration::new()
+            .getter(|scope: &mut v8::PinScope<'_, '_>,
+                     key: Local<v8::Name>,
+                     args: v8::PropertyCallbackArguments,
+                     mut rv: v8::ReturnValue<v8::Value>| -> v8::Intercepted {
+                if !key.is_string() {
+                    return v8::Intercepted::kNo;
+                }
+
+                let name = key.to_rust_string_lossy(scope);
+                if name == "__probe__" {
+                    let value = v8::String::new(scope, "instance-handler-active").unwrap();
+                    rv.set(value.into());
+                    return v8::Intercepted::kYes;
+                }
+
+                // Prefer the DeclarationFFI stored on the instance (holder internal field[0]).
+                // Fall back to the callback data if the holder lacks the internal field.
+                let holder = args.holder();
+                let dec_field_opt = holder.get_internal_field(scope, 0);
+                let dec = if let Some(dec_field) = dec_field_opt {
+                    let dec_ext = unsafe { dec_field.cast::<v8::External>() };
+                    let dec_ptr = dec_ext.value() as *mut DeclarationFFI;
+                    unsafe { &*dec_ptr }
+                } else {
+                    let dec_ext = unsafe { args.data().cast::<v8::External>() };
+                    let dec_ptr = dec_ext.value() as *mut DeclarationFFI;
+                    unsafe { &*dec_ptr }
+                };
+
+                let lock = dec.read();
+
+                let Some(clazz) = lock.as_any().downcast_ref::<ClassDeclaration>() else {
+                    return v8::Intercepted::kNo;
+                };
+
+                // If a JS-assigned override exists in the per-instance store, return it.
+                // Use the holder (where the property was found) to access the side-store map.
+                let this = holder;
+                if let Some(store_field) = this.get_internal_field(scope, 1) {
+                    let store = unsafe { store_field.cast::<v8::Map>() };
+                    if let Some(cache) = store.get(scope, key.into()) {
+                        if !cache.is_null_or_undefined() {
+                            rv.set(cache);
+                            return v8::Intercepted::kYes;
+                        }
+                    }
+                }
+
+                if let Some(property) = find_class_property(clazz, &name) {
+                    let Some(ns_instance) = dec.instance.clone() else {
+                        return v8::Intercepted::kNo;
+                    };
+                    let Some(mut property_call) = PropertyCall::new(&property, false, ns_instance, false) else {
+                        return v8::Intercepted::kNo;
+                    };
+                    let (ret, result) = property_call.call_with_values(scope, &[]);
+
+                    if ret.is_err() {
+                        let detail = format!("Property get '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
+                        let message = v8::String::new(scope, &detail).unwrap();
+                        let error = v8::Exception::error(scope, message);
+                        scope.throw_exception(error);
+                        return v8::Intercepted::kYes;
+                    }
+
+                    if property_call.is_void() {
+                        rv.set_undefined();
+                        return v8::Intercepted::kYes;
+                    }
+
+                    let return_sig = property_call.return_type().to_string();
+                    if return_sig.contains('.') {
+                        let instance = unsafe { IUnknown::from_raw(result) };
+                        let lookup = helpers::strip_generic_suffix(return_sig.as_str());
+                        if let Some(declaration) = MetadataReader::find_by_name(lookup) {
+                            let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into();
+                            rv.set(ret);
+                            return v8::Intercepted::kYes;
+                        }
+                    }
+
+                    if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+                        unsafe { set_ret_val(result, scope, rv, return_type); }
+                        return v8::Intercepted::kYes;
+                    }
+
+                    return v8::Intercepted::kNo;
+                }
+
+                if let Some(method) = find_class_method(clazz, &name) {
+                    let declaration = Arc::new(RwLock::new(method.clone()));
+                    let declaration = Box::into_raw(Box::new(DeclarationFFI::new_with_instance(declaration, dec.instance.clone())));
+                    let ext = v8::External::new(scope, declaration as _);
+
+                    let builder = v8::Function::builder(|scope: &mut v8::PinScope<'_, '_>,
+                                                         args: v8::FunctionCallbackArguments,
+                                                         mut retval: v8::ReturnValue| {
+                        let dec = unsafe { args.data().cast::<v8::External>() };
+                        let dec = dec.value() as *mut DeclarationFFI;
+                        let dec = unsafe { &*dec };
+                        let lock = dec.read();
+                        let Some(method) = lock.as_any().downcast_ref::<MethodDeclaration>() else { return; };
+                        let Some(ns_instance) = dec.instance.clone() else { return; };
+                        let mut method = MethodCall::new(method, method.is_sealed(), ns_instance, false);
+                        let (ret, result) = method.call(scope, &args);
+
+                        if ret.is_err() {
+                            let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                            let message = v8::String::new(scope, &detail).unwrap();
+                            let error = v8::Exception::error(scope, message);
+                            scope.throw_exception(error);
+                            return;
+                        }
+
+                        if method.is_void() {
+                            retval.set_undefined();
+                            return;
+                        }
+
+                        let return_sig = method.return_type().to_string();
+                        if return_sig.contains('.') {
+                            let instance = unsafe { IUnknown::from_raw(result) };
+                            let lookup = helpers::strip_generic_suffix(return_sig.as_str());
+                            if let Some(declaration) = MetadataReader::find_by_name(lookup) {
+                                let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into();
+                                retval.set(ret.into());
+                                return;
+                            }
+                        }
+
+                        if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+                            unsafe { set_ret_val(result, scope, retval, return_type); }
+                        }
+                    })
+                    .data(ext.into())
+                    .build(scope)
+                    .unwrap();
+
+                    rv.set(builder.into());
+                    return v8::Intercepted::kYes;
+                }
+
+                v8::Intercepted::kNo
+            })
+                .data(v8::External::new(scope, declaration_ptr as _).into())
+    );
+
+    instance_tmpl.set_indexed_property_handler(
+        v8::IndexedPropertyHandlerConfiguration::new()
+            .setter(handle_indexed_property_setter)
+            .getter(handle_indexed_property_getter)
+            .data(v8::External::new(scope, declaration_ptr as _).into())
+    );
+
+    instance_tmpl.set_internal_field_count(2);
     tmpl.set_class_name(name);
 
 
@@ -4553,14 +4833,18 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
         let lock = declaration.read();
 
         if lock.kind() != DeclarationKind::Class {
-            let func = tmpl.get_function(scope).unwrap();
+            let Some(func) = tmpl.get_function(scope) else {
+                CREATING_CTORS.with(|set| { set.borrow_mut().remove(name_str); });
+                return v8::undefined(scope).into();
+            };
             CREATING_CTORS.with(|set| { set.borrow_mut().remove(name_str); });
             return func.into();
         }
 
-        let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
-        debug_output(&format!("[NativeScript] create_ns_ctor_object: building methods for {}\n", clazz.full_name()));
-
+        let Some(clazz) = lock.as_any().downcast_ref::<ClassDeclaration>() else {
+            CREATING_CTORS.with(|set| { set.borrow_mut().remove(name_str); });
+            return v8::undefined(scope).into();
+        };
         let mut added_names: AHashSet<String> = AHashSet::new();
 
         for method in clazz.methods().iter() {
@@ -4606,11 +4890,13 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
                 let lock = dec.read();
 
-                let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
+                let Some(method) = lock.as_any().downcast_ref::<MethodDeclaration>() else { return; };
 
                 let return_type = method.return_type();
 
-                let signature = Signature::to_string(method.metadata().unwrap(), &return_type);
+                let signature = method.metadata()
+                    .map(|m| Signature::to_string(m, &return_type))
+                    .unwrap_or_default();
 
 
                 let factory = match resolve_class_factory_from_parent(dec) {
@@ -4743,10 +5029,6 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
                 let mut prop_call_opt = PropertyCall::new(property, false, factory, false);
                 if prop_call_opt.is_none() {
-                    debug_output(&format!(
-                        "[DIAG] PropertyCall::new returned None for property '{}' signature='{}'\n",
-                        property.name(), signature
-                    ));
                     return;
                 }
 
@@ -4754,18 +5036,14 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
                 let (hresult, result) = prop_call.call_with_values(scope, &[]);
 
-                debug_output(&format!(
-                    "[DIAG] static getter '{}' signature='{}' -> hresult={:?} message='{}' hrcode={:#x} result_ptr_null={}\n",
-                    property.name(), signature, hresult, hresult.message().to_string(), hresult.0 as u32, result.is_null()
-                ));
-
                 // If the call failed because the process is unpackaged, do not provide a runtime shim.
                 // HRESULT 0x80073D54 = "The process has no package identity." — let callers/tests handle fallback.
                 if !hresult.is_ok() && (hresult.0 as u32) == 0x80073D54u32 {
-                    debug_output(&format!(
-                        "[DIAG] static getter '{}' signature='{}' -> missing package identity, returning undefined\n",
-                        property.name(), signature
-                    ));
+
+                    // If the static getter failed because the process is unpackaged,
+                    // do not synthesize values here; let the caller/tests detect the
+                    // missing package identity via the diagnostic marker on the
+                    // constructor/object and provide any test-only fallbacks.
 
                     // Expose a small, non-invasive diagnostic on the JS constructor/object
                     // so code running in V8 can inspect why the value was absent.
@@ -4825,7 +5103,10 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
     }
 
-    let func = tmpl.get_function(scope).unwrap();
+    let Some(func) = tmpl.get_function(scope) else {
+        CREATING_CTORS.with(|set| { set.borrow_mut().remove(name_str); });
+        return v8::undefined(scope).into();
+    };
 
     {
         let lock = declaration.read();
@@ -4877,18 +5158,22 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
 
         let mut field_types: Vec<NativeType> = Vec::new();
 
-        let struct_dec = lock.as_any().downcast_ref::<StructDeclaration>().unwrap();
+        let Some(struct_dec) = lock.as_any().downcast_ref::<StructDeclaration>() else { return; };
 
-        let object = args.get(0).to_object(scope).unwrap();
+        let Some(object) = args.get(0).to_object(scope) else {
+            throw_js_error(scope, "Expected object argument for struct constructor");
+            return;
+        };
 
         for field in struct_dec.fields() {
-            let field_type = Signature::to_string(field.base().metadata().unwrap(), &field.type_());
+            let Some(metadata) = field.base().metadata() else { continue; };
+            let field_type = Signature::to_string(metadata, &field.type_());
 
-            let native_type = NativeType::try_from(field_type.as_str()).unwrap();
+            let Ok(native_type) = NativeType::try_from(field_type.as_str()) else { continue; };
 
             field_types.push(native_type.clone());
 
-            let name = v8::String::new(scope, field.name()).unwrap();
+            let Some(name) = v8::String::new(scope, field.name()) else { continue; };
 
             let field_value = object.get(scope, name.into());
 
@@ -4986,7 +5271,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                 })
                 .collect::<Result<Vec<libffi::middle::Type>, error::AnyError>>();
 
-        assert!(params.is_ok());
+        if params.is_err() { return; }
 
         let mut struct_buf: Vec<u8> = unsafe { vec![0_u8; struct_size] };
 
@@ -5047,11 +5332,11 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
                     .build(scope);
 
 
-                rv.set(func.unwrap().into());
+                if let Some(f) = func { rv.set(f.into()); }
                 return v8::Intercepted::kYes;
             }
 
-            let struct_dec = lock.as_any().downcast_ref::<StructDeclaration>().unwrap();
+            let Some(struct_dec) = lock.as_any().downcast_ref::<StructDeclaration>() else { return v8::Intercepted::kNo; };
 
             let mut offset = 0;
             let instance = dec.struct_instance.as_ref();
@@ -5200,7 +5485,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
 
             let lock = dec.write();
 
-            let struct_dec = lock.as_any().downcast_ref::<StructDeclaration>().unwrap();
+            let Some(struct_dec) = lock.as_any().downcast_ref::<StructDeclaration>() else { return v8::Intercepted::kNo; };
 
             let mut offset = 0;
 
@@ -5316,7 +5601,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
         );
 
 
-        let object = object_tmpl.new_instance(scope).unwrap();
+        let Some(object) = object_tmpl.new_instance(scope) else { return; };
 
         object.set_internal_field(0, unsafe { ext.cast::<v8::Data>() });
 
@@ -5326,7 +5611,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
     tmpl.set_class_name(name);
 
 
-    let func = tmpl.get_function(scope).unwrap();
+    let Some(func) = tmpl.get_function(scope) else { return v8::undefined(scope).into(); };
     let ret = func;
 
     ret.into()
@@ -5334,7 +5619,7 @@ fn create_ns_struct_ctor_object<'a>(name: &str, declaration: Arc<RwLock<dyn Decl
 
 fn init_meta(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, context: Local<v8::Context>) {
     let global = context.global(scope);
-    let global_metadata = MetadataReader::find_by_name("").unwrap();
+    let Some(global_metadata) = MetadataReader::find_by_name("") else { return; };
     let data = global_metadata.read();
     let ns = data.as_any().downcast_ref::<NamespaceDeclaration>();
     if let Some(global_namespaces) = ns {
@@ -5493,12 +5778,12 @@ fn handle_named_property_getter(scope: &mut v8::PinScope<'_, '_>,
                                 args: v8::PropertyCallbackArguments,
                                 mut rv: v8::ReturnValue<v8::Value>) -> v8::Intercepted {
     let this = args.holder();
-    let dec = this.get_internal_field(scope, 0).unwrap();
+    let Some(dec) = this.get_internal_field(scope, 0) else { return v8::Intercepted::kNo; };
     let dec = unsafe { dec.cast::<v8::External>() };
     let dec = dec.value() as *mut DeclarationFFI;
     let dec = unsafe { &*dec };
     let lock = dec.read();
-    let store = this.get_internal_field(scope, 1).unwrap();
+    let Some(store) = this.get_internal_field(scope, 1) else { return v8::Intercepted::kNo; };
     let store = unsafe { store.cast::<v8::Map>() };
     let kind = lock.kind();
 
@@ -5510,7 +5795,10 @@ fn handle_named_property_getter(scope: &mut v8::PinScope<'_, '_>,
             }
         }
 
-        let name = key.to_string(scope).unwrap().to_rust_string_lossy(scope);
+        let name = match key.to_string(scope) {
+            Some(s) => s.to_rust_string_lossy(scope),
+            None => return v8::Intercepted::kNo,
+        };
         match kind {
             DeclarationKind::Namespace => {
                 let parent = dec.inner.clone();
@@ -5524,7 +5812,7 @@ fn handle_named_property_getter(scope: &mut v8::PinScope<'_, '_>,
 
                         match lock.kind() {
                             DeclarationKind::Struct => {
-                                let struct_dec = lock.as_any().downcast_ref::<StructDeclaration>().unwrap();
+                                let Some(struct_dec) = lock.as_any().downcast_ref::<StructDeclaration>() else { return v8::Intercepted::kNo; };
                                 let name = struct_dec.name().to_string();
                                 drop(lock);
 
@@ -5587,14 +5875,12 @@ fn handle_named_property_getter(scope: &mut v8::PinScope<'_, '_>,
 
                             let lock = dec.read();
 
-                            let method = lock.as_any().downcast_ref::<MethodDeclaration>();
+                            let Some(method) = lock.as_any().downcast_ref::<MethodDeclaration>() else { return; };
 
-                            let method = method.unwrap();
-
-                            let instance = dec.instance.clone().unwrap();
+                            let Some(ns_instance) = dec.instance.clone() else { return; };
 
                             let mut method = MethodCall::new(
-                                method, method.is_sealed(), instance, false,
+                                method, method.is_sealed(), ns_instance, false,
                             );
 
                             let (_ret, _result) = method.call(scope, &args);
@@ -5602,7 +5888,7 @@ fn handle_named_property_getter(scope: &mut v8::PinScope<'_, '_>,
                             .data(ext.into()).build(scope);
 
 
-                        let func = builder.unwrap();
+                        let Some(func) = builder else { return v8::Intercepted::kNo; };
 
                         let func: Local<v8::Value> = func.into();
                         store.set(scope, key.into(), func);
@@ -5821,15 +6107,32 @@ unsafe extern "system" fn js_delegate_invoke(
     this: *mut JsDelegate,
     p0: usize, p1: usize, p2: usize, _p3: usize,
 ) -> HRESULT {
+    // Wrap everything in catch_unwind so Rust panics cannot propagate through
+    // the WinRT C++ caller stack (which would be UB and cause CLR FailFast).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        js_delegate_invoke_inner(this, p0, p1, p2)
+    }));
+    match result {
+        Ok(hr) => hr,
+        Err(_) => HRESULT(0x80004005u32 as i32), // E_FAIL on panic
+    }
+}
+
+fn js_delegate_invoke_inner(
+    this: *mut JsDelegate,
+    p0: usize, p1: usize, p2: usize,
+) -> HRESULT {
     if this.is_null() { return HRESULT(0x80004005u32 as i32); }
-    let data_ptr = (*this).data;
-    if data_ptr.is_null() { return HRESULT(0x80004005u32 as i32); }
-    let data = &*data_ptr;
+    let data = unsafe {
+        let data_ptr = (*this).data;
+        if data_ptr.is_null() { return HRESULT(0x80004005u32 as i32); }
+        &*data_ptr
+    };
 
     let isolate_ptr = DELEGATE_ISOLATE_PTR.with(|c| c.get());
     if isolate_ptr.is_null() { return HRESULT(0x80004005u32 as i32); }
 
-    let isolate: &mut v8::Isolate = &mut *isolate_ptr;
+    let isolate: &mut v8::Isolate = unsafe { &mut *isolate_ptr };
     v8::scope!(scope, isolate);
     let ctx_global = {
         let Some(g) = scope.get_slot::<v8::Global<v8::Context>>() else {
@@ -5839,9 +6142,11 @@ unsafe extern "system" fn js_delegate_invoke(
     };
     let context = v8::Local::new(scope, &ctx_global);
     let scope = &mut v8::ContextScope::new(scope, context);
+    // TryCatch so JS exceptions don't escape into WinRT C++ frames.
+    v8::tc_scope!(tc, scope);
 
-    let func = v8::Local::new(scope, &data.js_func);
-    let recv = v8::undefined(scope);
+    let func = v8::Local::new(tc, &data.js_func);
+    let recv = v8::undefined(tc);
 
     let params_raw = [p0, p1, p2];
     let n = data.param_types.len().min(3);
@@ -5852,31 +6157,39 @@ unsafe extern "system" fn js_delegate_invoke(
         let val: v8::Local<v8::Value> = match data.param_types[i] {
             NativeType::Pointer => {
                 if raw.is_null() {
-                    v8::null(scope).into()
+                    v8::null(tc).into()
                 } else {
-                    let obj = v8::Object::new(scope);
-                    if let Some(key) = v8::String::new(scope, "handle") {
-                        let ext = v8::External::new(scope, raw);
-                        obj.set(scope, key.into(), ext.into());
+                    let obj = v8::Object::new(tc);
+                    if let Some(key) = v8::String::new(tc, "handle") {
+                        let ext = v8::External::new(tc, raw);
+                        obj.set(tc, key.into(), ext.into());
                     }
                     obj.into()
                 }
             }
-            NativeType::Bool  => v8::Boolean::new(scope, (raw as u8) != 0).into(),
-            NativeType::U8    => v8::Integer::new_from_unsigned(scope, raw as u8 as u32).into(),
-            NativeType::I8    => v8::Integer::new(scope, raw as i8 as i32).into(),
-            NativeType::U16   => v8::Integer::new_from_unsigned(scope, raw as u16 as u32).into(),
-            NativeType::I16   => v8::Integer::new(scope, raw as i16 as i32).into(),
-            NativeType::U32   => v8::Integer::new_from_unsigned(scope, raw as u32).into(),
-            NativeType::I32   => v8::Integer::new(scope, raw as i32).into(),
-            NativeType::U64   => v8::Number::new(scope, raw as u64 as f64).into(),
-            NativeType::I64   => v8::Number::new(scope, raw as i64 as f64).into(),
-            _                 => v8::undefined(scope).into(),
+            NativeType::Bool  => v8::Boolean::new(tc, (raw as u8) != 0).into(),
+            NativeType::U8    => v8::Integer::new_from_unsigned(tc, raw as u8 as u32).into(),
+            NativeType::I8    => v8::Integer::new(tc, raw as i8 as i32).into(),
+            NativeType::U16   => v8::Integer::new_from_unsigned(tc, raw as u16 as u32).into(),
+            NativeType::I16   => v8::Integer::new(tc, raw as i16 as i32).into(),
+            NativeType::U32   => v8::Integer::new_from_unsigned(tc, raw as u32).into(),
+            NativeType::I32   => v8::Integer::new(tc, raw as i32).into(),
+            NativeType::U64   => v8::Number::new(tc, raw as u64 as f64).into(),
+            NativeType::I64   => v8::Number::new(tc, raw as i64 as f64).into(),
+            _                 => v8::undefined(tc).into(),
         };
         js_args.push(val);
     }
 
-    func.call(scope, recv.into(), &js_args);
+    let _ = func.call(tc, recv.into(), &js_args);
+    if tc.has_caught() {
+        if let Some(ex) = tc.exception() {
+            let msg = ex.to_rust_string_lossy(tc);
+            debug_output(&format!("[NativeScript] delegate invoke JS error: {}\n", msg));
+            store_last_js_error(msg);
+        }
+        tc.reset();
+    }
     HRESULT(0)
 }
 
@@ -5890,9 +6203,9 @@ pub(crate) fn js_delegate_params_from_declaration(
             .parameters()
             .iter()
             .filter(|p| !p.is_out())
-            .map(|p| {
-                let sig = Signature::to_string(p.metadata().unwrap(), &p.type_());
-                crate::helpers::ffi_native_type_from_signature(&sig)
+            .filter_map(|p| {
+                let sig = Signature::to_string(p.metadata()?, &p.type_());
+                Some(crate::helpers::ffi_native_type_from_signature(&sig))
             })
             .collect();
         (guid, params)
@@ -5928,8 +6241,10 @@ impl Runtime {
 
         let winrt_initialized = match unsafe { RoInitialize(RO_INIT_SINGLETHREADED) } {
             Ok(_) => true,
-            Err(error) if error.code() == HRESULT(0x80010106u32 as i32) => false,
-            Err(error) => panic!("RoInitialize failed: {}", error.message()),
+            // Any failure (including RPC_E_CHANGED_MODE=0x80010106 and the ASTA apartment
+            // model used by UWP/XAML hosts) means WinRT was already initialized externally.
+            // Skip RoUninitialize on drop rather than panicking.
+            Err(_) => false,
         };
 
         let params = v8::CreateParams::default();
@@ -6151,9 +6466,14 @@ impl Runtime {
         // Rethrowing into an empty V8 scope causes V8 to call its fatal-error handler
         // → abort() → System.ExecutionEngineException in the CLR.
         if tc.has_caught() {
+            let mut error_report = String::new();
             if let Some(msg) = tc.message() {
                 let text = msg.get(tc).to_rust_string_lossy(tc);
                 let line = msg.get_line_number(tc).unwrap_or(0);
+                let file_name = msg.get_script_resource_name(tc)
+                    .map(|v| v.to_rust_string_lossy(tc))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                error_report.push_str(&format!("{} ({}:{})\n", text, file_name, line));
                 debug_output(&format!("[NativeScript] JS error at line {}: {}\n", line, text));
                 if let Some(stack) = msg.get_stack_trace(tc) {
                     for i in 0..stack.get_frame_count() {
@@ -6164,14 +6484,20 @@ impl Runtime {
                             let file = frame.get_script_name(tc)
                                 .map(|s| s.to_rust_string_lossy(tc))
                                 .unwrap_or_else(|| "<unknown>".to_string());
-                            debug_output(&format!("    at {} ({}:{}:{})\n", fn_name, file,
-                                frame.get_line_number(), frame.get_column()));
+                            let line_str = format!("    at {} ({}:{}:{})\n", fn_name, file,
+                                frame.get_line_number(), frame.get_column());
+                            error_report.push_str(&line_str);
+                            debug_output(&line_str);
                         }
                     }
                 }
             } else if let Some(exc) = tc.exception() {
                 let text = exc.to_rust_string_lossy(tc);
+                error_report.push_str(&text);
                 debug_output(&format!("[NativeScript] JS exception: {}\n", text));
+            }
+            if !error_report.is_empty() {
+                store_last_js_error(error_report);
             }
             return;
         }

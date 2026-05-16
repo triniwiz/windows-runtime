@@ -204,11 +204,15 @@ impl Metadata {
                 metadata, CorTokenType(attribute as i32),
             );
 
-            let matches = if target_resolved {
-                // Fast path: integer comparison, no allocation.
-                class_token == target_typedef_token
+            // Fast path: exact token match (both in same assembly).
+            // When the attribute type is defined in a different assembly, the class_token
+            // will be a TypeRef (0x01xxxxxx) while target_typedef_token is a TypeDef
+            // (0x02xxxxxx) — they represent the same type but are different token values.
+            // In that case fall through to the name-based comparison.
+            let matches = if target_resolved && class_token == target_typedef_token {
+                true
             } else {
-                // Fallback: name comparison (typedef lookup failed, e.g. external assembly).
+                // Fallback: name comparison handles cross-assembly TypeRef vs TypeDef mismatches.
                 let name = get_type_name(metadata, CorTokenType(class_token as i32));
                 name.as_str() == attribute_name
             };
@@ -402,7 +406,6 @@ impl Metadata {
 
                     let factory_token = Metadata::get_custom_attribute_type_argument(metadata, CorTokenType(attributeToken as i32));
 
-
                     let factory_methods = Metadata::get_class_methods(
                         metadata, CorTokenType(factory_token as i32),
                     );
@@ -437,9 +440,26 @@ impl Metadata {
         match metadata {
             None => None,
             Some(metadata) => {
-                let method_signature = Metadata::get_method_signature(
-                    metadata, method_token,
-                );
+                // Retrieve the method signature and its size so we can
+                // perform a length-aware comparison against candidate
+                // static method signatures. This avoids false-positive
+                // prefix matches when signatures differ in length.
+                let mut method_sig_ptr = std::ptr::null_mut();
+                let mut method_sig_size = 0_u32;
+                let _ = unsafe {
+                    metadata.GetMethodProps(
+                        method_token.0 as u32,
+                        0 as _,
+                        None,
+                        0 as _,
+                        0 as _,
+                        addr_of_mut!(method_sig_ptr),
+                        &mut method_sig_size,
+                        0 as _,
+                        0 as _,
+                    )
+                };
+                let method_signature = unsafe { PCCOR_SIGNATURE(method_sig_ptr.offset(1)) };
                 let class_token = Metadata::get_method_containing_class_token(
                     metadata, method_token,
                 );
@@ -447,10 +467,32 @@ impl Metadata {
                     CorTokenType(type_from_token(CorTokenType(class_token as i32))) == mdtTypeDef
                 );
 
+                // Extract the target method name for a fallback name-based match
+                let mut target_method_name = String::new();
+                {
+                    let mut name_length = 0_u32;
+                    let mut name_buf = [0_u16; MAX_IDENTIFIER_LENGTH];
+                    let _ = unsafe {
+                        metadata.GetMethodProps(
+                            method_token.0 as u32,
+                            0 as _,
+                            Some(&mut name_buf),
+                            &mut name_length,
+                            0 as _,
+                            0 as _,
+                            0 as _,
+                            0 as _,
+                            0 as _,
+                        )
+                    };
+                    if name_length > 0 {
+                        target_method_name = String::from_utf16_lossy(&name_buf[..name_length.saturating_sub(1) as usize]);
+                    }
+                }
+
                 let static_attributes = Metadata::get_custom_attributes_with_name(
                     metadata, CorTokenType(class_token as i32), STATIC_ATTRIBUTE,
                 );
-
 
                 let mut ret: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>> = None;
                 for attributeToken in static_attributes.iter() {
@@ -479,9 +521,38 @@ impl Metadata {
                             )
                         };
                         debug_assert!(result.is_ok());
-                        //let static_signature: &[u8] = &static_signature[..static_signature_size as usize];
 
-                        // todo validate size is valid;
+                        if static_signature_size != method_sig_size {
+                            // Signature sizes differ; fall back to name-based
+                            // matching (if available).
+                            if !target_method_name.is_empty() {
+                                let mut name_length = 0_u32;
+                                let mut name_buf = [0_u16; MAX_IDENTIFIER_LENGTH];
+                                let _ = unsafe {
+                                    metadata.GetMethodProps(
+                                        *staticMethod,
+                                        0 as _,
+                                        Some(&mut name_buf),
+                                        &mut name_length,
+                                        0 as _,
+                                        0 as _,
+                                        0 as _,
+                                        0 as _,
+                                        0 as _,
+                                    )
+                                };
+                                if name_length == 0 {
+                                    continue;
+                                }
+                                let static_name = String::from_utf16_lossy(&name_buf[..name_length.saturating_sub(1) as usize]);
+                                if static_name != target_method_name {
+                                    continue;
+                                }
+                                // name matches; treat this as the correct statics method
+                            } else {
+                                continue;
+                            }
+                        }
 
                         let a = unsafe {
                             std::slice::from_raw_parts(
@@ -493,12 +564,68 @@ impl Metadata {
                         let b = unsafe {
                             std::slice::from_raw_parts(
                                 method_signature.0,
-                                static_signature_size as usize - 1,
+                                method_sig_size as usize - 1,
                             )
                         };
 
                         if a != b {
-                            continue;
+                            // Signature bytes didn't match; attempt a name-based
+                            // fallback in case metadata signature encodings differ.
+                            if !target_method_name.is_empty() {
+                                let mut name_length = 0_u32;
+                                let mut name_buf = [0_u16; MAX_IDENTIFIER_LENGTH];
+                                let _ = unsafe {
+                                    metadata.GetMethodProps(
+                                        *staticMethod,
+                                        0 as _,
+                                        Some(&mut name_buf),
+                                        &mut name_length,
+                                        0 as _,
+                                        0 as _,
+                                        0 as _,
+                                        0 as _,
+                                        0 as _,
+                                    )
+                                };
+                                if name_length == 0 {
+                                    continue;
+                                }
+                                let static_name = String::from_utf16_lossy(&name_buf[..name_length.saturating_sub(1) as usize]);
+                                if static_name != target_method_name {
+                                    continue;
+                                }
+                                // name matches; treat this as the correct statics method
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            // Signatures matched; ensure the method name also
+                            // matches the target to avoid accidental matches
+                            // (e.g., differing calling-convention flags).
+                            if !target_method_name.is_empty() {
+                                let mut name_length = 0_u32;
+                                let mut name_buf = [0_u16; MAX_IDENTIFIER_LENGTH];
+                                let _ = unsafe {
+                                    metadata.GetMethodProps(
+                                        *staticMethod,
+                                        0 as _,
+                                        Some(&mut name_buf),
+                                        &mut name_length,
+                                        0 as _,
+                                        0 as _,
+                                        0 as _,
+                                        0 as _,
+                                        0 as _,
+                                    )
+                                };
+                                if name_length == 0 {
+                                    continue;
+                                }
+                                let static_name = String::from_utf16_lossy(&name_buf[..name_length.saturating_sub(1) as usize]);
+                                if static_name != target_method_name {
+                                    continue;
+                                }
+                            }
                         }
                         *out_index = i;
                         ret = Some(Arc::new(RwLock::new(InterfaceDeclaration::new(Some(metadata), CorTokenType(statics_token as i32)))));
@@ -506,11 +633,7 @@ impl Metadata {
                     }
                 }
 
-                if ret.is_some() {
-                    return ret;
-                }
-
-                None
+                ret
             }
         }
     }

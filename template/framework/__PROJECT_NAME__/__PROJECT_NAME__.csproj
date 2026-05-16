@@ -25,6 +25,10 @@
     <NSLibPlatform Condition="'$(Platform)' != ''">$(Platform)</NSLibPlatform>
     <NSLibPlatform Condition="'$(NSLibPlatform)' == '' and '$(RuntimeIdentifier)' != ''">$([System.Text.RegularExpressions.Regex]::Replace('$(RuntimeIdentifier)','^win-',''))</NSLibPlatform>
     <NSLibPlatform Condition="'$(NSLibPlatform)' == ''">x64</NSLibPlatform>
+    <!-- Windows SDK .NET runtime pack location (resolved from NuGet cache) -->
+    <_WinSdkNetRefPkg>$(NuGetPackageRoot)microsoft.windows.sdk.net.ref</_WinSdkNetRefPkg>
+    <_WinSdkNetRefVer Condition="Exists('$(_WinSdkNetRefPkg)\10.0.26100.57')">10.0.26100.57</_WinSdkNetRefVer>
+    <_WinSdkNetRefLib Condition="'$(_WinSdkNetRefVer)' != ''">$(_WinSdkNetRefPkg)\$(_WinSdkNetRefVer)\lib\net8.0</_WinSdkNetRefLib>
   </PropertyGroup>
 
   <ItemGroup>
@@ -38,6 +42,29 @@
 
     <!-- App_Resources: platform-specific assets (images, fonts, etc.) -->
     <Content Include="App_Resources\**\*" Condition="Exists('App_Resources')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+
+    <!-- UWP logo/splash assets required for Add-AppxPackage -Register -->
+    <Content Include="Assets\**\*" Condition="Exists('Assets')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+
+    <!-- Windows SDK .NET runtime pack assemblies — required when the dotnet workload
+         is not installed; copied from the NuGet package cache. -->
+    <Content Include="$(_WinSdkNetRefLib)\Microsoft.Windows.UI.Xaml.dll"
+             Condition="'$(_WinSdkNetRefLib)' != '' and Exists('$(_WinSdkNetRefLib)\Microsoft.Windows.UI.Xaml.dll')">
+      <Link>Microsoft.Windows.UI.Xaml.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="$(_WinSdkNetRefLib)\WinRT.Runtime.dll"
+             Condition="'$(_WinSdkNetRefLib)' != '' and Exists('$(_WinSdkNetRefLib)\WinRT.Runtime.dll')">
+      <Link>WinRT.Runtime.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="$(_WinSdkNetRefLib)\Microsoft.Windows.SDK.NET.dll"
+             Condition="'$(_WinSdkNetRefLib)' != '' and Exists('$(_WinSdkNetRefLib)\Microsoft.Windows.SDK.NET.dll')">
+      <Link>Microsoft.Windows.SDK.NET.dll</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
 

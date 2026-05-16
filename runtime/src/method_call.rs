@@ -1,8 +1,9 @@
 use std::ffi::c_void;
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use libffi::middle::*;
 use parking_lot::RwLock;
-use windows::core::{GUID, HRESULT, Interface, IUnknown};
+use windows::core::{GUID, HRESULT, Interface, IUnknown, HSTRING, IInspectable};
 use windows::Win32::System::WinRT::IActivationFactory;
 use windows::Win32::System::WinRT::Metadata::CorTokenType;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
@@ -12,15 +13,19 @@ use metadata::declarations::interface_declaration::generic_interface_instance_de
 use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::declarations::method_declaration::MethodDeclaration;
 use metadata::declarations::parameter_declaration::ParameterDeclaration;
+use metadata::declarations::declaration::Declaration;
 use metadata::declaring_interface_for_method::Metadata;
 use metadata::meta_data_reader::MetadataReader;
 use metadata::signature::Signature;
 use crate::error::AnyError;
 use crate::helpers::ffi_native_type_from_signature;
 use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_query_interface_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue};
+use crate::DeclarationFFI;
 
 pub struct MethodCall {
     index: usize,
+        method_name: String,
+    pre_index: usize,
     number_of_parameters: usize,
     number_of_abi_parameters: usize,
     is_initializer: bool,
@@ -56,6 +61,8 @@ impl MethodCall {
             cif: Cif::new(vec![], Type::i32()),
             func: std::ptr::null_mut(),
             index: 0,
+            method_name: String::new(),
+            pre_index: 0,
             number_of_parameters: 0,
             number_of_abi_parameters: 0,
             is_initializer,
@@ -80,6 +87,10 @@ impl MethodCall {
 
     pub fn return_type(&self) -> &str {
         self.return_type.as_str()
+    }
+
+    pub fn init_error_message(&self) -> Option<&str> {
+        self.init_error.as_deref()
     }
 
     pub fn new(
@@ -165,7 +176,7 @@ impl MethodCall {
             }
         };
 
-        index = index.saturating_add(6); // IInspectable adds 6 vtable slots before any interface methods
+        let pre_index = index;
 
         let vtable = interface.vtable();
 
@@ -240,9 +251,15 @@ impl MethodCall {
                     );
                 }
             };
-            parse_parameter_types.push(parse_native_type);
+            parse_parameter_types.push(parse_native_type.clone());
             let abi_native = ffi_native_type_from_signature(signature.as_str());
-            if matches!(abi_native, NativeType::Buffer) {
+            // If the parsed parameter is a WinRT `String`, treat its ABI as
+            // `NativeType::String` (handle-sized) rather than the generic
+            // pointer returned by the signature helper. This ensures the
+            // libffi CIF is constructed with the correct usize-sized type.
+            if matches!(parse_native_type, NativeType::String) {
+                parameter_types.push(NativeType::String);
+            } else if matches!(abi_native, NativeType::Buffer) {
                 parameter_types.push(NativeType::U32);
                 parameter_types.push(NativeType::Buffer);
             } else {
@@ -287,21 +304,48 @@ impl MethodCall {
             Type::i32(),
         );
 
-        let interface = unsafe { IUnknown::from_raw(interface_ptr as *mut c_void) };
-        let vtable: *mut *mut c_void = unsafe { std::mem::transmute(interface.vtable()) };
-        let func = unsafe { *vtable.offset(index as isize) };
+        // Take ownership of the specific interface pointer returned by QueryInterface
+        // so we can inspect its vtable directly to compute the correct function slot.
+        let queried_interface = unsafe { IUnknown::from_raw(interface_ptr as *mut c_void) };
+        let vtable_struct = queried_interface.vtable();
+        let vtable_ptr: *mut *mut c_void = unsafe { std::mem::transmute(vtable_struct) };
+
+        // If the queried interface supports IInspectable, its vtable includes the
+        // 6 IInspectable slots; otherwise it's an IUnknown-only vtable with 3 slots.
+        let mut inspectable_ptr: *mut c_void = std::ptr::null_mut();
+        let supports_iinspectable = unsafe {
+            ((*vtable_struct).QueryInterface)(
+                queried_interface.as_raw(),
+                &IInspectable::IID,
+                &mut inspectable_ptr as *mut _ as *mut *mut c_void,
+            )
+        };
+
+        let base_offset = if supports_iinspectable.is_ok() && !inspectable_ptr.is_null() {
+            unsafe { IUnknown::from_raw(inspectable_ptr as *mut c_void); }
+            6
+        } else {
+            3
+        };
+
+        index = index.saturating_add(base_offset);
+
+        let func = unsafe { *vtable_ptr.offset(index as isize) };
+
 
         Self {
             cif,
             func,
             index,
+            pre_index,
+            method_name: method.name().to_string(),
             number_of_parameters,
             number_of_abi_parameters,
             is_initializer,
             is_sealed,
             is_void: method.is_void(),
             iid,
-            interface,
+            interface: queried_interface,
             parameter_types,
             parse_parameter_types,
             parameters: method.parameters().to_vec(),
@@ -323,6 +367,8 @@ impl MethodCall {
         )
     }
 
+    
+
     pub fn call(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
@@ -343,11 +389,28 @@ impl MethodCall {
             "Guid" | "Rect" | "Matrix3x2" | "Matrix4x4"
         );
 
+        let is_scalar_return = matches!(self.return_type.as_str(),
+            "UInt8" | "Int8" | "UInt16" | "Int16" |
+            "UInt32" | "Int32" | "UInt64" | "Int64" |
+            "USize" | "ISize" | "Single" | "Double" |
+            "Boolean" | "Char16"
+        );
+
+        // HSTRING out-params must also land in a stable buffer so the returned
+        // pointer remains valid after this call frame is unwound.
+        let is_string_return = self.return_type.as_str() == "String";
+
         // Reuse the pre-allocated buffer — avoids a heap allocation on every call.
         self.argument_buf.clear();
+        // Track the corresponding parse-level type for each ABI argument slot so
+        // we can choose the correct `NativeType` when creating `Arg`s.  Some
+        // parsed parameters expand to multiple ABI slots (e.g. buffers), so a
+        // simple index subtraction is insufficient.
+        let mut argument_parse_types: Vec<Option<NativeType>> = Vec::with_capacity(_number_of_abi_parameters);
         let mut queried_interfaces: Vec<IUnknown> = Vec::new();
 
         self.argument_buf.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
+        argument_parse_types.push(None);
 
         for (i, native_type) in self.parse_parameter_types.iter().enumerate() {
             let value = args.get(i as i32);
@@ -452,7 +515,9 @@ impl MethodCall {
                     };
 
                     self.argument_buf.push(NativeValue { u32_value: byte_length });
+                    argument_parse_types.push(Some(native_type.clone()));
                     self.argument_buf.push(buffer_value);
+                    argument_parse_types.push(Some(native_type.clone()));
                     continue;
                 }
                 NativeType::Function => {
@@ -472,6 +537,7 @@ impl MethodCall {
             };
 
             self.argument_buf.push(value);
+            argument_parse_types.push(Some(native_type.clone()));
         }
 
         let mut result: *mut c_void = std::ptr::null_mut();
@@ -486,40 +552,54 @@ impl MethodCall {
                         pointer: &mut composition_outer as *mut _ as *mut c_void,
                     })
                 };
+                argument_parse_types.push(None);
                 unsafe {
                     self.argument_buf.push(NativeValue {
                         pointer: &mut composition_inner as *mut _ as *mut c_void,
                     })
                 };
+                argument_parse_types.push(None);
             }
             unsafe { self.argument_buf.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void }) };
+            argument_parse_types.push(None);
         } else if !is_void {
-            if is_value_type {
-                // Value structs (GUID=16B, Rect=16B, …) are written directly into the
-                // out-param location — not through a pointer-to-pointer.  Use the
-                // pre-allocated scratch buffer so we don't overflow a pointer-sized slot.
+            // Scalar, value-type, and String returns all use the stable
+            // pre-allocated scratch buffer so the returned pointer is valid
+            // after this call frame is unwound.
+            if is_value_type || is_scalar_return || is_string_return {
                 let buf_ptr = self.return_value_buf.as_mut_ptr() as *mut c_void;
                 self.argument_buf.push(NativeValue { pointer: buf_ptr });
+                argument_parse_types.push(None);
             } else {
                 self.argument_buf.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
+                argument_parse_types.push(None);
             }
         }
 
-        let mut call_args: Vec<Arg> = Vec::with_capacity(self.argument_buf.len());
-        for (i, v) in self.argument_buf.iter().enumerate() {
-            // SAFETY: Creating a `Arg` from a `NativeValue` is safe when the parallel type vector matches.
-            let Some(native_type) = self.parameter_types.get(i) else {
-                return (call_failure(), std::ptr::null_mut());
-            };
-            call_args.push(unsafe { v.as_arg(native_type) });
-        }
 
-        let ret = unsafe {
-            self.cif.call(
-                CodePtr::from_ptr(self.func),
-                &call_args,
-            )
+        // Delegate the first-pass preparation of effective ABI natives and
+        // stable HSTRING storage to the `ffi` helper module. This keeps the
+        // libffi-oriented logic isolated while leaving `Arg` construction here
+        // so references remain valid in this scope.
+        let prep = match crate::ffi::prepare_string_storage(&self.argument_buf, &self.parameter_types, &argument_parse_types) {
+            Ok(value) => value,
+            Err(_) => return (call_failure(), std::ptr::null_mut()),
         };
+
+        // Keep the prepared string storage alive for the duration of the call;
+        // argument `Arg` values will be constructed later and will borrow from `prep`.
+        let mut prep = prep;
+
+        
+        let func_to_call = self.func;
+        let func_index = self.index;
+
+        // Always use the libffi call path to avoid fragile in-process
+        // typed invocations; this keeps behavior predictable and avoids
+        // crashes caused by calling the wrong vtable slot.
+        let call_args = crate::ffi::build_call_args(&prep, &self.argument_buf, &argument_parse_types);
+        let ret = unsafe { self.cif.call(CodePtr::from_ptr(func_to_call), &call_args) };
+
 
         if is_initializer && !is_sealed && result.is_null() {
             if !composition_inner.is_null() {
@@ -529,8 +609,9 @@ impl MethodCall {
             }
         }
 
-        if !is_initializer && !is_void && is_value_type {
-            // Point result at the scratch buffer so the caller can read the bytes.
+        if !is_initializer && !is_void && (is_value_type || is_scalar_return || is_string_return) {
+            // Point result at the scratch buffer — all three categories write
+            // into return_value_buf, so the pointer is stable for the caller.
             result = self.return_value_buf.as_mut_ptr() as *mut c_void;
         }
 

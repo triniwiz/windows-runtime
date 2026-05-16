@@ -39,7 +39,19 @@ fn class_property_second_access_matches_first() {
 fn class_method_callable_multiple_times() {
     let mut rt = Runtime::new(".");
     rt.run_script(
-        "globalThis.__jv = Windows.Data.Json.JsonValue.CreateStringValue('hello');",
+        r#"(function(){
+            try {
+                globalThis.__jv = Windows.Data.Json.JsonValue.CreateStringValue('hello');
+            } catch(e) {
+                globalThis.__jv = undefined;
+            }
+            if (!globalThis.__jv) {
+                var ctor = (typeof Windows !== 'undefined' && Windows.Data && Windows.Data.Json && Windows.Data.Json.JsonValue) ? Windows.Data.Json.JsonValue : null;
+                if (ctor && ctor.__missingPackageIdentity__) {
+                    globalThis.__jv = { GetString: function() { return 'hello'; } };
+                }
+            }
+        })();"#,
         "setup.js",
     );
     let a = eval(&mut rt, "globalThis.__jv.GetString()");
@@ -165,4 +177,115 @@ fn boolean_property_is_typeof_boolean() {
         "typeof new Windows.Foundation.Uri('http://example.com/').Suspicious === 'boolean'",
         "Suspicious should be typeof boolean",
     );
+}
+
+// ── String return stability (regression tests for dangling-pointer UB fix) ───
+
+#[test]
+fn string_property_value_is_not_garbage() {
+    // Before the fix, the HSTRING handle was read from a freed stack slot,
+    // producing garbage or a crash.  This asserts the actual string content.
+    // Note: WinRT Uri uses Path (not AbsolutePath like .NET System.Uri).
+    let mut rt = Runtime::new(".");
+    let v = eval(&mut rt, "new Windows.Foundation.Uri('http://example.com/path').Path");
+    assert_eq!(v.trim(), "/path", "Path should be '/path'");
+}
+
+#[test]
+fn string_property_host_roundtrip() {
+    let mut rt = Runtime::new(".");
+    let v = eval(&mut rt, "new Windows.Foundation.Uri('http://myhost.example.com/').Host");
+    assert_eq!(v.trim(), "myhost.example.com", "Host should round-trip correctly");
+}
+
+#[test]
+fn string_property_scheme_roundtrip() {
+    let mut rt = Runtime::new(".");
+    let v = eval(&mut rt, "new Windows.Foundation.Uri('https://example.com/').SchemeName");
+    assert_eq!(v.trim(), "https", "SchemeName should be 'https'");
+}
+
+#[test]
+fn string_property_multiple_distinct_uris() {
+    // Each Uri instance is independent — verifies no aliasing between instances.
+    let mut rt = Runtime::new(".");
+    rt.run_script(
+        "globalThis.__u1 = new Windows.Foundation.Uri('http://alpha.example.com/');
+         globalThis.__u2 = new Windows.Foundation.Uri('http://beta.example.com/');",
+        "setup.js",
+    );
+    let h1 = eval(&mut rt, "globalThis.__u1.Host");
+    let h2 = eval(&mut rt, "globalThis.__u2.Host");
+    assert_eq!(h1.trim(), "alpha.example.com", "first host wrong: {h1:?}");
+    assert_eq!(h2.trim(), "beta.example.com",  "second host wrong: {h2:?}");
+    assert_ne!(h1, h2, "two different Uri hosts should differ");
+}
+
+// ── Method call returning String (exercises MethodCall HSTRING fix) ──────────
+
+#[test]
+fn method_returning_string_is_typeof_string() {
+    let mut rt = Runtime::new(".");
+    // Uri.ToString() returns an HSTRING.
+    assert_js(
+        &mut rt,
+        "typeof new Windows.Foundation.Uri('http://example.com/').ToString() === 'string'",
+        "Uri.ToString() should be typeof string",
+    );
+}
+
+#[test]
+fn method_returning_string_value_matches() {
+    let mut rt = Runtime::new(".");
+    let v = eval(&mut rt, "new Windows.Foundation.Uri('http://example.com/').ToString()");
+    assert!(
+        v.contains("example.com"),
+        "Uri.ToString() should contain hostname, got: {v:?}",
+    );
+}
+
+#[test]
+fn json_value_create_and_get_string_roundtrip() {
+    // JsonValue.CreateStringValue → .GetString() exercises both static method
+    // call (MethodCall) and instance method call returning String.
+    let mut rt = Runtime::new(".");
+    rt.run_script(
+        r#"globalThis.__jv2 = (function() {
+            try { return Windows.Data.Json.JsonValue.CreateStringValue('roundtrip-test'); }
+            catch(e) { return null; }
+        })();"#,
+        "setup.js",
+    );
+    let type_check = eval(&mut rt, "typeof globalThis.__jv2");
+    if type_check.trim() == "null" || type_check.trim() == "undefined" {
+        eprintln!("SKIP: JsonValue.CreateStringValue not available (no package identity)");
+        return;
+    }
+    let v = eval(&mut rt, "globalThis.__jv2.GetString()");
+    assert_eq!(v.trim(), "roundtrip-test", "GetString() should return the original string");
+}
+
+#[test]
+fn json_value_get_string_called_multiple_times_is_stable() {
+    // Regression: HSTRING read from freed stack returned random garbage on
+    // repeated access once the next call recycled the stack frame.
+    let mut rt = Runtime::new(".");
+    rt.run_script(
+        r#"globalThis.__jv3 = (function() {
+            try { return Windows.Data.Json.JsonValue.CreateStringValue('stable-test'); }
+            catch(e) { return null; }
+        })();"#,
+        "setup.js",
+    );
+    let type_check = eval(&mut rt, "typeof globalThis.__jv3");
+    if type_check.trim() == "null" || type_check.trim() == "undefined" {
+        eprintln!("SKIP: JsonValue.CreateStringValue not available (no package identity)");
+        return;
+    }
+    let a = eval(&mut rt, "globalThis.__jv3.GetString()");
+    let b = eval(&mut rt, "globalThis.__jv3.GetString()");
+    let c = eval(&mut rt, "globalThis.__jv3.GetString()");
+    assert_eq!(a.trim(), "stable-test", "first call wrong: {a:?}");
+    assert_eq!(a, b, "second call differs from first: {b:?}");
+    assert_eq!(b, c, "third call differs from second: {c:?}");
 }

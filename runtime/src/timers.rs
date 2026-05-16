@@ -1,7 +1,8 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 use std::thread;
@@ -68,9 +69,9 @@ impl Scheduler {
 
     fn run(self: Arc<Self>) {
         loop {
-            let mut guard = self.inner.lock().unwrap();
+            let mut guard = self.inner.lock();
             while guard.timers.is_empty() {
-                guard = self.cond.wait(guard).unwrap();
+                self.cond.wait(&mut guard);
             }
 
             // Re-check in a loop to handle multiple timers becoming due
@@ -79,8 +80,7 @@ impl Scheduler {
                 let now = Instant::now();
                 if guard.timers[0].due > now {
                     let wait_dur = guard.timers[0].due - now;
-                    let (g, _timeout_res) = self.cond.wait_timeout(guard, wait_dur).unwrap();
-                    guard = g;
+                    let _timeout_res = self.cond.wait_for(&mut guard, wait_dur);
                     continue;
                 }
 
@@ -93,11 +93,7 @@ impl Scheduler {
                 }
 
                 // Grab its meta (clone) then release lock before sending
-                let meta = guard.metas.get(&id).cloned();
-                if meta.is_none() {
-                    continue;
-                }
-                let meta = meta.unwrap();
+                let Some(meta) = guard.metas.get(&id).cloned() else { continue; };
                 drop(guard);
 
                 // Send the fired id to the originating thread via the stored
@@ -108,7 +104,7 @@ impl Scheduler {
                 // Reschedule if repeating
                 if meta.repeats {
                     let new_due = tr.due + Duration::from_millis(meta.interval_ms);
-                    let mut g = self.inner.lock().unwrap();
+                    let mut g = self.inner.lock();
                     // insert keeping sorted order (binary search)
                     let idx = match g.timers.binary_search_by(|r| r.due.cmp(&new_due)) {
                         Ok(i) => i,
@@ -117,7 +113,7 @@ impl Scheduler {
                     g.timers.insert(idx, TimerRef { due: new_due, id });
                     guard = g;
                 } else {
-                    let mut g = self.inner.lock().unwrap();
+                    let mut g = self.inner.lock();
                     g.metas.remove(&id);
                     guard = g;
                 }
@@ -126,7 +122,7 @@ impl Scheduler {
     }
 
     fn add_timer(&self, id: i32, due: Instant, interval_ms: u64, repeats: bool, dest: Sender<i32>) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock();
         guard.metas.insert(id, TimerMeta { interval_ms, repeats, dest });
         let idx = match guard.timers.binary_search_by(|r| r.due.cmp(&due)) {
             Ok(i) => i,
@@ -138,7 +134,7 @@ impl Scheduler {
     }
 
     fn clear_timer(&self, id: i32) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock();
         guard.deleted.insert(id);
         guard.metas.remove(&id);
     }

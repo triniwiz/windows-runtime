@@ -4,5 +4,7 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-[dev-dependencies]
+[dependencies]
 runtime = { path = "../runtime" }
+windows = { version = "0.62.2", features = ["Win32_System_WinRT", "Win32_System_Memory"] }
+libffi = "5.1.0"

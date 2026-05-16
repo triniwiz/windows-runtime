@@ -178,8 +178,11 @@ impl GenericMethodCall {
         let number_of_abi_parameters = self.number_of_abi_parameters;
 
         let mut arguments: Vec<NativeValue> = Vec::with_capacity(number_of_abi_parameters);
+        // Track parse-level types for each ABI argument slot.
+        let mut argument_parse_types: Vec<Option<NativeType>> = Vec::with_capacity(number_of_abi_parameters);
 
         arguments.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
+        argument_parse_types.push(None);
 
         for (i, native_type) in self.parse_parameter_types.iter().enumerate() {
             let value = args.get(i as i32);
@@ -238,7 +241,9 @@ impl GenericMethodCall {
                     };
 
                     arguments.push(NativeValue { u32_value: byte_length });
+                    argument_parse_types.push(Some(native_type.clone()));
                     arguments.push(buffer_value);
+                    argument_parse_types.push(Some(native_type.clone()));
                     continue;
                 }
                 NativeType::Function => {
@@ -258,6 +263,7 @@ impl GenericMethodCall {
             };
 
             arguments.push(value);
+            argument_parse_types.push(Some(native_type.clone()));
         }
 
         let mut result: *mut c_void = std::ptr::null_mut();
@@ -265,19 +271,36 @@ impl GenericMethodCall {
 
         if self.is_initializer {
             unsafe { arguments.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void }) };
+            argument_parse_types.push(None);
         } else {
             if !self.is_void {
                 arguments.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
+                argument_parse_types.push(None);
             }
         }
 
         let mut call_args: Vec<Arg> = Vec::with_capacity(arguments.len());
         for (i, v) in arguments.iter().enumerate() {
             // SAFETY: Creating a `Arg` from a `NativeValue` is safe when the parallel type vector matches.
-            let Some(native_type) = self.parameter_types.get(i) else {
+            let Some(abi_native) = self.parameter_types.get(i) else {
                 return (call_failure(), std::ptr::null_mut());
             };
-            call_args.push(unsafe { v.as_arg(native_type) });
+
+            let effective_native = if matches!(abi_native, NativeType::Pointer) {
+                if let Some(Some(parse_pt)) = argument_parse_types.get(i) {
+                    if matches!(parse_pt, NativeType::String) {
+                        NativeType::String
+                    } else {
+                        abi_native.clone()
+                    }
+                } else {
+                    abi_native.clone()
+                }
+            } else {
+                abi_native.clone()
+            };
+
+            call_args.push(unsafe { v.as_arg(&effective_native) });
         }
 
 

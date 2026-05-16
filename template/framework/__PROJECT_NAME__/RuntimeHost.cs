@@ -27,6 +27,18 @@ namespace __PROJECT_NAME__
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_install_ctrlc_handler))]
         private static extern void runtime_install_ctrlc_handler(int exitCode);
 
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_set_local_folder))]
+        private static extern void runtime_set_local_folder([MarshalAs(UnmanagedType.LPUTF8Str)] string localFolder);
+
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_get_last_js_error))]
+        private static extern IntPtr runtime_get_last_js_error();
+
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_free_js_error))]
+        private static extern void runtime_free_js_error(IntPtr ptr);
+
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_has_devtools))]
+        private static extern bool runtime_has_devtools();
+
 #if DEBUG
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_devtools_start))]
         private static extern IntPtr runtime_devtools_start(long runtime, ushort port);
@@ -39,9 +51,11 @@ namespace __PROJECT_NAME__
 
         public string DevtoolsFrontendUrl { get; private set; }
 
+        private bool _devtoolsAvailable;
+
         public void PumpDevtools()
         {
-            if (!_initialized) return;
+            if (!_initialized || !_devtoolsAvailable) return;
             try { runtime_devtools_pump(_runtime); }
             catch (Exception ex)
             {
@@ -51,6 +65,7 @@ namespace __PROJECT_NAME__
 
         private void StartDevtoolsSafely()
         {
+            if (!runtime_has_devtools()) return;
             IntPtr urlPtr = IntPtr.Zero;
             try
             {
@@ -61,7 +76,10 @@ namespace __PROJECT_NAME__
                     ? $"devtools://devtools/bundled/inspector.html?ws={wsUrl.Replace("ws://", "")}"
                     : null;
                 if (DevtoolsFrontendUrl != null)
+                {
+                    _devtoolsAvailable = true;
                     System.Diagnostics.Debug.WriteLine($"[NativeScript DevTools] {DevtoolsFrontendUrl}");
+                }
             }
             catch (Exception ex)
             {
@@ -83,6 +101,7 @@ namespace __PROJECT_NAME__
             if (_initialized) return;
             AttachConsole(ATTACH_PARENT_PROCESS);
             runtime_install_ctrlc_handler(0);
+            runtime_set_local_folder(Windows.Storage.ApplicationData.Current.LocalFolder.Path);
             _runtime = runtime_init(AppContext.BaseDirectory);
 #if DEBUG
             if (ConsumeDebugBreakMarker())
@@ -225,6 +244,24 @@ namespace __PROJECT_NAME__
                 if (File.Exists(appUpper)) return appUpper;
             }
             return null;
+        }
+
+        /// Returns the last JavaScript error (message + stack trace) captured during
+        /// script execution, or null if no error was recorded since the last call.
+        public string GetLastJsError()
+        {
+            if (!_initialized) return null;
+            IntPtr ptr = IntPtr.Zero;
+            try
+            {
+                ptr = runtime_get_last_js_error();
+                return ptr == IntPtr.Zero ? null : Marshal.PtrToStringUTF8(ptr);
+            }
+            catch { return null; }
+            finally
+            {
+                if (ptr != IntPtr.Zero) runtime_free_js_error(ptr);
+            }
         }
 
         public void Dispose()

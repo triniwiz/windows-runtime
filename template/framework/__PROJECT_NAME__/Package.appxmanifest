@@ -2,16 +2,13 @@
 
 <Package
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
-  xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
-  IgnorableNamespaces="uap mp">
+  IgnorableNamespaces="uap">
 
   <Identity
     Name="__APP_IDENTIFIER__"
     Publisher="CN=__PROJECT_NAME__"
     Version="1.0.0.0" />
-
-  <mp:PhoneIdentity PhoneProductId="__APP_IDENTIFIER__" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
 
   <Properties>
     <DisplayName>__PROJECT_NAME__</DisplayName>
@@ -24,7 +21,7 @@
   </Dependencies>
 
   <Resources>
-    <Resource Language="x-generate"/>
+    <Resource Language="en-US"/>
   </Resources>
 
   <Applications>

@@ -452,10 +452,13 @@ pub(crate) fn handle_instance_property_getter(
         if property.name() != name {
             continue;
         }
-
-        let Some(mut property_call) = PropertyCall::new(&property, false, dec.instance.clone().unwrap(), false) else {
+        let instance_for_call = dec.instance.clone().unwrap();
+        let property_call_opt = PropertyCall::new(&property, false, instance_for_call, false);
+        if property_call_opt.is_none() {
             continue;
-        };
+        }
+
+        let mut property_call = property_call_opt.unwrap();
         let (ret, result) = property_call.call_with_values(scope, &[]);
 
         if ret.is_err() {
@@ -543,8 +546,6 @@ pub(crate) fn handle_instance_property_setter(
         return v8::Intercepted::kNo;
     };
 
-    debug_output(&format!("[NativeScript] instance setter on {} name='{}' value_kind=obj:{} null:{} undef:{}\n",
-        clazz.full_name(), name, value.is_object(), value.is_null(), value.is_undefined()));
 
     // Try WinRT properties first.
     for property in collect_class_properties(clazz) {
@@ -559,10 +560,6 @@ pub(crate) fn handle_instance_property_setter(
         let Some(mut property_call) = PropertyCall::new(&property, true, dec.instance.clone().unwrap(), false) else {
             return v8::Intercepted::kNo;
         };
-        debug_output(&format!(
-            "[NativeScript] set '{}' param_types={:?} abi_types={:?}\n",
-            name, property_call.parse_types_debug(), property_call.abi_types_debug()
-        ));
         let (ret, _) = property_call.call_with_values(scope, &[value]);
         if ret.is_err() {
             let detail = format!("Property set '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
@@ -578,7 +575,6 @@ pub(crate) fn handle_instance_property_setter(
         let instance = dec.instance.clone();
         drop(lock);
 
-        debug_output(&format!("[NativeScript] event set '{}' add='{}'\n", name, add_method.name()));
 
         // Remove the previous handler if one was registered under this name.
         if let Some(&old_token) = dec.event_tokens.get(&name) {
@@ -599,19 +595,16 @@ pub(crate) fn handle_instance_property_setter(
                             if let Some(inst) = instance {
                                 let mut mc = MethodCall::new(&add_method, add_method.is_sealed(), inst, false);
                                 let (ret, token) = mc.call_with_raw_ptr(delegate_ptr);
-                                debug_output(&format!("[NativeScript] add_Click hr=0x{:08X} token={}\n", ret.0 as u32, token));
                                 if ret.is_ok() {
                                     dec.event_tokens.insert(name, token);
                                 }
                             }
                         } else {
-                            debug_output(&format!("[NativeScript] event set '{}': value has no External handle (value is_null={})\n", name, value.is_null()));
                         }
                     }
                 }
             }
         } else {
-            debug_output(&format!("[NativeScript] event set '{}': value is not object (is_null={} is_undefined={})\n", name, value.is_null(), value.is_undefined()));
         }
 
         return v8::Intercepted::kYes;
@@ -797,7 +790,6 @@ pub(crate) unsafe fn raw_result_to_local<'s>(
     parent_decl: Option<Arc<RwLock<dyn Declaration>>>,
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Option<Local<'s, v8::Value>> {
-    debug_output(&format!("[NativeScript] raw_result_to_local: sig={} result={:p}\n", signature, result));
     let raw = result as usize;
     match signature {
         "Void" => None,
@@ -1066,7 +1058,9 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let dec = unsafe { &*dec };
                         let lock = dec.read();
                         let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
-                        let Some(mut method) = PropertyCall::new(method, false, dec.instance.clone().unwrap(), false) else { return; };
+                        let Some(mut method) = PropertyCall::new(method, false, dec.instance.clone().unwrap(), false) else {
+                            return;
+                        };
                         let (ret, result) = method.call(scope, &args);
                         if ret.is_err() {
                             let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
@@ -1095,6 +1089,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                     })
                     .data(getter_declaration_ext.into())
                     .build(scope);
+
 
                     let mut setter: Option<Local<FunctionTemplate>> = None;
                     if property.setter().is_some() {
@@ -1342,7 +1337,9 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let dec = unsafe { &*dec };
                                     let lock = dec.read();
                                     let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
-                                    let Some(mut method) = PropertyCall::new(method, false, dec.instance.clone().unwrap(), false) else { return; };
+                                    let Some(mut method) = PropertyCall::new(method, false, dec.instance.clone().unwrap(), false) else {
+                                        return;
+                                    };
                                     let (ret, result) = method.call(scope, &args);
                                     if ret.is_err() {
                                         let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
@@ -1512,7 +1509,9 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let dec = unsafe { &*dec };
                         let lock = dec.read();
                         let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
-                        let Some(mut method) = PropertyCall::new(method, false, dec.instance.clone().unwrap(), false) else { return; };
+                        let Some(mut method) = PropertyCall::new(method, false, dec.instance.clone().unwrap(), false) else {
+                            return;
+                        };
                                     let (ret, result) = method.call(scope, &args);
                                     if ret.is_err() {
                                         let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
@@ -1651,18 +1650,15 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
         }
     }
 
-    debug_output("[NativeScript] create_ns_ctor_instance_object: calling new_instance\n");
     let object = match object_tmpl.new_instance(scope) {
         Some(o) => o,
         None => {
-            debug_output("[NativeScript] create_ns_ctor_instance_object: new_instance returned None!\n");
             let msg = v8::String::new(scope, "Failed to create instance object").unwrap();
             let err = v8::Exception::error(scope, msg.into());
             scope.throw_exception(err);
             return v8::null(scope).into();
         }
     };
-    debug_output("[NativeScript] create_ns_ctor_instance_object: new_instance OK\n");
 
     object.set_internal_field(0, ext.into());
 
@@ -1731,7 +1727,6 @@ pub(crate) fn create_ns_ctor_object<'a>(
         match kind {
             DeclarationKind::Class => {
                 let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
-                debug_output(&format!("[NativeScript] ctor-callback: new {}\n", clazz.full_name()));
 
                 let clazz_factory = match class_activation_factory(clazz.full_name()) {
                     Ok(factory) => factory,
@@ -1865,7 +1860,6 @@ pub(crate) fn create_ns_ctor_object<'a>(
                     };
                     if let Some(func) = maybe_func {
                         if let Some((guid, param_types)) = js_delegate_params_from_declaration(&*lock, kind) {
-                            debug_output(&format!("[NativeScript] delegate ctor: created JsDelegate guid={:?} params={}\n", guid, param_types.len()));
                             let global_func = v8::Global::new(scope, func);
                             let data = Box::new(JsDelegateData { js_func: global_func, param_types });
                             let delegate = Box::new(JsDelegate {
@@ -1942,7 +1936,6 @@ pub(crate) fn create_ns_ctor_object<'a>(
         }
 
         let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
-        debug_output(&format!("[NativeScript] create_ns_ctor_object: building methods for {}\n", clazz.full_name()));
 
         let mut added_names: HashSet<String> = HashSet::new();
 

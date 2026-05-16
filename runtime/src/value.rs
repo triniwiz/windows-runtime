@@ -91,11 +91,30 @@ impl NativeType {
                     types::pointer.size
                 }
                 NativeType::Struct(ref value) => {
-                    let mut size = 0_usize;
-                    for native_type in value.iter() {
-                        size = size + 1 + native_type.size();
+                    // Prefer libffi's computed struct size (handles alignment/padding).
+                    // Fall back to naive sum of field sizes if Type construction fails.
+                    let try_size = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut fields_vec: Vec<libffi::middle::Type> = Vec::new();
+                        for f in value.iter() {
+                            match std::convert::TryFrom::try_from(f.clone()) {
+                                Ok(t) => fields_vec.push(t),
+                                Err(_) => return None,
+                            }
+                        }
+                        let s = libffi::middle::Type::structure(fields_vec);
+                        let raw = s.as_raw_ptr();
+                        Some(unsafe { (*raw).size })
+                    }));
+
+                    if let Ok(Some(s)) = try_size {
+                        s
+                    } else {
+                        let mut size = 0_usize;
+                        for native_type in value.iter() {
+                            size = size + native_type.size();
+                        }
+                        size
                     }
-                    size
                 }
             }
         }
@@ -120,7 +139,12 @@ impl TryFrom<NativeType> for libffi::middle::Type {
             NativeType::ISize => libffi::middle::Type::isize(),
             NativeType::F32 => libffi::middle::Type::f32(),
             NativeType::F64 => libffi::middle::Type::f64(),
-            NativeType::Pointer | NativeType::Buffer | NativeType::Function | NativeType::String => {
+            NativeType::Pointer | NativeType::Buffer | NativeType::Function => {
+                libffi::middle::Type::pointer()
+            }
+            NativeType::String => {
+                // HSTRING is an opaque pointer-sized handle at the ABI layer.
+                // Use libffi's pointer type so the callee sees a `void*`.
                 libffi::middle::Type::pointer()
             }
             NativeType::Struct(fields) => {
@@ -233,8 +257,11 @@ impl NativeValue {
             }
             NativeType::Struct(_) => Arg::new(&*self.pointer),
             NativeType::String => {
-                let addr = &*self.string;
-                Arg::new::<*mut c_void>(mem::transmute(addr))
+                // HSTRING must be passed by value (handle-sized) on WinRT x64.
+                // The union stores the HSTRING in the same memory as `usize_value`,
+                // so take the address of `usize_value` to provide a stable
+                // handle-sized reference for libffi without creating temporaries.
+                Arg::new(&self.usize_value)
             }
         }
     }
@@ -371,13 +398,51 @@ pub fn ffi_parse_string_arg(
     scope: &mut v8::PinScope<'_, '_>,
     arg: v8::Local<v8::Value>,
 ) -> std::result::Result<NativeValue, AnyError> {
+    // If the JS value carries an `__hstring_ptr` External (set by
+    // `create_hstring_backed_js_value`), reuse it to avoid reallocation.
+    if arg.is_object() {
+        if let Some(obj) = arg.to_object(scope) {
+            if let Some(key) = v8::String::new(scope, "__hstring_ptr") {
+                if let Some(val) = obj.get(scope, key.into()) {
+                    if let Ok(ext) = v8::Local::<v8::External>::try_from(val) {
+                        let raw = ext.value() as *const HSTRING;
+                        if !raw.is_null() {
+                            let hclone = unsafe { (*raw).clone() };
+                            return Ok(NativeValue { string: ManuallyDrop::new(hclone) });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let string_value = v8::Local::<v8::String>::try_from(arg)
         .map_err(|_| type_error("Invalid FFI String type, expected String"))?;
 
     let string = string_value.to_rust_string_lossy(scope);
-
     Ok(NativeValue { string: ManuallyDrop::new(HSTRING::from(string)) })
 }
+
+/// Create a JS object that carries an `HSTRING` pointer in `__hstring_ptr`.
+/// This is a convenience helper; callers should avoid creating these unless
+/// they expect the JS value to be passed back to native code later.
+pub fn create_hstring_backed_js_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    h: HSTRING,
+) -> v8::Local<'s, v8::Object> {
+    let obj = v8::Object::new(scope);
+    // Box the HSTRING so we have an address to store in the External.
+    let boxed = Box::new(h);
+    let ptr = Box::into_raw(boxed) as *mut std::ffi::c_void;
+    let ext = v8::External::new(scope, ptr);
+    let key = v8::String::new(scope, "__hstring_ptr").unwrap();
+    let _ = obj.set(scope, key.into(), ext.into());
+    // Also expose the string content under `value` for convenience.
+    let s = unsafe { (&*(ptr as *mut HSTRING)).to_string_lossy() };
+    let _ = obj.set(scope, v8::String::new(scope, "value").unwrap().into(), v8::String::new(scope, &s).unwrap().into());
+    obj
+}
+
 
 
 #[inline]
@@ -864,59 +929,50 @@ fn external_or_null<'a>(
 
 #[inline]
 pub unsafe fn set_ret_val(value:*mut c_void, scope: &mut v8::PinScope<'_, '_>, mut rv: v8::ReturnValue, native_type: NativeType){
-    let raw = value as usize;
-
     match native_type {
         NativeType::Void => {
             rv.set_undefined();
         }
         NativeType::Bool => {
-            rv.set_bool((raw as u8) != 0);
+            let b = unsafe { std::ptr::read_unaligned(value as *const u8) } != 0u8;
+            rv.set_bool(b);
         }
         NativeType::U8 => {
-            rv.set_uint32(
-                raw as u8 as u32
-            );
+            let v = unsafe { std::ptr::read_unaligned(value as *const u8) };
+            rv.set_uint32(v as u32);
         }
         NativeType::I8 => {
-            rv.set_int32(
-                raw as u8 as i8 as i32
-            );
+            let v = unsafe { std::ptr::read_unaligned(value as *const i8) };
+            rv.set_int32(v as i32);
         }
         NativeType::U16 => {
-            rv.set_uint32(
-                raw as u16 as u32
-            );
+            let v = unsafe { std::ptr::read_unaligned(value as *const u16) };
+            rv.set_uint32(v as u32);
         }
         NativeType::I16 => {
-            rv.set_int32(
-                raw as u16 as i16 as i32
-            );
+            let v = unsafe { std::ptr::read_unaligned(value as *const i16) };
+            rv.set_int32(v as i32);
         }
         NativeType::U32 => {
-            rv.set_uint32(
-                raw as u32
-            );
+            let v = unsafe { std::ptr::read_unaligned(value as *const u32) };
+            rv.set_uint32(v);
         }
         NativeType::I32 => {
-            rv.set_int32(
-                raw as u32 as i32
-            );
+            let v = unsafe { std::ptr::read_unaligned(value as *const i32) };
+            rv.set_int32(v);
         }
         NativeType::U64 => {
-            let ret = raw as u64;
-
+            let ret = unsafe { std::ptr::read_unaligned(value as *const u64) };
             let local_value: v8::Local<v8::Value> =
                 if ret > MAX_SAFE_INTEGER as u64 {
                     v8::BigInt::new_from_u64(scope, ret).into()
                 } else {
                     v8::Number::new(scope, ret as f64).into()
                 };
-
             rv.set(local_value);
         }
         NativeType::I64 => {
-            let ret = raw as u64 as i64;
+            let ret = unsafe { std::ptr::read_unaligned(value as *const i64) };
             let local_value: v8::Local<v8::Value> =
                 if ret > MAX_SAFE_INTEGER as i64 || ret < MIN_SAFE_INTEGER as i64
                 {
@@ -927,7 +983,7 @@ pub unsafe fn set_ret_val(value:*mut c_void, scope: &mut v8::PinScope<'_, '_>, m
             rv.set(local_value);
         }
         NativeType::USize => {
-            let ret = raw;
+            let ret = unsafe { std::ptr::read_unaligned(value as *const usize) };
             let local_value: v8::Local<v8::Value> =
                 if ret > MAX_SAFE_INTEGER as usize {
                     v8::BigInt::new_from_u64(scope, ret as u64).into()
@@ -937,7 +993,7 @@ pub unsafe fn set_ret_val(value:*mut c_void, scope: &mut v8::PinScope<'_, '_>, m
             rv.set(local_value);
         }
         NativeType::ISize => {
-            let ret = raw as isize;
+            let ret = unsafe { std::ptr::read_unaligned(value as *const isize) };
             let local_value: v8::Local<v8::Value> =
                 if !(MIN_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&ret) {
                     v8::BigInt::new_from_i64(scope, ret as i64).into()
@@ -947,14 +1003,13 @@ pub unsafe fn set_ret_val(value:*mut c_void, scope: &mut v8::PinScope<'_, '_>, m
             rv.set(local_value);
         }
         NativeType::F32 => {
-            let ret = f32::from_bits(raw as u32);
-
-            rv.set(
-                v8::Number::new(scope, ret as f64).into()
-            );
+            let bits = unsafe { std::ptr::read_unaligned(value as *const u32) };
+            let ret = f32::from_bits(bits);
+            rv.set(v8::Number::new(scope, ret as f64).into());
         }
         NativeType::F64 => {
-            let ret = f64::from_bits(raw as u64);
+            let bits = unsafe { std::ptr::read_unaligned(value as *const u64) };
+            let ret = f64::from_bits(bits);
             rv.set_double(ret);
         }
         NativeType::Pointer => {
@@ -970,10 +1025,21 @@ pub unsafe fn set_ret_val(value:*mut c_void, scope: &mut v8::PinScope<'_, '_>, m
             rv.set(external_or_null(scope, value));
         }
         NativeType::String => {
-            let hstring: HSTRING = unsafe { mem::transmute(value) };
-            let v = v8::String::new(scope, &hstring.to_string_lossy())
-                .unwrap_or_else(|| v8::String::empty(scope));
-            rv.set(v.into());
+            if value.is_null() {
+                rv.set_undefined();
+            } else {
+                // `value` points to the return_value_buf scratch area where
+                // WinRT wrote the HSTRING handle.  Read it out, take
+                // ownership via transmute (we are the callee-allocated owner),
+                // convert to a Rust string, then drop to release the WinRT
+                // string buffer.
+                let raw_usize = unsafe { std::ptr::read_unaligned(value as *const usize) };
+                let hstring: HSTRING = unsafe { std::mem::transmute(raw_usize) };
+                let s = hstring.to_string_lossy();
+                drop(hstring);
+                let v = v8::String::new(scope, &s).unwrap_or_else(|| v8::String::empty(scope));
+                rv.set(v.into());
+            }
         }
     }
 }

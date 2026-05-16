@@ -9,8 +9,8 @@
 ///
 /// 1. Find the entry for the correct DLL group (or add a new group comment).
 /// 2. Append a line:
-///    ```
-///    KnownFn { dll: "somedll.dll", name: "FunctionName", ret: "retType", params: &["arg0type", …] },
+///    ```text
+///    KnownFn { dll: "somedll.dll", name: "FunctionName", ret: "retType", params: &["arg0type", /* ... */] },
 ///    ```
 /// 3. Rebuild.  No other files need to change.
 ///

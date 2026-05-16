@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use libffi::middle::*;
 use parking_lot::RwLock;
-use windows::core::{GUID, HRESULT, Interface, IUnknown};
+use windows::core::{GUID, HRESULT, Interface, IUnknown, IInspectable};
 use windows::Win32::System::WinRT::IActivationFactory;
 use windows::Win32::System::WinRT::Metadata::CorTokenType;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
@@ -16,7 +16,6 @@ use metadata::declaring_interface_for_method::Metadata;
 use metadata::signature::Signature;
 use crate::error::AnyError;
 use crate::helpers::ffi_native_type_from_signature;
-use crate::debug_output;
 use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue};
 
 pub struct PropertyCall {
@@ -39,6 +38,9 @@ pub struct PropertyCall {
     pub(crate) declaration: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>>,
     /// Pre-allocated argument buffer reused on every call to avoid per-call heap allocation.
     argument_buf: Vec<NativeValue>,
+    /// Scratch buffer used when a WinRT property/method returns a value type
+    /// or scalar that must be written into caller-owned storage.
+    return_value_buf: [u8; 128],
 }
 
 #[inline]
@@ -136,7 +138,7 @@ impl PropertyCall {
             }
         };
 
-        index = index.saturating_add(6); // account for IInspectable vtable overhead
+        let pre_index = index;
 
         let vtable = interface.vtable();
 
@@ -151,12 +153,6 @@ impl PropertyCall {
         };
 
         if result.is_err() || interface_ptr.is_null() {
-            let _ = std::panic::catch_unwind(|| {
-                debug_output(&format!(
-                    "[DIAG] PropertyCall::new: QueryInterface failed for method '{}' iid={:?} hr={:?} interface_ptr_null={}\n",
-                    method.name(), iid, result, interface_ptr.is_null()
-                ));
-            });
             return None;
         }
 
@@ -239,8 +235,29 @@ impl PropertyCall {
         let parent_interface = interface.clone();
 
         let interface = unsafe { IUnknown::from_raw(interface_ptr as *mut c_void) };
-        let vtable: *mut *mut c_void = unsafe { std::mem::transmute(interface.vtable()) };
-        let func = unsafe { *vtable.offset(index as isize) };
+        let vtable_struct = interface.vtable();
+        let vtable_ptr: *mut *mut c_void = unsafe { std::mem::transmute(vtable_struct) };
+
+        let mut inspectable_ptr: *mut c_void = std::ptr::null_mut();
+        let supports_iinspectable = unsafe {
+            ((*vtable_struct).QueryInterface)(
+                interface.as_raw(),
+                &IInspectable::IID,
+                &mut inspectable_ptr as *mut _ as *mut *mut c_void,
+            )
+        };
+
+        let base_offset = if supports_iinspectable.is_ok() && !inspectable_ptr.is_null() {
+            unsafe { IUnknown::from_raw(inspectable_ptr as *mut c_void); }
+            6
+        } else {
+            3
+        };
+
+        index = index.saturating_add(base_offset);
+
+        let func = unsafe { *vtable_ptr.offset(index as isize) };
+
 
 
         Some(Self {
@@ -261,6 +278,7 @@ impl PropertyCall {
             declaration,
             return_type,
             is_setter,
+            return_value_buf: [0u8; 128],
             argument_buf: Vec::with_capacity(number_of_abi_parameters),
         })
     }
@@ -285,10 +303,28 @@ impl PropertyCall {
     ) -> (HRESULT, *mut c_void) {
         let is_void = self.is_void;
 
+        let is_value_type = matches!(self.return_type.as_str(),
+            "Guid" | "Rect" | "Matrix3x2" | "Matrix4x4"
+        );
+
+        let is_scalar_return = matches!(self.return_type.as_str(),
+            "UInt8" | "Int8" | "UInt16" | "Int16" |
+            "UInt32" | "Int32" | "UInt64" | "Int64" |
+            "USize" | "ISize" | "Single" | "Double" |
+            "Boolean" | "Char16"
+        );
+
+        // HSTRING out-params must also land in a stable buffer; the local
+        // `result` variable goes out of scope before the caller can read it.
+        let is_string_return = self.return_type.as_str() == "String";
+
         // Reuse the pre-allocated buffer — avoids a heap allocation on every call.
         self.argument_buf.clear();
+        // Track parse-level types per ABI slot to handle String->Pointer mapping.
+        let mut argument_parse_types: Vec<Option<NativeType>> = Vec::with_capacity(self.number_of_abi_parameters);
 
         self.argument_buf.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
+        argument_parse_types.push(None);
 
         for (i, native_type) in self.parse_parameter_types.iter().enumerate() {
             let Some(value) = values.get(i).copied() else {
@@ -349,7 +385,9 @@ impl PropertyCall {
                     };
 
                     self.argument_buf.push(NativeValue { u32_value: byte_length });
+                    argument_parse_types.push(Some(native_type.clone()));
                     self.argument_buf.push(buffer_value);
+                    argument_parse_types.push(Some(native_type.clone()));
                     continue;
                 }
                 NativeType::Function => {
@@ -370,29 +408,56 @@ impl PropertyCall {
             };
 
             self.argument_buf.push(value);
+            argument_parse_types.push(Some(native_type.clone()));
         }
 
         let mut result: *mut c_void = std::ptr::null_mut();
 
         if !self.is_initializer && !is_void {
-            self.argument_buf.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
+            if is_value_type || is_scalar_return || is_string_return {
+                // Write into the stable pre-allocated scratch buffer so the
+                // returned pointer remains valid after this function returns.
+                let buf_ptr = self.return_value_buf.as_mut_ptr() as *mut c_void;
+                self.argument_buf.push(NativeValue { pointer: buf_ptr });
+                argument_parse_types.push(None);
+            } else {
+                self.argument_buf.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
+                argument_parse_types.push(None);
+            }
         }
 
         let mut call_args: Vec<Arg> = Vec::with_capacity(self.argument_buf.len());
+
         for (i, v) in self.argument_buf.iter().enumerate() {
             // SAFETY: Creating a `Arg` from a `NativeValue` is safe when the parallel type vector matches.
-            let Some(native_type) = self.parameter_types.get(i) else {
+            let Some(abi_native) = self.parameter_types.get(i) else {
                 return (call_failure(), std::ptr::null_mut());
             };
-            call_args.push(unsafe { v.as_arg(native_type) });
+
+            let effective_native = if matches!(abi_native, NativeType::Pointer) {
+                if let Some(Some(parse_pt)) = argument_parse_types.get(i) {
+                    if matches!(parse_pt, NativeType::String) {
+                        NativeType::String
+                    } else {
+                        abi_native.clone()
+                    }
+                } else {
+                    abi_native.clone()
+                }
+            } else {
+                abi_native.clone()
+            };
+
+            call_args.push(unsafe { v.as_arg(&effective_native) });
         }
 
-        let ret = unsafe {
-            self.cif.call(
-                CodePtr::from_ptr(self.func),
-                &call_args,
-            )
-        };
+        let ret = unsafe { self.cif.call(CodePtr::from_ptr(self.func), &call_args) };
+
+        if !self.is_initializer && !is_void && (is_value_type || is_scalar_return || is_string_return) {
+            // Point result at the stable scratch buffer for value-type, scalar,
+            // and String returns — all three write into return_value_buf above.
+            result = self.return_value_buf.as_mut_ptr() as *mut c_void;
+        }
 
         (HRESULT(ret), result)
     }

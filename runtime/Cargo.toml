@@ -39,6 +39,7 @@ features = [
     "Win32_Graphics_Dwm",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+    "Data_Json",
 ]
 
 [dev-dependencies]
