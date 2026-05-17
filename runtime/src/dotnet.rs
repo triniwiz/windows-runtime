@@ -62,14 +62,30 @@ type FnBridgeInvoke = unsafe extern "C" fn(
     response_len: *mut i32,
 ) -> i32;
 
+// Binary ABI: same signature, different entry point and wire format.
+type FnBridgeInvokeBinary = unsafe extern "C" fn(
+    request_ptr: *const u8,
+    request_len: i32,
+    response_ptr: *mut *mut u8,
+    response_len: *mut i32,
+) -> i32;
+
 type FnBridgeFree = unsafe extern "C" fn(ptr: *mut u8);
+
+// RegisterJsCallback: C# stores this pointer so managed delegates can call
+// back into V8.  Signature: (callback_id, args_ptr, args_len, &resp_ptr, &resp_len) -> void
+pub(crate) type FnJsCallback =
+    unsafe extern "C" fn(i32, *const u8, i32, *mut *mut u8, *mut i32);
+type FnRegisterJsCallback = unsafe extern "C" fn(callback: FnJsCallback) -> i32;
 
 // ── host state ────────────────────────────────────────────────────────────────
 
 struct DotNetHost {
     _hostfxr: HMODULE,
     invoke: FnBridgeInvoke,
+    invoke_binary: FnBridgeInvokeBinary,
     free: FnBridgeFree,
+    register_js_callback: FnRegisterJsCallback,
 }
 
 // SAFETY: only ever accessed from the main JS/UI thread.
@@ -193,10 +209,12 @@ fn build_host(bridge_dll: &str, runtime_config: &str) -> Result<DotNetHost, Stri
         Ok(fn_out)
     };
 
-    let invoke: FnBridgeInvoke = unsafe { std::mem::transmute(bind("Invoke")?) };
-    let free:   FnBridgeFree   = unsafe { std::mem::transmute(bind("Free")?) };
+    let invoke:               FnBridgeInvoke          = unsafe { std::mem::transmute(bind("Invoke")?) };
+    let invoke_binary:        FnBridgeInvokeBinary     = unsafe { std::mem::transmute(bind("InvokeBinary")?) };
+    let free:                 FnBridgeFree             = unsafe { std::mem::transmute(bind("Free")?) };
+    let register_js_callback: FnRegisterJsCallback     = unsafe { std::mem::transmute(bind("RegisterJsCallback")?) };
 
-    Ok(DotNetHost { _hostfxr: hostfxr, invoke, free })
+    Ok(DotNetHost { _hostfxr: hostfxr, invoke, invoke_binary, free, register_js_callback })
 }
 
 // ── public API ────────────────────────────────────────────────────────────────
@@ -259,6 +277,50 @@ pub(crate) fn call_dotnet(request_json: &str) -> Result<String, String> {
     let slice = unsafe { std::slice::from_raw_parts(resp_ptr, resp_len as usize) };
     // SAFETY: the bridge serialises JSON which is always valid UTF-8.
     let result = unsafe { std::str::from_utf8_unchecked(slice) }.to_owned();
+    unsafe { (host.free)(resp_ptr) };
+    Ok(result)
+}
+
+/// Registers the Rust V8 callback function with the managed bridge so that
+/// .NET delegates created via opcode 0x09 can call back into JavaScript.
+/// Must be called after `try_init_dotnet` succeeds.
+pub(crate) fn init_js_callbacks(callback: FnJsCallback) {
+    let host = match DOTNET_HOST.get() {
+        Some(Ok(h)) => h,
+        _ => return,
+    };
+    unsafe { (host.register_js_callback)(callback) };
+}
+
+/// Calls the managed bridge with a pre-built binary request packet and returns
+/// the raw binary response bytes.  No JSON involved on either side.
+pub(crate) fn call_dotnet_binary(request: &[u8]) -> Result<Vec<u8>, String> {
+    let host = DOTNET_HOST
+        .get()
+        .ok_or_else(|| "DotNet host not yet initialised".to_string())?
+        .as_ref()
+        .map_err(|e| e.clone())?;
+
+    let mut resp_ptr: *mut u8 = std::ptr::null_mut();
+    let mut resp_len: i32 = 0;
+
+    let hr = unsafe {
+        (host.invoke_binary)(
+            request.as_ptr(),
+            request.len() as i32,
+            &mut resp_ptr,
+            &mut resp_len,
+        )
+    };
+    if hr < 0 {
+        return Err(format!("DotNetBridge.InvokeBinary HRESULT 0x{:08X}", hr as u32));
+    }
+    if resp_ptr.is_null() || resp_len < 0 {
+        return Err("DotNetBridge.InvokeBinary returned null/empty response".to_string());
+    }
+
+    let slice = unsafe { std::slice::from_raw_parts(resp_ptr, resp_len as usize) };
+    let result = slice.to_vec();
     unsafe { (host.free)(resp_ptr) };
     Ok(result)
 }

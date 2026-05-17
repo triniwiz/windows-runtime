@@ -34,7 +34,7 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Once, OnceLock};
-use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 use parking_lot::{Mutex, RawRwLock, RwLock};
 use parking_lot::lock_api::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLockReadGuard, RwLockWriteGuard};
@@ -75,6 +75,12 @@ thread_local!(static ISOLATE: RefCell<Option<&'static mut v8::Isolate>> = RefCel
 /// Raw pointer to the V8 isolate, set once during Runtime::new so that
 /// JS delegate Invoke trampolines can enter V8 without a scope on the stack.
 thread_local!(pub(crate) static DELEGATE_ISOLATE_PTR: Cell<*mut v8::Isolate> = Cell::new(std::ptr::null_mut()));
+
+/// JS functions registered via NSWinRT.asDelegate so managed .NET delegates can
+/// call back into V8. Keyed by the integer id sent to C# as the callback id.
+/// Thread-local because V8 globals must be accessed on the isolate's thread.
+thread_local!(pub(crate) static DOTNET_JS_CALLBACKS: RefCell<HashMap<i32, v8::Global<v8::Function>>> = RefCell::new(HashMap::new()));
+pub(crate) static DOTNET_NEXT_CB_ID: AtomicI32 = AtomicI32::new(1);
 
 /// Optional hook called from the async-wait message loop so external tools
 /// (e.g. the devtools server) can pump their own messages without the runtime
@@ -201,6 +207,35 @@ pub struct Runtime {
 
 static INIT: Once = Once::new();
 static PROXY_MANIFESTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+/// COM identity → JS wrapper object cache. Keyed on the canonical IUnknown pointer
+/// (obtained via QueryInterface(IID_IUnknown)), so the same underlying COM object
+/// always maps to the same JS proxy.
+thread_local!(pub(crate) static INSTANCE_CACHE: RefCell<HashMap<usize, v8::Weak<v8::Object>>> = RefCell::new(HashMap::new()));
+
+/// When the cache exceeds this size, request an incremental GC so that weak
+/// finalizers can drain dead entries.
+pub(crate) const INSTANCE_CACHE_GC_THRESHOLD: usize = 512;
+
+/// Set when the cache grows past INSTANCE_CACHE_GC_THRESHOLD. Cleared after the
+/// GC nudge is delivered. Using Cell<bool> avoids RefCell overhead on the fast path.
+thread_local!(pub(crate) static GC_NUDGE_PENDING: std::cell::Cell<bool> = std::cell::Cell::new(false));
+
+/// Called with an active isolate reference after inserting into the cache.
+/// Requests an incremental V8 GC when the soft threshold is exceeded.
+#[inline]
+pub(crate) fn maybe_request_gc_nudge(cache_size: usize, isolate: &mut v8::Isolate) {
+    if cache_size > INSTANCE_CACHE_GC_THRESHOLD {
+        let already_pending = GC_NUDGE_PENDING.with(|f| f.get());
+        if !already_pending {
+            GC_NUDGE_PENDING.with(|f| f.set(true));
+            isolate.memory_pressure_notification(v8::MemoryPressureLevel::Moderate);
+        }
+    } else {
+        // Cache shrank back below threshold (GC ran) — reset the flag.
+        GC_NUDGE_PENDING.with(|f| f.set(false));
+    }
+}
 
 pub(crate) fn proxy_manifests() -> &'static Mutex<Vec<String>> {
     PROXY_MANIFESTS.get_or_init(|| Mutex::new(Vec::new()))
@@ -2914,9 +2949,6 @@ fn create_ns_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, s
     ret.into()
 }
 
-/// Build a JS object representing a GUID value struct, mirroring how NativeScript iOS/Android
-/// projects NSUUID: the instance carries the raw fields and `toString()` returns the string form.
-///
 /// Properties exposed on the returned JS object:
 ///   .data1   – UInt32
 ///   .data2   – UInt16
@@ -2986,7 +3018,19 @@ unsafe fn guid_ptr_to_js_object<'a>(
 }
 
 fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, parent: Option<Arc<RwLock<dyn Declaration>>>, declaration: Arc<RwLock<dyn Declaration>>, instance: Option<IUnknown>, scope: &mut v8::PinScope<'a, '_>) -> Local<'a, v8::Value> {
-    
+    // COM identity key: QI(IID_IUnknown) gives the canonical pointer regardless of which
+    // interface we hold.
+    let identity_key: Option<usize> = instance.as_ref().and_then(|unk| {
+        unk.cast::<IUnknown>().ok().map(|id| id.as_raw() as usize)
+    });
+    if let Some(key) = identity_key {
+        let hit = INSTANCE_CACHE.with(|cache| {
+            cache.borrow().get(&key).and_then(|weak| weak.to_local(scope))
+        });
+        if let Some(local) = hit {
+            return local.into();
+        }
+    }
 
     let class_name = v8::String::new(scope, name).unwrap();
 
@@ -4274,6 +4318,24 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
     }
 
     let ret = object;
+
+    if let Some(key) = identity_key {
+        let weak = v8::Weak::with_guaranteed_finalizer(
+            scope.as_mut(),
+            ret,
+            Box::new(move || {
+                INSTANCE_CACHE.with(|cache| {
+                    cache.borrow_mut().remove(&key);
+                });
+            }),
+        );
+        let new_size = INSTANCE_CACHE.with(|cache| {
+            let mut c = cache.borrow_mut();
+            c.insert(key, weak);
+            c.len()
+        });
+        maybe_request_gc_nudge(new_size, scope.as_mut());
+    }
 
     ret.into()
 }
@@ -6168,12 +6230,31 @@ fn js_delegate_invoke_inner(
                 if raw.is_null() {
                     v8::null(tc).into()
                 } else {
-                    let obj = v8::Object::new(tc);
-                    if let Some(key) = v8::String::new(tc, "handle") {
-                        let ext = v8::External::new(tc, raw);
-                        obj.set(tc, key.into(), ext.into());
-                    }
-                    obj.into()
+                    // Delegate [in] parameters are borrowed COM pointers (the caller
+                    // owns the ref for the duration of Invoke). Clone (AddRef) before
+                    // wrapping so the proxy can outlive this stack frame.
+                    let owned: IUnknown = unsafe {
+                        let borrowed = std::mem::ManuallyDrop::new(IUnknown::from_raw(raw));
+                        (*borrowed).clone()
+                    };
+                    // Try to resolve the concrete WinRT type so the JS callback
+                    // receives a fully typed proxy (with property/method access)
+                    // rather than an opaque plain object.
+                    let proxy = (|| -> Option<v8::Local<v8::Value>> {
+                        let inspectable = owned.cast::<IInspectable>().ok()?;
+                        let class_name = inspectable.GetRuntimeClassName().ok()?;
+                        let name_str = class_name.to_string();
+                        let decl = MetadataReader::find_by_name(&name_str)?;
+                        Some(create_ns_ctor_instance_object(
+                            &name_str,
+                            None,
+                            None,
+                            decl,
+                            Some(owned.clone()),
+                            tc,
+                        ).into())
+                    })();
+                    proxy.unwrap_or_else(|| v8::External::new(tc, raw).into())
                 }
             }
             NativeType::Bool  => v8::Boolean::new(tc, (raw as u8) != 0).into(),
@@ -6235,6 +6316,60 @@ pub(crate) fn js_delegate_params_from_declaration(
         }
         _ => return None,
     })
+}
+
+/// JS-callable handler for `__nsAsDelegate(typeName, fn)`.
+///
+/// Looks up `typeName` in the WinRT metadata, derives the delegate's GUID and
+/// input-parameter NativeTypes via `js_delegate_params_from_declaration`, then
+/// allocates a `JsDelegate` COM object and returns `{ handle: External }` —
+/// the same shape that WinRT event-add methods expect.
+pub(crate) fn handle_as_delegate(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 2 {
+        throw_js_error(scope, "__nsAsDelegate(typeName, fn): expected 2 arguments");
+        return;
+    }
+    let Some(name_v8) = args.get(0).to_string(scope) else {
+        throw_js_error(scope, "__nsAsDelegate: first argument must be a string");
+        return;
+    };
+    let type_name = name_v8.to_rust_string_lossy(scope);
+
+    let Ok(func) = v8::Local::<v8::Function>::try_from(args.get(1)) else {
+        throw_js_error(scope, "__nsAsDelegate: second argument must be a function");
+        return;
+    };
+
+    let Some(declaration) = MetadataReader::find_by_name(&type_name) else {
+        throw_js_error(scope, &format!("Type not found in WinRT metadata: {}", type_name));
+        return;
+    };
+    let lock = declaration.read();
+    let kind = lock.kind();
+
+    let Some((guid, param_types)) = js_delegate_params_from_declaration(&*lock, kind) else {
+        throw_js_error(scope, &format!("{} is not a WinRT delegate type", type_name));
+        return;
+    };
+
+    let data = Box::new(JsDelegateData { js_func: v8::Global::new(scope, func), param_types });
+    let delegate = Box::new(JsDelegate {
+        vtable:    &JS_DELEGATE_VTBL as *const _,
+        ref_count: AtomicU32::new(1),
+        guid,
+        data:      Box::into_raw(data),
+    });
+    let raw = Box::into_raw(delegate) as *mut c_void;
+
+    let result_obj = v8::Object::new(scope);
+    if let Some(key) = v8::String::new(scope, "handle") {
+        result_obj.set(scope, key.into(), v8::External::new(scope, raw).into());
+    }
+    retval.set(result_obj.into());
 }
 
 impl Runtime {
@@ -6552,6 +6687,7 @@ impl Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
+        INSTANCE_CACHE.with(|cache| cache.borrow_mut().clear());
         if self.winrt_initialized {
             unsafe { RoUninitialize() };
         }
@@ -6681,6 +6817,9 @@ impl Runtime {
 
 #[cfg(test)]
 mod error_handling_test;
+
+#[cfg(test)]
+mod instance_cache_test;
 
 #[cfg(test)]
 mod interop_test;

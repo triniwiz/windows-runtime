@@ -908,6 +908,18 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
     instance: Option<IUnknown>,
     scope: &mut v8::PinScope<'a, '_>,
 ) -> Local<'a, v8::Value> {
+    let identity_key: Option<usize> = instance.as_ref().and_then(|unk| {
+        unk.cast::<IUnknown>().ok().map(|id| id.as_raw() as usize)
+    });
+    if let Some(key) = identity_key {
+        let hit = crate::INSTANCE_CACHE.with(|cache| {
+            cache.borrow().get(&key).and_then(|weak| weak.to_local(scope))
+        });
+        if let Some(local) = hit {
+            return local.into();
+        }
+    }
+
     let class_name = v8::String::new(scope, name).unwrap();
 
     let tmpl = FunctionTemplate::new(scope, handle_ns_func);
@@ -1677,6 +1689,24 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
             v8::null(scope).into()
         };
         object.set(scope, handle_key.into(), handle_value);
+    }
+
+    if let Some(key) = identity_key {
+        let weak = v8::Weak::with_guaranteed_finalizer(
+            scope.as_mut(),
+            object,
+            Box::new(move || {
+                crate::INSTANCE_CACHE.with(|cache| {
+                    cache.borrow_mut().remove(&key);
+                });
+            }),
+        );
+        let new_size = crate::INSTANCE_CACHE.with(|cache| {
+            let mut c = cache.borrow_mut();
+            c.insert(key, weak);
+            c.len()
+        });
+        crate::maybe_request_gc_nudge(new_size, scope.as_mut());
     }
 
     object.into()

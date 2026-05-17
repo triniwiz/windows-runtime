@@ -1,0 +1,124 @@
+using System;
+using System.Buffers;
+using System.Buffers.Binary;
+using System.Text;
+
+namespace NativeScriptBridge;
+
+internal readonly struct HandleRef(int id)
+{
+    public readonly int Id = id;
+}
+
+internal ref struct BinReader(ReadOnlySpan<byte> buf)
+{
+    private readonly ReadOnlySpan<byte> _buf = buf;
+    private int _pos = 0;
+
+    public byte ReadByte() => _buf[_pos++];
+
+    public int ReadI32()
+    {
+        var v = BinaryPrimitives.ReadInt32LittleEndian(_buf[_pos..]);
+        _pos += 4;
+        return v;
+    }
+
+    public ushort ReadU16()
+    {
+        var v = BinaryPrimitives.ReadUInt16LittleEndian(_buf[_pos..]);
+        _pos += 2;
+        return v;
+    }
+
+    public double ReadF64()
+    {
+        var v = BinaryPrimitives.ReadDoubleLittleEndian(_buf[_pos..]);
+        _pos += 8;
+        return v;
+    }
+
+    public string ReadString16()
+    {
+        var len = ReadU16();
+        var s   = Encoding.UTF8.GetString(_buf.Slice(_pos, len));
+        _pos += len;
+        // Intern so repeated method/type names reuse the same heap string.
+        // Eliminates the allocation on every subsequent warm-path call.
+        return string.Intern(s);
+    }
+
+    public object?[] ReadArgs()
+    {
+        var count = ReadByte();
+        if (count == 0) return [];
+        var args = new object?[count];
+        for (int i = 0; i < count; i++)
+        {
+            var tag = ReadByte();
+            args[i] = tag switch
+            {
+                0x00 => null,
+                0x01 => (object)false,
+                0x02 => (object)true,
+                0x03 => (object)ReadI32(),
+                0x04 => (object)ReadF64(),
+                0x05 => (object)ReadString16(),
+                0x06 => (object)new HandleRef(ReadI32()),
+                _    => null,
+            };
+        }
+        return args;
+    }
+}
+
+internal ref struct BinWriter(ArrayBufferWriter<byte> buf)
+{
+    private readonly ArrayBufferWriter<byte> _buf = buf;
+
+    public void WriteByte(byte b)
+    {
+        _buf.GetSpan(1)[0] = b;
+        _buf.Advance(1);
+    }
+
+    public void WriteI32(int v)
+    {
+        BinaryPrimitives.WriteInt32LittleEndian(_buf.GetSpan(4), v);
+        _buf.Advance(4);
+    }
+
+    public void WriteU16(ushort v)
+    {
+        BinaryPrimitives.WriteUInt16LittleEndian(_buf.GetSpan(2), v);
+        _buf.Advance(2);
+    }
+
+    public void WriteU32(uint v)
+    {
+        BinaryPrimitives.WriteUInt32LittleEndian(_buf.GetSpan(4), v);
+        _buf.Advance(4);
+    }
+
+    public void WriteF64(double v)
+    {
+        BinaryPrimitives.WriteDoubleLittleEndian(_buf.GetSpan(8), v);
+        _buf.Advance(8);
+    }
+
+    public void WriteString32(ReadOnlySpan<char> s)
+    {
+        var byteCount = Encoding.UTF8.GetByteCount(s);
+        WriteU32((uint)byteCount);
+        Encoding.UTF8.GetBytes(s, _buf.GetSpan(byteCount));
+        _buf.Advance(byteCount);
+    }
+
+    public void WriteString16(ReadOnlySpan<char> s)
+    {
+        var byteCount = Encoding.UTF8.GetByteCount(s);
+        WriteU16((ushort)byteCount);
+        Encoding.UTF8.GetBytes(s, _buf.GetSpan(byteCount));
+        _buf.Advance(byteCount);
+    }
+}

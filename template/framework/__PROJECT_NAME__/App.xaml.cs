@@ -47,6 +47,7 @@ namespace __PROJECT_NAME__
                 {
                     CrashDiagnostics.WriteMessage("JS Error", jsError);
                     var report = CrashDiagnostics.BuildErrorReport(null, jsError);
+                    CrashDiagnostics.WriteToTraceLog(report);
                     await CrashDiagnostics.ShowCrashDialogAsync("JavaScript Error", report);
                 }
             }
@@ -56,6 +57,7 @@ namespace __PROJECT_NAME__
                 System.Diagnostics.Debug.WriteLine($"[NativeScript] Script exception: {scriptEx.Message}");
                 CrashDiagnostics.WriteExceptionReport("RunMainScript", scriptEx, null);
                 var report = CrashDiagnostics.BuildErrorReport(scriptEx, jsError);
+                CrashDiagnostics.WriteToTraceLog(report);
                 await CrashDiagnostics.ShowCrashDialogAsync("Script Execution Error", report);
             }
 
@@ -102,6 +104,7 @@ namespace __PROJECT_NAME__
                 "JsError=" + (jsError ?? "<none>"));
 
             var report = CrashDiagnostics.BuildErrorReport(e.Exception, jsError);
+            CrashDiagnostics.WriteToTraceLog(report);
             var _ = CrashDiagnostics.ShowCrashDialogAsync(
                 e.Message ?? "Unhandled exception", report);
         }

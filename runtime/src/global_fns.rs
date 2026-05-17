@@ -2126,13 +2126,21 @@ const HELPER_SOURCE: &str = r#"
         // Requires the dotnet-bridge project to be published into
         //   <app-root>/dotnet-bridge/publish/DotNetBridge.dll
         (function () {
-            if (typeof globalThis.__nsDotNetInvoke !== 'function') return;
+            if (typeof globalThis.__nsDotNetInvokeBin !== 'function') return;
 
+            // Binary protocol: no JSON.stringify / JSON.parse.
+            // __nsDotNetInvokeBin(handle, typeName, assembly, method, ...args)
+            // throws on error, returns the result value directly.
             function _invoke(req) {
-                var json = globalThis.__nsDotNetInvoke(JSON.stringify(req));
-                var res  = JSON.parse(json);
-                if (res.error) throw new Error(res.error);
-                return res.result;
+                var handle = (req.handle !== undefined && req.handle !== null) ? req.handle : -1;
+                var args   = req.args || [];
+                return globalThis.__nsDotNetInvokeBin(
+                    handle,
+                    req.typeName  || '',
+                    req.assembly  || '',
+                    req.method    || '',
+                    ...args
+                );
             }
 
             // ── Type-metadata cache ──────────────────────────────────────────
@@ -2275,6 +2283,31 @@ const HELPER_SOURCE: &str = r#"
             }
             globalThis.System    = _makeNamespaceProxy('System');
             globalThis.Microsoft = _makeNamespaceProxy('Microsoft');
+
+            // ── NSWinRT.dotnet.asDelegate ────────────────────────────────────
+            // Creates a typed .NET BCL delegate (not a WinRT COM delegate).
+            // Use this when the API expects a managed System.Action,
+            // System.EventHandler, etc. rather than a WinRT delegate interface.
+            // For WinRT delegate types use NSWinRT.asDelegate instead.
+            if (typeof globalThis.__nsDotNetCreateDelegate === 'function') {
+                globalThis.NSWinRT.dotnet.asDelegate = function(typeNameOrFn, fn) {
+                    var typeName, callback;
+                    if (typeof typeNameOrFn === 'function') {
+                        typeName = '';
+                        callback = typeNameOrFn;
+                    } else {
+                        typeName = typeNameOrFn || '';
+                        callback = fn;
+                    }
+                    if (typeof callback !== 'function')
+                        throw new TypeError('NSWinRT.dotnet.asDelegate: callback must be a function');
+                    var wrapped = function() {
+                        var args = Array.prototype.slice.call(arguments).map(_wrap);
+                        return callback.apply(null, args);
+                    };
+                    return globalThis.__nsDotNetCreateDelegate(typeName, wrapped);
+                };
+            }
         })();
 
         // ── NSWinRT.win32 — dynamic Win32 FFI via libffi ────────────────────
@@ -2379,6 +2412,36 @@ const HELPER_SOURCE: &str = r#"
                             });
                     });
                 },
+            };
+        })();
+
+        // ── NSWinRT.asDelegate ───────────────────────────────────────────────
+        // Wraps a JS function as a typed WinRT delegate via the native JsDelegate
+        // COM bridge using WinRT metadata for GUID and parameter-type resolution.
+        //
+        //   NSWinRT.asDelegate('Windows.UI.Popups.UICommandInvokedHandler', fn)
+        //
+        // Returns {handle} which can be passed directly to any WinRT event-add
+        // or method that expects that delegate type.
+        // Callback parameters that carry COM object pointers arrive as
+        // {handle: External}; wrap them with the appropriate WinRT constructor
+        // to get a full proxy.
+        // For managed BCL delegates (System.Action etc.) use
+        // NSWinRT.dotnet.asDelegate() instead.
+        (function () {
+            if (typeof globalThis.__nsAsDelegate !== 'function') return;
+            globalThis.NSWinRT.asDelegate = function(typeNameOrFn, fn) {
+                var typeName, callback;
+                if (typeof typeNameOrFn === 'function') {
+                    typeName = '';
+                    callback = typeNameOrFn;
+                } else {
+                    typeName = typeNameOrFn || '';
+                    callback = fn;
+                }
+                if (typeof callback !== 'function')
+                    throw new TypeError('NSWinRT.asDelegate: callback must be a function');
+                return globalThis.__nsAsDelegate(typeName, callback);
             };
         })();
 
@@ -2493,6 +2556,379 @@ pub(crate) fn handle_dotnet_invoke(
             }
         }
         Err(e) => throw_js_error(scope, &e),
+    }
+}
+
+// ── __nsDotNetInvokeBin ───────────────────────────────────────────────────────
+
+/// Binary-protocol bridge: builds a compact request packet from structured V8
+/// arguments, calls the C# InvokeBinary entry point, and converts the binary
+/// response directly into a V8 value — no JSON.stringify / JSON.parse on either
+/// side.
+///
+/// Argument convention (matches the JS _invoke wrapper):
+///   args[0]  handle: i32 (≥0) or null/undefined (−1 ⇒ static)
+///   args[1]  typeName: string  (empty for instance calls)
+///   args[2]  assembly: string  (empty for instance calls)
+///   args[3]  method:   string
+///   args[4…] method arguments as raw JS values
+pub(crate) fn handle_dotnet_invoke_binary(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 4 {
+        throw_js_error(scope, "__nsDotNetInvokeBin: expected (handle, typeName, assembly, method, ...args)");
+        return;
+    }
+
+    let handle_v8 = args.get(0);
+    let handle: i32 = if handle_v8.is_null_or_undefined() {
+        -1
+    } else if let Ok(n) = v8::Local::<v8::Integer>::try_from(handle_v8) {
+        n.value() as i32
+    } else if let Ok(n) = v8::Local::<v8::Number>::try_from(handle_v8) {
+        n.value() as i32
+    } else {
+        -1
+    };
+
+    let type_name = args.get(1)
+        .to_string(scope)
+        .map(|s| s.to_rust_string_lossy(scope))
+        .unwrap_or_default();
+
+    let assembly = args.get(2)
+        .to_string(scope)
+        .map(|s| s.to_rust_string_lossy(scope))
+        .unwrap_or_default();
+
+    let method = args.get(3)
+        .to_string(scope)
+        .map(|s| s.to_rust_string_lossy(scope))
+        .unwrap_or_default();
+
+    let mut req: Vec<u8> = Vec::with_capacity(64);
+
+    // Determine opcode.
+    let op: u8 = if handle >= 0 {
+        match method.as_str() {
+            "__release"   => 0x04,
+            "__members__" => 0x05,
+            _             => 0x01,
+        }
+    } else {
+        match method.as_str() {
+            "__members__" => 0x06,
+            ".ctor"       => 0x03,
+            _             => 0x02,
+        }
+    };
+
+    req.push(op);
+
+    match op {
+        0x01 | 0x04 | 0x05 => req.extend_from_slice(&handle.to_le_bytes()),
+        _ => {
+            bin_write_str16(&mut req, type_name.as_bytes());
+            bin_write_str16(&mut req, assembly.as_bytes());
+        }
+    }
+
+    if op == 0x01 || op == 0x02 {
+        bin_write_str16(&mut req, method.as_bytes());
+    }
+
+    if matches!(op, 0x01 | 0x02 | 0x03) {
+        let arg_count = (args.length() - 4).max(0) as u8;
+        req.push(arg_count);
+        for i in 4..4 + arg_count as i32 {
+            bin_write_v8_arg(&mut req, scope, args.get(i));
+        }
+    }
+
+    match crate::dotnet::call_dotnet_binary(&req) {
+        Ok(response) => match bin_read_response(scope, &response) {
+            Ok(v8_val) => retval.set(v8_val),
+            Err(e)     => throw_js_error(scope, &e),
+        },
+        Err(e) => throw_js_error(scope, &e),
+    }
+}
+
+// ── __nsDotNetCreateDelegate ──────────────────────────────────────────────────
+
+/// Called by the Rust runtime (via stored function pointer) when a managed .NET
+/// delegate fires.  Runs on the V8/JS isolate thread — same pattern as the
+/// existing WinRT JsDelegate COM bridge.
+///
+/// Wire format for args_ptr: [count: u8] [tagged values...]  (response-tag scheme)
+pub(crate) unsafe extern "C" fn invoke_dotnet_js_callback(
+    callback_id: i32,
+    args_ptr: *const u8,
+    args_len: i32,
+    _resp_ptr: *mut *mut u8,
+    _resp_len: *mut i32,
+) {
+    let isolate_ptr = crate::DELEGATE_ISOLATE_PTR.with(|c| c.get());
+    if isolate_ptr.is_null() { return; }
+
+    let isolate: &mut v8::Isolate = &mut *isolate_ptr;
+    v8::scope!(scope, isolate);
+    let ctx_global = match scope.get_slot::<v8::Global<v8::Context>>() {
+        Some(g) => g.clone(),
+        None => return,
+    };
+    let context = v8::Local::new(scope, &ctx_global);
+    let scope = &mut v8::ContextScope::new(scope, context);
+    v8::tc_scope!(tc, scope);
+
+    let func_global = crate::DOTNET_JS_CALLBACKS.with(|m| {
+        m.borrow().get(&callback_id).cloned()
+    });
+    let Some(func_global) = func_global else { return; };
+    let func = v8::Local::new(tc, &func_global);
+    let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+
+    let args_slice = if args_len > 0 {
+        std::slice::from_raw_parts(args_ptr, args_len as usize)
+    } else {
+        &[]
+    };
+    let js_args = parse_dotnet_callback_args(tc, args_slice);
+
+    let _ = func.call(tc, recv, &js_args);
+    if tc.has_caught() {
+        if let Some(ex) = tc.exception() {
+            let msg = ex.to_rust_string_lossy(tc);
+            crate::debug_output(&format!("[NativeScript] asDelegate callback error: {}\n", msg));
+            crate::store_last_js_error(msg);
+        }
+        tc.reset();
+    }
+}
+
+fn parse_dotnet_callback_args<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: &[u8],
+) -> Vec<v8::Local<'s, v8::Value>> {
+    if bytes.is_empty() { return vec![]; }
+    let count = bytes[0] as usize;
+    let mut pos = 1usize;
+    let mut result = Vec::with_capacity(count);
+    for _ in 0..count {
+        if pos >= bytes.len() { break; }
+        match bin_read_value(scope, bytes, &mut pos) {
+            Ok(v) => result.push(v),
+            Err(_) => break,
+        }
+    }
+    result
+}
+
+/// Registers a JS function as a typed .NET delegate and returns the managed
+/// handle.  The handle can be passed to any .NET method that accepts a delegate.
+///
+/// Args: args[0] = typeName (string, "" → System.Action), args[1] = function
+pub(crate) fn handle_dotnet_create_delegate(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 2 {
+        throw_js_error(scope, "__nsDotNetCreateDelegate(typeName, fn): expected 2 arguments");
+        return;
+    }
+
+    let type_name = args.get(0)
+        .to_string(scope)
+        .map(|s| s.to_rust_string_lossy(scope))
+        .unwrap_or_default();
+
+    let Ok(func) = v8::Local::<v8::Function>::try_from(args.get(1)) else {
+        throw_js_error(scope, "__nsDotNetCreateDelegate: second argument must be a function");
+        return;
+    };
+
+    let cb_id = crate::DOTNET_NEXT_CB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::DOTNET_JS_CALLBACKS.with(|m| {
+        m.borrow_mut().insert(cb_id, v8::Global::new(scope, func));
+    });
+
+    // opcode 0x09 | type_name (str16) | callback_id (i32)
+    let mut req: Vec<u8> = Vec::with_capacity(32);
+    req.push(0x09);
+    bin_write_str16(&mut req, type_name.as_bytes());
+    req.extend_from_slice(&cb_id.to_le_bytes());
+
+    match crate::dotnet::call_dotnet_binary(&req) {
+        Ok(response) => match bin_read_response(scope, &response) {
+            Ok(v)  => retval.set(v),
+            Err(e) => throw_js_error(scope, &e),
+        },
+        Err(e) => throw_js_error(scope, &e),
+    }
+}
+
+fn bin_write_str16(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn bin_write_v8_arg(buf: &mut Vec<u8>, scope: &mut v8::PinScope<'_, '_>, arg: v8::Local<v8::Value>) {
+    if arg.is_null_or_undefined() { buf.push(0x00); return; }
+
+    if arg.is_boolean() {
+        buf.push(if arg.is_true() { 0x02 } else { 0x01 });
+        return;
+    }
+
+    // Integer (Smi) check before general Number to preserve i32 tag where possible.
+    if let Ok(n) = v8::Local::<v8::Integer>::try_from(arg) {
+        let v = n.value();
+        if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
+            buf.push(0x03);
+            buf.extend_from_slice(&(v as i32).to_le_bytes());
+            return;
+        }
+    }
+
+    if let Ok(n) = v8::Local::<v8::Number>::try_from(arg) {
+        buf.push(0x04);
+        buf.extend_from_slice(&n.value().to_bits().to_le_bytes());
+        return;
+    }
+
+    if arg.is_string() {
+        if let Some(s) = arg.to_string(scope) {
+            let bytes = s.to_rust_string_lossy(scope).into_bytes();
+            buf.push(0x05);
+            bin_write_str16(buf, &bytes);
+            return;
+        }
+    }
+
+    if arg.is_object() {
+        if let Some(obj) = arg.to_object(scope) {
+            if let Some(key) = v8::String::new(scope, "__handle") {
+                if let Some(hval) = obj.get(scope, key.into()) {
+                    if let Ok(n) = v8::Local::<v8::Integer>::try_from(hval) {
+                        buf.push(0x06);
+                        buf.extend_from_slice(&(n.value() as i32).to_le_bytes());
+                        return;
+                    }
+                    if let Ok(n) = v8::Local::<v8::Number>::try_from(hval) {
+                        buf.push(0x06);
+                        buf.extend_from_slice(&(n.value() as i32).to_le_bytes());
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    buf.push(0x00); // null fallback for unsupported types
+}
+
+fn bin_read_response<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: &[u8],
+) -> Result<v8::Local<'s, v8::Value>, String> {
+    if bytes.is_empty() { return Ok(v8::null(scope).into()); }
+    let mut pos = 0usize;
+    bin_read_value(scope, bytes, &mut pos)
+}
+
+fn bin_read_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: &[u8],
+    pos: &mut usize,
+) -> Result<v8::Local<'s, v8::Value>, String> {
+    let tag = *bytes.get(*pos).ok_or("response truncated")?;
+    *pos += 1;
+
+    match tag {
+        0x00 => Ok(v8::null(scope).into()),
+        0x01 => Ok(v8::Boolean::new(scope, false).into()),
+        0x02 => Ok(v8::Boolean::new(scope, true).into()),
+
+        0x03 => {
+            let v = i32::from_le_bytes(bytes[*pos..*pos+4].try_into().map_err(|_| "i32 read")?);
+            *pos += 4;
+            Ok(v8::Integer::new(scope, v).into())
+        }
+
+        0x04 => {
+            let bits = u64::from_le_bytes(bytes[*pos..*pos+8].try_into().map_err(|_| "f64 read")?);
+            *pos += 8;
+            Ok(v8::Number::new(scope, f64::from_bits(bits)).into())
+        }
+
+        0x05 => { // string: u32 len + utf8
+            let len = u32::from_le_bytes(bytes[*pos..*pos+4].try_into().map_err(|_| "str len")?) as usize;
+            *pos += 4;
+            let s = std::str::from_utf8(&bytes[*pos..*pos+len]).map_err(|_| "utf8")?;
+            *pos += len;
+            Ok(v8::String::new(scope, s).map(Into::into).unwrap_or_else(|| v8::null(scope).into()))
+        }
+
+        0x06 => { // handle → JS object {__handle, __type}
+            let id = i32::from_le_bytes(bytes[*pos..*pos+4].try_into().map_err(|_| "handle id")?);
+            *pos += 4;
+            let type_len = u16::from_le_bytes(bytes[*pos..*pos+2].try_into().map_err(|_| "type len")?) as usize;
+            *pos += 2;
+            let type_name = std::str::from_utf8(&bytes[*pos..*pos+type_len]).map_err(|_| "utf8")?;
+            *pos += type_len;
+
+            let obj = v8::Object::new(scope);
+            let hk = v8::String::new(scope, "__handle").ok_or("v8 str")?;
+            let tk = v8::String::new(scope, "__type").ok_or("v8 str")?;
+            let tv = v8::String::new(scope, type_name).ok_or("v8 str")?;
+            obj.set(scope, hk.into(), v8::Integer::new(scope, id).into());
+            obj.set(scope, tk.into(), tv.into());
+            Ok(obj.into())
+        }
+
+        0x07 => { // array: u32 count + N items
+            let count = u32::from_le_bytes(bytes[*pos..*pos+4].try_into().map_err(|_| "arr count")?) as usize;
+            *pos += 4;
+            let arr = v8::Array::new(scope, count as i32);
+            for i in 0..count {
+                let item = bin_read_value(scope, bytes, pos)?;
+                arr.set_index(scope, i as u32, item);
+            }
+            Ok(arr.into())
+        }
+
+        0x08 => { // members: {methods, properties, staticMethods, staticProperties}
+            let obj = v8::Object::new(scope);
+            for key in ["methods", "properties", "staticMethods", "staticProperties"] {
+                let count = u16::from_le_bytes(bytes[*pos..*pos+2].try_into().map_err(|_| "member count")?) as usize;
+                *pos += 2;
+                let arr = v8::Array::new(scope, count as i32);
+                for i in 0..count {
+                    let len = u16::from_le_bytes(bytes[*pos..*pos+2].try_into().map_err(|_| "str len")?) as usize;
+                    *pos += 2;
+                    let s = std::str::from_utf8(&bytes[*pos..*pos+len]).map_err(|_| "utf8")?;
+                    *pos += len;
+                    if let Some(sv) = v8::String::new(scope, s) {
+                        arr.set_index(scope, i as u32, sv.into());
+                    }
+                }
+                let k = v8::String::new(scope, key).ok_or("v8 str")?;
+                obj.set(scope, k.into(), arr.into());
+            }
+            Ok(obj.into())
+        }
+
+        0xFF => { // error: u32 len + utf8 message
+            let len = u32::from_le_bytes(bytes[*pos..*pos+4].try_into().map_err(|_| "err len")?) as usize;
+            *pos += 4;
+            let msg = std::str::from_utf8(&bytes[*pos..*pos+len]).map_err(|_| "utf8")?;
+            Err(msg.to_string())
+        }
+
+        t => Err(format!("Unknown binary response tag 0x{t:02X}")),
     }
 }
 
@@ -2697,7 +3133,10 @@ pub(crate) fn init_async_helpers(
     register!("__nsWorkerTerminate",            handle_worker_terminate);
     register!("__nsWorkerPollMessagesBlocking", handle_worker_poll_messages_blocking);
     register!("__nsLiveSyncCopyFile",           handle_livesync_copy_file);
+    register!("__nsAsDelegate",                 crate::handle_as_delegate);
     register!("__nsDotNetInvoke",               handle_dotnet_invoke);
+    register!("__nsDotNetInvokeBin",            handle_dotnet_invoke_binary);
+    register!("__nsDotNetCreateDelegate",       handle_dotnet_create_delegate);
     register!("__nsWin32Call",                  handle_win32_call);
     register!("__nsWin32CallRaw",               handle_win32_call_raw);
     register!("__nsWin32Exports",               handle_win32_exports);
@@ -2725,6 +3164,9 @@ pub(crate) fn init_async_helpers(
     // Attempt to initialise the .NET BCL host in the background; failures are
     // deferred so the runtime still starts without .NET installed.
     crate::dotnet::try_init_dotnet(app_root);
+    // Register the V8 callback function pointer with the managed bridge so
+    // delegates created via NSWinRT.asDelegate can call back into JavaScript.
+    crate::dotnet::init_js_callbacks(invoke_dotnet_js_callback);
 
     crate::globals::url::install_url_globals(scope);
 

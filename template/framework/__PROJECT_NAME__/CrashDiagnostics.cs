@@ -168,6 +168,23 @@ namespace __PROJECT_NAME__
             }
         }
 
+        /// <summary>
+        /// Appends <paramref name="message"/> to ns_trace.log using the Win32 temp path.
+        /// Inside UWP, GetTempPath() virtualises to AC\Temp — the same folder Rust's
+        /// std::env::temp_dir() uses — so this write appears in the CLI's log stream.
+        /// </summary>
+        public static void WriteToTraceLog(string message)
+        {
+            try
+            {
+                // System.IO.Path.GetTempPath() calls Win32 GetTempPathW() which inside a
+                // UWP process returns the container's AC\Temp folder, matching Rust.
+                var tracePath = Path.Combine(System.IO.Path.GetTempPath(), "ns_trace.log");
+                File.AppendAllText(tracePath, message, Encoding.UTF8);
+            }
+            catch { }
+        }
+
         private static void AppendToLog(string content)
         {
             try

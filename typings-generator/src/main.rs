@@ -213,12 +213,19 @@ fn map_type_to_ts_with_generics(value: &str, generic_params: &[String]) -> Strin
 
     if base_no_arity == "IVector" || base_no_arity.ends_with(".IVector") ||
        base_no_arity == "IReadOnlyList" || base_no_arity.ends_with(".IReadOnlyList") ||
-       base_no_arity == "IIterable" || base_no_arity.ends_with(".IIterable") {
+       base_no_arity == "IIterable" || base_no_arity.ends_with(".IIterable") ||
+       base_no_arity == "IVectorView" || base_no_arity.ends_with(".IVectorView") {
         if let Some(inner) = value.find('<').and_then(|s| {
             let inner = &value[s + 1..value.len().saturating_sub(1)];
             if inner.is_empty() { None } else { Some(inner) }
         }) {
-            return format!("{}[]", map_type_to_ts_with_generics(inner, generic_params));
+            let inner_ts = map_type_to_ts_with_generics(inner, generic_params);
+            let iface = if base_no_arity.contains('.') {
+                base_no_arity.to_string()
+            } else {
+                format!("Windows.Foundation.Collections.{}", base_no_arity)
+            };
+            return format!("{}<{}> | {}[]", iface, inner_ts, inner_ts);
         }
         return "unknown[]".to_string();
     }
@@ -236,15 +243,19 @@ fn map_type_to_ts_with_generics(value: &str, generic_params: &[String]) -> Strin
                     _ => {}
                 }
             }
-            if let Some(split) = split {
-                let k = map_type_to_ts_with_generics(inner[..split].trim(), generic_params);
-                let v = map_type_to_ts_with_generics(inner[split + 1..].trim(), generic_params);
-                // Prefer emitting the concrete WinRT interface rather than a TS Record.
+            if let Some(split_idx) = split {
+                let k = map_type_to_ts_with_generics(inner[..split_idx].trim(), generic_params);
+                let v = map_type_to_ts_with_generics(inner[split_idx + 1..].trim(), generic_params);
+                // Prefer emitting the concrete WinRT interface rather than a TS Record,
+                // but expose a JS-friendly `Record<string, V>` when the key is `string`.
                 let iface = if base_no_arity.contains('.') {
                     base_no_arity.to_string()
                 } else {
                     format!("Windows.Foundation.Collections.{}", base_no_arity)
                 };
+                if k == "string" {
+                    return format!("{}<{}, {}> | Record<string, {}>", iface, k, v, v);
+                }
                 return format!("{}<{}, {}>", iface, k, v);
             }
         }
@@ -759,10 +770,10 @@ fn render_struct(name: &str, struct_decl: &StructDeclaration) -> String {
 fn render_delegate(name: &str, delegate: &DelegateDeclaration) -> String {
     let mut out = String::new();
     let invoke = delegate.invoke_method();
+    let call_sig = method_signature(invoke, false);
+    let arrow_sig = method_signature(invoke, true);
     out.push_str(&format!(
-        "type {} = {};\n\n",
-        name,
-        method_signature(invoke, true)
+        "interface {name} {{\n  {call_sig};\n}}\nvar {name}: {{\n  new(callback: {arrow_sig}): {name};\n}};\n\n"
     ));
     out
 }
@@ -840,11 +851,10 @@ fn render_generic_delegate(delegate: &GenericDelegateDeclaration) -> String {
         format!("<{}>", generic_params.join(", "))
     };
     let invoke = delegate.invoke_method();
+    let call_sig = method_signature_with_generics(invoke, &generic_params, false);
+    let arrow_sig = method_signature_with_generics(invoke, &generic_params, true);
     out.push_str(&format!(
-        "type {}{} = {};\n\n",
-        name,
-        generic_suffix,
-        method_signature_with_generics(invoke, &generic_params, true)
+        "interface {name}{generic_suffix} {{\n  {call_sig};\n}}\nvar {name}: {{\n  new{generic_suffix}(callback: {arrow_sig}): {name}{generic_suffix};\n}};\n\n"
     ));
     out
 }
