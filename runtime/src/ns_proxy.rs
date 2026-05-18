@@ -44,6 +44,7 @@ use crate::generic_method_call::GenericMethodCall;
 use crate::{
     debug_output, throw_js_error, class_activation_factory, resolve_class_factory_from_parent,
     DeclarationFFI, JsDelegate, JsDelegateData, JS_DELEGATE_VTBL, js_delegate_params_from_declaration,
+    delegate_info_from_add_method,
 };
 use crate::error;
 
@@ -128,7 +129,7 @@ pub(crate) fn handle_named_property_getter(
                 if let Some(dec) = dec {
                     let full_name = format!("{}.{}", dec.full_name(), name.as_str());
 
-                    if let Some(dec) = MetadataReader::find_by_name(full_name.as_str()) {
+                    if let Some(dec) = MetadataReader::find_by_name_or_generic(full_name.as_str()) {
                         let declaration = Arc::clone(&dec);
                         let lock = dec.read();
 
@@ -335,24 +336,41 @@ pub(crate) fn handle_named_property_setter(
                     }
                 }
 
-                if value.is_object() {
-                    if let Some(obj) = value.to_object(scope) {
-                        if let Some(handle_key) = v8::String::new(scope, "handle") {
-                            if let Some(handle_val) = obj.get(scope, handle_key.into()) {
-                                if let Ok(ext) = v8::Local::<v8::External>::try_from(handle_val) {
-                                    let delegate_ptr = ext.value();
-                                    if let Some(instance) = instance {
-                                        let mut mc = MethodCall::new(
-                                            &add_method, add_method.is_sealed(), instance, false,
-                                        );
-                                        let (_, token) = mc.call_with_raw_ptr(delegate_ptr);
-                                        if let Some(tok_key_str) = v8::String::new(scope, &token_key) {
-                                            let tok_ptr = token as *mut c_void;
-                                            store.set(scope, tok_key_str.into(), v8::External::new(scope, tok_ptr).into());
-                                        }
-                                    }
-                                }
-                            }
+                // Path A — `{ handle: External }` from a delegate constructor.
+                // Path B — plain JS function: auto-derive the delegate type and wrap it.
+                let effective_ptr: Option<*mut c_void> = if value.is_object() {
+                    value.to_object(scope).and_then(|obj| {
+                        let key = v8::String::new(scope, "handle")?;
+                        let handle_val = obj.get(scope, key.into())?;
+                        v8::Local::<v8::External>::try_from(handle_val).ok().map(|ext| ext.value())
+                    })
+                } else if let Ok(func) = v8::Local::<v8::Function>::try_from(value) {
+                    delegate_info_from_add_method(&add_method).map(|(guid, param_types)| {
+                        let data = Box::new(JsDelegateData {
+                            js_func: v8::Global::new(scope, func),
+                            param_types,
+                        });
+                        let delegate = Box::new(JsDelegate {
+                            vtable:    &JS_DELEGATE_VTBL as *const _,
+                            ref_count: std::sync::atomic::AtomicU32::new(1),
+                            guid,
+                            data:      Box::into_raw(data),
+                        });
+                        Box::into_raw(delegate) as *mut c_void
+                    })
+                } else {
+                    None
+                };
+
+                if let Some(delegate_ptr) = effective_ptr {
+                    if let Some(instance) = instance {
+                        let mut mc = MethodCall::new(
+                            &add_method, add_method.is_sealed(), instance, false,
+                        );
+                        let (_, token) = mc.call_with_raw_ptr(delegate_ptr);
+                        if let Some(tok_key_str) = v8::String::new(scope, &token_key) {
+                            let tok_ptr = token as *mut c_void;
+                            store.set(scope, tok_key_str.into(), v8::External::new(scope, tok_ptr).into());
                         }
                     }
                 }
@@ -403,14 +421,24 @@ fn instance_method_dispatch(
 
     let return_sig = method.return_type().to_string();
     if return_sig.contains('.') {
-        let instance = unsafe { IUnknown::from_raw(result) };
-        let lookup = crate::helpers::strip_generic_suffix(return_sig.as_str());
-        if let Some(declaration) = MetadataReader::find_by_name(lookup) {
-            let ret: Local<v8::Value> = create_ns_ctor_instance_object(
-                return_sig.as_str(), None, dec.parent.clone(), declaration, Some(instance), scope,
-            ).into();
-            retval.set(ret);
-            return;
+        // Dotted return signatures may be either COM reference types or value
+        // structs. Prefer struct wrapping when metadata says so.
+        if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
+            if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                let obj = crate::create_struct_object_from_raw(declaration, result, scope).into();
+                retval.set(obj);
+                return;
+            } else if !result.is_null() {
+                let instance = unsafe { IUnknown::from_raw(result) };
+                let ret: Local<v8::Value> = create_ns_ctor_instance_object(
+                    return_sig.as_str(), None, dec.parent.clone(), declaration, Some(instance), scope,
+                ).into();
+                retval.set(ret);
+                return;
+            } else {
+                retval.set(v8::null(scope).into());
+                return;
+            }
         }
     }
 
@@ -476,12 +504,15 @@ pub(crate) fn handle_instance_property_getter(
 
         let return_sig = property_call.return_type().to_string();
         if return_sig.contains('.') {
-            let instance = unsafe { IUnknown::from_raw(result) };
-            let lookup = crate::helpers::strip_generic_suffix(return_sig.as_str());
-            if let Some(declaration) = MetadataReader::find_by_name(lookup) {
-                let ret: Local<v8::Value> = create_ns_ctor_instance_object(
-                    return_sig.as_str(), None, None, declaration, Some(instance), scope,
-                ).into();
+            if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
+                let ret: Local<v8::Value> = if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                    crate::create_struct_object_from_raw(declaration, result, scope).into()
+                } else if result.is_null() {
+                    v8::null(scope).into()
+                } else {
+                    let instance = unsafe { IUnknown::from_raw(result) };
+                    create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into()
+                };
                 rv.set(ret);
                 return v8::Intercepted::kYes;
             }
@@ -542,6 +573,58 @@ pub(crate) fn handle_instance_property_setter(
     let dec = unsafe { &mut *dec };
     let lock = dec.read();
 
+    // For interface declarations, handle property setters directly using the
+    // parameterized IID from the declaration and type-arg substitution.
+    {
+        use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
+        let kind = lock.kind();
+        let (iface_iid, type_args, properties) = match kind {
+            DeclarationKind::Interface => {
+                if let Some(iface) = lock.as_any().downcast_ref::<InterfaceDeclaration>() {
+                    let props = iface.properties().to_vec();
+                    (Some(iface.id()), Vec::<String>::new(), props)
+                } else {
+                    (None, Vec::new(), Vec::new())
+                }
+            }
+            DeclarationKind::GenericInterfaceInstance => {
+                if let Some(iface) = lock.as_any().downcast_ref::<GenericInterfaceInstanceDeclaration>() {
+                    let full = iface.full_name();
+                    let type_args = if let Some(open) = full.find('<') {
+                        let inner = &full[open + 1..full.len() - 1];
+                        inner.split(',').map(|s| s.trim().to_string()).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let props = iface.properties().to_vec();
+                    (Some(iface.id()), type_args, props)
+                } else {
+                    (None, Vec::new(), Vec::new())
+                }
+            }
+            _ => (None, Vec::new(), Vec::new()),
+        };
+
+        if let Some(iid) = iface_iid {
+            for property in properties.iter() {
+                if property.name() != name { continue; }
+                if property.setter().is_none() { break; }
+                let Some(ref instance) = dec.instance else { break; };
+                let Some(mut property_call) = PropertyCall::new_for_interface(
+                    property, true, instance.clone(), false, iid, type_args.clone(),
+                ) else { break; };
+                let (ret, _) = property_call.call_with_values(scope, &[value]);
+                if ret.is_err() {
+                    let detail = format!("Property set '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
+                    let message = v8::String::new(scope, &detail).unwrap();
+                    let error = v8::Exception::error(scope, message);
+                    scope.throw_exception(error);
+                }
+                return v8::Intercepted::kYes;
+            }
+        }
+    }
+
     let Some(clazz) = lock.as_any().downcast_ref::<ClassDeclaration>() else {
         return v8::Intercepted::kNo;
     };
@@ -585,26 +668,40 @@ pub(crate) fn handle_instance_property_setter(
             dec.event_tokens.remove(&name);
         }
 
-        // Register the new handler: the value must be `{ handle: External }` from a delegate constructor.
-        if value.is_object() {
-            if let Some(obj) = value.to_object(scope) {
-                if let Some(handle_key) = v8::String::new(scope, "handle") {
-                    if let Some(handle_val) = obj.get(scope, handle_key.into()) {
-                        if let Ok(ext) = v8::Local::<v8::External>::try_from(handle_val) {
-                            let delegate_ptr = ext.value();
-                            if let Some(inst) = instance {
-                                let mut mc = MethodCall::new(&add_method, add_method.is_sealed(), inst, false);
-                                let (ret, token) = mc.call_with_raw_ptr(delegate_ptr);
-                                if ret.is_ok() {
-                                    dec.event_tokens.insert(name, token);
-                                }
-                            }
-                        } else {
-                        }
-                    }
+        // Path A — `{ handle: External }` from a delegate constructor.
+        // Path B — plain JS function: auto-derive the delegate type and wrap it.
+        let effective_ptr: Option<*mut c_void> = if value.is_object() {
+            value.to_object(scope).and_then(|obj| {
+                let key = v8::String::new(scope, "handle")?;
+                let handle_val = obj.get(scope, key.into())?;
+                v8::Local::<v8::External>::try_from(handle_val).ok().map(|ext| ext.value())
+            })
+        } else if let Ok(func) = v8::Local::<v8::Function>::try_from(value) {
+            delegate_info_from_add_method(&add_method).map(|(guid, param_types)| {
+                let data = Box::new(JsDelegateData {
+                    js_func: v8::Global::new(scope, func),
+                    param_types,
+                });
+                let delegate = Box::new(JsDelegate {
+                    vtable:    &JS_DELEGATE_VTBL as *const _,
+                    ref_count: std::sync::atomic::AtomicU32::new(1),
+                    guid,
+                    data:      Box::into_raw(data),
+                });
+                Box::into_raw(delegate) as *mut c_void
+            })
+        } else {
+            None
+        };
+
+        if let Some(delegate_ptr) = effective_ptr {
+            if let Some(inst) = instance {
+                let mut mc = MethodCall::new(&add_method, add_method.is_sealed(), inst, false);
+                let (ret, token) = mc.call_with_raw_ptr(delegate_ptr);
+                if ret.is_ok() {
+                    dec.event_tokens.insert(name, token);
                 }
             }
-        } else {
         }
 
         return v8::Intercepted::kYes;
@@ -1015,15 +1112,18 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                 match NativeType::try_from(return_sig.as_str()) {
                                     Ok(return_type) => {
                                         if return_sig.contains('.') {
-                                            let instance = unsafe { IUnknown::from_raw(result) };
-                                            let lookup = crate::helpers::strip_generic_suffix(return_sig.as_str());
-                                            let declaration = MetadataReader::find_by_name(lookup)
-                                                .unwrap_or_else(|| dec.inner.clone());
-                                            let ret: Local<v8::Value> = create_ns_ctor_instance_object(
-                                                return_sig.as_str(), None, dec.parent.clone(), declaration, Some(instance), scope,
-                                            ).into();
-                                            retval.set(ret.into());
-                                            return;
+                                            if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
+                                                let ret: Local<v8::Value> = if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                                    crate::create_struct_object_from_raw(declaration, result, scope).into()
+                                                } else if result.is_null() {
+                                                    v8::null(scope).into()
+                                                } else {
+                                                    let instance = unsafe { IUnknown::from_raw(result) };
+                                                    create_ns_ctor_instance_object(return_sig.as_str(), None, dec.parent.clone(), declaration, Some(instance), scope).into()
+                                                };
+                                                retval.set(ret.into());
+                                                return;
+                                            }
                                         }
                                         unsafe { set_ret_val(result, scope, retval, return_type); }
                                     }
@@ -1083,10 +1183,15 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         } else if !method.is_void() {
                             let return_sig = method.return_type().to_string();
                             if return_sig.contains('.') {
-                                let instance = unsafe { IUnknown::from_raw(result) };
-                                let lookup = crate::helpers::strip_generic_suffix(return_sig.as_str());
-                                if let Some(declaration) = MetadataReader::find_by_name(lookup) {
-                                    let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into();
+                                if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
+                                    let ret: Local<v8::Value> = if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                        crate::create_struct_object_from_raw(declaration, result, scope).into()
+                                    } else if result.is_null() {
+                                        v8::null(scope).into()
+                                    } else {
+                                        let instance = unsafe { IUnknown::from_raw(result) };
+                                        create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into()
+                                    };
                                     retval.set(ret.into());
                                     return;
                                 }
@@ -1638,15 +1743,16 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                             match NativeType::try_from(return_sig) {
                                 Ok(return_type) => {
                                     if return_sig.contains('.') {
-                                        let instance = unsafe { IUnknown::from_raw(*(result as *mut *mut c_void)) };
-                                        let lookup = crate::helpers::strip_generic_suffix(return_sig);
-                                        let declaration = MetadataReader::find_by_name(lookup)
-                                            .unwrap_or_else(|| dec.inner.clone());
-                                        let ret: Local<v8::Value> = create_ns_ctor_instance_object(
-                                            return_sig, None, dec.parent.clone(), declaration, Some(instance), scope,
-                                        ).into();
-                                        retval.set(ret.into());
-                                        return;
+                                        if let Some(declaration) = MetadataReader::find_by_name(return_sig) {
+                                            let ret: Local<v8::Value> = if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                                crate::create_struct_object_from_raw(declaration, result, scope).into()
+                                            } else {
+                                                let instance = unsafe { IUnknown::from_raw(*(result as *mut *mut c_void)) };
+                                                create_ns_ctor_instance_object(return_sig, None, dec.parent.clone(), declaration, Some(instance), scope).into()
+                                            };
+                                            retval.set(ret.into());
+                                            return;
+                                        }
                                     }
                                     unsafe { set_ret_val(result, scope, retval, return_type); }
                                 }
@@ -2467,7 +2573,7 @@ pub(crate) fn create_ns_struct_ctor_object<'a>(
         );
 
         let object = object_tmpl.new_instance(scope).unwrap();
-        object.set_internal_field(0, unsafe { ext.cast::<v8::Data>() });
+        object.set_internal_field(0, ext.into());
         retval.set(object.into());
     })
     .data(ext.into())

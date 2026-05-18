@@ -888,6 +888,31 @@ pub fn ffi_parse_struct_arg(
     Ok(NativeValue { pointer })
 }
 
+/// Write a single struct field value (from a V8 value) into a byte buffer in little-endian order.
+/// Used when converting a plain JS object like `{A:255, R:0, G:0, B:0}` to WinRT struct bytes.
+pub(crate) fn append_struct_field_bytes(
+    buf: &mut Vec<u8>,
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<v8::Value>,
+    native_type: &NativeType,
+) {
+    let num = value.number_value(scope).unwrap_or(0.0);
+    match native_type {
+        NativeType::F64  => buf.extend_from_slice(&num.to_le_bytes()),
+        NativeType::F32  => buf.extend_from_slice(&(num as f32).to_le_bytes()),
+        NativeType::I32  => buf.extend_from_slice(&(num as i32).to_le_bytes()),
+        NativeType::U32  => buf.extend_from_slice(&(num as u32).to_le_bytes()),
+        NativeType::I64  => buf.extend_from_slice(&(num as i64).to_le_bytes()),
+        NativeType::U64  => buf.extend_from_slice(&(num as u64).to_le_bytes()),
+        NativeType::I16  => buf.extend_from_slice(&(num as i16).to_le_bytes()),
+        NativeType::U16  => buf.extend_from_slice(&(num as u16).to_le_bytes()),
+        NativeType::I8   => buf.extend_from_slice(&(num as i8).to_le_bytes()),
+        NativeType::U8   => buf.push(num as u8),
+        NativeType::Bool => buf.push(if value.boolean_value(scope) { 1u8 } else { 0u8 }),
+        _                => buf.extend(std::iter::repeat(0u8).take(native_type.size())),
+    }
+}
+
 #[inline]
 pub fn ffi_parse_function_arg(
     scope: &mut v8::PinScope<'_, '_>,

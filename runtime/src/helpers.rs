@@ -5,16 +5,14 @@ use crate::value::NativeType;
 static RE_GENERIC_COUNT: OnceLock<Regex> = OnceLock::new();
 static RE_GENERIC_PARAMS: OnceLock<Regex> = OnceLock::new();
 
-/// Strip the generic instantiation suffix from a WinRT type name.
+/// Returns the open-generic type name without the closed `<T, U, …>` arguments,
+/// preserving the backtick+arity suffix required by WinRT metadata lookups.
 ///
-/// `"Windows.Foundation.IAsyncOperation`1<IUICommand>"` → `"Windows.Foundation.IAsyncOperation"`.
-///
-/// Returns the input unchanged when no backtick / angle-bracket suffix is present.
+/// Example: `"Windows.Foundation.IAsyncOperationWithProgress`2<T,P>"` → `"Windows.Foundation.IAsyncOperationWithProgress`2"`
 #[inline]
 pub fn strip_generic_suffix(name: &str) -> &str {
     if let Some(angle) = name.find('<') {
-        let backtick_pos = name[..angle].rfind('`').unwrap_or(angle);
-        return &name[..backtick_pos];
+        return &name[..angle];
     }
     name
 }

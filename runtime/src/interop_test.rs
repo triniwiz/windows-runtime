@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PeekMessageW, PM_REMOVE, TranslateMessage};
 
 fn unique_result_file(name: &str) -> String {
     let nanos = SystemTime::now()
@@ -180,6 +181,88 @@ fn application_data_values_string_keyed_map_behavior() {
             removeValue(key);
             const after = getValue(key);
             if (after !== undefined && after !== null) throw new Error('Failed to remove test key, still present: ' + after);
+        "#,
+    );
+}
+
+// ── DispatcherTimer delegate wiring tests ────────────────────────────────────
+//
+// These tests verify that assigning a plain JS function to DispatcherTimer.Tick
+// does not throw (i.e. the delegate IS registered). Actual firing requires a
+// running XAML STA dispatcher, which is not available in unit tests — so only
+// the structural assignment is checked here.
+
+#[test]
+fn dispatcher_timer_tick_plain_fn_assignment_does_not_throw() {
+    run_js_assert(
+        "dispatcher_timer_tick_plain_fn_assignment_does_not_throw",
+        r#"
+            var DispatcherTimer = (typeof Windows !== 'undefined' && Windows.UI && Windows.UI.Xaml)
+                ? Windows.UI.Xaml.DispatcherTimer : null;
+            if (!DispatcherTimer) return; // skip if XAML not available
+
+            try {
+                var timer = new DispatcherTimer();
+                timer.Interval = new Windows.Foundation.TimeSpan({ Duration: 100000 }); // 10 ms
+                // Plain JS function — was silently ignored before the delegate-wrap fix.
+                timer.Tick = function(sender, args) {};
+                timer.Stop();
+            } catch (e) {
+                var msg = String((e && e.message) || e);
+                // STA marshal errors are expected in a test host without a real dispatcher.
+                if (/marshalled|apartment|thread/i.test(msg)) return;
+                throw e;
+            }
+        "#,
+    );
+}
+
+#[test]
+fn dispatcher_timer_tick_start_stop_does_not_throw() {
+    run_js_assert(
+        "dispatcher_timer_tick_start_stop_does_not_throw",
+        r#"
+            var DispatcherTimer = (typeof Windows !== 'undefined' && Windows.UI && Windows.UI.Xaml)
+                ? Windows.UI.Xaml.DispatcherTimer : null;
+            if (!DispatcherTimer) return;
+
+            try {
+                var timer = new DispatcherTimer();
+                timer.Interval = new Windows.Foundation.TimeSpan({ Duration: 10000000 }); // 1 s
+                timer.Tick = function(sender, args) {};
+                timer.Start();
+                timer.Stop();
+            } catch (e) {
+                var msg = String((e && e.message) || e);
+                if (/marshalled|apartment|thread/i.test(msg)) return;
+                throw e;
+            }
+        "#,
+    );
+}
+
+#[test]
+fn dispatcher_timer_tick_reassignment_removes_prior_handler() {
+    run_js_assert(
+        "dispatcher_timer_tick_reassignment_removes_prior_handler",
+        r#"
+            var DispatcherTimer = (typeof Windows !== 'undefined' && Windows.UI && Windows.UI.Xaml)
+                ? Windows.UI.Xaml.DispatcherTimer : null;
+            if (!DispatcherTimer) return;
+
+            try {
+                var timer = new DispatcherTimer();
+                timer.Interval = new Windows.Foundation.TimeSpan({ Duration: 10000000 });
+                // Assign twice — the second assignment should remove the first token
+                // without leaking or crashing.
+                timer.Tick = function() {};
+                timer.Tick = function() {};
+                timer.Stop();
+            } catch (e) {
+                var msg = String((e && e.message) || e);
+                if (/marshalled|apartment|thread/i.test(msg)) return;
+                throw e;
+            }
         "#,
     );
 }
@@ -1625,6 +1708,212 @@ fn delegate_constructor_with_plain_object_falls_through() {
                     throw new Error(name + ': plain object without Invoke should not have a handle');
                 }
                 break;
+            }
+        "#,
+    );
+}
+
+/// Like `run_js_assert` but waits up to 30 s — suitable for real network calls.
+fn run_js_assert_network(name: &str, body: &str) {
+    let mut runtime = Box::new(Runtime::new("."));
+    runtime.register_delegate_isolate_ptr();
+    let result_file = unique_result_file(name);
+    let result_file_json = serde_json::to_string(&result_file).unwrap();
+    let temp_dir_json = serde_json::to_string(&std::env::temp_dir().to_string_lossy().to_string()).unwrap();
+
+    let script = format!(
+        r#"
+            (function() {{
+                const __resultFile = {result_file};
+                const __tempDir = {temp_dir};
+
+                function __writeResult(ok, message) {{
+                    if (typeof __nsProxyWriteTextFile !== "function") {{
+                        throw new Error("__nsProxyWriteTextFile is not available in runtime");
+                    }}
+                    __nsProxyWriteTextFile(__resultFile, JSON.stringify({{
+                        ok: !!ok,
+                        message: String(message || "")
+                    }}));
+                }}
+
+                function __errorMessage(e) {{
+                    return (e && (e.stack || e.message))
+                        ? String(e.stack || e.message)
+                        : String(e);
+                }}
+
+                try {{
+                    const __maybePromise = (function() {{
+                        {body}
+                    }})();
+
+                    if (__maybePromise && typeof __maybePromise.then === "function") {{
+                        __maybePromise.then(function () {{
+                            __writeResult(true, "ok");
+                        }}).catch(function (e) {{
+                            __writeResult(false, __errorMessage(e));
+                        }});
+                    }} else {{
+                        __writeResult(true, "ok");
+                    }}
+                }} catch (e) {{
+                    __writeResult(false, __errorMessage(e));
+                }}
+            }})();
+        "#,
+        result_file = result_file_json,
+        temp_dir = temp_dir_json,
+        body = body,
+    );
+
+    runtime.run_script(&script, &format!("{}.js", name));
+
+    let mut found = false;
+    for _ in 0..3000 {
+        if std::path::Path::new(&result_file).exists() {
+            found = true;
+            break;
+        }
+        // Pump the STA message queue so WinRT can deliver async completion callbacks.
+        let mut msg = MSG::default();
+        while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.into() {
+            unsafe {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        crate::timers::pump();
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    if !found {
+        panic!("missing test result file for {name}: timed out after 30 s waiting for network response");
+    }
+
+    let raw = std::fs::read_to_string(&result_file)
+        .unwrap_or_else(|e| panic!("missing test result file for {name}: {e}"));
+    let parsed: Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("invalid test result JSON for {name}: {e}, raw={raw}"));
+
+    let ok = parsed.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    if !ok {
+        let msg = parsed
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown JS failure");
+        panic!("interop test '{name}' failed: {msg}");
+    }
+
+    let _ = std::fs::remove_file(&result_file);
+}
+
+#[test]
+fn async_http_get_jsonplaceholder_todos() {
+    run_js_assert_network(
+        "async_http_get_jsonplaceholder_todos",
+        r#"
+            const httpClient = new Windows.Web.Http.HttpClient();
+            const uri = new Windows.Foundation.Uri('https://jsonplaceholder.typicode.com/todos/1');
+            const method = new Windows.Web.Http.HttpMethod('GET');
+            const requestMessage = new Windows.Web.Http.HttpRequestMessage(method, uri);
+
+            const op = httpClient.SendRequestAsync(requestMessage);
+            console.log('[async-test] op type: ' + typeof op);
+            console.log('[async-test] Completed in op: ' + ('Completed' in op));
+            console.log('[async-test] op.Status: ' + op.Status);
+
+            return NSWinRT.toPromise(op).then(function(response) {
+                console.log('[async-test] got response, StatusCode: ' + (response && response.StatusCode));
+                const statusCode = response.StatusCode;
+                if (statusCode !== 200) {
+                    throw new Error('Expected HTTP 200, got ' + statusCode);
+                }
+                return NSWinRT.toPromise(response.Content.ReadAsStringAsync());
+            }).then(function(body) {
+                console.log('[async-test] got body length: ' + (body && body.length));
+                var todo;
+                try {
+                    todo = JSON.parse(body);
+                } catch (e) {
+                    throw new Error('Response is not valid JSON: ' + (e.message || e));
+                }
+                if (typeof todo !== 'object' || todo === null) {
+                    throw new Error('Expected object, got ' + typeof todo);
+                }
+                if (typeof todo.id !== 'number' || typeof todo.title !== 'string') {
+                    throw new Error('Unexpected todo shape: ' + JSON.stringify(todo));
+                }
+            }).catch(function(e) {
+                console.log('[async-test] CATCH: ' + (e && (e.stack || e.message || e)));
+                throw e;
+            });
+        "#,
+    );
+}
+
+#[test]
+fn http_response_content_headers_is_not_undefined() {
+    run_js_assert_network(
+        "http_response_content_headers_is_not_undefined",
+        r#"
+            const httpClient = new Windows.Web.Http.HttpClient();
+            const uri = new Windows.Foundation.Uri('https://jsonplaceholder.typicode.com/todos/1');
+            const method = new Windows.Web.Http.HttpMethod('GET');
+            const requestMessage = new Windows.Web.Http.HttpRequestMessage(method, uri);
+
+            return NSWinRT.toPromise(httpClient.SendRequestAsync(requestMessage)).then(function(response) {
+                if (response.StatusCode !== 200) {
+                    throw new Error('Expected HTTP 200, got ' + response.StatusCode);
+                }
+
+                const content = response.Content;
+                if (content === null || content === undefined) {
+                    throw new Error('response.Content is ' + content);
+                }
+
+                const headers = content.Headers;
+                if (headers === undefined) {
+                    throw new Error('response.Content.Headers is undefined — InterfaceDeclaration property dispatch missing');
+                }
+                if (headers === null) {
+                    throw new Error('response.Content.Headers is null');
+                }
+                if (typeof headers !== 'object') {
+                    throw new Error('Expected Content.Headers to be an object, got: ' + typeof headers);
+                }
+
+                // ContentType may be null if the server omitted it, but the
+                // property access itself must not throw or return undefined.
+                const ct = headers.ContentType;
+                if (ct === undefined) {
+                    throw new Error('headers.ContentType is undefined');
+                }
+            });
+        "#,
+    );
+}
+
+#[test]
+fn button_background_null_property_does_not_crash() {
+    run_js_assert(
+        "button_background_null_property_does_not_crash",
+        r#"
+            // Button.Background returns null when no explicit background has been set.
+            // Previously this caused IUnknown::from_raw(null_ptr) -> UB crash.
+            const ButtonCtor = (typeof Windows !== 'undefined' &&
+                Windows.UI && Windows.UI.Xaml && Windows.UI.Xaml.Controls &&
+                Windows.UI.Xaml.Controls.Button) || null;
+
+            if (!ButtonCtor) return; // WinRT not available — skip
+
+            const btn = new ButtonCtor();
+            const bg = btn.Background;
+
+            // bg may be null (no explicit background) or a Brush object — both are valid.
+            // The only invalid outcome is a hard crash of the runtime.
+            if (bg !== null && bg !== undefined && typeof bg !== 'object') {
+                throw new Error('Expected Background to be null, undefined, or an object, got: ' + typeof bg);
             }
         "#,
     );

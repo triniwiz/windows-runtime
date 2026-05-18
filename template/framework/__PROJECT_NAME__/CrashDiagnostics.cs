@@ -1,10 +1,12 @@
 using System;
 using System.IO;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Windows.ApplicationModel.Core;
 using Windows.ApplicationModel.DataTransfer;
 using Windows.Storage;
+using Windows.System;
 using Windows.UI.Popups;
 
 namespace __PROJECT_NAME__
@@ -118,6 +120,31 @@ namespace __PROJECT_NAME__
             catch { return null; }
         }
 
+        /// Parses the first "path:line:col" source location from a JS stack trace.
+        /// Returns null if none found. Handles Windows drive-letter paths (C:\...).
+        public static (string file, int line, int col)? TryExtractSourceLocation(string errorReport)
+        {
+            if (string.IsNullOrEmpty(errorReport)) return null;
+
+            // Match the contents of the first (path:line:col) group in the stack trace.
+            var m = Regex.Match(errorReport, @"\(([^)]+)\)");
+            if (!m.Success) return null;
+
+            var inner = m.Groups[1].Value; // e.g. "C:\app\bundle.js:42:13"
+
+            // Parse col from the right (last :digits).
+            var lastColon = inner.LastIndexOf(':');
+            if (lastColon < 0 || !int.TryParse(inner.Substring(lastColon + 1), out int col)) return null;
+            inner = inner.Substring(0, lastColon);
+
+            // Parse line from the right (second-to-last :digits).
+            lastColon = inner.LastIndexOf(':');
+            if (lastColon < 0 || !int.TryParse(inner.Substring(lastColon + 1), out int line)) return null;
+            var file = inner.Substring(0, lastColon);
+
+            return string.IsNullOrEmpty(file) ? null : (file, line, col);
+        }
+
         public static async Task ShowCrashDialogAsync(string heading, string errorReport)
         {
             try
@@ -139,16 +166,40 @@ namespace __PROJECT_NAME__
 
                 var dialog = new MessageDialog(summary, "NativeScript Runtime Error");
 
-                dialog.Commands.Add(new UICommand("Copy Details", _ =>
+                // MessageDialog supports at most 3 commands. When a source location is
+                // available, swap "Copy Details" for "Open in VS Code" so the user can
+                // choose between jumping to the error or restarting. Full details are
+                // always written to the log file shown in the dialog text.
+                var srcLocation = TryExtractSourceLocation(errorReport);
+                if (srcLocation.HasValue)
                 {
-                    try
+                    var (srcFile, srcLine, srcCol) = srcLocation.Value;
+                    dialog.Commands.Add(new UICommand("Open Source File", async _ =>
                     {
-                        var dp = new DataPackage();
-                        dp.SetText(errorReport);
-                        Clipboard.SetContent(dp);
-                    }
-                    catch { }
-                }));
+                        try
+                        {
+                            var normalizedPath = srcFile.Replace('\\', '/');
+                            var uriStr = $"file:///{normalizedPath}";
+                            if (Uri.TryCreate(uriStr, UriKind.Absolute, out var fileUri))
+                                await Launcher.LaunchUriAsync(fileUri,
+                                    new LauncherOptions { DisplayApplicationPicker = true });
+                        }
+                        catch { }
+                    }));
+                }
+                else
+                {
+                    dialog.Commands.Add(new UICommand("Copy Details", _ =>
+                    {
+                        try
+                        {
+                            var dp = new DataPackage();
+                            dp.SetText(errorReport);
+                            Clipboard.SetContent(dp);
+                        }
+                        catch { }
+                    }));
+                }
 
                 dialog.Commands.Add(new UICommand("Restart App", async _ =>
                 {

@@ -201,6 +201,18 @@ pub extern "C" fn runtime_devtools_pump(_runtime: i64) {
     });
 }
 
+/// Drain the JS timer queue on the calling thread.
+///
+/// Must be called regularly on the V8/UI thread (e.g. every render frame) so
+/// that `setTimeout` / `setInterval` callbacks fire.  The C# host wires this
+/// to `CompositionTarget.Rendering` which fires at the display refresh rate.
+#[no_mangle]
+pub extern "C" fn runtime_pump_timers() {
+    let _ = std::panic::catch_unwind(|| {
+        runtime::timers::pump();
+    });
+}
+
 /// Free a string previously returned by `runtime_devtools_start`.
 #[cfg(feature = "devtools")]
 #[no_mangle]

@@ -163,6 +163,12 @@ pub(crate) fn handle_host_wait_for_async(
         }
         match try_get_async_status(scope, op_value) {
             Ok(0) => {
+                // deadline == None means timeout_ms == 0: non-blocking check requested.
+                // Return the op as-is rather than spinning forever.
+                if deadline.is_none() {
+                    retval.set(op_value);
+                    return;
+                }
                 while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.into() {
                     unsafe { let _ = TranslateMessage(&message); DispatchMessageW(&message); }
                 }
@@ -779,42 +785,78 @@ const HELPER_SOURCE: &str = r#"
                 }
 
                 return new Promise(function (resolve, reject) {
+                    var settled = false;
+
                     function settleFromStatus(overrideStatus) {
+                        if (settled) { return; }
                         try {
                             var status = normalizeStatus(
                                 overrideStatus !== undefined ? overrideStatus : (op && op.Status)
                             );
 
                             if (status === statusEnum.Completed || status === 1) {
+                                settled = true;
                                 resolve(getResults(op));
                                 return;
                             }
                             if (status === statusEnum.Canceled || status === 2) {
+                                settled = true;
                                 reject(new Error('WinRT async operation was canceled'));
                                 return;
                             }
                             if (status === statusEnum.Error || status === 3) {
+                                settled = true;
                                 reject((op && op.ErrorCode) || new Error('WinRT async operation failed'));
                                 return;
                             }
-
-                            reject(
-                                new Error('WinRT async operation is still pending and no completion callback was attached')
-                            );
+                            // status === 0 (Started): still running — do not settle yet.
                         } catch (err) {
+                            settled = true;
                             reject(err);
                         }
                     }
 
                     try {
                         if (op && 'Completed' in op) {
+                            // Settle immediately if the operation already finished before we
+                            // could register the handler — WinRT will not fire Completed
+                            // retroactively once the operation has left the Started state.
+                            var initialStatus = normalizeStatus(op.Status);
+                            if (!Number.isNaN(initialStatus) && initialStatus !== 0) {
+                                settleFromStatus(initialStatus);
+                                return;
+                            }
+
                             op.Completed = function (asyncInfo, asyncStatus) {
                                 settleFromStatus(asyncStatus);
                             };
+
+                            // Re-check after assignment: the op may have completed in the
+                            // narrow window between the status read and the handler assignment.
+                            var raceStatus = normalizeStatus(op.Status);
+                            if (!Number.isNaN(raceStatus) && raceStatus !== 0) {
+                                settleFromStatus(raceStatus);
+                            }
                             return;
                         }
                     } catch (_) {
-                        // Fall through and attempt status-based settlement.
+                        // Completed setter not available; fall through to synchronous wait.
+                    }
+
+                    // Synchronous wait fallback — only safe when a finite timeout is given.
+                    // Calling wait() with timeout=0 enters an infinite spin in the host.
+                    var timeoutMs = normalizeTimeoutMs(options);
+                    if (timeoutMs === 0) {
+                        var currentStatus = normalizeStatus(op && op.Status);
+                        if (!Number.isNaN(currentStatus) && currentStatus !== 0) {
+                            settleFromStatus(currentStatus);
+                        } else {
+                            reject(new Error(
+                                'Cannot await this WinRT async operation: it has no Completed property ' +
+                                'and no timeoutMs was specified. Pass { timeoutMs: N } as the second argument.'
+                            ));
+                        }
+                        return;
                     }
 
                     try {
@@ -1870,83 +1912,6 @@ const HELPER_SOURCE: &str = r#"
             };
         })();
 
-        // ── Blob / File ───────────────────────────────────────────────────────
-        (function () {
-            // Minimal UTF-8 encoder (covers BMP + surrogates) for string parts.
-            function _utf8(str) {
-                var out = [];
-                for (var i = 0; i < str.length; ) {
-                    var c = str.codePointAt(i);
-                    if      (c < 0x80)    { out.push(c); i += 1; }
-                    else if (c < 0x800)   { out.push(0xC0|(c>>6), 0x80|(c&0x3F)); i += 1; }
-                    else if (c < 0x10000) { out.push(0xE0|(c>>12), 0x80|((c>>6)&0x3F), 0x80|(c&0x3F)); i += 1; }
-                    else                  { out.push(0xF0|(c>>18), 0x80|((c>>12)&0x3F), 0x80|((c>>6)&0x3F), 0x80|(c&0x3F)); i += 2; }
-                }
-                return new Uint8Array(out).buffer;
-            }
-
-            function _toAb(part) {
-                if (typeof part === 'string') return _utf8(part);
-                if (part instanceof globalThis.Blob) return part._buf;
-                if (part instanceof ArrayBuffer) return part;
-                if (ArrayBuffer.isView(part))
-                    return part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength);
-                return new ArrayBuffer(0);
-            }
-
-            function _concat(parts) {
-                var total = 0;
-                var bufs = (parts || []).map(function (p) { var ab = _toAb(p); total += ab.byteLength; return ab; });
-                var out = new Uint8Array(total);
-                var off = 0;
-                for (var i = 0; i < bufs.length; i++) { out.set(new Uint8Array(bufs[i]), off); off += bufs[i].byteLength; }
-                return out.buffer;
-            }
-
-            function Blob(blobParts, options) {
-                this._buf = _concat(blobParts);
-                this.type = (options && options.type) ? String(options.type).toLowerCase() : '';
-                this.size = this._buf.byteLength;
-            }
-            Blob.prototype.arrayBuffer = function () { return Promise.resolve(this._buf.slice(0)); };
-            Blob.prototype.text = function () {
-                // Simple Latin-1 decode; good enough for ASCII/binary; a real
-                // TextDecoder (if polyfilled later) would be more correct.
-                var b = new Uint8Array(this._buf), s = '';
-                for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
-                return Promise.resolve(s);
-            };
-            Blob.prototype.slice = function (start, end, type) {
-                var sz = this.size;
-                var s = start == null ? 0 : (start < 0 ? Math.max(0, sz + start) : Math.min(start, sz));
-                var e = end   == null ? sz : (end   < 0 ? Math.max(0, sz + end)  : Math.min(end, sz));
-                return new Blob([this._buf.slice(s, e)], { type: type || '' });
-            };
-            Blob.prototype.stream = function () {
-                var buf = this._buf, done = false;
-                return {
-                    getReader: function () {
-                        return {
-                            read:        function () { if (done) return Promise.resolve({ done: true, value: undefined }); done = true; return Promise.resolve({ done: false, value: new Uint8Array(buf.slice(0)) }); },
-                            cancel:      function () { done = true; return Promise.resolve(); },
-                            releaseLock: function () {}
-                        };
-                    }
-                };
-            };
-            globalThis.Blob = Blob;
-
-            function File(fileBits, fileName, options) {
-                Blob.call(this, fileBits, options);
-                this.name = String(fileName);
-                this.lastModified = (options && options.lastModified != null)
-                    ? Number(options.lastModified) : Date.now();
-            }
-            File.prototype = Object.create(Blob.prototype);
-            File.prototype.constructor = File;
-            globalThis.File = File;
-        })();
-
         // ── URL / URLSearchParams / URLPattern post-install wiring ────────────
         // The native classes are installed by install_url_globals() before this
         // script runs.  This block adds the JS-layer searchParams accessor
@@ -2429,19 +2394,23 @@ const HELPER_SOURCE: &str = r#"
         // For managed BCL delegates (System.Action etc.) use
         // NSWinRT.dotnet.asDelegate() instead.
         (function () {
-            if (typeof globalThis.__nsAsDelegate !== 'function') return;
             globalThis.NSWinRT.asDelegate = function(typeNameOrFn, fn) {
-                var typeName, callback;
-                if (typeof typeNameOrFn === 'function') {
-                    typeName = '';
-                    callback = typeNameOrFn;
-                } else {
-                    typeName = typeNameOrFn || '';
-                    callback = fn;
+                // Two-argument form: asDelegate(typeName, fn) → COM-backed JsDelegate
+                if (typeof typeNameOrFn === 'string') {
+                    if (typeof fn !== 'function')
+                        throw new TypeError('NSWinRT.asDelegate: callback must be a function');
+                    if (typeof globalThis.__nsAsDelegate === 'function')
+                        return globalThis.__nsAsDelegate(typeNameOrFn, fn);
+                    return fn;
                 }
-                if (typeof callback !== 'function')
-                    throw new TypeError('NSWinRT.asDelegate: callback must be a function');
-                return globalThis.__nsAsDelegate(typeName, callback);
+                // One-argument form: asDelegate(fn) or asDelegate({invoke(){}})
+                if (typeof typeNameOrFn === 'function') {
+                    return typeNameOrFn;
+                }
+                if (typeNameOrFn && typeof typeNameOrFn.invoke === 'function') {
+                    return typeNameOrFn.invoke.bind(typeNameOrFn);
+                }
+                throw new TypeError('NSWinRT.asDelegate: expected a function, { invoke() } object, or (typeName, fn) pair');
             };
         })();
 
@@ -2526,6 +2495,17 @@ const HELPER_SOURCE: &str = r#"
                 Object.defineProperty(globalThis, '__dirname',  { value: _appDir, writable: true, configurable: true });
                 Object.defineProperty(globalThis, '__filename', { value: _appDir + '\\bundle.js', writable: true, configurable: true });
             }
+        })();
+        
+        (function () {
+            if (typeof WeakRef === 'undefined') return;
+            WeakRef.prototype.get = WeakRef.prototype.deref;
+            WeakRef.prototype.__hasWarnedAboutClear = false;
+            WeakRef.prototype.clear = function () {
+                if (WeakRef.prototype.__hasWarnedAboutClear) return;
+                WeakRef.prototype.__hasWarnedAboutClear = true;
+                console.warn('WeakRef.clear() is non-standard and has been deprecated. It does nothing and the call can be safely removed.');
+            };
         })();
         "#;
 

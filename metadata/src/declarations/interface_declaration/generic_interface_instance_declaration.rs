@@ -20,6 +20,7 @@ pub struct GenericInterfaceInstanceDeclaration {
     closed_token: CorTokenType,
     full_name: String,
     iid_full_name: String,
+    cached_id: GUID,
 }
 
 impl GenericInterfaceInstanceDeclaration {
@@ -56,6 +57,12 @@ impl GenericInterfaceInstanceDeclaration {
             }
         }
 
+        let cached_id = if iid_full_name.is_empty() {
+            GUID::zeroed()
+        } else {
+            GenericInstanceIdBuilder::generate_id_from_name(&iid_full_name)
+        };
+
         Self {
             base: InterfaceDeclaration::new_with_kind(
                 DeclarationKind::GenericInterfaceInstance,
@@ -66,11 +73,35 @@ impl GenericInterfaceInstanceDeclaration {
             closed_token,
             full_name,
             iid_full_name,
+            cached_id,
+        }
+    }
+
+    /// Build from the open-generic metadata/token and pre-computed type name strings.
+    /// Used when we have the full closed-generic type name but no TypeSpec token.
+    pub fn new_from_names(
+        open_metadata: Option<&IMetaDataImport2>,
+        open_token: CorTokenType,
+        full_name: String,
+        iid_full_name: String,
+    ) -> Self {
+        let cached_id = GenericInstanceIdBuilder::generate_id_from_name(&iid_full_name);
+        Self {
+            base: InterfaceDeclaration::new_with_kind(
+                DeclarationKind::GenericInterfaceInstance,
+                open_metadata,
+                open_token,
+            ),
+            closed_metadata: None,
+            closed_token: CorTokenType::default(),
+            full_name,
+            iid_full_name,
+            cached_id,
         }
     }
 
     pub fn id(&self) -> GUID {
-        GenericInstanceIdBuilder::generate_id_from_name(&self.iid_full_name)
+        self.cached_id
     }
 }
 

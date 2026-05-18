@@ -61,9 +61,7 @@ namespace __PROJECT_NAME__
                 await CrashDiagnostics.ShowCrashDialogAsync("Script Execution Error", report);
             }
 
-#if DEBUG
             Windows.UI.Xaml.Media.CompositionTarget.Rendering += OnRenderFrame;
-#endif
 
             if (Window.Current.Content == null)
             {
@@ -86,9 +84,7 @@ namespace __PROJECT_NAME__
         private void OnSuspending(object sender, SuspendingEventArgs e)
         {
             var deferral = e.SuspendingOperation.GetDeferral();
-#if DEBUG
             Windows.UI.Xaml.Media.CompositionTarget.Rendering -= OnRenderFrame;
-#endif
             ApplicationData.Current.LocalSettings.Values[LastLaunchArgsKey] = string.Empty;
             _runtimeHost.Dispose();
             deferral.Complete();
@@ -109,8 +105,12 @@ namespace __PROJECT_NAME__
                 e.Message ?? "Unhandled exception", report);
         }
 
+        private void OnRenderFrame(object sender, object e)
+        {
+            _runtimeHost.PumpTimers();
 #if DEBUG
-        private void OnRenderFrame(object sender, object e) => _runtimeHost.PumpDevtools();
+            _runtimeHost.PumpDevtools();
 #endif
+        }
     }
 }
