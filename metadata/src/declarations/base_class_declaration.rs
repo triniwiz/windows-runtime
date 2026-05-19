@@ -238,7 +238,7 @@ impl BaseClassDeclaration {
     }
 }
 
-pub trait BaseClassDeclarationImpl {
+pub trait BaseClassDeclarationImpl: dyn_clone::DynClone {
 
     fn as_declaration(&self) -> &dyn Declaration;
 
@@ -270,22 +270,18 @@ pub trait BaseClassDeclarationImpl {
         // let mut properties = self.properties().into_iter().filter(|prop| prop.full_name() == name).collect();
         // result.append(&mut properties);
 
-        let properties = self.properties().to_vec();
-
-        for property in properties.into_iter() {
+        for property in self.properties().iter() {
             if property.full_name() == name {
-                result.push(Box::new(property));
+                result.push(Box::new(property.clone()));
             }
         }
 
         // let mut events = self.events().into_iter().filter(|event| event.full_name() == name).collect();
         // result.append(&mut events);
 
-        let events = self.events().to_vec();
-
-        for event in events {
+        for event in self.events().iter() {
             if event.full_name() == name {
-                result.push(Box::new(event))
+                result.push(Box::new(event.clone()))
             }
         }
 
@@ -295,10 +291,10 @@ pub trait BaseClassDeclarationImpl {
     fn find_methods_with_name(&self, name: &str) -> Vec<MethodDeclaration> {
         debug_assert!(!name.is_empty());
         let mut method_tokens = [0_u32; 1024];
+        let mut methods_count = 0_u32;
         if let Some(metadata) = self.base().metadata() {
             let mut enumerator = std::ptr::null_mut();
 
-            let mut methods_count = 0;
             let name = HSTRING::from(name);
             let name = PCWSTR(name.as_ptr());
             let base = self.base();
@@ -316,10 +312,10 @@ pub trait BaseClassDeclarationImpl {
             unsafe { metadata.CloseEnum(enumerator) };
         }
 
-        method_tokens
-            .into_iter()
+        method_tokens[..methods_count as usize]
+            .iter()
             .map(|method_token| {
-                MethodDeclaration::new(self.base().metadata(), CorTokenType(method_token as i32))
+                MethodDeclaration::new(self.base().metadata(), CorTokenType(*method_token as i32))
             })
             .collect()
     }
@@ -381,8 +377,4 @@ impl Declaration for BaseClassDeclaration {
     }
 }
 
-impl Clone for Box<dyn BaseClassDeclarationImpl> {
-    fn clone(&self) -> Self {
-        self.clone()
-    }
-}
+dyn_clone::clone_trait_object!(BaseClassDeclarationImpl);

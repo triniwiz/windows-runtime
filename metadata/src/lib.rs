@@ -1,7 +1,9 @@
 use std::ffi::c_void;
-use std::fmt::{Debug, Formatter};
-use windows::core::{GUID, IUnknown};
-use windows::Win32::System::WinRT::Metadata::IMetaDataImport2;
+use windows::core::{GUID, HSTRING, IUnknown, Interface};
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+use windows::Win32::System::WinRT::Metadata::{
+    CLSID_CorMetaDataDispenser, IMetaDataDispenserEx, IMetaDataImport2, ofRead,
+};
 
 pub mod com_helpers;
 pub mod declarations;
@@ -13,45 +15,18 @@ pub mod generic_instance_id_builder;
 pub mod declaration_factory;
 pub mod declaring_interface_for_method;
 
-
-#[cxx::bridge]
-mod ffi {
-    unsafe extern "C++" {
-        include!("metadata/src/bindings.h");
-
-        type c_void;
-
-        type IUnknown;
-
-        // Returns the function pointer at vtable slot `index` of `iface`.
-        pub unsafe fn GetMethod(iface: *mut IUnknown, index: usize, method: *mut *mut c_void);
-
-        // Calls QueryInterface on `factory` using the given GUID, then returns the vtable
-        // function pointer at `index` from the resulting interface via `func`.
-        pub unsafe fn QueryInterface(
-            index: usize,
-            factory: *mut c_void,
-            data1: u32,
-            data2: u16,
-            data3: u16,
-            data4: &[u8],
-            activation_factory: *mut c_void,
-            func: *mut *mut c_void,
-        );
-
-        // Opens an IMetaDataImport2 scope for any CLI metadata file (.dll, .winmd, .exe).
-        // Returns an AddRef'd raw pointer; caller must Release() it.  Returns null on error.
-        pub unsafe fn OpenMetadataScope(path: &str) -> *mut c_void;
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Vtable / COM helpers
 // ---------------------------------------------------------------------------
 
 pub fn get_method(iface: &IUnknown, index: usize, method: *mut *mut c_void) {
+    if method.is_null() {
+        return;
+    }
+
     unsafe {
-        ffi::GetMethod(std::mem::transmute_copy(iface), index, std::mem::transmute(method))
+        let vtable = *(iface.as_raw() as *mut *mut *mut c_void);
+        *method = *vtable.add(index);
     }
 }
 
@@ -62,22 +37,27 @@ pub fn query_interface(
     activation_factory: &mut IUnknown,
     func: *mut *mut c_void,
 ) {
+    let _ = activation_factory;
+    if func.is_null() {
+        return;
+    }
+
     unsafe {
-        ffi::QueryInterface(
-            index,
-            std::mem::transmute_copy(factory),
-            guid.data1,
-            guid.data2,
-            guid.data3,
-            guid.data4.as_slice(),
-            std::mem::transmute_copy(activation_factory),
-            std::mem::transmute(func),
-        )
+        *func = std::ptr::null_mut();
+
+        let mut queried = std::ptr::null_mut();
+        if factory.query(guid, &mut queried).is_err() || queried.is_null() {
+            return;
+        }
+
+        let queried = IUnknown::from_raw(queried);
+        let vtable = *(queried.as_raw() as *mut *mut *mut c_void);
+        *func = *vtable.add(index);
     }
 }
 
 // ---------------------------------------------------------------------------
-// GUID helpers — pure Rust, no C++ required
+// GUID helpers
 // ---------------------------------------------------------------------------
 
 /// Formats a GUID as `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}`.
@@ -118,12 +98,50 @@ pub unsafe fn get_guid(data: *const u8) -> GUID {
 /// so it works for arbitrary .NET assemblies, not just registered WinRT types.
 pub fn open_metadata_scope_from_file(path: &std::path::Path) -> Option<IMetaDataImport2> {
     let path_str = path.to_string_lossy();
-    let raw = unsafe { ffi::OpenMetadataScope(&path_str) };
-    if raw.is_null() {
-        return None;
+
+    unsafe {
+        let dispenser: IMetaDataDispenserEx =
+            CoCreateInstance(&CLSID_CorMetaDataDispenser, None, CLSCTX_INPROC_SERVER).ok()?;
+        let path = HSTRING::from(path_str.as_ref());
+        let unknown = dispenser
+            .OpenScope(&path, ofRead.0 as u32, &IMetaDataImport2::IID)
+            .ok()?;
+
+        Some(IMetaDataImport2::from_raw(unknown.into_raw()))
     }
-    // SAFETY: OpenMetadataScope returns a valid AddRef'd IMetaDataImport2 COM pointer.
-    // IMetaDataImport2 in windows-rs is #[repr(transparent)] over a single pointer,
-    // so transmuting from *mut c_void with the same pointer value is well-defined.
-    Some(unsafe { std::mem::transmute(raw) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_guid_without_cxx_bridge() {
+        let guid = GUID {
+            data1: 0x12345678,
+            data2: 0x9abc,
+            data3: 0xdef0,
+            data4: [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0],
+        };
+
+        assert_eq!(
+            guid_to_string(&guid),
+            "{12345678-9ABC-DEF0-1234-56789ABCDEF0}"
+        );
+    }
+
+    #[test]
+    fn reads_unaligned_windows_guid_bytes() {
+        let bytes = [
+            0x78, 0x56, 0x34, 0x12, 0xbc, 0x9a, 0xf0, 0xde, 0x12, 0x34, 0x56, 0x78,
+            0x9a, 0xbc, 0xde, 0xf0,
+        ];
+
+        let guid = unsafe { get_guid(bytes.as_ptr()) };
+
+        assert_eq!(guid.data1, 0x12345678);
+        assert_eq!(guid.data2, 0x9abc);
+        assert_eq!(guid.data3, 0xdef0);
+        assert_eq!(guid.data4, [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0]);
+    }
 }

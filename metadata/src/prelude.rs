@@ -206,6 +206,30 @@ pub fn get_guid_attribute_value(metadata: Option<&IMetaDataImport2>, token: CorT
     guid
 }
 
+pub fn has_custom_attribute(
+    metadata: &IMetaDataImport2,
+    token: CorTokenType,
+    attribute_name: &str,
+) -> bool {
+    debug_assert!(token.0 != 0);
+    debug_assert!(!attribute_name.is_empty());
+
+    let mut data = std::ptr::null_mut() as *const c_void;
+    let mut size = 0_u32;
+    let name = HSTRING::from(attribute_name);
+    let name = PCWSTR(name.as_ptr());
+    let result = unsafe {
+        metadata.GetCustomAttributeByName(
+            token.0 as u32,
+            name,
+            addr_of_mut!(data) as *const *const c_void,
+            &mut size,
+        )
+    };
+
+    result.is_ok() && !data.is_null() && size > 0
+}
+
 pub fn get_string_value_from_blob(
     signature: &PCCOR_SIGNATURE,
 ) -> String {

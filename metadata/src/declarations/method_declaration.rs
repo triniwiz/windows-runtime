@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::ptr::addr_of_mut;
-use windows::core::{HSTRING, PCWSTR};
+use windows::core::PCWSTR;
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMAGE_CEE_CS_CALLCONV_GENERIC, IMetaDataImport2, mdtMethodDef};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::parameter_declaration::ParameterDeclaration;
@@ -17,7 +17,9 @@ pub struct MethodDeclaration {
     return_type: PCCOR_SIGNATURE,
     full_name: String,
     overload_name: String,
-    is_void: bool
+    method_flags: u32,
+    is_void: bool,
+    is_default_overload: bool,
 }
 
 const OVERLOAD_ATTRIBUTE: &str = "Windows.Foundation.Metadata.OverloadAttribute";
@@ -37,18 +39,22 @@ impl MethodDeclaration {
         let mut return_type = PCCOR_SIGNATURE::default();
         let mut full_name = String::new();
         let mut overload_name = String::new();
+        let mut method_flags = 0_u32;
         let mut is_void = false;
+        let mut is_default_overload = false;
         unsafe {
             match metadata {
                 None => {}
                 Some(metadata) => {
+                    let mut name_length = 0_u32;
+                    let mut name_data = [0_u16; MAX_IDENTIFIER_LENGTH];
                     let result = unsafe {
                         metadata.GetMethodProps(
                             token.0 as u32,
                             0 as _,
-                            None,
-                            0 as _,
-                            0 as _,
+                            Some(&mut name_data),
+                            &mut name_length,
+                            &mut method_flags,
                             addr_of_mut!(signature),
                             &mut signature_size,
                             0 as _,
@@ -106,29 +112,18 @@ impl MethodDeclaration {
                         ))
                     }
 
-                    // Read name in the same GetMethodProps call as the signature above
-                    // to avoid a second COM round-trip.
-                    let mut name_length = 0_u32;
-                    let mut data = [0_u16; MAX_IDENTIFIER_LENGTH];
-                    let result = metadata.GetMethodProps(
-                        token.0 as u32,
-                        0 as _,
-                        Some(&mut data),
-                        &mut name_length,
-                        0 as _,
-                        0 as _,
-                        0 as _,
-                        0 as _,
-                        0 as _,
-                    );
-                    debug_assert!(result.is_ok());
-
-                    full_name = String::from_utf16_lossy(&data[0..name_length.saturating_sub(1) as usize]);
+                    full_name = String::from_utf16_lossy(&name_data[0..name_length.saturating_sub(1) as usize]);
 
                     overload_name = get_unary_custom_attribute_string_value(
                         &metadata,
                         token,
                         OVERLOAD_ATTRIBUTE,
+                    );
+
+                    is_default_overload = has_custom_attribute(
+                        metadata,
+                        token,
+                        DEFAULT_OVERLOAD_ATTRIBUTE,
                     );
 
                     // Use the element-type byte directly rather than allocating a String.
@@ -148,7 +143,9 @@ impl MethodDeclaration {
             return_type,
             full_name,
             overload_name,
-            is_void
+            method_flags,
+            is_void,
+            is_default_overload,
         }
     }
 
@@ -191,45 +188,11 @@ impl MethodDeclaration {
     }
 
     pub fn is_static(&self) -> bool {
-        let mut method_flags = 0;
-        if let Some(metadata) = self.metadata.as_ref() {
-            let result = unsafe {
-                metadata.GetMethodProps(
-                    self.token.0 as u32,
-                    0 as _,
-                    None,
-                    0 as _,
-                    &mut method_flags,
-                    0 as _,
-                    0 as _,
-                    0 as _,
-                    0 as _,
-                )
-            };
-            assert!(result.is_ok());
-        }
-        is_md_static(method_flags as i32)
+        is_md_static(self.method_flags as i32)
     }
 
     pub fn is_sealed(&self) -> bool {
-        let mut method_flags = 0;
-        if let Some(metadata) = self.metadata.as_ref() {
-            let result = unsafe {
-                metadata.GetMethodProps(
-                    self.token.0 as u32,
-                    0 as _,
-                    None,
-                    0 as _,
-                    &mut method_flags,
-                    0 as _,
-                    0 as _,
-                    0 as _,
-                    0 as _,
-                )
-            };
-            assert!(result.is_ok());
-        }
-        is_md_static(method_flags as i32) || is_md_final(method_flags as i32)
+        is_md_static(self.method_flags as i32) || is_md_final(self.method_flags as i32)
     }
 
     pub fn parameters(&self) -> &[ParameterDeclaration] {
@@ -245,15 +208,7 @@ impl MethodDeclaration {
     }
 
     pub fn is_default_overload(&self) -> bool {
-        let data = HSTRING::from(DEFAULT_OVERLOAD_ATTRIBUTE);
-        let data = PCWSTR(data.as_ptr());
-        if let Some(metadata) = self.metadata.as_ref() {
-            let get_attribute_result =
-                unsafe { metadata.GetCustomAttributeByName(self.token.0 as u32, data, 0 as _, 0 as _) };
-            debug_assert!(get_attribute_result.is_ok());
-            return get_attribute_result.is_ok();
-        }
-        false
+        self.is_default_overload
     }
 
     pub fn return_type(&self) -> PCCOR_SIGNATURE {
@@ -271,25 +226,7 @@ impl Declaration for MethodDeclaration {
     }
 
     fn is_exported(&self) -> bool {
-        let mut method_flags = 0_u32;
-        if let Some(metadata) = self.metadata.as_ref() {
-            let result = unsafe {
-                metadata.GetMethodProps(
-                    self.token.0 as u32,
-                    0 as _,
-                    None,
-                    0 as _,
-                    &mut method_flags,
-                    0 as _,
-                    0 as _,
-                    0 as _,
-                    0 as _,
-                )
-            };
-            debug_assert!(result.is_ok());
-        }
-
-        let method_flags = method_flags as i32;
+        let method_flags = self.method_flags as i32;
 
         if !(is_md_public(method_flags)
             || is_md_family(method_flags)

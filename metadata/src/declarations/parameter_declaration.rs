@@ -26,13 +26,14 @@ impl ParameterDeclaration {
             None => String::new(),
             Some(metadata) => {
                 let mut length = 0;
+                let mut full_name_data = [0_u16; MAX_IDENTIFIER_LENGTH];
 
                 let result = unsafe {
                     metadata.GetParamProps(
                         token.0 as u32,
                         0 as _,
                         0 as _,
-                        None,
+                        Some(&mut full_name_data),
                         &mut length,
                         0 as _,
                         0 as _,
@@ -41,23 +42,6 @@ impl ParameterDeclaration {
                     )
                 };
 
-                assert!(result.is_ok());
-
-                let mut full_name_data = vec![0u16; length as usize];
-
-                let result = unsafe {
-                    metadata.GetParamProps(
-                        token.0 as u32,
-                        0 as _,
-                        0 as _,
-                        Some(full_name_data.as_mut_slice()),
-                        0 as _,
-                        0 as _,
-                        0 as _,
-                        0 as _,
-                        0 as _,
-                    )
-                };
                 assert!(result.is_ok());
                 String::from_utf16_lossy(&full_name_data[..length.saturating_sub(1) as usize])
             }
