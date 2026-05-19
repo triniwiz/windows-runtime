@@ -591,8 +591,10 @@ fn render_interface(name: &str, interface: &InterfaceDeclaration) -> String {
     for prop in properties {
         let Some(md) = prop.getter().metadata() else { continue };
         let return_ty = Signature::to_string(md, &prop.getter().return_type());
+        let readonly = if prop.setter().is_none() { "readonly " } else { "" };
         out.push_str(&format!(
-            "  {}: {};\n",
+            "  {}{}: {};\n",
+            readonly,
             sanitize_member(prop.name()),
             map_type_to_ts(return_ty.as_str())
         ));
@@ -606,9 +608,6 @@ fn render_interface(name: &str, interface: &InterfaceDeclaration) -> String {
     // Emit an indexer for well-known map-like interfaces so TS consumers can
     // access members with bracket notation (e.g. `ps["name"]`). We prefer
     // the concrete WinRT method surface but provide the indexer for ergonomics.
-    if name.contains("PropertySet") || name.contains("StringMap") || name.contains("ValueSet") {
-        println!("typings-generator: render_interface saw: {}", name);
-    }
     match name {
         "IPropertySet" | "ValueSet" => {
             out.push_str("  [key: string]: Object;\n");
@@ -691,10 +690,11 @@ fn render_class(name: &str, class_decl: &ClassDeclaration) -> String {
         let return_ty = Signature::to_string(md, &prop.getter().return_type());
         let pname = sanitize_member(prop.name());
         let ts_ty = map_type_to_ts(return_ty.as_str());
+        let readonly = if prop.setter().is_none() { "readonly " } else { "" };
         if prop.is_static() {
-            out.push_str(&format!("  static {pname}: {ts_ty};\n"));
+            out.push_str(&format!("  static {readonly}{pname}: {ts_ty};\n"));
         } else {
-            out.push_str(&format!("  {pname}: {ts_ty};\n"));
+            out.push_str(&format!("  {readonly}{pname}: {ts_ty};\n"));
         }
     }
 
@@ -816,8 +816,10 @@ fn render_generic_interface(interface: &GenericInterfaceDeclaration) -> String {
     for prop in properties {
         let Some(md) = prop.getter().metadata() else { continue };
         let return_ty = Signature::to_string(md, &prop.getter().return_type());
+        let readonly = if prop.setter().is_none() { "readonly " } else { "" };
         out.push_str(&format!(
-            "  {}: {};\n",
+            "  {}{}: {};\n",
+            readonly,
             prop.name(),
             map_type_to_ts_with_generics(return_ty.as_str(), &generic_params)
         ));
@@ -2045,12 +2047,54 @@ fn write_split_output(
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Returns true when every requested root is a non-WinRT namespace AND the input
+/// is a .dll or .csproj.  In that case we delegate to the dotnet-typings-gen
+/// sub-tool which uses System.Reflection.Metadata for accurate .NET type mapping.
+fn is_dotnet_mode(config: &GeneratorConfig) -> bool {
+    let Some(input) = &config.input else { return false };
+    let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if !matches!(ext, "dll" | "csproj") {
+        return false;
+    }
+    // If any root is Windows or Windows.* this is a WinRT build.
+    !config.roots.iter().any(|r| r == "Windows" || r.starts_with("Windows."))
+}
+
+fn run_dotnet_typings_gen(config: &GeneratorConfig) {
+    // The C# sub-tool lives next to this source file's project directory.
+    let this_manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sub_proj = this_manifest.join("dotnet-src").join("dotnet-typings-gen.csproj");
+
+    let mut cmd = std::process::Command::new("dotnet");
+    cmd.arg("run")
+        .arg("--project").arg(&sub_proj)
+        .arg("--")
+        .arg("--input").arg(config.input.as_ref().unwrap())
+        .arg("--out").arg(&config.out);
+
+    for root in &config.roots {
+        cmd.arg("--root").arg(root);
+    }
+
+    let status = cmd.status().expect("failed to launch dotnet");
+    if !status.success() {
+        eprintln!("[typings-generator] dotnet-typings-gen exited with {}", status);
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
 fn main() {
     // Initialize COM MTA so that CoCreateInstance(CLSID_CorMetaDataDispenser) works
     // in OpenMetadataScope (used by open_metadata_scope_from_file in Phase 2).
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() };
 
     let config = parse_args();
+
+    // Dotnet mode: delegate to the C# reflection-based sub-tool.
+    if is_dotnet_mode(&config) {
+        run_dotnet_typings_gen(&config);
+        return;
+    }
 
     // Phase 1: BFS namespace walk — discovers types reachable via RoResolveNamespace.
     let mut modules: BTreeMap<String, Vec<String>> = BTreeMap::new();
