@@ -23,6 +23,9 @@ namespace __PROJECT_NAME__
         {
             _runtimeHost.Initialize();
 
+            // Capture before any await — continuations may resume on a thread pool thread.
+            var dispatcher = Window.Current.Dispatcher;
+
             // Show crash report from the previous run if one exists.
             try
             {
@@ -61,24 +64,29 @@ namespace __PROJECT_NAME__
                 await CrashDiagnostics.ShowCrashDialogAsync("Script Execution Error", report);
             }
 
-            Windows.UI.Xaml.Media.CompositionTarget.Rendering += OnRenderFrame;
-
-            if (Window.Current.Content == null)
+            // After any await, the continuation may run on a thread pool thread.
+            // Schedule all UI-thread-required operations through the dispatcher.
+            _ = dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
             {
-                Window.Current.Content = new Windows.UI.Xaml.Controls.TextBlock
+                Windows.UI.Xaml.Media.CompositionTarget.Rendering += OnRenderFrame;
+
+                if (Window.Current.Content == null)
                 {
-                    Text = "NativeScript runtime initialized but no UI was rendered.\n" +
-                           "Check the Output window for JS errors.",
-                    Margin = new Windows.UI.Xaml.Thickness(20),
-                    TextWrapping = Windows.UI.Xaml.TextWrapping.Wrap,
-                    FontSize = 16,
-                };
-            }
+                    Window.Current.Content = new Windows.UI.Xaml.Controls.TextBlock
+                    {
+                        Text = "NativeScript runtime initialized but no UI was rendered.\n" +
+                               "Check the Output window for JS errors.",
+                        Margin = new Windows.UI.Xaml.Thickness(20),
+                        TextWrapping = Windows.UI.Xaml.TextWrapping.Wrap,
+                        FontSize = 16,
+                    };
+                }
 
-            if (!e.PrelaunchActivated)
-            {
-                Window.Current.Activate();
-            }
+                if (!e.PrelaunchActivated)
+                {
+                    Window.Current.Activate();
+                }
+            });
         }
 
         private void OnSuspending(object sender, SuspendingEventArgs e)

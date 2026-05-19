@@ -27,18 +27,12 @@ BenchmarkRunner.Run<BridgeBenchmarks>(args: args);
 [CategoriesColumn]
 public class BridgeBenchmarks
 {
-    // ── pre-built raw request bytes (for full-pipeline benchmarks) ───────────
-
     // JSON: {"assembly":"System","typeName":"System.Math","method":"Abs","args":[-42]}
     private static readonly byte[] s_jsonMathAbsBytes =
         System.Text.Encoding.UTF8.GetBytes(
             """{"assembly":"System","typeName":"System.Math","method":"Abs","args":[-42]}""");
 
-    // ── pre-built JSON args ───────────────────────────────────────────────────
-
     private static readonly JsonElement[] s_arg42 = [JsonSerializer.SerializeToElement(-42)];
-
-    // ── pre-built binary packets ──────────────────────────────────────────────
 
     private static readonly byte[] s_binMathAbs = BuildPacket(w =>
     {
@@ -61,8 +55,6 @@ public class BridgeBenchmarks
     // handle-dependent packets built in GlobalSetup
     private int    _sbHandle;
     private byte[] _binGetLength = null!;
-
-    // ── setup / teardown ──────────────────────────────────────────────────────
 
     [GlobalSetup]
     public void GlobalSetup()
@@ -91,8 +83,6 @@ public class BridgeBenchmarks
     [GlobalCleanup]
     public void GlobalCleanup() => Bridge.ClearCaches();
 
-    // ── warm: static method call ──────────────────────────────────────────────
-
     [BenchmarkCategory("StaticCall"), Benchmark(Baseline = true)]
     public int Json_StaticCall()
         => Bridge.Dispatch(new InvokeRequest("System", "System.Math", "Abs", null, s_arg42)).GetHashCode();
@@ -104,8 +94,6 @@ public class BridgeBenchmarks
         return Bridge.DispatchBin(ref r).GetHashCode();
     }
 
-    // ── warm: instance property get ──────────────────────────────────────────
-
     [BenchmarkCategory("PropertyGet"), Benchmark(Baseline = true)]
     public int Json_PropertyGet()
         => Bridge.Dispatch(new InvokeRequest(null, null, "get_Length", _sbHandle, null)).GetHashCode();
@@ -116,8 +104,6 @@ public class BridgeBenchmarks
         var r = new BinReader(_binGetLength.AsSpan());
         return Bridge.DispatchBin(ref r).GetHashCode();
     }
-
-    // ── constructor + release ─────────────────────────────────────────────────
 
     [BenchmarkCategory("Constructor"), Benchmark(Baseline = true)]
     public void Json_Constructor()
@@ -135,7 +121,6 @@ public class BridgeBenchmarks
         Bridge.Dispatch(new InvokeRequest(null, null, "__release", result.HandleId(), null));
     }
 
-    // ── full pipeline: parse + dispatch + serialise ───────────────────────────
     // Fair end-to-end comparison: JSON includes Deserialize + WriteTo(Utf8JsonWriter);
     // binary includes BinReader parsing + WriteAsBin. Both start from raw bytes.
 
@@ -147,8 +132,6 @@ public class BridgeBenchmarks
     public int Bin_Pipeline_StaticCall()
         => Bridge.PipelineBinary(s_binMathAbs).Length;
 
-    // ── cold: first call (type resolution + expression compile) ──────────────
-    //
     // [InvocationCount(1)] ensures each iteration is exactly one call so the
     // [IterationSetup] cache clear takes effect for every measurement.
 
@@ -167,8 +150,6 @@ public class BridgeBenchmarks
         var r = new BinReader(s_binMathAbs.AsSpan());
         return Bridge.DispatchBin(ref r).GetHashCode();
     }
-
-    // ── helpers ───────────────────────────────────────────────────────────────
 
     private static byte[] BuildPacket(Action<BinWriter> write)
     {

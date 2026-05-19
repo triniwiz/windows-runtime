@@ -9,8 +9,6 @@ using Xunit;
 
 namespace DotNetBridgeTests;
 
-// ── JsDelegateTests ───────────────────────────────────────────────────────────
-//
 // Tests for the .NET-bridge JS delegate path (Bridge.JsDelegate.cs):
 //   opcode 0x09  — CreateJsDelegate
 //   CallJsCallback — serialises args in response-binary tag format
@@ -24,8 +22,6 @@ namespace DotNetBridgeTests;
 [Collection("Bridge")]
 public sealed class JsDelegateTests : IDisposable
 {
-    // ── static capture sink ───────────────────────────────────────────────────
-
     private static int    s_capturedId;
     private static int    s_captureCount;
     private static byte[] s_capturedArgs = [];
@@ -41,8 +37,6 @@ public sealed class JsDelegateTests : IDisposable
         *respLen = 0;
     }
 
-    // ── setup / teardown ──────────────────────────────────────────────────────
-
     public unsafe JsDelegateTests()
     {
         Bridge.ClearCaches();
@@ -57,8 +51,6 @@ public sealed class JsDelegateTests : IDisposable
         Bridge.s_jsInvoker = null;
         Bridge.ClearCaches();
     }
-
-    // ── opcode 0x09: CreateJsDelegate ─────────────────────────────────────────
 
     [Fact]
     public void CreateJsDelegate_SystemAction_ReturnsHandle()
@@ -105,8 +97,6 @@ public sealed class JsDelegateTests : IDisposable
         Release(r2);
     }
 
-    // ── end-to-end invocation: Action (0 args) ────────────────────────────────
-
     [Fact]
     public void InvokeDelegate_SystemAction_FiresCallback()
     {
@@ -120,8 +110,6 @@ public sealed class JsDelegateTests : IDisposable
         // arg buffer: [count=0]
         Assert.Equal(0, s_capturedArgs[0]);
     }
-
-    // ── end-to-end invocation: arg serialisation ──────────────────────────────
 
     [Fact]
     public void InvokeDelegate_NullArg_SerializesNullTag()
@@ -259,8 +247,6 @@ public sealed class JsDelegateTests : IDisposable
         Assert.Equal(0x05, s_capturedArgs[7]); // string
     }
 
-    // ── no-invoker guard ──────────────────────────────────────────────────────
-
     [Fact]
     public unsafe void CallJsCallback_NoInvokerRegistered_DoesNotThrow()
     {
@@ -268,8 +254,6 @@ public sealed class JsDelegateTests : IDisposable
         var ex = Record.Exception(() => Bridge.CallJsCallback(99, [42]));
         Assert.Null(ex);
     }
-
-    // ── EventHandler end-to-end ───────────────────────────────────────────────
 
     [Fact]
     public void InvokeDelegate_EventHandler_BothArgsSerialised()
@@ -293,8 +277,6 @@ public sealed class JsDelegateTests : IDisposable
         Assert.Equal(0x06, s_capturedArgs[arg1Start]); // EventArgs → handle tag
     }
 
-    // ── WinRT delegate path notes ─────────────────────────────────────────────
-    //
     // The native WinRT delegate path (NSWinRT.asDelegate / __nsAsDelegate) runs
     // through Rust's handle_as_delegate() in lib.rs, which uses MetadataReader
     // to look up the delegate GUID and parameter NativeTypes, then allocates a
@@ -304,8 +286,6 @@ public sealed class JsDelegateTests : IDisposable
     // suite where the full Windows Runtime metadata is available.  The C# bridge
     // side does not participate in the native WinRT path — there is no opcode for
     // it and no managed code involved.
-
-    // ── helpers ───────────────────────────────────────────────────────────────
 
     private static DispatchResult DispatchCreateDelegate(string typeName, int callbackId)
     {

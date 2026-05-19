@@ -10,6 +10,13 @@ internal readonly struct HandleRef(int id)
     public readonly int Id = id;
 }
 
+// Carries a raw IUnknown/IInspectable pointer from a WinRT proxy (tag 0x0A).
+// CoerceBin calls Marshal.GetObjectForIUnknown to create a managed RCW.
+internal readonly struct WinRtRef(long ptr)
+{
+    public readonly long Ptr = ptr;
+}
+
 internal ref struct BinReader(ReadOnlySpan<byte> buf)
 {
     private readonly ReadOnlySpan<byte> _buf = buf;
@@ -21,6 +28,13 @@ internal ref struct BinReader(ReadOnlySpan<byte> buf)
     {
         var v = BinaryPrimitives.ReadInt32LittleEndian(_buf[_pos..]);
         _pos += 4;
+        return v;
+    }
+
+    public long ReadI64()
+    {
+        var v = BinaryPrimitives.ReadInt64LittleEndian(_buf[_pos..]);
+        _pos += 8;
         return v;
     }
 
@@ -65,6 +79,7 @@ internal ref struct BinReader(ReadOnlySpan<byte> buf)
                 0x04 => (object)ReadF64(),
                 0x05 => (object)ReadString16(),
                 0x06 => (object)new HandleRef(ReadI32()),
+                0x0A => (object)new WinRtRef(ReadI64()),
                 _    => null,
             };
         }
@@ -98,6 +113,12 @@ internal ref struct BinWriter(ArrayBufferWriter<byte> buf)
     {
         BinaryPrimitives.WriteUInt32LittleEndian(_buf.GetSpan(4), v);
         _buf.Advance(4);
+    }
+
+    public void WriteI64(long v)
+    {
+        BinaryPrimitives.WriteInt64LittleEndian(_buf.GetSpan(8), v);
+        _buf.Advance(8);
     }
 
     public void WriteF64(double v)

@@ -83,356 +83,6 @@ fn try_resolve_with_known_extensions(candidate: PathBuf) -> PathBuf {
     candidate
 }
 
-pub(crate) fn handle_create_composition_border(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments,
-    mut retval: v8::ReturnValue,
-) {
-    if args.length() < 1 {
-        throw_js_error(scope, "__nsCreateCompositionBorder expects an element-like argument");
-        return;
-    }
-
-    let ptr = match try_extract_pointer_from_value(scope, args.get(0)) {
-        Some(p) => p,
-        None => { throw_js_error(scope, "Unable to extract native pointer from element"); return; }
-    };
-
-    let id = match crate::composition_border::create_border_instance(ptr) {
-        Ok(id) => id,
-        Err(e) => { throw_js_error(scope, format!("create_border_instance failed: {:?}", e).as_str()); return; }
-    };
-
-    let proxy = v8::Object::new(scope);
-    let id_key = v8::String::new(scope, "__id").unwrap();
-    let id_val = v8::Number::new(scope, id as f64);
-    let _ = proxy.set(scope, id_key.into(), id_val.into());
-
-    if let Some(update_fn) = v8::Function::new(scope, handle_composition_border_proxy_update) {
-        let key = v8::String::new(scope, "update").unwrap();
-        let _ = proxy.set(scope, key.into(), update_fn.into());
-    }
-    if let Some(uw_fn) = v8::Function::new(scope, handle_composition_border_proxy_update_border_width) {
-        let key = v8::String::new(scope, "updateBorderWidth").unwrap();
-        let _ = proxy.set(scope, key.into(), uw_fn.into());
-        let key2 = v8::String::new(scope, "UpdateBorderWidth").unwrap();
-        let _ = proxy.set(scope, key2.into(), uw_fn.into());
-    }
-    if let Some(uc_fn) = v8::Function::new(scope, handle_composition_border_proxy_update_border_color) {
-        let key = v8::String::new(scope, "updateBorderColor").unwrap();
-        let _ = proxy.set(scope, key.into(), uc_fn.into());
-        let key2 = v8::String::new(scope, "UpdateBorderColor").unwrap();
-        let _ = proxy.set(scope, key2.into(), uc_fn.into());
-    }
-    if let Some(ur_fn) = v8::Function::new(scope, handle_composition_border_proxy_update_radius) {
-        let key = v8::String::new(scope, "updateBorderRadius").unwrap();
-        let _ = proxy.set(scope, key.into(), ur_fn.into());
-        let key2 = v8::String::new(scope, "UpdateBorderRadius").unwrap();
-        let _ = proxy.set(scope, key2.into(), ur_fn.into());
-    }
-
-    let global = scope.get_current_context().global(scope);
-    let fin_key = v8::String::new(scope, "__nsCompositionBorderFinalizer").unwrap();
-    let mut fin_obj: Option<v8::Local<v8::Value>> = None;
-    if let Some(existing) = global.get(scope, fin_key.into()) {
-        if !existing.is_undefined() && !existing.is_null() {
-            fin_obj = Some(existing);
-        }
-    }
-
-    if fin_obj.is_none() {
-        if let Some(fr_ctor_val) = global.get(scope, v8::String::new(scope, "FinalizationRegistry").unwrap().into()) {
-            if let Ok(fr_ctor) = v8::Local::<v8::Function>::try_from(fr_ctor_val) {
-                if let Some(cb_fn) = v8::Function::new(scope, handle_composition_border_finalizer_cb) {
-                    if let Some(finalizer_instance) = fr_ctor.new_instance(scope, &[cb_fn.into()]) {
-                        let _ = global.set(scope, fin_key.into(), finalizer_instance.into());
-                        fin_obj = global.get(scope, fin_key.into());
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(fin) = fin_obj {
-        if let Ok(finalizer_fn) = v8::Local::<v8::Object>::try_from(fin) {
-            if let Some(register_fn_val) = finalizer_fn.get(scope, v8::String::new(scope, "register").unwrap().into()) {
-                if let Ok(register_fn) = v8::Local::<v8::Function>::try_from(register_fn_val) {
-                    // register(proxy, heldValue, unregisterToken)
-                    let _ = register_fn.call(scope, finalizer_fn.into(), &[proxy.into(), id_val.into(), proxy.into()]);
-                }
-            }
-        }
-    }
-
-    retval.set(proxy.into());
-}
-
-pub(crate) fn handle_composition_border_proxy_update(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments,
-    mut retval: v8::ReturnValue,
-) {
-    let this = args.this();
-    let obj = match this.to_object(scope) { Some(o) => o, None => { throw_js_error(scope, "update must be called as a method"); return; } };
-    let id_key = v8::String::new(scope, "__id").unwrap();
-    let id_val = match obj.get(scope, id_key.into()) {
-        Some(v) => v,
-        None => { throw_js_error(scope, "internal border id missing"); return; }
-    };
-    let id = id_val.number_value(scope).unwrap_or(0.0) as i64;
-    if id == 0 { return; }
-
-    // Accept either an options object or a list of numbers.
-    let mut left = 0f32; let mut top = 0f32; let mut right = 0f32; let mut bottom = 0f32;
-    let mut color: u32 = 0; let mut rtl = 0f32; let mut rtr = 0f32; let mut rbr = 0f32; let mut rbl = 0f32;
-
-    if args.length() >= 1 && args.get(0).is_object() {
-        if let Some(opts) = args.get(0).to_object(scope) {
-            if let Some(v) = opts.get(scope, v8::String::new(scope, "left").unwrap().into()) { left = v.number_value(scope).unwrap_or(0.0) as f32; }
-            if let Some(v) = opts.get(scope, v8::String::new(scope, "top").unwrap().into()) { top = v.number_value(scope).unwrap_or(0.0) as f32; }
-            if let Some(v) = opts.get(scope, v8::String::new(scope, "right").unwrap().into()) { right = v.number_value(scope).unwrap_or(0.0) as f32; }
-            if let Some(v) = opts.get(scope, v8::String::new(scope, "bottom").unwrap().into()) { bottom = v.number_value(scope).unwrap_or(0.0) as f32; }
-            if let Some(v) = opts.get(scope, v8::String::new(scope, "color").unwrap().into()) { color = v.number_value(scope).unwrap_or(0.0) as u32; }
-            if let Some(v) = opts.get(scope, v8::String::new(scope, "radiusTopLeft").unwrap().into()) { rtl = v.number_value(scope).unwrap_or(0.0) as f32; }
-            if let Some(v) = opts.get(scope, v8::String::new(scope, "radiusTopRight").unwrap().into()) { rtr = v.number_value(scope).unwrap_or(0.0) as f32; }
-            if let Some(v) = opts.get(scope, v8::String::new(scope, "radiusBottomRight").unwrap().into()) { rbr = v.number_value(scope).unwrap_or(0.0) as f32; }
-            if let Some(v) = opts.get(scope, v8::String::new(scope, "radiusBottomLeft").unwrap().into()) { rbl = v.number_value(scope).unwrap_or(0.0) as f32; }
-        }
-    } else {
-        // positional args: (left, top, right, bottom, color, rtl, rtr, rbr, rbl)
-        left = args.get(0).number_value(scope).unwrap_or(0.0) as f32;
-        top = args.get(1).number_value(scope).unwrap_or(0.0) as f32;
-        right = args.get(2).number_value(scope).unwrap_or(0.0) as f32;
-        bottom = args.get(3).number_value(scope).unwrap_or(0.0) as f32;
-        color = args.get(4).number_value(scope).unwrap_or(0.0) as u32;
-        rtl = args.get(5).number_value(scope).unwrap_or(0.0) as f32;
-        rtr = args.get(6).number_value(scope).unwrap_or(0.0) as f32;
-        rbr = args.get(7).number_value(scope).unwrap_or(0.0) as f32;
-        rbl = args.get(8).number_value(scope).unwrap_or(0.0) as f32;
-    }
-
-    match crate::composition_border::set_border(id, left, top, right, bottom, color, rtl, rtr, rbr, rbl) {
-        Ok(()) => { retval.set_undefined(); }
-        Err(e) => { throw_js_error(scope, format!("set_border failed: {:?}", e).as_str()); }
-    }
-}
-
-pub(crate) fn handle_composition_border_proxy_update_border_width(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments,
-    mut retval: v8::ReturnValue,
-) {
-    let this = args.this();
-    let obj = match this.to_object(scope) { Some(o) => o, None => { throw_js_error(scope, "updateBorderWidth must be called as a method"); return; } };
-    let id_key = v8::String::new(scope, "__id").unwrap();
-    let id_val = match obj.get(scope, id_key.into()) {
-        Some(v) => v,
-        None => { throw_js_error(scope, "internal border id missing"); return; }
-    };
-    let id = id_val.number_value(scope).unwrap_or(0.0) as i64;
-    if id == 0 { return; }
-
-    // Parse widths: allow object {left,top,right,bottom}, or numbers: (w) or (l,t,r,b)
-    let mut left = None; let mut top = None; let mut right = None; let mut bottom = None;
-    if args.length() >= 1 && args.get(0).is_object() {
-        if let Some(opts) = args.get(0).to_object(scope) {
-            if let Some(v) = opts.get(scope, v8::String::new(scope, "left").unwrap().into()) { left = Some(v.number_value(scope).unwrap_or(0.0) as f32); }
-            if let Some(v) = opts.get(scope, v8::String::new(scope, "top").unwrap().into()) { top = Some(v.number_value(scope).unwrap_or(0.0) as f32); }
-            if let Some(v) = opts.get(scope, v8::String::new(scope, "right").unwrap().into()) { right = Some(v.number_value(scope).unwrap_or(0.0) as f32); }
-            if let Some(v) = opts.get(scope, v8::String::new(scope, "bottom").unwrap().into()) { bottom = Some(v.number_value(scope).unwrap_or(0.0) as f32); }
-        }
-    } else {
-        if args.length() == 1 {
-            let w = args.get(0).number_value(scope).unwrap_or(0.0) as f32;
-            left = Some(w); top = Some(w); right = Some(w); bottom = Some(w);
-        } else if args.length() >= 4 {
-            left = Some(args.get(0).number_value(scope).unwrap_or(0.0) as f32);
-            top = Some(args.get(1).number_value(scope).unwrap_or(0.0) as f32);
-            right = Some(args.get(2).number_value(scope).unwrap_or(0.0) as f32);
-            bottom = Some(args.get(3).number_value(scope).unwrap_or(0.0) as f32);
-        }
-    }
-
-    // Get existing params and merge
-    let params = match crate::composition_border::get_border_params(id) {
-        Ok(p) => p,
-        Err(e) => { throw_js_error(scope, format!("get_border_params failed: {:?}", e).as_str()); return; }
-    };
-    let (old_left, old_top, old_right, old_bottom, color, rtl, rtr, rbr, rbl) = params;
-    let new_left = left.unwrap_or(old_left);
-    let new_top = top.unwrap_or(old_top);
-    let new_right = right.unwrap_or(old_right);
-    let new_bottom = bottom.unwrap_or(old_bottom);
-
-    match crate::composition_border::set_border(id, new_left, new_top, new_right, new_bottom, color, rtl, rtr, rbr, rbl) {
-        Ok(()) => { retval.set_undefined(); }
-        Err(e) => { throw_js_error(scope, format!("set_border failed: {:?}", e).as_str()); }
-    }
-}
-
-pub(crate) fn handle_composition_border_proxy_update_border_color(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments,
-    mut retval: v8::ReturnValue,
-) {
-    let this = args.this();
-    let obj = match this.to_object(scope) { Some(o) => o, None => { throw_js_error(scope, "updateBorderColor must be called as a method"); return; } };
-    let id_key = v8::String::new(scope, "__id").unwrap();
-    let id_val = match obj.get(scope, id_key.into()) {
-        Some(v) => v,
-        None => { throw_js_error(scope, "internal border id missing"); return; }
-    };
-    let id = id_val.number_value(scope).unwrap_or(0.0) as i64;
-    if id == 0 { return; }
-
-    if args.length() < 1 {
-        throw_js_error(scope, "updateBorderColor(color) expects a numeric ARGB color");
-        return;
-    }
-    let color = args.get(0).number_value(scope).unwrap_or(0.0) as u32;
-
-    let params = match crate::composition_border::get_border_params(id) {
-        Ok(p) => p,
-        Err(e) => { throw_js_error(scope, format!("get_border_params failed: {:?}", e).as_str()); return; }
-    };
-    let (old_left, old_top, old_right, old_bottom, _old_color, rtl, rtr, rbr, rbl) = params;
-
-    match crate::composition_border::set_border(id, old_left, old_top, old_right, old_bottom, color, rtl, rtr, rbr, rbl) {
-        Ok(()) => { retval.set_undefined(); }
-        Err(e) => { throw_js_error(scope, format!("set_border failed: {:?}", e).as_str()); }
-    }
-}
-
-pub(crate) fn handle_composition_border_proxy_update_radius(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments,
-    mut retval: v8::ReturnValue,
-) {
-    let this = args.this();
-    let obj = match this.to_object(scope) { Some(o) => o, None => { throw_js_error(scope, "updateBorderRadius must be called as a method"); return; } };
-    let id_key = v8::String::new(scope, "__id").unwrap();
-    let id_val = match obj.get(scope, id_key.into()) {
-        Some(v) => v,
-        None => { throw_js_error(scope, "internal border id missing"); return; }
-    };
-    let id = id_val.number_value(scope).unwrap_or(0.0) as i64;
-    if id == 0 { return; }
-
-    // Parse radii: object {radiusTopLeft,...} or numbers (r) or (tl,tr,br,bl)
-    let mut rtl = None; let mut rtr = None; let mut rbr = None; let mut rbl = None;
-    if args.length() >= 1 && args.get(0).is_object() {
-        if let Some(opts) = args.get(0).to_object(scope) {
-            if let Some(v) = opts.get(scope, v8::String::new(scope, "radiusTopLeft").unwrap().into()) { rtl = Some(v.number_value(scope).unwrap_or(0.0) as f32); }
-            if let Some(v) = opts.get(scope, v8::String::new(scope, "radiusTopRight").unwrap().into()) { rtr = Some(v.number_value(scope).unwrap_or(0.0) as f32); }
-            if let Some(v) = opts.get(scope, v8::String::new(scope, "radiusBottomRight").unwrap().into()) { rbr = Some(v.number_value(scope).unwrap_or(0.0) as f32); }
-            if let Some(v) = opts.get(scope, v8::String::new(scope, "radiusBottomLeft").unwrap().into()) { rbl = Some(v.number_value(scope).unwrap_or(0.0) as f32); }
-        }
-    } else {
-        if args.length() == 1 {
-            let r = args.get(0).number_value(scope).unwrap_or(0.0) as f32;
-            rtl = Some(r); rtr = Some(r); rbr = Some(r); rbl = Some(r);
-        } else if args.length() >= 4 {
-            rtl = Some(args.get(0).number_value(scope).unwrap_or(0.0) as f32);
-            rtr = Some(args.get(1).number_value(scope).unwrap_or(0.0) as f32);
-            rbr = Some(args.get(2).number_value(scope).unwrap_or(0.0) as f32);
-            rbl = Some(args.get(3).number_value(scope).unwrap_or(0.0) as f32);
-        }
-    }
-
-    let params = match crate::composition_border::get_border_params(id) {
-        Ok(p) => p,
-        Err(e) => { throw_js_error(scope, format!("get_border_params failed: {:?}", e).as_str()); return; }
-    };
-    let (left, top, right, bottom, color, old_rtl, old_rtr, old_rbr, old_rbl) = params;
-    let new_rtl = rtl.unwrap_or(old_rtl);
-    let new_rtr = rtr.unwrap_or(old_rtr);
-    let new_rbr = rbr.unwrap_or(old_rbr);
-    let new_rbl = rbl.unwrap_or(old_rbl);
-
-    match crate::composition_border::set_border(id, left, top, right, bottom, color, new_rtl, new_rtr, new_rbr, new_rbl) {
-        Ok(()) => { retval.set_undefined(); }
-        Err(e) => { throw_js_error(scope, format!("set_border failed: {:?}", e).as_str()); }
-    }
-}
-
-pub(crate) fn handle_composition_border_proxy_free(
-    scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments,
-    mut retval: v8::ReturnValue,
-) {
-    let this = _args.this();
-    let obj = match this.to_object(scope) { Some(o) => o, None => { return; } };
-    let id_key = v8::String::new(scope, "__id").unwrap();
-    let id_val = match obj.get(scope, id_key.into()) {
-        Some(v) => v,
-        None => { return; }
-    };
-    let id = id_val.number_value(scope).unwrap_or(0.0) as i64;
-    if id == 0 { return; }
-
-    let _ = crate::composition_border::free_border_instance(id);
-    let _ = obj.set(scope, id_key.into(), v8::Number::new(scope, 0.0).into());
-    retval.set_undefined();
-}
-
-pub(crate) fn handle_composition_border_finalizer_cb(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments,
-    mut _retval: v8::ReturnValue,
-) {
-    if args.length() < 1 { return; }
-    let id = args.get(0).number_value(scope).unwrap_or(0.0) as i64;
-    if id == 0 { return; }
-    let _ = crate::composition_border::free_border_instance(id);
-}
-
-pub(crate) fn handle_set_composition_border(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments,
-    mut retval: v8::ReturnValue,
-) {
-    if args.length() < 10 {
-        throw_js_error(scope, "__nsSetCompositionBorder expects (id,left,top,right,bottom,color,rtl,rtr,rbr,rbl)");
-        return;
-    }
-
-    let id = args.get(0).number_value(scope).unwrap_or(0.0) as i64;
-    if id == 0 {
-        throw_js_error(scope, "Invalid border instance id");
-        return;
-    }
-
-    let left = args.get(1).number_value(scope).unwrap_or(0.0) as f32;
-    let top = args.get(2).number_value(scope).unwrap_or(0.0) as f32;
-    let right = args.get(3).number_value(scope).unwrap_or(0.0) as f32;
-    let bottom = args.get(4).number_value(scope).unwrap_or(0.0) as f32;
-    let color = args.get(5).number_value(scope).unwrap_or(0.0) as u32;
-    let rtl = args.get(6).number_value(scope).unwrap_or(0.0) as f32;
-    let rtr = args.get(7).number_value(scope).unwrap_or(0.0) as f32;
-    let rbr = args.get(8).number_value(scope).unwrap_or(0.0) as f32;
-    let rbl = args.get(9).number_value(scope).unwrap_or(0.0) as f32;
-
-    match crate::composition_border::set_border(id, left, top, right, bottom, color, rtl, rtr, rbr, rbl) {
-        Ok(()) => { retval.set(v8::Boolean::new(scope, true).into()); }
-        Err(e) => { throw_js_error(scope, format!("set_border failed: {:?}", e).as_str()); }
-    }
-}
-
-pub(crate) fn handle_free_composition_border(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments,
-    mut retval: v8::ReturnValue,
-) {
-    if args.length() < 1 {
-        throw_js_error(scope, "__nsFreeCompositionBorder expects an instance id");
-        return;
-    }
-    let id = args.get(0).number_value(scope).unwrap_or(0.0) as i64;
-    if id == 0 { retval.set_undefined(); return; }
-    let _ = crate::composition_border::free_border_instance(id);
-    retval.set_undefined();
-}
-
 fn default_auto_capture_path() -> PathBuf {
     if let Ok(explicit) = std::env::var("NSWINRT_AUTO_METADATA_PATH") {
         return PathBuf::from(explicit);
@@ -1251,14 +901,6 @@ const HELPER_SOURCE: &str = r#"
             globalThis.NSWinRT.onCompleted = onCompleted;
             globalThis.NSWinRT.setDefaultTimeoutMs = setDefaultTimeoutMs;
 
-            globalThis.NSWinRT.createCompositionBorder = function (element) {
-                if (!element) {
-                    throw new Error('NSWinRT.createCompositionBorder(element) requires an element');
-                }
-                var ptr = handleOf(element);
-                return __nsCreateCompositionBorder(ptr);
-            };
-
             function Pointer(handle) {
                 this.handle = handle == null ? null : handle;
             }
@@ -1266,6 +908,7 @@ const HELPER_SOURCE: &str = r#"
             Pointer.prototype.isNull = function () {
                 return this.handle == null;
             };
+
 
             Pointer.prototype.unwrap = function () {
                 return this.handle;
@@ -1450,7 +1093,7 @@ const HELPER_SOURCE: &str = r#"
                 },
             };
 
-            // Expose top-level `interop` alias for consistency with other runtimes (e.g. iOS).
+            // Expose top-level `interop` alias.
             // This lets code reference `globalThis.interop` while keeping backwards
             // compatibility with `globalThis.NSWinRT`.
             globalThis.interop = globalThis.interop || globalThis.NSWinRT.interop;
@@ -2469,7 +2112,11 @@ const HELPER_SOURCE: &str = r#"
             // ── Type-metadata cache ──────────────────────────────────────────
             // Populated lazily on first access; avoids repeated bridge round-trips.
             var _typeInfoCache = {};
-            var _emptyInfo = { methods: [], properties: [], staticMethods: [], staticProperties: [] };
+            var _emptyInfo = { methods: [], properties: [], staticMethods: [], staticProperties: [], readonlyProperties: [], readonlyStaticProperties: [], writeonlyProperties: [], writeonlyStaticProperties: [] };
+            // Optional mapping for namespace root → assembly simple-name. Use
+            // NSWinRT.dotnet.registerNamespace('com', 'My.Assembly.Name') to map
+            // top-level roots (e.g. `com`) to the assembly that contains types.
+            var _namespaceAssemblyMap = Object.create(null);
 
             // ── Auto-release via FinalizationRegistry ────────────────────────
             // When the JS GC collects a DotNet proxy the registry fires the
@@ -2481,12 +2128,33 @@ const HELPER_SOURCE: &str = r#"
                   })
                 : null;
 
+            // Auto-populate namespace→assembly map from the managed side.
+            // GetNamespaceAssemblyMapJson scans the app directory for assemblies and
+            // returns a JSON map of { rootNamespace: assemblySimpleName }.
+            // Runs once at IIFE init; any failure is silently ignored.
+            try {
+                var _autoNsJson = _invoke({ assembly: '', typeName: 'NativeScriptBridge.Bridge', method: 'GetNamespaceAssemblyMapJson', args: [] });
+                if (typeof _autoNsJson === 'string' && _autoNsJson) {
+                    var _parsed = JSON.parse(_autoNsJson);
+                    if (_parsed && typeof _parsed === 'object') {
+                        for (var _k in _parsed) {
+                            if (Object.prototype.hasOwnProperty.call(_parsed, _k) && typeof _parsed[_k] === 'string') {
+                                _namespaceAssemblyMap[_k] = _parsed[_k];
+                            }
+                        }
+                    }
+                }
+            } catch (_e) {}
+
             function _getTypeInfo(assembly, typeName) {
                 if (!typeName) return _emptyInfo;
                 var cached = _typeInfoCache[typeName];
                 if (cached !== undefined) return cached;
                 try {
-                    var info = _invoke({ assembly: assembly || typeName.split('.')[0], typeName: typeName, method: '__members__', args: [] });
+                    // Respect an explicitly-provided assembly name. When empty,
+                    // let the managed side attempt resolution (BCL types via Type.GetType).
+                    var asm = (typeof assembly === 'string') ? assembly : '';
+                    var info = _invoke({ assembly: asm, typeName: typeName, method: '__members__', args: [] });
                     _typeInfoCache[typeName] = (info && typeof info === 'object') ? info : _emptyInfo;
                 } catch (e) {
                     _typeInfoCache[typeName] = _emptyInfo;
@@ -2518,21 +2186,28 @@ const HELPER_SOURCE: &str = r#"
                         };
                         // Re-read info in case it was populated after construction.
                         var i = _typeInfoCache[typeName] || _emptyInfo;
-                        if (i.properties && i.properties.indexOf(prop) >= 0) {
-                            // Property: resolve value immediately.
+                        // Write-only: has setter but no getter — reading it is an error.
+                        if (i.writeonlyProperties && i.writeonlyProperties.indexOf(prop) >= 0)
+                            throw new TypeError('Cannot read write-only property \'' + prop + '\' of .NET type \'' + typeName + '\'');
+                        if (i.properties && i.properties.indexOf(prop) >= 0)
                             return _wrap(_invoke({ handle: handle, method: 'get_' + prop, args: [] }));
-                        }
-                        // Method (or unknown): return a callable.
+                        // Not a native property — return a callable for method dispatch.
                         return function () {
                             var args = Array.prototype.slice.call(arguments).map(_unwrap);
                             return _wrap(_invoke({ handle: handle, method: prop, args: args }));
                         };
                     },
                     set: function (_, prop, value) {
+                        if (typeof prop === 'symbol') return true;
                         var i = _typeInfoCache[typeName] || _emptyInfo;
-                        if (i.properties && i.properties.indexOf(prop) >= 0) {
+                        // Read-only: has getter but no setter — assignment is an error.
+                        if (i.readonlyProperties && i.readonlyProperties.indexOf(prop) >= 0)
+                            throw new TypeError('Cannot assign to read-only property \'' + prop + '\' of .NET type \'' + typeName + '\'');
+                        // Writable (read-write or write-only) — invoke the setter.
+                        if ((i.properties && i.properties.indexOf(prop) >= 0) ||
+                            (i.writeonlyProperties && i.writeonlyProperties.indexOf(prop) >= 0))
                             _invoke({ handle: handle, method: 'set_' + prop, args: [_unwrap(value)] });
-                        }
+                        // Not a native property — don't intercept, let JS do its thing.
                         return true;
                     },
                 });
@@ -2545,7 +2220,8 @@ const HELPER_SOURCE: &str = r#"
                 if (Array.isArray(value)) return value.map(_wrap);
                 if (typeof value === 'object' && typeof value.__handle === 'number') {
                     var typeName = value.__type || '';
-                    var assembly = typeName.split('.')[0] || '';
+                    var root = (typeName || '').split('.')[0];
+                    var assembly = _namespaceAssemblyMap[root] || '';
                     return _makeDotNetInstance(value.__handle, assembly, typeName);
                 }
                 return value;
@@ -2559,8 +2235,36 @@ const HELPER_SOURCE: &str = r#"
                     return _wrap(_invoke({ assembly: assembly, typeName: typeName, method: 'get_' + prop, args: [] }));
                 },
                 fromHandle: function (handle, typeName) {
-                    var assembly = (typeName || '').split('.')[0] || '';
+                    var root = (typeName || '').split('.')[0];
+                    var assembly = _namespaceAssemblyMap[root] || '';
                     return _makeDotNetInstance(handle, assembly, typeName || '');
+                },
+                // Lazily register a top-level namespace root and optional assembly mapping.
+                // Example: NSWinRT.dotnet.registerNamespace('com', 'NativeScript');
+                registerNamespace: function(rootName, assemblyName) {
+                    if (!rootName || typeof rootName !== 'string') return;
+                    var root = String(rootName).split('.')[0];
+                    if (assemblyName && typeof assemblyName === 'string') {
+                        _namespaceAssemblyMap[root] = assemblyName;
+                    }
+                    if (root in globalThis) return;
+                    try {
+                        Object.defineProperty(globalThis, root, {
+                            configurable: true,
+                            enumerable: true,
+                            get: function() {
+                                var proxy = _makeNamespaceProxy(root);
+                                try { Object.defineProperty(globalThis, root, { value: proxy, writable: true, configurable: true, enumerable: true }); } catch (_) {}
+                                return proxy;
+                            }
+                        });
+                    } catch (_) {
+                        try { globalThis[root] = _makeNamespaceProxy(root); } catch (_) {}
+                    }
+                },
+                registerNamespaces: function(arr) {
+                    if (!Array.isArray(arr)) return;
+                    for (var i = 0; i < arr.length; i++) this.registerNamespace(arr[i]);
                 },
             };
 
@@ -2575,12 +2279,21 @@ const HELPER_SOURCE: &str = r#"
                 return new Proxy(_node, {
                     get: function (_, prop) {
                         if (typeof prop === 'symbol') return undefined;
-                        var assembly = path.split('.')[0];
+                        // Prevent string-coercion methods from descending into sub-proxies.
+                        // V8's console.log / JSON.stringify call toString/valueOf on unknown objects;
+                        // returning a sub-proxy causes the apply trap to fire with a non-existent
+                        // type name, producing a spurious "Type not found" bridge error.
+                        if (prop === 'toString' || prop === 'valueOf')
+                            return function() { return '[.NET ' + path + ']'; };
+                        var root = path.split('.')[0];
+                        var assembly = _namespaceAssemblyMap[root] || '';
                         var info = _getTypeInfo(assembly, path);
-                        // Static property: resolve value immediately.
-                        if (info.staticProperties && info.staticProperties.indexOf(prop) >= 0) {
+                        // Write-only static property — reading it is an error.
+                        if (info.writeonlyStaticProperties && info.writeonlyStaticProperties.indexOf(prop) >= 0)
+                            throw new TypeError('Cannot read write-only property \'' + prop + '\' of .NET type \'' + path + '\'');
+                        // Readable static property: resolve value immediately.
+                        if (info.staticProperties && info.staticProperties.indexOf(prop) >= 0)
                             return _wrap(_invoke({ assembly: assembly, typeName: path, method: 'get_' + prop, args: [] }));
-                        }
                         // Static method: return a callable.
                         if (info.staticMethods && info.staticMethods.indexOf(prop) >= 0) {
                             return function () {
@@ -2591,21 +2304,42 @@ const HELPER_SOURCE: &str = r#"
                         // Namespace / sub-type: keep descending.
                         return _makeNamespaceProxy(path + '.' + prop);
                     },
+                    set: function (_, prop, value) {
+                        if (typeof prop === 'symbol') return true;
+                        var root = path.split('.')[0];
+                        var assembly = _namespaceAssemblyMap[root] || '';
+                        var info = _getTypeInfo(assembly, path);
+                        // Read-only static property — assignment is an error.
+                        if (info.readonlyStaticProperties && info.readonlyStaticProperties.indexOf(prop) >= 0)
+                            throw new TypeError('Cannot assign to read-only property \'' + prop + '\' of .NET type \'' + path + '\'');
+                        // Writable (read-write or write-only) — invoke the setter.
+                        if ((info.staticProperties && info.staticProperties.indexOf(prop) >= 0) ||
+                            (info.writeonlyStaticProperties && info.writeonlyStaticProperties.indexOf(prop) >= 0))
+                            _invoke({ assembly: assembly, typeName: path, method: 'set_' + prop, args: [_unwrap(value)] });
+                        // Not a native property — don't intercept.
+                        return true;
+                    },
                     apply: function (_, _this, args) {
                         var lastDot  = path.lastIndexOf('.');
+                        // No dot means this is a top-level name being called directly —
+                        // there is no type+method pair to dispatch, so bail out.
+                        if (lastDot <= 0) return undefined;
                         var typeName = path.substring(0, lastDot);
                         var method   = path.substring(lastDot + 1);
-                        var assembly = typeName.split('.')[0];
+                        var root = typeName.split('.')[0];
+                        var assembly = _namespaceAssemblyMap[root] || '';
                         return _wrap(_invoke({ assembly: assembly, typeName: typeName, method: method, args: args.map(_unwrap) }));
                     },
                     construct: function (_, args) {
-                        var assembly = path.split('.')[0];
+                        var root = path.split('.')[0];
+                        var assembly = _namespaceAssemblyMap[root] || '';
                         return _wrap(_invoke({ assembly: assembly, typeName: path, method: '.ctor', args: args.map(_unwrap) }));
                     },
                 });
             }
-            globalThis.System    = _makeNamespaceProxy('System');
-            globalThis.Microsoft = _makeNamespaceProxy('Microsoft');
+            globalThis.System         = _makeNamespaceProxy('System');
+            globalThis.Microsoft      = _makeNamespaceProxy('Microsoft');
+            globalThis.NativeScript   = _makeNamespaceProxy('NativeScript');
 
             // ── NSWinRT.dotnet.asDelegate ────────────────────────────────────
             // Creates a typed .NET BCL delegate (not a WinRT COM delegate).
@@ -3148,6 +2882,7 @@ fn bin_write_v8_arg(buf: &mut Vec<u8>, scope: &mut v8::PinScope<'_, '_>, arg: v8
 
     if arg.is_object() {
         if let Some(obj) = arg.to_object(scope) {
+            // Dotnet bridge handle: { __handle: i32 }
             if let Some(key) = v8::String::new(scope, "__handle") {
                 if let Some(hval) = obj.get(scope, key.into()) {
                     if let Ok(n) = v8::Local::<v8::Integer>::try_from(hval) {
@@ -3162,10 +2897,25 @@ fn bin_write_v8_arg(buf: &mut Vec<u8>, scope: &mut v8::PinScope<'_, '_>, arg: v8
                     }
                 }
             }
+            // WinRT COM pointer: BigInt exposed as __native_ptr on WinRT proxy objects.
+            // Encoded as tag 0x0A + 8-byte little-endian u64 so C# can call
+            // Marshal.GetObjectForIUnknown to obtain a managed RCW.
+            if let Some(key) = v8::String::new(scope, "__native_ptr") {
+                if let Some(pval) = obj.get(scope, key.into()) {
+                    if let Ok(bi) = v8::Local::<v8::BigInt>::try_from(pval) {
+                        let (ptr, _) = bi.u64_value();
+                        if ptr != 0 {
+                            buf.push(0x0A);
+                            buf.extend_from_slice(&ptr.to_le_bytes());
+                            return;
+                        }
+                    }
+                }
+            }
         }
     }
 
-    buf.push(0x00); // null fallback for unsupported types
+    buf.push(0x00);
 }
 
 fn bin_read_response<'s>(
@@ -3238,9 +2988,11 @@ fn bin_read_value<'s>(
             Ok(arr.into())
         }
 
-        0x08 => { // members: {methods, properties, staticMethods, staticProperties}
+        0x08 => { // members: 8 string arrays — methods/props/staticMethods/staticProps + readonly/writeonly variants
             let obj = v8::Object::new(scope);
-            for key in ["methods", "properties", "staticMethods", "staticProperties"] {
+            for key in ["methods", "properties", "staticMethods", "staticProperties",
+                        "readonlyProperties", "readonlyStaticProperties",
+                        "writeonlyProperties", "writeonlyStaticProperties"] {
                 let count = u16::from_le_bytes(bytes[*pos..*pos+2].try_into().map_err(|_| "member count")?) as usize;
                 *pos += 2;
                 let arr = v8::Array::new(scope, count as i32);
@@ -3484,9 +3236,6 @@ pub(crate) fn init_async_helpers(
     register!("__ns__clearInterval",            crate::timers::handle_ns_clear_interval);
     register!("__nsDwmFlush",                   handle_dwm_flush);
     register!("__nsUUID",                       handle_ns_uuid);
-    register!("__nsCreateCompositionBorder",    handle_create_composition_border);
-    register!("__nsSetCompositionBorder",       handle_set_composition_border);
-    register!("__nsFreeCompositionBorder",      handle_free_composition_border);
 
     // Initialize native timers scheduler (non-blocking). This registers a
     // pump into `ASYNC_PUMP_HOOK` so blocking waits will also process timers.

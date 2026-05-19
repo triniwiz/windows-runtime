@@ -1713,6 +1713,78 @@ fn delegate_constructor_with_plain_object_falls_through() {
     );
 }
 
+// ── Composition border tests ──────────────────────────────────────────────────
+
+#[test]
+fn composition_border_iids_are_non_zero() {
+    let (ui_elem_iid, ecp_iid) = crate::composition_border::get_iids_for_test();
+    // Print so the test output shows the actual values (run with -- --nocapture).
+    println!("IUIElement IID:                    {:?}", ui_elem_iid);
+    println!("IElementCompositionPreviewStatics: {:?}", ecp_iid);
+    assert_ne!(ui_elem_iid, windows::core::GUID::zeroed(), "IUIElement IID is zeroed — metadata lookup failed");
+    assert_ne!(ecp_iid, windows::core::GUID::zeroed(), "IElementCompositionPreviewStatics IID is zeroed — metadata lookup failed");
+}
+
+/// Verifies that `__nsCreateCompositionBorder` surfaces a catchable JS error
+/// rather than aborting the process. The test thread is MTA so XAML construction
+/// itself will throw an STA error — that's fine, we skip in that case.
+/// What we're guarding is: no process crash, and proxy structure is valid if created.
+#[test]
+fn create_composition_border_throws_catchable_error_or_returns_proxy() {
+    run_js_assert(
+        "create_composition_border_throws_catchable_error_or_returns_proxy",
+        r#"
+            if (typeof __nsCreateCompositionBorder !== 'function') {
+                throw new Error('__nsCreateCompositionBorder is not defined');
+            }
+
+            var Grid = (typeof Windows !== 'undefined' &&
+                        Windows.UI &&
+                        Windows.UI.Xaml &&
+                        Windows.UI.Xaml.Controls &&
+                        Windows.UI.Xaml.Controls.Grid)
+                ? Windows.UI.Xaml.Controls.Grid
+                : null;
+
+            if (!Grid) return; // XAML not in this build — pass vacuously
+
+            var grid;
+            try {
+                grid = new Grid();
+            } catch (e) {
+                var msg = String((e && (e.message || e)) || '');
+                // STA/apartment/marshal errors mean we're on the wrong thread — expected in tests.
+                if (/marshalled|apartment|thread/i.test(msg)) return;
+                throw e; // unexpected error constructing Grid
+            }
+
+            var result;
+            try {
+                result = __nsCreateCompositionBorder(grid);
+            } catch (e) {
+                // Any catchable JS error is acceptable — process crash is not.
+                var msg = String((e && (e.message || e)) || '');
+                if (msg.length === 0) {
+                    throw new Error('__nsCreateCompositionBorder threw empty error — catch_unwind wrapper may be missing');
+                }
+                console.log('[composition_border_test] error (expected without visual tree):', msg);
+                return;
+            }
+
+            // Reached here: the call succeeded (element accepted by ECP).
+            if (result === null || result === undefined || typeof result !== 'object') {
+                throw new Error('expected proxy object, got: ' + typeof result + ' (' + String(result) + ')');
+            }
+            if (typeof result.update !== 'function') {
+                throw new Error('proxy missing update() — keys: ' + Object.keys(result).join(','));
+            }
+            if (typeof result.__id !== 'number' || result.__id <= 0) {
+                throw new Error('proxy has invalid __id: ' + result.__id);
+            }
+        "#,
+    );
+}
+
 /// Like `run_js_assert` but waits up to 30 s — suitable for real network calls.
 fn run_js_assert_network(name: &str, body: &str) {
     let mut runtime = Box::new(Runtime::new("."));

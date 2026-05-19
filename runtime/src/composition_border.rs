@@ -4,17 +4,21 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use parking_lot::Mutex;
-use windows::core::{IUnknown, Interface, GUID, HRESULT, HSTRING};
 use windows::UI::Composition::{
     CompositionColorBrush, ContainerVisual, SpriteVisual, Visual,
 };
 use windows::Win32::System::WinRT::RoGetActivationFactory;
+use windows::core::{IUnknown, Interface, GUID, HRESULT, HSTRING};
 
 use metadata::declarations::declaration::DeclarationKind;
 use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::meta_data_reader::MetadataReader;
 
 use crate::error::{AnyError, generic_error};
+
+// Hardcoded fallback IIDs verified from Windows.UI.Xaml.winmd (Windows 10/11, all versions).
+const IID_UI_ELEMENT_FALLBACK: GUID = GUID::from_u128(0x676d0be9_b65c_41c6_ba40_58cf87f201c1);
+const IID_ECP_STATICS_FALLBACK: GUID = GUID::from_u128(0x08c92b38_ec99_4c55_bc85_a1c180b27646);
 
 fn iid_ui_element() -> GUID {
     static IID: OnceLock<GUID> = OnceLock::new();
@@ -26,7 +30,8 @@ fn iid_ui_element() -> GUID {
                     lock.as_any().downcast_ref::<InterfaceDeclaration>().map(|i| i.id())
                 } else { None }
             })
-            .unwrap_or(GUID::zeroed())
+            .filter(|g| *g != GUID::zeroed())
+            .unwrap_or(IID_UI_ELEMENT_FALLBACK)
     })
 }
 
@@ -40,14 +45,16 @@ fn iid_ecp_statics() -> GUID {
                     lock.as_any().downcast_ref::<InterfaceDeclaration>().map(|i| i.id())
                 } else { None }
             })
-            .unwrap_or(GUID::zeroed())
+            .filter(|g| *g != GUID::zeroed())
+            .unwrap_or(IID_ECP_STATICS_FALLBACK)
     })
 }
 
 const SLOT_QI: usize = 0;
 const SLOT_RELEASE: usize = 2;
 const SLOT_ECP_GET_ELEMENT_VISUAL: usize = 6;
-const SLOT_ECP_SET_ELEMENT_CHILD_VISUAL: usize = 8;
+// IElementCompositionPreviewStatics vtable: IInspectable (0-5) + GetElementVisual (6) + SetElementChildVisual (7)
+const SLOT_ECP_SET_ELEMENT_CHILD_VISUAL: usize = 7;
 
 type QiFn = unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;
 type RelFn = unsafe extern "system" fn(*mut c_void) -> u32;
@@ -74,17 +81,34 @@ unsafe fn com_release(ptr: *mut c_void) {
 }
 
 fn ecp_get_element_visual(element_ptr: *mut c_void) -> Result<Visual, AnyError> {
+    if element_ptr.is_null() {
+        return Err(generic_error("ecp_get_element_visual: null element_ptr"));
+    }
     unsafe {
         let name = HSTRING::from("Windows.UI.Xaml.Hosting.ElementCompositionPreview");
         let factory = RoGetActivationFactory::<IUnknown>(&name)
             .map_err(|e| generic_error(format!("ECP factory: {:?}", e)))?;
 
-        let statics = com_qi(factory.as_raw() as *mut c_void, &iid_ecp_statics())
-            .ok_or_else(|| generic_error("QI IElementCompositionPreviewStatics failed"))?;
+        let factory_raw = factory.as_raw() as *mut c_void;
+        if factory_raw.is_null() {
+            return Err(generic_error("ECP factory returned null"));
+        }
 
-        let ui_elem = match com_qi(element_ptr, &iid_ui_element()) {
+        let ecp_iid = iid_ecp_statics();
+        let statics = com_qi(factory_raw, &ecp_iid)
+            .ok_or_else(|| generic_error(format!(
+                "QI IElementCompositionPreviewStatics failed (IID={:?})", ecp_iid
+            )))?;
+
+        let ui_iid = iid_ui_element();
+        let ui_elem = match com_qi(element_ptr, &ui_iid) {
             Some(p) => p,
-            None => { com_release(statics); return Err(generic_error("not a UIElement")); }
+            None => {
+                com_release(statics);
+                return Err(generic_error(format!(
+                    "QI IUIElement failed on element_ptr (IID={:?})", ui_iid
+                )));
+            }
         };
 
         let vtbl = vtable_of(statics);
@@ -95,7 +119,7 @@ fn ecp_get_element_visual(element_ptr: *mut c_void) -> Result<Visual, AnyError> 
         com_release(ui_elem);
         com_release(statics);
 
-        hr.ok().map_err(|e| generic_error(format!("GetElementVisual: {:?}", e)))?;
+        hr.ok().map_err(|e| generic_error(format!("GetElementVisual HRESULT: {:?}", e)))?;
         if visual_ptr.is_null() { return Err(generic_error("GetElementVisual returned null")); }
         Ok(Visual::from_raw(visual_ptr as *mut _))
     }
@@ -105,6 +129,9 @@ fn ecp_set_element_child_visual(
     element_ptr: *mut c_void,
     visual_ptr: Option<*mut c_void>,
 ) -> Result<(), AnyError> {
+    if element_ptr.is_null() {
+        return Err(generic_error("ecp_set_element_child_visual: null element_ptr"));
+    }
     unsafe {
         let name = HSTRING::from("Windows.UI.Xaml.Hosting.ElementCompositionPreview");
         let factory = RoGetActivationFactory::<IUnknown>(&name)
@@ -205,9 +232,12 @@ pub fn create_border_instance(element_ptr: *mut c_void) -> Result<i64, AnyError>
     if element_ptr.is_null() { return Err(generic_error("null element")); }
 
     let container_raw = ensure_container_for_element(element_ptr)? as *mut c_void;
+    if container_raw.is_null() { return Err(generic_error("container visual raw pointer is null")); }
 
     unsafe {
-        let container = ContainerVisual::from_raw(container_raw as *mut _);
+        // ManuallyDrop prevents the Drop impl from releasing the container on early-exit error
+        // paths — the shared container lives in BORDER_CONTAINERS and must not be freed here.
+        let container = std::mem::ManuallyDrop::new(ContainerVisual::from_raw(container_raw as *mut _));
         let compositor = container.Compositor()
             .map_err(|e| generic_error(format!("Compositor: {:?}", e)))?;
 
@@ -239,7 +269,7 @@ pub fn create_border_instance(element_ptr: *mut c_void) -> Result<i64, AnyError>
         let right_raw  = right.as_raw()  as *mut c_void; std::mem::forget(right);
         let bottom_raw = bottom.as_raw() as *mut c_void; std::mem::forget(bottom);
         let brush_raw  = brush.as_raw()  as *mut c_void; std::mem::forget(brush);
-        std::mem::forget(container);
+        // container is ManuallyDrop — no Release called here
 
         let id = NEXT_INSTANCE_ID.fetch_add(1, Ordering::SeqCst);
         INSTANCES.get_or_init(|| Mutex::new(HashMap::new())).lock().insert(id, BorderInstance {
@@ -264,13 +294,21 @@ pub fn set_border(
     let inst = guard.get_mut(&instance_id)
         .ok_or_else(|| generic_error("invalid border instance id"))?;
 
+    if inst.container_raw.is_null() || inst.left_raw.is_null() || inst.top_raw.is_null()
+        || inst.right_raw.is_null() || inst.bottom_raw.is_null() || inst.brush_raw.is_null()
+    {
+        return Err(generic_error("border instance has null COM pointer"));
+    }
+
     unsafe {
-        let container = ContainerVisual::from_raw(inst.container_raw as *mut _);
-        let left_v    = SpriteVisual::from_raw(inst.left_raw   as *mut _);
-        let top_v     = SpriteVisual::from_raw(inst.top_raw    as *mut _);
-        let right_v   = SpriteVisual::from_raw(inst.right_raw  as *mut _);
-        let bottom_v  = SpriteVisual::from_raw(inst.bottom_raw as *mut _);
-        let brush     = CompositionColorBrush::from_raw(inst.brush_raw as *mut _);
+        // All of these are borrowed from INSTANCES — use ManuallyDrop so no Release fires
+        // on error paths. The actual lifetime is managed by INSTANCES/BORDER_CONTAINERS.
+        let container = std::mem::ManuallyDrop::new(ContainerVisual::from_raw(inst.container_raw as *mut _));
+        let left_v    = std::mem::ManuallyDrop::new(SpriteVisual::from_raw(inst.left_raw   as *mut _));
+        let top_v     = std::mem::ManuallyDrop::new(SpriteVisual::from_raw(inst.top_raw    as *mut _));
+        let right_v   = std::mem::ManuallyDrop::new(SpriteVisual::from_raw(inst.right_raw  as *mut _));
+        let bottom_v  = std::mem::ManuallyDrop::new(SpriteVisual::from_raw(inst.bottom_raw as *mut _));
+        let brush     = std::mem::ManuallyDrop::new(CompositionColorBrush::from_raw(inst.brush_raw as *mut _));
 
         brush.SetColor(parse_color(color))
             .map_err(|e| generic_error(format!("SetColor: {:?}", e)))?;
@@ -288,24 +326,20 @@ pub fn set_border(
                 .map_err(|e| generic_error(format!("CreateExpressionAnimation: {:?}", e)))?;
             a.SetExpression(&HSTRING::from(expr))
                 .map_err(|e| generic_error(format!("SetExpression: {:?}", e)))?;
-            a.SetReferenceParameter(&HSTRING::from("root"), &container).ok();
+            a.SetReferenceParameter(&HSTRING::from("root"), &*container).ok();
             target.StartAnimation(&HSTRING::from(prop), &a).ok();
             Ok(())
         };
 
-        mk(&format!("Vector2({left},root.Size.Y)"),        "Size",   &left_v)?;
-        mk("Vector3(0,0,0)",                               "Offset", &left_v)?;
-        mk(&format!("Vector2({right},root.Size.Y)"),       "Size",   &right_v)?;
-        mk(&format!("Vector3(root.Size.X-{right},0,0)"),   "Offset", &right_v)?;
-        mk(&format!("Vector2(root.Size.X,{top})"),         "Size",   &top_v)?;
-        mk("Vector3(0,0,0)",                               "Offset", &top_v)?;
-        mk(&format!("Vector2(root.Size.X,{bottom})"),      "Size",   &bottom_v)?;
-        mk(&format!("Vector3(0,root.Size.Y-{bottom},0)"),  "Offset", &bottom_v)?;
-
-        std::mem::forget(container);
-        std::mem::forget(left_v); std::mem::forget(top_v);
-        std::mem::forget(right_v); std::mem::forget(bottom_v);
-        std::mem::forget(brush);
+        // Use explicit decimal formatting to avoid locale-dependent separators breaking expression parsing.
+        mk(&format!("Vector2({:.6},root.Size.Y)", left),              "Size",   &left_v)?;
+        mk("Vector3(0,0,0)",                                          "Offset", &left_v)?;
+        mk(&format!("Vector2({:.6},root.Size.Y)", right),             "Size",   &right_v)?;
+        mk(&format!("Vector3(root.Size.X-{:.6},0,0)", right),         "Offset", &right_v)?;
+        mk(&format!("Vector2(root.Size.X,{:.6})", top),               "Size",   &top_v)?;
+        mk("Vector3(0,0,0)",                                          "Offset", &top_v)?;
+        mk(&format!("Vector2(root.Size.X,{:.6})", bottom),            "Size",   &bottom_v)?;
+        mk(&format!("Vector3(0,root.Size.Y-{:.6},0)", bottom),        "Offset", &bottom_v)?;
     }
 
     Ok(())
@@ -338,13 +372,23 @@ pub fn free_border_instance(instance_id: i64) -> Result<(), AnyError> {
             }
         }
         unsafe {
-            let _ = ContainerVisual::from_raw(inst.container_raw as *mut _);
+            // Sprites and brush are exclusively owned by this instance — always release them.
             let _ = SpriteVisual::from_raw(inst.left_raw   as *mut _);
             let _ = SpriteVisual::from_raw(inst.top_raw    as *mut _);
             let _ = SpriteVisual::from_raw(inst.right_raw  as *mut _);
             let _ = SpriteVisual::from_raw(inst.bottom_raw as *mut _);
             let _ = CompositionColorBrush::from_raw(inst.brush_raw as *mut _);
+            // Container is shared across all instances for this element; only release
+            // when the last instance is gone (BORDER_CONTAINERS entry already removed above).
+            if !still_used {
+                let _ = ContainerVisual::from_raw(inst.container_raw as *mut _);
+            }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub fn get_iids_for_test() -> (GUID, GUID) {
+    (iid_ui_element(), iid_ecp_statics())
 }

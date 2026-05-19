@@ -19,7 +19,6 @@ mod type_description;
 mod global_fns;
 pub mod timers;
 mod ns_proxy;
-pub mod composition_border;
 pub(crate) mod dotnet;
 pub(crate) mod win32;
 pub(crate) mod win32_known_fns;
@@ -3783,8 +3782,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                         // the regular wrapper path. Async / IAsyncOperation<T>
                                         // returns flow through here too: the wrapped object exposes
                                         // .Status, .ErrorCode, .GetResults, .Completed, .Cancel,
-                                        // .Close — the dev wraps it in a JS Promise if they want
-                                        // (matching the iOS & Android NativeScript runtimes).
+                                        // .Close
                                         let declaration = MetadataReader::find_by_name(return_sig.as_str())
                                             .unwrap_or_else(|| dec.inner.clone());
 
@@ -5002,6 +5000,10 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                     let (ret, result) = method.call(scope, &args);
 
                     if ret.is_ok() {
+                        if result.is_null() {
+                            retval.set(v8::null(scope).into());
+                            return;
+                        }
                         let result = unsafe { IUnknown::from_raw(result) };
                         let vtable = result.vtable();
                         let mut qi_ptr: *mut c_void = std::ptr::null_mut();
@@ -6168,110 +6170,58 @@ pub(crate) fn create_struct_object_from_raw<'a>(
     raw_data: *mut c_void,
     scope: &mut v8::PinScope<'a, '_>,
 ) -> Local<'a, v8::Object> {
-    // Create an object with 1 internal field so the struct can be round-tripped
-    // back to native code via ffi_parse_pointer_arg → try_get_external_handle.
-    let tmpl = v8::ObjectTemplate::new(scope);
-    tmpl.set_internal_field_count(1);
     let fallback = v8::Object::new(scope);
-    let Some(object) = tmpl.new_instance(scope) else { return fallback; };
 
-    let lock = declaration.read();
-    let Some(struct_dec) = lock.as_any().downcast_ref::<StructDeclaration>() else {
-        return object;
+    // Build the byte buffer from raw_data before setting up the template.
+    let (struct_buf, field_types) = {
+        let lock = declaration.read();
+        let Some(struct_dec) = lock.as_any().downcast_ref::<StructDeclaration>() else {
+            return fallback;
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        let mut types: Vec<NativeType> = Vec::new();
+        let mut offset: isize = 0;
+        for field in struct_dec.fields() {
+            let Some(metadata) = field.base().metadata() else { continue; };
+            let field_type_str = Signature::to_string(metadata, &field.type_());
+            let Ok(native_type) = NativeType::try_from(field_type_str.as_str()) else { continue; };
+            let size = native_type.size() as isize;
+            let field_ptr = unsafe { (raw_data as *const u8).offset(offset) as *mut c_void };
+            let buf_start = buf.len();
+            buf.extend(std::iter::repeat(0u8).take(size as usize));
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    field_ptr as *const u8,
+                    buf[buf_start..].as_mut_ptr(),
+                    size as usize,
+                );
+            }
+            types.push(native_type);
+            offset += size;
+        }
+        (buf, types)
     };
 
-    let mut offset: isize = 0;
-    let mut struct_buf: Vec<u8> = Vec::new();
-    let mut field_types: Vec<NativeType> = Vec::new();
-
-    for field in struct_dec.fields() {
-        let Some(metadata) = field.base().metadata() else { continue; };
-        let field_type_str = Signature::to_string(metadata, &field.type_());
-        let Ok(native_type) = NativeType::try_from(field_type_str.as_str()) else { continue; };
-        let size = native_type.size() as isize;
-        let field_ptr = unsafe { (raw_data as *const u8).offset(offset) as *mut c_void };
-
-        // Copy this field's bytes into the struct buffer.
-        let buf_start = struct_buf.len();
-        struct_buf.extend(std::iter::repeat(0u8).take(size as usize));
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                field_ptr as *const u8,
-                struct_buf[buf_start..].as_mut_ptr(),
-                size as usize,
-            );
-        }
-        field_types.push(native_type.clone());
-
-        // Also expose the field as a plain JS property for easy reading.
-        let field_val: Option<Local<v8::Value>> = unsafe {
-            match &native_type {
-                NativeType::Bool => {
-                    let v = std::ptr::read_unaligned(field_ptr as *const u8) != 0;
-                    Some(v8::Boolean::new(scope, v).into())
-                }
-                NativeType::U8 => {
-                    Some(v8::Number::new(scope, std::ptr::read_unaligned(field_ptr as *const u8) as f64).into())
-                }
-                NativeType::I8 => {
-                    Some(v8::Number::new(scope, std::ptr::read_unaligned(field_ptr as *const i8) as f64).into())
-                }
-                NativeType::U16 => {
-                    Some(v8::Number::new(scope, std::ptr::read_unaligned(field_ptr as *const u16) as f64).into())
-                }
-                NativeType::I16 => {
-                    Some(v8::Number::new(scope, std::ptr::read_unaligned(field_ptr as *const i16) as f64).into())
-                }
-                NativeType::U32 => {
-                    Some(v8::Number::new(scope, std::ptr::read_unaligned(field_ptr as *const u32) as f64).into())
-                }
-                NativeType::I32 => {
-                    Some(v8::Number::new(scope, std::ptr::read_unaligned(field_ptr as *const i32) as f64).into())
-                }
-                NativeType::U64 => {
-                    let v = std::ptr::read_unaligned(field_ptr as *const u64);
-                    let local: Local<v8::Value> = if v > MAX_SAFE_INTEGER as u64 {
-                        v8::BigInt::new_from_u64(scope, v).into()
-                    } else {
-                        v8::Number::new(scope, v as f64).into()
-                    };
-                    Some(local)
-                }
-                NativeType::I64 => {
-                    let v = std::ptr::read_unaligned(field_ptr as *const i64);
-                    let local: Local<v8::Value> = if v > MAX_SAFE_INTEGER as i64 || v < MIN_SAFE_INTEGER as i64 {
-                        v8::BigInt::new_from_i64(scope, v).into()
-                    } else {
-                        v8::Number::new(scope, v as f64).into()
-                    };
-                    Some(local)
-                }
-                NativeType::F32 => {
-                    let bits = std::ptr::read_unaligned(field_ptr as *const u32);
-                    Some(v8::Number::new(scope, f32::from_bits(bits) as f64).into())
-                }
-                NativeType::F64 => {
-                    Some(v8::Number::new(scope, std::ptr::read_unaligned(field_ptr as *const f64)).into())
-                }
-                _ => None,
-            }
-        };
-        if let (Some(val), Some(key)) = (field_val, v8::String::new(scope, field.name())) {
-            object.set(scope, key.into(), val);
-        }
-        offset += size;
-    }
-
-    drop(lock);
-
-    // Store the byte buffer in a DeclarationFFI so try_get_external_handle can
-    // return a pointer to it when this object is passed back to native code.
+    // Store the byte buffer in a DeclarationFFI so native code can read it back
+    // via ffi_parse_pointer_arg → try_get_external_handle, AND so the property
+    // interceptors can keep reads/writes in sync with the same buffer.
     let mut dec_ffi = DeclarationFFI::new(Arc::clone(&declaration));
     dec_ffi.struct_instance = Some((struct_buf, field_types));
     let dec_raw = Box::into_raw(Box::new(dec_ffi));
     let ext = v8::External::new(scope, dec_raw as *mut c_void);
-    object.set_internal_field(0, ext.into());
 
+    // Use property interceptors so that JS writes (e.g. `size.Width = 300`) go
+    // through to the buffer, not just to a detached plain JS property.
+    let tmpl = v8::ObjectTemplate::new(scope);
+    tmpl.set_internal_field_count(1);
+    tmpl.set_named_property_handler(
+        v8::NamedPropertyHandlerConfiguration::new()
+            .getter(crate::ns_proxy::ns_struct_field_getter)
+            .setter(crate::ns_proxy::ns_struct_field_setter)
+            .data(ext.into())
+    );
+    let Some(object) = tmpl.new_instance(scope) else { return fallback; };
+    object.set_internal_field(0, ext.into());
     object
 }
 

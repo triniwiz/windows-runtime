@@ -10,8 +10,6 @@ namespace NativeScriptBridge;
 
 public static partial class Bridge
 {
-    // ── JS delegate creation ──────────────────────────────────────────────────
-    //
     // opcode 0x09: given a delegate type name (or "" for System.Action) and a
     // JS callback id, compile a .NET delegate that serialises its parameters as
     // binary and calls back into V8 via the s_jsInvoker function pointer.
@@ -50,8 +48,6 @@ public static partial class Bridge
         var del = Expression.Lambda(delegateType, body, paramExprs).Compile();
         return Box(del);
     }
-
-    // ── Callback invocation helper ────────────────────────────────────────────
 
     internal static unsafe void CallJsCallback(int id, object?[] args)
     {

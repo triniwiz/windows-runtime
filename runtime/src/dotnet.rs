@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use windows::Win32::Foundation::HMODULE;
-use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::core::{PCSTR, PCWSTR};
 
 // ── hostfxr ABI ───────────────────────────────────────────────────────────────
@@ -123,6 +123,14 @@ fn find_hostfxr() -> Option<PathBuf> {
     None
 }
 
+fn parse_version(s: &str) -> (u64, u64, u64) {
+    let mut parts = s.splitn(3, '.');
+    let major = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let patch = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    (major, minor, patch)
+}
+
 fn scan_fxr_dir(dir: &PathBuf) -> Option<PathBuf> {
     let mut versions: Vec<PathBuf> = std::fs::read_dir(dir)
         .ok()?
@@ -131,10 +139,11 @@ fn scan_fxr_dir(dir: &PathBuf) -> Option<PathBuf> {
         .map(|e| e.path())
         .collect();
 
+    // Sort descending by numeric version so "10.x" sorts above "8.x".
     versions.sort_by(|a, b| {
-        let av = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let bv = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        bv.cmp(av)
+        let av = parse_version(a.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+        let bv = parse_version(b.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+        bv.cmp(&av)
     });
 
     versions.into_iter().find_map(|v| {
@@ -146,14 +155,19 @@ fn scan_fxr_dir(dir: &PathBuf) -> Option<PathBuf> {
 // ── initialisation ────────────────────────────────────────────────────────────
 
 fn build_host(bridge_dll: &str, runtime_config: &str) -> Result<DotNetHost, String> {
-    let hostfxr_path = find_hostfxr()
-        .ok_or_else(|| "hostfxr.dll not found — is .NET 6+ installed?".to_string())?;
-
-    let hostfxr_wide = to_wide_null(&hostfxr_path.to_string_lossy());
-    let hostfxr = unsafe {
-        LoadLibraryW(PCWSTR(hostfxr_wide.as_ptr()))
-            .map_err(|e| format!("LoadLibraryW(hostfxr.dll): {}", e))?
-    };
+    // Prefer the hostfxr.dll that is already loaded into this process (e.g. when the
+    // host is itself a .NET application such as the UWP toolbox).  Using a different
+    // major-version hostfxr inside an already-hosted runtime causes InvalidArgFailure.
+    let hostfxr_wide = to_wide_null("hostfxr.dll");
+    let hostfxr = unsafe { GetModuleHandleW(PCWSTR(hostfxr_wide.as_ptr())).ok() }
+        .map(|h| Ok(h))
+        .unwrap_or_else(|| {
+            let path = find_hostfxr()
+                .ok_or_else(|| "hostfxr.dll not found — is .NET 6+ installed?".to_string())?;
+            let wide = to_wide_null(&path.to_string_lossy());
+            unsafe { LoadLibraryW(PCWSTR(wide.as_ptr())) }
+                .map_err(|e| format!("LoadLibraryW(hostfxr.dll): {e}"))
+        })?;
 
     macro_rules! resolve {
         ($sym:literal, $ty:ty) => {{
@@ -187,6 +201,12 @@ fn build_host(bridge_dll: &str, runtime_config: &str) -> Result<DotNetHost, Stri
     let dll_wide  = to_wide_null(bridge_dll);
     let type_wide = to_wide_null("NativeScriptBridge.Bridge, DotNetBridge");
 
+    // Sentinel defined by the .NET hosting API for [UnmanagedCallersOnly] methods.
+    // Must be (const char_t*)-1, NOT null.  Passing null selects the typed-delegate
+    // path which requires a matching C# delegate type and returns E_INVALIDARG for
+    // [UnmanagedCallersOnly] methods.
+    let unmanaged_callers_only: *const u16 = usize::MAX as *const u16;
+
     let bind = |method: &str| -> Result<*mut c_void, String> {
         let method_wide = to_wide_null(method);
         let mut fn_out: *mut c_void = std::ptr::null_mut();
@@ -195,7 +215,7 @@ fn build_host(bridge_dll: &str, runtime_config: &str) -> Result<DotNetHost, Stri
                 dll_wide.as_ptr(),
                 type_wide.as_ptr(),
                 method_wide.as_ptr(),
-                std::ptr::null(),
+                unmanaged_callers_only,
                 std::ptr::null(),
                 &mut fn_out,
             )
@@ -214,7 +234,10 @@ fn build_host(bridge_dll: &str, runtime_config: &str) -> Result<DotNetHost, Stri
     let free:                 FnBridgeFree             = unsafe { std::mem::transmute(bind("Free")?) };
     let register_js_callback: FnRegisterJsCallback     = unsafe { std::mem::transmute(bind("RegisterJsCallback")?) };
 
-    Ok(DotNetHost { _hostfxr: hostfxr, invoke, invoke_binary, free, register_js_callback })
+    Ok(DotNetHost {
+        _hostfxr: hostfxr,
+        invoke, invoke_binary, free, register_js_callback,
+    })
 }
 
 // ── public API ────────────────────────────────────────────────────────────────
@@ -324,3 +347,4 @@ pub(crate) fn call_dotnet_binary(request: &[u8]) -> Result<Vec<u8>, String> {
     unsafe { (host.free)(resp_ptr) };
     Ok(result)
 }
+

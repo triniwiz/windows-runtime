@@ -36,7 +36,7 @@ public static partial class Bridge
         else
         {
             type = ResolveType(req.Assembly, req.TypeName)
-                ?? throw new TypeLoadException($"Type not found: {req.TypeName}");
+                ?? throw new TypeLoadException($"Type not found: {req.TypeName} (assembly: {req.Assembly})");
         }
 
         if (method == "__members__")
@@ -85,8 +85,6 @@ public static partial class Bridge
         try   { return Box(AwaitIfTask(dispEntry.Invoke(target, builtArgs))); }
         finally { if (builtArgs.Length > 0) ReturnArgs(builtArgs); }
     }
-
-    // ── compiled dispatch cache ───────────────────────────────────────────────
 
     private static DispatchEntry GetCachedMethod(Type type, string name, int argCount, BindingFlags flags)
         => s_methodCache.GetOrAdd(
@@ -148,8 +146,6 @@ public static partial class Bridge
             new PropKey(type, method[prefixLen..], flags),
             static k => k.Type.GetProperty(k.Name, k.Flags));
 
-    // ── argument coercion ─────────────────────────────────────────────────────
-
     // Pooled: rented array passed to the compiled delegate (which accesses by index,
     // not by Length). Caller must return via ReturnArgs immediately after invoke.
     private static object?[] BuildArgs(JsonElement[] elements, ParameterInfo[] parameters)
@@ -186,8 +182,6 @@ public static partial class Bridge
         return el.Deserialize(targetType, s_coerceOpts);
     }
 
-    // ── async unwrapping ──────────────────────────────────────────────────────
-
     private static object? AwaitIfTask(object? value)
     {
         if (value is null) return null;
@@ -216,8 +210,6 @@ public static partial class Bridge
         return value;
     }
 
-    // ── result boxing ─────────────────────────────────────────────────────────
-
     private static DispatchResult Box(object? value)
     {
         if (value is null) return DispatchResult.Void;
@@ -239,17 +231,24 @@ public static partial class Bridge
         return DispatchResult.Handle(id, t.FullName ?? t.Name);
     }
 
-    // ── type/member resolution ────────────────────────────────────────────────
-
     internal static DispatchResult BuildMembersResult(Type t)
     {
         const BindingFlags inst = BindingFlags.Public | BindingFlags.Instance;
         const BindingFlags stat = BindingFlags.Public | BindingFlags.Static;
+
+        var instProps = t.GetProperties(inst);
+        var statProps = t.GetProperties(stat);
+
         return DispatchResult.Members(
-            t.GetMethods(inst).Where(m => !m.IsSpecialName).Select(m => m.Name).Distinct().ToArray(),
-            t.GetProperties(inst).Select(p => p.Name).Distinct().ToArray(),
-            t.GetMethods(stat).Where(m => !m.IsSpecialName).Select(m => m.Name).Distinct().ToArray(),
-            t.GetProperties(stat).Select(p => p.Name).Distinct().ToArray());
+            methods:               t.GetMethods(inst).Where(m => !m.IsSpecialName).Select(m => m.Name).Distinct().ToArray(),
+            props:                 instProps.Where(p => p.GetGetMethod() != null).Select(p => p.Name).Distinct().ToArray(),
+            staticMethods:         t.GetMethods(stat).Where(m => !m.IsSpecialName).Select(m => m.Name).Distinct().ToArray(),
+            staticProps:           statProps.Where(p => p.GetGetMethod() != null).Select(p => p.Name).Distinct().ToArray(),
+            readonlyProps:         instProps.Where(p => p.GetGetMethod() != null && p.GetSetMethod() == null).Select(p => p.Name).Distinct().ToArray(),
+            readonlyStaticProps:   statProps.Where(p => p.GetGetMethod() != null && p.GetSetMethod() == null).Select(p => p.Name).Distinct().ToArray(),
+            writeonlyProps:        instProps.Where(p => p.GetGetMethod() == null && p.GetSetMethod() != null).Select(p => p.Name).Distinct().ToArray(),
+            writeonlyStaticProps:  statProps.Where(p => p.GetGetMethod() == null && p.GetSetMethod() != null).Select(p => p.Name).Distinct().ToArray()
+        );
     }
 
     internal static Type? ResolveType(string? assemblyName, string? typeName)
@@ -261,19 +260,75 @@ public static partial class Bridge
 
     private static Type? ResolveTypeCore(string? assemblyName, string? typeName)
     {
+        if (string.IsNullOrEmpty(typeName)) return null;
+
+        // Fast/normal lookup first (assembly-qualified or plain type name).
         var fqn = string.IsNullOrEmpty(assemblyName) ? typeName! : $"{typeName}, {assemblyName}";
-        var t   = Type.GetType(fqn);
+        var t = Type.GetType(fqn);
         if (t is not null) return t;
+
+        t = Type.GetType(typeName);
+        if (t is not null) return t;
+
+        // Last segment (type name without namespace) used for loose matching below.
+        var lastDot = typeName.LastIndexOf('.');
+        var shortName = lastDot >= 0 ? typeName[(lastDot + 1)..] : typeName;
+
+        // Search loaded assemblies quickly; prefer asm.GetType which is inexpensive.
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
         {
-            t = asm.GetType(typeName!);
-            if (t is not null) return t;
+            try
+            {
+                t = asm.GetType(typeName);
+                if (t is not null) return t;
+
+                // Fall back to scanning exported types only when necessary. Some
+                // assemblies throw on GetTypes() (ReflectionTypeLoadException) so
+                // we catch and continue.
+                foreach (var ty in asm.GetTypes())
+                {
+                    if (string.Equals(ty.FullName, typeName, StringComparison.Ordinal))
+                        return ty;
+                    // Short-name match only when input has no namespace prefix (e.g. "Stopwatch").
+                    // Guarding on lastDot < 0 prevents matching unrelated types in other namespaces
+                    // (e.g. "NativeScript.Widgets.FlexboxLayout" must not match a different
+                    //  FlexboxLayout that happens to live in another namespace).
+                    if (lastDot < 0 && string.Equals(ty.Name, shortName, StringComparison.Ordinal))
+                        return ty;
+                }
+            }
+            catch (ReflectionTypeLoadException) { }
+            catch { }
         }
+
+        // If an assembly name was provided try loading it explicitly and repeat
+        // the above search inside that assembly only (less work than scanning all).
         if (!string.IsNullOrEmpty(assemblyName))
         {
-            try { t = Assembly.Load(assemblyName).GetType(typeName!); } catch { }
+            try
+            {
+                var asm = Assembly.Load(assemblyName);
+                if (asm is not null)
+                {
+                    t = asm.GetType(typeName!);
+                    if (t is not null) return t;
+                    try
+                    {
+                        foreach (var ty in asm.GetTypes())
+                        {
+                            if (string.Equals(ty.FullName, typeName, StringComparison.Ordinal))
+                                return ty;
+                            if (lastDot < 0 && string.Equals(ty.Name, shortName, StringComparison.Ordinal))
+                                return ty;
+                        }
+                    }
+                    catch (ReflectionTypeLoadException) { }
+                }
+            }
+            catch { }
         }
-        return t;
+
+        return null;
     }
 
     private static MethodInfo? FindMethodCore(Type type, string name, int argCount, BindingFlags flags)
@@ -286,7 +341,6 @@ public static partial class Bridge
     internal static Exception Unwrap(Exception ex) =>
         ex is TargetInvocationException { InnerException: { } inner } ? Unwrap(inner) : ex;
 
-    // ── full-pipeline helpers (parse + dispatch + serialise) ──────────────────
     // Used by benchmarks to give a fair end-to-end comparison of protocols.
 
     internal static byte[] PipelineJson(ReadOnlySpan<byte> jsonRequest)
@@ -311,8 +365,6 @@ public static partial class Bridge
         result.WriteAsBin(buf);
         return buf.WrittenSpan.ToArray();
     }
-
-    // ── JSON response writers ─────────────────────────────────────────────────
 
     private static unsafe void WriteResult(DispatchResult res, byte** outPtr, int* outLen)
     {

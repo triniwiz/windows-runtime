@@ -42,7 +42,6 @@ fn bench_script_eval(c: &mut Criterion) {
     group.finish();
 }
 
-/// Port of the NativeScript iOS marshalling benchmarks.
 fn bench_marshalling(c: &mut Criterion) {
     let mut group = c.benchmark_group("marshalling");
     group.sample_size(10);

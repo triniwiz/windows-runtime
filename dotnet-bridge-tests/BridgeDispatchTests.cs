@@ -19,8 +19,6 @@ public sealed class BridgeDispatchTests : IDisposable
     public BridgeDispatchTests() => Bridge.ClearCaches();
     public void Dispose()        => Bridge.ClearCaches();
 
-    // ── type resolution ──────────────────────────────────────────────────────
-
     [Fact]
     public void TypeResolution_ByFullName_FindsType()
     {
@@ -35,8 +33,6 @@ public sealed class BridgeDispatchTests : IDisposable
         var req = MakeStatic("NuGet.Does.Not.Exist", "__members__");
         Assert.Throws<TypeLoadException>(() => Bridge.Dispatch(req));
     }
-
-    // ── constructors ─────────────────────────────────────────────────────────
 
     [Fact]
     public void Constructor_NoArgs_ReturnsHandle()
@@ -55,8 +51,6 @@ public sealed class BridgeDispatchTests : IDisposable
         Assert.Equal(DispatchKind.Handle, result.Kind());
         Release(result);
     }
-
-    // ── instance method calls ────────────────────────────────────────────────
 
     [Fact]
     public void InstanceMethodCall_Append_ReturnsSelf()
@@ -89,8 +83,6 @@ public sealed class BridgeDispatchTests : IDisposable
         Release(handle);
     }
 
-    // ── instance properties ──────────────────────────────────────────────────
-
     [Fact]
     public void PropertyGet_Length_ReturnsInt()
     {
@@ -112,8 +104,6 @@ public sealed class BridgeDispatchTests : IDisposable
         Release(handle);
     }
 
-    // ── static methods and properties ────────────────────────────────────────
-
     [Fact]
     public void StaticMethodCall_MathAbs_ReturnsPositive()
     {
@@ -132,8 +122,6 @@ public sealed class BridgeDispatchTests : IDisposable
         Assert.NotEmpty((string)result.PrimitiveValue()!);
     }
 
-    // ── handle lifecycle ─────────────────────────────────────────────────────
-
     [Fact]
     public void Release_RemovesHandle()
     {
@@ -150,8 +138,6 @@ public sealed class BridgeDispatchTests : IDisposable
         var req = MakeInstance(99999, "ToString");
         Assert.Throws<KeyNotFoundException>(() => Bridge.Dispatch(req));
     }
-
-    // ── __members__ ──────────────────────────────────────────────────────────
 
     [Fact]
     public void Members_ByHandle_ContainsKnownMembers()
@@ -171,8 +157,6 @@ public sealed class BridgeDispatchTests : IDisposable
         Assert.Equal(DispatchKind.Members, result.Kind());
     }
 
-    // ── enumerable results ────────────────────────────────────────────────────
-
     [Fact]
     public void MethodReturningArray_WrapsAsCollection()
     {
@@ -181,8 +165,6 @@ public sealed class BridgeDispatchTests : IDisposable
         var result = Bridge.Dispatch(req);
         Assert.Equal(DispatchKind.Collection, result.Kind());
     }
-
-    // ── helpers ───────────────────────────────────────────────────────────────
 
     private static int CreateSb(string? initial = null)
     {

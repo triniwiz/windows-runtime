@@ -37,12 +37,7 @@ pub fn init_console(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, 
 // ── Core string-builder ──────────────────────────────────────────────────────
 
 /// Converts one JS value to its string representation and appends to `output`.
-///
-/// Mirrors iOS/Android's `buildStringFromArg` pattern with three additions:
-/// - WinRT native proxy objects show their type name instead of `[object Object]`
-/// - Typed arrays (Uint8Array etc.) are rendered via `toString()` without
-///   inspecting internal fields, avoiding a BadType panic in the V8 cast API
-/// - Arrays render as `[a, b, c]` matching the reference runtimes
+
 fn handle_item_log(
     scope: &mut v8::PinScope<'_, '_>,
     item: v8::Local<v8::Value>,
@@ -61,7 +56,6 @@ fn handle_item_log(
         return;
     }
 
-    // ── JS Arrays → [a, b, c] matching iOS/Android ─────────────────────────
     if item.is_array() {
         if let Ok(arr) = v8::Local::<v8::Array>::try_from(item) {
             let len = arr.length() as usize;
@@ -205,9 +199,7 @@ fn handle_item_log(
             }
         }
 
-        // 4) Fallback — mirrors iOS/Android: toString() first, then JSON.stringify().
-        //    toString() succeeds for objects with a custom toString (e.g., Error, Date).
-        //    JSON.stringify() handles plain data objects.
+
         v8::tc_scope!(tc, scope);
         if let Some(s) = item.to_string(tc) {
             if !tc.has_caught() {

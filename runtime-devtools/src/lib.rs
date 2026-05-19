@@ -24,9 +24,6 @@ pub struct DevtoolsServerConfig {
 
 impl Default for DevtoolsServerConfig {
     fn default() -> Self {
-        // Port 42000: Windows runtime inspector.
-        // NativeScript iOS runtime uses 40000, Android uses 41000 — Windows takes
-        // the next slot so the CLI can auto-discover all three on the same host.
         Self { host: "127.0.0.1".to_string(), port: 42000 }
     }
 }

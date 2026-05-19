@@ -16,8 +16,6 @@ public sealed class BinaryProtocolTests : IDisposable
     public BinaryProtocolTests() => Bridge.ClearCaches();
     public void Dispose()        => Bridge.ClearCaches();
 
-    // ── BinReader ─────────────────────────────────────────────────────────────
-
     [Fact]
     public void BinReader_ReadByte()
     {
@@ -125,8 +123,6 @@ public sealed class BinaryProtocolTests : IDisposable
         Assert.Equal(99, hr.Id);
     }
 
-    // ── BinWriter ─────────────────────────────────────────────────────────────
-
     [Fact]
     public void BinWriter_WriteByte_Single()
     {
@@ -166,8 +162,6 @@ public sealed class BinaryProtocolTests : IDisposable
         Assert.Equal((byte)'O', bytes[4]);
         Assert.Equal((byte)'K', bytes[5]);
     }
-
-    // ── DispatchResult binary encoding ────────────────────────────────────────
 
     [Fact]
     public void WriteAsBin_Void_EmitsNullTag()
@@ -254,14 +248,12 @@ public sealed class BinaryProtocolTests : IDisposable
     public void WriteAsBin_Members_EmitsMembersTag()
     {
         var buf = new ArrayBufferWriter<byte>();
-        DispatchResult.Members(["Foo"], ["Bar"], [], []).WriteAsBin(buf);
+        DispatchResult.Members(["Foo"], ["Bar"], [], [], [], [], [], []).WriteAsBin(buf);
         var bytes = buf.WrittenSpan.ToArray();
         Assert.Equal(0x08, bytes[0]);
         // methods count = 1
         Assert.Equal(1, BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(1)));
     }
-
-    // ── binary dispatch (DispatchBin) ─────────────────────────────────────────
 
     [Fact]
     public void DispatchBin_Constructor_NoArgs_ReturnsHandle()
@@ -376,7 +368,64 @@ public sealed class BinaryProtocolTests : IDisposable
         Assert.Equal(DispatchKind.Members, result.Kind());
     }
 
-    // ── helpers ───────────────────────────────────────────────────────────────
+    /// Verifies that tag 0x0A (WinRtRef) is decoded and marshaled to a non-null
+    /// managed object when dispatching a static call.  Uses a plain .NET object
+    /// (StringBuilder) as the COM target so no WinRT runtime is required.
+    [Fact]
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    public void DispatchBin_WinRtRef_PassedAsObjectParam_ReceivesNonNull()
+    {
+        var managed = new System.Text.StringBuilder("winrt-rcw-test");
+        var pUnk = IntPtr.Zero;
+        try
+        {
+            pUnk = System.Runtime.InteropServices.Marshal.GetIUnknownForObject(managed);
+
+            var pkt = BuildPacket(w =>
+            {
+                w.WriteByte(0x02);  // static call
+                w.WriteString16("DotNetBridgeTests.WinRtRefHelper");
+                w.WriteString16("");
+                w.WriteString16("AcceptsObject");
+                w.WriteByte(1);     // 1 argument
+                w.WriteByte(0x0A);  // WinRtRef tag
+                w.WriteI64(pUnk.ToInt64());
+            });
+            var r      = new BinReader(pkt.AsSpan());
+            var result = Bridge.DispatchBin(ref r);
+
+            // Method returns true when argument is non-null.
+            Assert.Equal(DispatchKind.Primitive, result.Kind());
+            Assert.Equal(true, result.PrimitiveValue());
+        }
+        finally
+        {
+            if (pUnk != IntPtr.Zero) System.Runtime.InteropServices.Marshal.Release(pUnk);
+        }
+    }
+
+    /// Verifies that a null WinRtRef (Ptr == 0) is treated as null, not as a
+    /// struct value.  AcceptsObject(null) must return false.
+    [Fact]
+    public void DispatchBin_WinRtRef_NullPtr_PassesNullToMethod()
+    {
+        var pkt = BuildPacket(w =>
+        {
+            w.WriteByte(0x02);  // static call
+            w.WriteString16("DotNetBridgeTests.WinRtRefHelper");
+            w.WriteString16("");
+            w.WriteString16("AcceptsObject");
+            w.WriteByte(1);
+            w.WriteByte(0x0A);  // WinRtRef tag with zero pointer
+            w.WriteI64(0L);
+        });
+        var r      = new BinReader(pkt.AsSpan());
+        var result = Bridge.DispatchBin(ref r);
+
+        // CoerceBin maps WinRtRef{Ptr=0} → null, so AcceptsObject(null) → false.
+        Assert.Equal(DispatchKind.Primitive, result.Kind());
+        Assert.Equal(false, result.PrimitiveValue());
+    }
 
     private static BinReader Reader(params byte[] bytes) =>
         new BinReader(bytes.AsSpan());
@@ -388,4 +437,11 @@ public sealed class BinaryProtocolTests : IDisposable
         build(w);
         return buf.WrittenSpan.ToArray();
     }
+}
+
+/// Helper type used by WinRtRef dispatch tests.
+internal static class WinRtRefHelper
+{
+    /// Returns true when <paramref name="obj"/> is non-null, false otherwise.
+    public static bool AcceptsObject(object? obj) => obj != null;
 }

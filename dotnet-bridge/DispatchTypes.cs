@@ -12,13 +12,9 @@ using System.Threading.Tasks;
 
 namespace NativeScriptBridge;
 
-// ── JSON source-gen context ───────────────────────────────────────────────────
-
 [JsonSerializable(typeof(InvokeRequest))]
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
 internal partial class BridgeJsonContext : JsonSerializerContext { }
-
-// ── JSON wire type ────────────────────────────────────────────────────────────
 
 internal sealed record InvokeRequest(
     string?        Assembly,
@@ -28,7 +24,6 @@ internal sealed record InvokeRequest(
     JsonElement[]? Args
 );
 
-// ── cache key structs ─────────────────────────────────────────────────────────
 //
 // Using Type as the key field (rather than Type.FullName) is correct and faster:
 // Type instances are singletons within an AssemblyLoadContext, so reference
@@ -37,8 +32,6 @@ internal sealed record InvokeRequest(
 internal readonly record struct MethodKey(Type Type, string Name, int ArgCount, BindingFlags Flags);
 internal readonly record struct PropKey(Type Type, string Name, BindingFlags Flags);
 internal readonly record struct CtorKey(Type Type, int ArgCount);
-
-// ── cache value types ─────────────────────────────────────────────────────────
 
 internal readonly struct DispatchEntry(Func<object?, object?[], object?>? invoke, ParameterInfo[] parameters)
 {
@@ -52,8 +45,6 @@ internal readonly struct CtorEntry(ConstructorInfo? ctor, ParameterInfo[] parame
     public readonly ConstructorInfo? Ctor       = ctor;
     public readonly ParameterInfo[]  Parameters = parameters;
 }
-
-// ── dispatch result ───────────────────────────────────────────────────────────
 
 internal enum DispatchKind : byte { Void, Primitive, Handle, Collection, Members }
 
@@ -71,14 +62,22 @@ internal readonly struct DispatchResult
     private readonly string[]?    _properties;
     private readonly string[]?    _staticMethods;
     private readonly string[]?    _staticProperties;
+    private readonly string[]?    _readonlyProperties;
+    private readonly string[]?    _readonlyStaticProperties;
+    private readonly string[]?    _writeonlyProperties;
+    private readonly string[]?    _writeonlyStaticProperties;
 
     private DispatchResult(DispatchKind kind, object? value, Type? type, int handle,
         string? typeName, string[]? methods, string[]? props,
-        string[]? staticMethods, string[]? staticProps)
+        string[]? staticMethods, string[]? staticProps,
+        string[]? readonlyProps = null, string[]? readonlyStaticProps = null,
+        string[]? writeonlyProps = null, string[]? writeonlyStaticProps = null)
     {
         _kind = kind; _value = value; _type = type; _handle = handle;
         _typeName = typeName; _methods = methods; _properties = props;
         _staticMethods = staticMethods; _staticProperties = staticProps;
+        _readonlyProperties = readonlyProps; _readonlyStaticProperties = readonlyStaticProps;
+        _writeonlyProperties = writeonlyProps; _writeonlyStaticProperties = writeonlyStaticProps;
     }
 
     public static DispatchResult Primitive(object value, Type type)
@@ -91,12 +90,14 @@ internal readonly struct DispatchResult
         => new(DispatchKind.Collection, items, null, 0, null, null, null, null, null);
 
     public static DispatchResult Members(
-        string[] methods, string[] props, string[] staticMethods, string[] staticProps)
-        => new(DispatchKind.Members, null, null, 0, null, methods, props, staticMethods, staticProps);
+        string[] methods, string[] props, string[] staticMethods, string[] staticProps,
+        string[] readonlyProps, string[] readonlyStaticProps,
+        string[] writeonlyProps, string[] writeonlyStaticProps)
+        => new(DispatchKind.Members, null, null, 0, null,
+               methods, props, staticMethods, staticProps,
+               readonlyProps, readonlyStaticProps, writeonlyProps, writeonlyStaticProps);
 
     internal int HandleId() => _handle;
-
-    // ── JSON serialisation ────────────────────────────────────────────────────
 
     public void WriteTo(Utf8JsonWriter w, JsonSerializerOptions opts)
     {
@@ -126,10 +127,14 @@ internal readonly struct DispatchResult
 
             case DispatchKind.Members:
                 w.WriteStartObject();
-                WriteStringArray(w, "methods"u8,          _methods!);
-                WriteStringArray(w, "properties"u8,       _properties!);
-                WriteStringArray(w, "staticMethods"u8,    _staticMethods!);
-                WriteStringArray(w, "staticProperties"u8, _staticProperties!);
+                WriteStringArray(w, "methods"u8,                  _methods!);
+                WriteStringArray(w, "properties"u8,               _properties!);
+                WriteStringArray(w, "staticMethods"u8,            _staticMethods!);
+                WriteStringArray(w, "staticProperties"u8,         _staticProperties!);
+                WriteStringArray(w, "readonlyProperties"u8,       _readonlyProperties!);
+                WriteStringArray(w, "readonlyStaticProperties"u8, _readonlyStaticProperties!);
+                WriteStringArray(w, "writeonlyProperties"u8,      _writeonlyProperties!);
+                WriteStringArray(w, "writeonlyStaticProperties"u8,_writeonlyStaticProperties!);
                 w.WriteEndObject();
                 break;
         }
@@ -142,7 +147,6 @@ internal readonly struct DispatchResult
         w.WriteEndArray();
     }
 
-    // ── binary serialisation ──────────────────────────────────────────────────
     //
     // Response tags:
     //   0x00 = null   0x01 = false   0x02 = true
@@ -185,6 +189,10 @@ internal readonly struct DispatchResult
                 WriteStringArrayBin(ref w, _properties!);
                 WriteStringArrayBin(ref w, _staticMethods!);
                 WriteStringArrayBin(ref w, _staticProperties!);
+                WriteStringArrayBin(ref w, _readonlyProperties!);
+                WriteStringArrayBin(ref w, _readonlyStaticProperties!);
+                WriteStringArrayBin(ref w, _writeonlyProperties!);
+                WriteStringArrayBin(ref w, _writeonlyStaticProperties!);
                 break;
         }
     }
@@ -241,8 +249,6 @@ internal readonly struct DispatchResult
         foreach (var s in arr) w.WriteString16(s);
     }
 }
-
-// ── async result helpers ──────────────────────────────────────────────────────
 
 internal static class TaskResultCache
 {

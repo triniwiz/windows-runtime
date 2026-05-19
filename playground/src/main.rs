@@ -58,8 +58,7 @@ fn run_js_app() {
         .expect("DispatcherQueueController creation failed");
 
     // The runtime returns native WinRT objects directly — including
-    // IAsyncOperation. JS code wraps it in a Promise itself, the same way
-    // NativeScript-iOS and NativeScript-Android expose native async types.
+    // IAsyncOperation. JS code wraps it in a Promise itself.
     let (app_root, script) = script_to_run();
     let app_root_cstr = CString::new(app_root).unwrap();
     let rt = nativescript::runtime_init(app_root_cstr.as_ptr());

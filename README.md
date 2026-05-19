@@ -1,7 +1,6 @@
 # NativeScript Windows Runtime
 
-Windows support for NativeScript, with the same goal as the iOS and Android runtimes:
-first-class access to Windows Runtime APIs and .NET APIs from JavaScript.
+Windows support for NativeScript allowing 100% access to Windows Runtime APIs and .NET APIs from JavaScript.
 
 The workspace is split into the main runtime pieces:
 
@@ -11,7 +10,7 @@ The workspace is split into the main runtime pieces:
 - `runtime-binding-gen` - runtime-phase binding metadata support.
 - `nativescript` - native library entry point used by template/demo apps.
 - `dotnet-bridge` - .NET/C# dispatch bridge.
-- `sbg` - static binding generator, intended to move toward the NativeScript Android static binding generator model.
+- `sbg` - static binding generator. js -> cs
 - `devtools` / `runtime-devtools` - debugging and developer tooling.
 
 ## Prerequisites

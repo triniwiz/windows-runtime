@@ -53,7 +53,7 @@ public static partial class Bridge
             var typeName = r.ReadString16();
             var assembly = r.ReadString16();
             var type = ResolveType(NullIfEmpty(assembly), typeName)
-                ?? throw new TypeLoadException($"Type not found: {typeName}");
+                ?? throw new TypeLoadException($"Type not found: {typeName} (assembly: {assembly})");
             return BuildMembersResult(type);
         }
 
@@ -79,7 +79,7 @@ public static partial class Bridge
         var typeNameS = r.ReadString16();
         var assemblyS = r.ReadString16();
         var typeS = ResolveType(NullIfEmpty(assemblyS), typeNameS)
-            ?? throw new TypeLoadException($"Type not found: {typeNameS}");
+            ?? throw new TypeLoadException($"Type not found: {typeNameS} (assembly: {assemblyS})");
 
         if (op == 0x03) // constructor
         {
@@ -157,6 +157,24 @@ public static partial class Bridge
         {
             s_handles.TryGetValue(hr.Id, out var obj);
             return obj;
+        }
+        if (value is WinRtRef wr)
+        {
+            if (wr.Ptr == 0) return null;
+            var nativePtr = new IntPtr((long)wr.Ptr);
+            // 1. Typed QI first: works for COM/CsWinRT interface types that carry a
+            //    [Guid] attribute.  More precise than a generic RCW for strongly-typed
+            //    parameters such as Windows.UI.Xaml.UIElement.
+            if (targetType != typeof(object) && targetType.GUID != Guid.Empty)
+            {
+                try { return Marshal.GetTypedObjectForIUnknown(nativePtr, targetType); }
+                catch { }
+            }
+            // 2. Generic RCW: .NET WinRT interop calls IInspectable::GetRuntimeClassName
+            //    and projects to the appropriate CsWinRT type automatically.
+            //    Do NOT swallow the exception — a null return silently breaks the call
+            //    downstream; a thrown exception surfaces a meaningful error instead.
+            return Marshal.GetObjectForIUnknown(nativePtr);
         }
         if (value.GetType() == targetType) return value;
         try { return Convert.ChangeType(value, targetType); }
