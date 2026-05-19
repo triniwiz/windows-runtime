@@ -119,14 +119,16 @@ foreach ($t in $Targets) {
 
     if (-not $SkipRelease) {
         Write-Host "`n=== Release ($arch) ===" -ForegroundColor Cyan
-        Build-Crate -Profile "release" -Target $rustTarget
+        $releaseArgs = @()
+        Build-Crate -Profile "release" -Target $rustTarget -ExtraArgs $releaseArgs
         $dll = Join-Path $RepoRoot "target\$rustTarget\release\nativescript.dll"
         Copy-Dll -Src $dll -Dest (Join-Path $FrameworkLibs "$arch\nativescript.dll")
     }
 
     if (-not $SkipDevtools) {
         Write-Host "`n=== Release-with-devtools ($arch) ===" -ForegroundColor Cyan
-        Build-Crate -Profile "release-with-devtools" -Target $rustTarget -ExtraArgs @("--features", "devtools")
+        $devtoolsArgs = @("--features", "devtools")
+        Build-Crate -Profile "release-with-devtools" -Target $rustTarget -ExtraArgs $devtoolsArgs
         $dll = Join-Path $RepoRoot "target\$rustTarget\release-with-devtools\nativescript.dll"
         Copy-Dll -Src $dll -Dest (Join-Path $FrameworkLibs "devtools\$arch\nativescript.dll")
     }

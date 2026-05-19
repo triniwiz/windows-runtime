@@ -1,4 +1,4 @@
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, CStr, CString, c_void};
 use std::sync::{Once, OnceLock};
 use std::sync::Arc;
 use runtime::Runtime;
@@ -211,6 +211,68 @@ pub extern "C" fn runtime_pump_timers() {
     let _ = std::panic::catch_unwind(|| {
         runtime::timers::pump();
     });
+}
+
+/// Attach a (cached) container visual to the supplied `UIElement` pointer and
+/// return the raw visual pointer as an `i64`. Returns 0 on error.
+#[no_mangle]
+pub extern "C" fn runtime_attach_border_container(element: *mut c_void) -> i64 {
+    if element.is_null() { return 0; }
+    let result = std::panic::catch_unwind(|| {
+        match runtime::composition_border::ensure_container_for_element(element) {
+            Ok(ptr) => ptr,
+            Err(err) => {
+                eprintln!("[NativeScript] runtime_attach_border_container error: {:?}", err);
+                0
+            }
+        }
+    });
+    match result {
+        Ok(v) => v,
+        Err(_) => 0,
+    }
+}
+
+/// Create a border helper instance attached to `element` and return an opaque id.
+#[no_mangle]
+pub extern "C" fn runtime_create_border_instance(element: *mut c_void) -> i64 {
+    if element.is_null() { return 0; }
+    match runtime::composition_border::create_border_instance(element) {
+        Ok(id) => id,
+        Err(err) => {
+            eprintln!("[NativeScript] runtime_create_border_instance error: {:?}", err);
+            0
+        }
+    }
+}
+
+/// Set border on previously created instance. Returns 1 on success, 0 on failure.
+#[no_mangle]
+pub extern "C" fn runtime_set_border(
+    instance_id: i64,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    color: u32,
+    radius_tl: f32,
+    radius_tr: f32,
+    radius_br: f32,
+    radius_bl: f32,
+) -> i32 {
+    match runtime::composition_border::set_border(instance_id, left, top, right, bottom, color, radius_tl, radius_tr, radius_br, radius_bl) {
+        Ok(()) => 1,
+        Err(err) => {
+            eprintln!("[NativeScript] runtime_set_border error: {:?}", err);
+            0
+        }
+    }
+}
+
+/// Free a border instance previously created.
+#[no_mangle]
+pub extern "C" fn runtime_free_border_instance(instance_id: i64) {
+    let _ = runtime::composition_border::free_border_instance(instance_id);
 }
 
 /// Free a string previously returned by `runtime_devtools_start`.

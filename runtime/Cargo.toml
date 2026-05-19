@@ -40,7 +40,13 @@ features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Data_Json",
+    "UI_Composition",
+    "Foundation_Numerics",
+    "Graphics_Imaging",
 ]
+
+[features]
+default = []
 
 [dev-dependencies]
 criterion = "0.5"
