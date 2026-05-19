@@ -1,6 +1,5 @@
 use std::any::Any;
-use std::ptr::addr_of_mut;
-use windows::core::{HSTRING, PCWSTR};
+use std::sync::OnceLock;
 use windows::Win32::System::WinRT::Metadata::{COR_CTOR_METHOD_NAME_W, CorTokenType, IMetaDataImport2};
 use crate::declaration_factory::DeclarationFactory;
 use crate::declarations::base_class_declaration::{BaseClassDeclaration, BaseClassDeclarationImpl};
@@ -17,8 +16,8 @@ const DEFAULT_ATTRIBUTE: &str = "Windows.Foundation.Metadata.DefaultAttribute";
 
 #[derive(Clone)]
 pub struct ClassDeclaration {
-    initializers: Vec<MethodDeclaration>,
-    default_interface: Option<Box<dyn BaseClassDeclarationImpl>>,
+    initializers: OnceLock<Vec<MethodDeclaration>>,
+    default_interface: OnceLock<Option<Box<dyn BaseClassDeclarationImpl>>>,
     base: BaseClassDeclaration,
     base_full_name: String,
 }
@@ -32,29 +31,18 @@ impl ClassDeclaration {
 
         if let Some(metadata) = metadata {
 
-            let mut enumerator = std::ptr::null_mut();
-            let mut count = 0;
-            let mut tokens = [0_u32; 1024];
-
-            let result = unsafe {
+            let tokens = BaseClassDeclaration::collect_enum_tokens(metadata, |enumerator, buffer, buffer_len, count| unsafe {
                 metadata.EnumMembersWithName(
-                    addr_of_mut!(enumerator),
+                    enumerator,
                     token.0 as u32,
                     COR_CTOR_METHOD_NAME_W,
-                    tokens.as_mut_ptr(),
-                    tokens.len() as u32,
-                    &mut count,
+                    buffer,
+                    buffer_len,
+                    count,
                 )
-            };
+            });
 
-            debug_assert!(result.is_ok());
-
-            debug_assert!(count < (tokens.len().saturating_sub(1)) as u32);
-
-            unsafe { metadata.CloseEnum(enumerator) };
-
-            for i in 0..count as usize {
-                let method_token = tokens[i];
+            for method_token in tokens {
 
                 // TODO: Make a InstanceInitializerDeclaration and check this in it's isExported method
                 let mut flags = 0;
@@ -94,37 +82,18 @@ impl ClassDeclaration {
             None => {}
             Some(metadata) => {
 
-                let mut interface_impl_tokens = [0 as u32; 1024];
-                let mut interface_impl_count = 0;
-                let mut interface_enumerator = std::ptr::null_mut();
-                let result = unsafe {
+                let interface_impl_tokens = BaseClassDeclaration::collect_enum_tokens(metadata, |enumerator, buffer, buffer_len, count| unsafe {
                     metadata.EnumInterfaceImpls(
-                        addr_of_mut!(interface_enumerator),
+                        enumerator,
                         token.0 as u32,
-                        interface_impl_tokens.as_mut_ptr(),
-                        interface_impl_tokens.len() as u32,
-                        &mut interface_impl_count,
+                        buffer,
+                        buffer_len,
+                        count,
                     )
-                };
-                debug_assert!(result.is_ok());
+                });
 
-                debug_assert!(interface_impl_count < interface_impl_tokens.len() as u32);
-                unsafe { metadata.CloseEnum(interface_enumerator) };
-                let attr = HSTRING::from(DEFAULT_ATTRIBUTE);
-                let attr = PCWSTR(attr.as_ptr());
-                for i in 0..interface_impl_count as usize {
-                    let interface_impl_token = interface_impl_tokens[i];
-                    let get_custom_attribute_result = unsafe {
-                        metadata
-                            .GetCustomAttributeByName(
-                                interface_impl_token,
-                                attr,
-                                0 as _,
-                                0 as _,
-                            )
-                    };
-                    debug_assert!(get_custom_attribute_result.is_ok());
-                    if get_custom_attribute_result.is_ok() {
+                for interface_impl_token in interface_impl_tokens {
+                    if has_custom_attribute(metadata, CorTokenType(interface_impl_token as i32), DEFAULT_ATTRIBUTE) {
                         let mut interface_token = 0_u32;
                         let result = unsafe {
                             metadata.GetInterfaceImplProps(
@@ -167,14 +136,8 @@ impl ClassDeclaration {
         }
 
         Self {
-            initializers: ClassDeclaration::make_initializer_declarations(
-                metadata.clone(),
-                token,
-            ),
-            default_interface: ClassDeclaration::make_default_interface(
-                metadata.clone(),
-                token,
-            ),
+            initializers: OnceLock::new(),
+            default_interface: OnceLock::new(),
             base: BaseClassDeclaration::new(DeclarationKind::Class, metadata.clone(), token),
             base_full_name,
         }
@@ -185,7 +148,12 @@ impl ClassDeclaration {
     }
 
     pub fn default_interface(&self) -> Option<&InterfaceDeclaration> {
-        self.default_interface.as_ref().map(|f|{
+        self.default_interface.get_or_init(|| {
+            ClassDeclaration::make_default_interface(
+                self.base.base().metadata(),
+                self.base.base().token(),
+            )
+        }).as_ref().map(|f|{
             let f = f.as_declaration();
            let declaration =  f;
             declaration.as_any().downcast_ref::<InterfaceDeclaration>()
@@ -193,7 +161,7 @@ impl ClassDeclaration {
     }
 
     pub fn is_instantiable(&self) -> bool {
-        !self.initializers.is_empty()
+        !self.initializers().is_empty()
     }
 
     pub fn is_sealed(&self) -> bool {
@@ -214,7 +182,12 @@ impl ClassDeclaration {
     }
 
     pub fn initializers(&self) -> &[MethodDeclaration] {
-        self.initializers.as_slice()
+        self.initializers.get_or_init(|| {
+            ClassDeclaration::make_initializer_declarations(
+                self.base.base().metadata(),
+                self.base.base().token(),
+            )
+        })
     }
 }
 

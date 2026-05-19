@@ -3,7 +3,7 @@ use std::mem::MaybeUninit;
 use std::os::windows::prelude::OsStringExt;
 use std::sync::Arc;
 use std::cell::RefCell;
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use parking_lot::{RwLock};
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::RO_E_METADATA_NAME_IS_NAMESPACE;
@@ -26,6 +26,8 @@ use crate::prelude::*;
 thread_local! {
     static DECLARATION_CACHE: RefCell<AHashMap<String, Arc<RwLock<dyn Declaration>>>> =
         RefCell::new(AHashMap::new());
+    static DECLARATION_MISS_CACHE: RefCell<AHashSet<String>> =
+        RefCell::new(AHashSet::new());
 }
 
 
@@ -63,7 +65,17 @@ impl MetadataReader {
             return Some(arc);
         }
 
-        let declaration = MetadataReader::find_by_name_uncached(full_name)?;
+        let known_miss = DECLARATION_MISS_CACHE.with(|cache| cache.borrow().contains(full_name));
+        if known_miss {
+            return None;
+        }
+
+        let Some(declaration) = MetadataReader::find_by_name_uncached(full_name) else {
+            DECLARATION_MISS_CACHE.with(|cache| {
+                cache.borrow_mut().insert(full_name.to_string());
+            });
+            return None;
+        };
         
         DECLARATION_CACHE.with(|cache| {
             cache.borrow_mut().insert(full_name.to_string(), Arc::clone(&declaration));

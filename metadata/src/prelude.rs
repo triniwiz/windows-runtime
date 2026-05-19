@@ -1,12 +1,25 @@
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::fmt::Debug;
 use std::mem::MaybeUninit;
-use windows::core::{GUID, HSTRING, PCSTR, PCWSTR, Type};
+use ahash::AHashMap;
+use windows::core::{GUID, HSTRING, Interface, PCSTR, PCWSTR, Type};
 use windows::Win32::System::WinRT::Metadata::{tdAbstract, tdAnsiClass, tdAutoClass, tdAutoLayout, tdBeforeFieldInit, tdClass, tdClassSemanticsMask, tdCustomFormatClass, tdExplicitLayout, tdForwarder, tdHasSecurity, tdImport, tdInterface, tdLayoutMask, tdNestedAssembly, tdNestedFamANDAssem, tdNestedFamORAssem, tdNestedFamily, tdNestedPrivate, tdNestedPublic, tdNotPublic, tdPublic, tdRTSpecialName, tdSealed, tdSequentialLayout, tdSerializable, tdSpecialName, tdStringFormatMask, tdUnicodeClass, tdVisibilityMask, tdWindowsRuntime, CorTokenType, IMetaDataImport2, mdtTypeDef, mdtTypeRef, mdMemberAccessMask, mdPrivateScope, mdPrivate, mdFamANDAssem, mdAssem, mdFamily, mdFamORAssem, mdPublic, mdStatic, mdFinal, mdVirtual, mdHideBySig, mdVtableLayoutMask, mdReuseSlot, mdNewSlot, mdCheckAccessOnOverride, mdAbstract, mdSpecialName, mdPinvokeImpl, mdUnmanagedExport, mdRTSpecialName, COR_CTOR_METHOD_NAME, COR_CTOR_METHOD_NAME_W, COR_CCTOR_METHOD_NAME, COR_CCTOR_METHOD_NAME_W, mdHasSecurity, mdRequireSecObject, prSpecialName, prHasDefault, prRTSpecialName, RoGetMetaDataFile, IMetaDataDispenserEx, evSpecialName, evRTSpecialName, CorElementType, mdtTypeSpec, mdtBaseType};
 use std::os::windows::prelude::*;
 use std::ptr::addr_of_mut;
 
 pub const LOCALE_SYSTEM_DEFAULT: u32 = 0x0800;
+
+thread_local! {
+    static TYPE_NAME_CACHE: RefCell<AHashMap<(usize, i32), String>> =
+        RefCell::new(AHashMap::new());
+    static GUID_ATTRIBUTE_CACHE: RefCell<AHashMap<(usize, i32), GUID>> =
+        RefCell::new(AHashMap::new());
+}
+
+fn metadata_token_cache_key(metadata: &IMetaDataImport2, token: CorTokenType) -> (usize, i32) {
+    (metadata.as_raw() as usize, token.0)
+}
 
 pub fn cor_sig_uncompress_calling_conv(p_data: &mut PCCOR_SIGNATURE) -> u32 {
     let p_data = &mut p_data.0;
@@ -173,6 +186,11 @@ pub fn get_guid_attribute_value(metadata: Option<&IMetaDataImport2>, token: CorT
     match metadata {
         None => {}
         Some(metadata) => {
+            let cache_key = metadata_token_cache_key(metadata, token);
+            if let Some(cached) = GUID_ATTRIBUTE_CACHE.with(|cache| cache.borrow().get(&cache_key).copied()) {
+                return cached;
+            }
+
             let mut size = 0;
             let mut data = std::ptr::null_mut() as *mut c_void;
             let name = HSTRING::from(GUID_ATTRIBUTE);
@@ -193,6 +211,9 @@ pub fn get_guid_attribute_value(metadata: Option<&IMetaDataImport2>, token: CorT
             // attribute is absent, leaving data == null and size == 0. Guard both
             // to avoid a null-pointer dereference in GetGUID.
             if data.is_null() || size < 2 {
+                GUID_ATTRIBUTE_CACHE.with(|cache| {
+                    cache.borrow_mut().insert(cache_key, guid);
+                });
                 return guid; // zeroed GUID
             }
 
@@ -201,6 +222,10 @@ pub fn get_guid_attribute_value(metadata: Option<&IMetaDataImport2>, token: CorT
             let os_data = unsafe { data.add(2) };
 
             guid = unsafe { crate::get_guid(os_data) };
+
+            GUID_ATTRIBUTE_CACHE.with(|cache| {
+                cache.borrow_mut().insert(cache_key, guid);
+            });
         }
     }
     guid
@@ -327,8 +352,13 @@ pub fn resolve_type_ref(
 
 pub fn get_type_name(metadata: &IMetaDataImport2, token: CorTokenType) -> String {
     assert_ne!(token.0, 0);
+    let cache_key = metadata_token_cache_key(metadata, token);
+    if let Some(cached) = TYPE_NAME_CACHE.with(|cache| cache.borrow().get(&cache_key).cloned()) {
+        return cached;
+    }
+
     let mut length = 0_u32;
-    match CorTokenType(type_from_token(token)) {
+    let name = match CorTokenType(type_from_token(token)) {
         mdtTypeDef => {
             // let result = unsafe { metadata.GetTypeDefProps(token.0 as u32, None, &mut length, 0 as _, 0 as _) };
             // assert!(result.is_ok());
@@ -336,7 +366,7 @@ pub fn get_type_name(metadata: &IMetaDataImport2, token: CorTokenType) -> String
             let mut buf = [0_u16; MAX_IDENTIFIER_LENGTH];
             let result = unsafe { metadata.GetTypeDefProps(token.0 as u32, Some(buf.as_mut_slice()), &mut length, 0 as _, 0 as _) };
             assert!(result.is_ok());
-            return String::from_utf16_lossy(&buf[..length.saturating_sub(1) as usize]);
+            String::from_utf16_lossy(&buf[..length.saturating_sub(1) as usize])
         }
         mdtTypeRef => {
             // let result = unsafe { metadata.GetTypeRefProps(token.0 as u32, 0 as _, None, &mut length) };
@@ -348,12 +378,17 @@ pub fn get_type_name(metadata: &IMetaDataImport2, token: CorTokenType) -> String
             let result = unsafe { metadata.GetTypeRefProps(token.0 as u32, 0 as _, Some(buf.as_mut_slice()), &mut length) };
             assert!(result.is_ok());
 
-            return String::from_utf16_lossy(&buf[..length.saturating_sub(1) as usize]);
+            String::from_utf16_lossy(&buf[..length.saturating_sub(1) as usize])
         }
         _ => {
             unreachable!()
         }
-    }
+    };
+
+    TYPE_NAME_CACHE.with(|cache| {
+        cache.borrow_mut().insert(cache_key, name.clone());
+    });
+    name
 }
 
 
