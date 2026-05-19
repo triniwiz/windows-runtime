@@ -35,7 +35,8 @@ use crate::value::{
     MAX_SAFE_INTEGER, MIN_SAFE_INTEGER,
 };
 use crate::class_helpers::{
-    class_has_member_named, collect_class_methods, collect_class_properties, find_event_methods,
+    class_has_member_named, collect_class_methods, collect_class_properties, find_class_method,
+    find_class_property, find_event_methods,
 };
 use metadata::value::Value;
 use crate::method_call::MethodCall;
@@ -476,17 +477,13 @@ pub(crate) fn handle_instance_property_getter(
         return v8::Intercepted::kNo;
     };
 
-    for property in collect_class_properties(clazz) {
-        if property.name() != name {
-            continue;
-        }
+    if let Some(property) = find_class_property(clazz, &name) {
         let instance_for_call = dec.instance.clone().unwrap();
         let property_call_opt = PropertyCall::new(&property, false, instance_for_call, false);
-        if property_call_opt.is_none() {
-            continue;
-        }
+        let Some(mut property_call) = property_call_opt else {
+            return v8::Intercepted::kNo;
+        };
 
-        let mut property_call = property_call_opt.unwrap();
         let (ret, result) = property_call.call_with_values(scope, &[]);
 
         if ret.is_err() {
@@ -526,14 +523,20 @@ pub(crate) fn handle_instance_property_getter(
         return v8::Intercepted::kNo;
     }
 
-    for method in collect_class_methods(clazz) {
-        let mut method_name = method.overload_name();
-        if method_name.is_empty() {
-            method_name = method.name();
-        }
+    if let Some(method) = find_class_method(clazz, &name) {
+        let cache_key = format!("__nswinrt_method_cache__{}", name);
+        let cache_key = v8::String::new(scope, &cache_key).unwrap();
+        let method_cache = args.holder().get_internal_field(scope, 1).map(|store_field| {
+            unsafe { store_field.cast::<v8::Map>() }
+        });
 
-        if method_name != name {
-            continue;
+        if let Some(store) = method_cache {
+            if let Some(cached) = store.get(scope, cache_key.into()) {
+                if !cached.is_null_or_undefined() {
+                    rv.set(cached);
+                    return v8::Intercepted::kYes;
+                }
+            }
         }
 
         let method_dec = Arc::new(RwLock::new(method.clone()));
@@ -546,7 +549,12 @@ pub(crate) fn handle_instance_property_getter(
             .build(scope)
             .unwrap();
 
-        rv.set(builder.into());
+        let function: Local<v8::Value> = builder.into();
+        if let Some(store) = method_cache {
+            store.set(scope, cache_key.into(), function);
+        }
+
+        rv.set(function);
         return v8::Intercepted::kYes;
     }
 
@@ -578,13 +586,16 @@ pub(crate) fn handle_instance_property_setter(
     {
         use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
         let kind = lock.kind();
-        let (iface_iid, type_args, properties) = match kind {
+        let iface_property = match kind {
             DeclarationKind::Interface => {
                 if let Some(iface) = lock.as_any().downcast_ref::<InterfaceDeclaration>() {
-                    let props = iface.properties().to_vec();
-                    (Some(iface.id()), Vec::<String>::new(), props)
+                    iface.properties()
+                        .iter()
+                        .find(|p| p.name() == name)
+                        .cloned()
+                        .map(|property| (iface.id(), Vec::<String>::new(), property))
                 } else {
-                    (None, Vec::new(), Vec::new())
+                    None
                 }
             }
             DeclarationKind::GenericInterfaceInstance => {
@@ -596,32 +607,34 @@ pub(crate) fn handle_instance_property_setter(
                     } else {
                         Vec::new()
                     };
-                    let props = iface.properties().to_vec();
-                    (Some(iface.id()), type_args, props)
+                    iface.properties()
+                        .iter()
+                        .find(|p| p.name() == name)
+                        .cloned()
+                        .map(|property| (iface.id(), type_args, property))
                 } else {
-                    (None, Vec::new(), Vec::new())
+                    None
                 }
             }
-            _ => (None, Vec::new(), Vec::new()),
+            _ => None,
         };
 
-        if let Some(iid) = iface_iid {
-            for property in properties.iter() {
-                if property.name() != name { continue; }
-                if property.setter().is_none() { break; }
-                let Some(ref instance) = dec.instance else { break; };
-                let Some(mut property_call) = PropertyCall::new_for_interface(
-                    property, true, instance.clone(), false, iid, type_args.clone(),
-                ) else { break; };
-                let (ret, _) = property_call.call_with_values(scope, &[value]);
-                if ret.is_err() {
-                    let detail = format!("Property set '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
-                    let message = v8::String::new(scope, &detail).unwrap();
-                    let error = v8::Exception::error(scope, message);
-                    scope.throw_exception(error);
-                }
-                return v8::Intercepted::kYes;
+        if let Some((iid, type_args, property)) = iface_property {
+            if property.setter().is_none() {
+                return v8::Intercepted::kNo;
             }
+            let Some(ref instance) = dec.instance else { return v8::Intercepted::kNo; };
+            let Some(mut property_call) = PropertyCall::new_for_interface(
+                &property, true, instance.clone(), false, iid, type_args,
+            ) else { return v8::Intercepted::kNo; };
+            let (ret, _) = property_call.call_with_values(scope, &[value]);
+            if ret.is_err() {
+                let detail = format!("Property set '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
+                let message = v8::String::new(scope, &detail).unwrap();
+                let error = v8::Exception::error(scope, message);
+                scope.throw_exception(error);
+            }
+            return v8::Intercepted::kYes;
         }
     }
 
@@ -631,11 +644,7 @@ pub(crate) fn handle_instance_property_setter(
 
 
     // Try WinRT properties first.
-    for property in collect_class_properties(clazz) {
-        if property.name() != name {
-            continue;
-        }
-
+    if let Some(property) = find_class_property(clazz, &name) {
         if property.setter().is_none() {
             return v8::Intercepted::kNo;
         }
@@ -1022,7 +1031,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
     let tmpl = FunctionTemplate::new(scope, handle_ns_func);
     let object_tmpl = tmpl.instance_template(scope);
 
-    object_tmpl.set_internal_field_count(1);
+    object_tmpl.set_internal_field_count(2);
 
     let declaration_ffi = Box::into_raw(Box::new(
         DeclarationFFI::new_with_instance(declaration.clone(), instance.clone()),
@@ -1787,6 +1796,8 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
     };
 
     object.set_internal_field(0, ext.into());
+    let object_store = v8::Map::new(scope);
+    object.set_internal_field(1, object_store.into());
 
     if let Some(handle_key) = v8::String::new(scope, "handle") {
         let handle_value: Local<v8::Value> = if let Some(instance) = instance.as_ref() {

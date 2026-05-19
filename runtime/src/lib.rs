@@ -30,7 +30,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use ahash::{AHasher, AHashSet};
+use ahash::{AHashMap, AHasher, AHashSet};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -391,24 +391,24 @@ fn collect_class_properties(class_declaration: &ClassDeclaration) -> Vec<Propert
 }
 
 struct ClassMembers {
-    properties: HashMap<String, PropertyDeclaration>,
+    properties: AHashMap<String, PropertyDeclaration>,
     /// Keyed by overload name when present, plain name otherwise.
-    methods: HashMap<String, MethodDeclaration>,
+    methods: AHashMap<String, MethodDeclaration>,
 }
 
 /// Per-thread because `PropertyDeclaration` / `MethodDeclaration` carry raw
 /// WinMD pointers that aren't `Send`. UWP runs single-threaded, so this is
 /// effectively a global cache.
-thread_local!(static CLASS_MEMBERS_CACHE: RefCell<HashMap<String, ClassMembers>> = RefCell::new(HashMap::new()));
+thread_local!(static CLASS_MEMBERS_CACHE: RefCell<AHashMap<String, ClassMembers>> = RefCell::new(AHashMap::new()));
 
 fn fill_class_members(
     class_declaration: &ClassDeclaration,
-    properties: &mut HashMap<String, PropertyDeclaration>,
-    methods: &mut HashMap<String, MethodDeclaration>,
+    properties: &mut AHashMap<String, PropertyDeclaration>,
+    methods: &mut AHashMap<String, MethodDeclaration>,
 ) {
     // Use contains_key() before inserting to avoid allocating the String key on every
-    // call when the entry already exists. HashMap<String,V> supports Borrow<str> for
-    // contains_key / get, so the lookup is allocation-free on the common (hit) path.
+    // call when the entry already exists; String-keyed maps can borrow &str for
+    // contains_key / get, so the lookup is allocation-free on the common hit path.
     let mut absorb_props = |list: &[PropertyDeclaration]| {
         for p in list {
             let key = p.name();
@@ -450,7 +450,7 @@ fn with_class_members<R>(class_declaration: &ClassDeclaration, f: impl FnOnce(&C
         let full_name = class_declaration.full_name();
 
         // Fast path: read with a shared borrow — no String allocation for the key.
-        // HashMap<String, V> accepts &str via the Borrow<str> blanket impl.
+        // String-keyed maps accept &str via the Borrow<str> blanket impl.
         {
             let borrow = cache.borrow();
             if let Some(entry) = borrow.get(full_name) {
@@ -461,8 +461,8 @@ fn with_class_members<R>(class_declaration: &ClassDeclaration, f: impl FnOnce(&C
         // Cache miss: build the member maps, then insert.
         // fill_class_members calls itself recursively but never re-enters
         // with_class_members, so the RefCell is free to borrow_mut here.
-        let mut properties = HashMap::new();
-        let mut methods = HashMap::new();
+        let mut properties = AHashMap::new();
+        let mut methods = AHashMap::new();
         fill_class_members(class_declaration, &mut properties, &mut methods);
         let mut borrow = cache.borrow_mut();
         let entry = borrow
@@ -3286,7 +3286,12 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         .build(scope)
                         .unwrap();
 
-                        rv.set(func.into());
+                        let func: Local<v8::Value> = func.into();
+                        if let Some(store_field) = holder.get_internal_field(scope, 1) {
+                            let store = unsafe { store_field.cast::<v8::Map>() };
+                            store.set(scope, key.into(), func);
+                        }
+                        rv.set(func);
                         return v8::Intercepted::kYes;
                     }
 
@@ -3418,7 +3423,12 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         .build(scope)
                         .unwrap();
 
-                        rv.set(func.into());
+                        let func: Local<v8::Value> = func.into();
+                        if let Some(store_field) = holder.get_internal_field(scope, 1) {
+                            let store = unsafe { store_field.cast::<v8::Map>() };
+                            store.set(scope, key.into(), func);
+                        }
+                        rv.set(func);
                         return v8::Intercepted::kYes;
                     }
 
@@ -3541,7 +3551,12 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     .build(scope)
                     .unwrap();
 
-                    rv.set(builder.into());
+                    let func: Local<v8::Value> = builder.into();
+                    if let Some(store_field) = holder.get_internal_field(scope, 1) {
+                        let store = unsafe { store_field.cast::<v8::Map>() };
+                        store.set(scope, key.into(), func);
+                    }
+                    rv.set(func);
                     return v8::Intercepted::kYes;
                 }
 
@@ -5298,7 +5313,12 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                     .build(scope)
                     .unwrap();
 
-                    rv.set(builder.into());
+                    let func: Local<v8::Value> = builder.into();
+                    if let Some(store_field) = holder.get_internal_field(scope, 1) {
+                        let store = unsafe { store_field.cast::<v8::Map>() };
+                        store.set(scope, key.into(), func);
+                    }
+                    rv.set(func);
                     return v8::Intercepted::kYes;
                 }
 
