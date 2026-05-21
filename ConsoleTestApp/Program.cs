@@ -1,7 +1,10 @@
 ﻿using System.Runtime.InteropServices;
 
 #if DEBUG
-const string NativeScriptLibrary = "..\\libs\\devtools\\x64\\nativescript.dll";
+// Use the simple DLL name so the loader resolves the copy placed next to the
+// executable during build. The previous relative path fails when the process
+// working directory differs from the repo root.
+const string NativeScriptLibrary = "nativescript";
 #else
 const string NativeScriptLibrary = "nativescript";
 #endif
@@ -29,12 +32,23 @@ var upperEntry = Path.Combine(baseDir, "App", "main.js");
 string entry = System.IO.File.Exists(lowerEntry) ? lowerEntry : upperEntry;
 Int64 runtime = runtime_init(AppContext.BaseDirectory);
 #if DEBUG
-IntPtr devtoolsPtr = runtime_devtools_start(runtime, 42000);
+IntPtr devtoolsPtr = IntPtr.Zero;
+try {
+	// runtime_devtools_start may not be present in non-devtools builds of the
+	// native DLL; guard the call and continue if the symbol is missing.
+	devtoolsPtr = runtime_devtools_start(runtime, 42000);
+} catch (EntryPointNotFoundException) {
+	devtoolsPtr = IntPtr.Zero;
+}
 if (devtoolsPtr != IntPtr.Zero)
 {
-	var ws = Marshal.PtrToStringUTF8(devtoolsPtr);
-	runtime_free_string(devtoolsPtr);
-	if (!string.IsNullOrEmpty(ws)) Console.WriteLine($"[NativeScript DevTools] {ws}");
+	try {
+		var ws = Marshal.PtrToStringUTF8(devtoolsPtr);
+		try { runtime_free_string(devtoolsPtr); } catch (EntryPointNotFoundException) { }
+		if (!string.IsNullOrEmpty(ws)) Console.WriteLine($"[NativeScript DevTools] {ws}");
+	} catch (Exception) {
+		// Ignore any errors reading the devtools string.
+	}
 }
 #endif
 var script = File.ReadAllText(Path.GetFullPath(entry));

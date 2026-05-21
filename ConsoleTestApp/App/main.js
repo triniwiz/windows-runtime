@@ -127,30 +127,45 @@ function runRuntimeConformanceTests() {
 	console.log(`[TEST SUMMARY] passed=${passed}, failed=${failed}`);
 }
 
-runRuntimeConformanceTests();
-
-// Additional logging tests for console.dir and constructor exception propagation
 try {
-	console.log("[DEBUG] ctor __typeName__:", Windows.Data.Json.JsonObject.__typeName__);
-	console.dir("??", Windows.Data.Json.JsonObject);
-} catch (e) {
-	console.log("[ERROR] console.dir threw:", e && e.message ? e.message : e);
+	runRuntimeConformanceTests();
+}catch (error) {
+	console.log("[ERROR] Test execution threw an error:", error && error.message ? error.message : error);
 }
 
 try {
-	const obj = new Windows.Data.Json.JsonObject();
-	console.log("[DIR-TEST] new JsonObject:", obj);
-	try {
-		console.dir(obj);
-	} catch (e) {
-		console.log("[DIR-TEST] console.dir(obj) threw:", e && e.message ? e.message : e);
-	}
-} catch (e) {
-	console.log("[ERROR] new Windows.Data.Json.JsonObject threw:", e && e.message ? e.message : e);
+	const data = new Windows.Data.Json.JsonObject();
+	console.dir("??", data);
+}catch (error) {
+	console.log("[ERROR] console.dir threw an error:", error && error.message ? error.message : error);
 }
 
 // Optional async sample:
 // const dialog = new Windows.UI.Popups.MessageDialog("Hello from NativeScript Windows template");
+// const dialog = new Windows.UI.Popups.MessageDialog("Hello from NativeScript Windows template");
 // NSWinRT.toPromise(dialog.ShowAsync(), { timeoutMs: 10000 })
 //   .then((result) => console.log("Dialog result:", result))
 //   .catch((error) => console.log("Dialog error:", error));
+
+// Sample: exercise XAML constructor (FontFamily) on UI thread when available.
+try {
+	if (typeof __nsRunOnUIThread === 'function') {
+		__nsRunOnUIThread(function(){
+			try {
+				const ff = new Windows.UI.Xaml.Media.FontFamily('Arial');
+				console.log('FontFamily sample: created', ff && (ff.constructor && ff.constructor.name ? ff.constructor.name : ff));
+			} catch (e) {
+				console.log('FontFamily sample error (UI thread):', e && e.message ? e.message : e);
+			}
+		});
+	} else {
+		try {
+			const ff = new Windows.UI.Xaml.Media.FontFamily('Arial');
+			console.log('FontFamily sample (non-UI): created', ff && (ff.constructor && ff.constructor.name ? ff.constructor.name : ff));
+		} catch (e) {
+			console.log('FontFamily sample error (non-UI thread):', e && e.message ? e.message : e);
+		}
+	}
+} catch (e) {
+	console.log('FontFamily sample failed:', e && e.message ? e.message : e);
+}
