@@ -4,6 +4,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Runtime.InteropServices;
 using System.Runtime.Loader;
 using System.Text.Json;
@@ -125,9 +127,22 @@ public static partial class Bridge
                     dirs.Add(processDir);
 
                     // plugins/ subtree: CLI-managed plugin DLLs live here.
+                    // Check both {processDir}/plugins and {processDir}/../plugins because
+                    // the NS CLI places plugins/ as a sibling of bin/, not inside it.
                     var pluginsDir = Path.Combine(processDir, "plugins");
                     if (Directory.Exists(pluginsDir))
                         try { dirs.AddRange(Directory.GetDirectories(pluginsDir, "*", SearchOption.AllDirectories)); } catch { }
+
+                    var parentDir = Path.GetDirectoryName(processDir);
+                    if (!string.IsNullOrEmpty(parentDir))
+                    {
+                        var parentPlugins = Path.Combine(parentDir, "plugins");
+                        if (Directory.Exists(parentPlugins))
+                        {
+                            dirs.Add(parentPlugins);
+                            try { dirs.AddRange(Directory.GetDirectories(parentPlugins, "*", SearchOption.AllDirectories)); } catch { }
+                        }
+                    }
 
                     // libs/ relative to the app root (alternative convention).
                     var processLibs = Path.Combine(processDir, "libs");
@@ -144,6 +159,118 @@ public static partial class Bridge
         {
             s_assemblySearchDirs = Array.Empty<string>();
         }
+    }
+
+    public static object? RunOnUIThread(int callbackId)
+    {
+        var action = new Action(() =>
+        {
+            unsafe
+            {
+                if (s_jsInvoker == null) return;
+                byte* respPtr = null;
+                int respLen = 0;
+                s_jsInvoker(callbackId, null, 0, &respPtr, &respLen);
+                if (respPtr != null && respLen > 0) Marshal.FreeHGlobal((IntPtr)respPtr);
+            }
+        });
+
+        try
+        {
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                var coreAppType = asm.GetType("Windows.ApplicationModel.Core.CoreApplication");
+                if (coreAppType == null) continue;
+                var mainViewProp = coreAppType.GetProperty("MainView", BindingFlags.Public | BindingFlags.Static);
+                var mainView = mainViewProp?.GetValue(null);
+                if (mainView == null) continue;
+                var dispatcherProp = mainView.GetType().GetProperty("Dispatcher", BindingFlags.Public | BindingFlags.Instance);
+                var dispatcher = dispatcherProp?.GetValue(mainView);
+                if (dispatcher == null) continue;
+
+                var hasAccessProp = dispatcher.GetType().GetProperty("HasThreadAccess", BindingFlags.Public | BindingFlags.Instance);
+                if (hasAccessProp?.GetValue(dispatcher) is true)
+                {
+                    action();
+                    return null;
+                }
+
+                foreach (var m in dispatcher.GetType().GetMethods().Where(m => m.Name == "RunAsync"))
+                {
+                    var parameters = m.GetParameters();
+                    if (parameters.Length != 2) continue;
+                    var enumType = parameters[0].ParameterType;
+                    object priority = enumType.IsEnum ? Enum.ToObject(enumType, 0) : Activator.CreateInstance(enumType)!;
+                    var handlerType = parameters[1].ParameterType;
+                    var mre = new ManualResetEventSlim(false);
+                    var wrapped = new Action(() => { try { action(); } finally { mre.Set(); } });
+                    try
+                    {
+                        var d = Delegate.CreateDelegate(handlerType, wrapped.Target, wrapped.Method);
+                        m.Invoke(dispatcher, new object[] { priority, d });
+                        mre.Wait();
+                        return null;
+                    }
+                    catch { }
+                }
+                break;
+            }
+        }
+        catch { }
+
+        try
+        {
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                var dqType = asm.GetType("Microsoft.UI.Dispatching.DispatcherQueue");
+                if (dqType == null) continue;
+                var getForCurrent = dqType.GetMethod("GetForCurrentThread", BindingFlags.Public | BindingFlags.Static);
+                var dq = getForCurrent?.Invoke(null, null);
+                if (dq == null) continue;
+
+                if (dq.GetType().GetProperty("HasThreadAccess")?.GetValue(dq) is true)
+                {
+                    action();
+                    return null;
+                }
+                break;
+            }
+        }
+        catch { }
+
+        try
+        {
+            var wpfDispatcherType = AppDomain.CurrentDomain.GetAssemblies()
+                .Select(a => a.GetType("System.Windows.Threading.Dispatcher"))
+                .FirstOrDefault(t => t != null);
+            if (wpfDispatcherType != null)
+            {
+                var currentDispatcherProp = wpfDispatcherType.GetProperty("CurrentDispatcher", BindingFlags.Public | BindingFlags.Static);
+                var dispatcher = currentDispatcherProp?.GetValue(null);
+                if (dispatcher != null)
+                {
+                    var checkAccess = dispatcher.GetType().GetMethod("CheckAccess");
+                    if (checkAccess?.Invoke(dispatcher, null) is true)
+                    {
+                        action();
+                        return null;
+                    }
+                    var beginInvoke = dispatcher.GetType().GetMethod("BeginInvoke", new[] { typeof(Action) })
+                        ?? dispatcher.GetType().GetMethods().FirstOrDefault(m => m.Name == "BeginInvoke" && m.GetParameters().Length == 1);
+                    if (beginInvoke != null)
+                    {
+                        var mre = new ManualResetEventSlim(false);
+                        beginInvoke.Invoke(dispatcher, new object[] { new Action(() => { try { action(); } finally { mre.Set(); } }) });
+                        mre.Wait();
+                        return null;
+                    }
+                }
+            }
+        }
+        catch { }
+
+        action();
+        return null;
     }
 
     private static Assembly? OnAssemblyResolve(object? sender, ResolveEventArgs args)

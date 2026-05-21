@@ -46,7 +46,7 @@ internal readonly struct CtorEntry(ConstructorInfo? ctor, ParameterInfo[] parame
     public readonly ParameterInfo[]  Parameters = parameters;
 }
 
-internal enum DispatchKind : byte { Void, Primitive, Handle, Collection, Members }
+internal enum DispatchKind : byte { Void, Primitive, Handle, Collection, Members, TaskHandle }
 
 internal readonly struct DispatchResult
 {
@@ -86,6 +86,9 @@ internal readonly struct DispatchResult
     public static DispatchResult Handle(int id, string typeName)
         => new(DispatchKind.Handle, null, null, id, typeName, null, null, null, null);
 
+    public static DispatchResult TaskHandle(int id, string typeName)
+        => new(DispatchKind.TaskHandle, null, null, id, typeName, null, null, null, null);
+
     public static DispatchResult Collection(IEnumerable items)
         => new(DispatchKind.Collection, items, null, 0, null, null, null, null, null);
 
@@ -115,6 +118,14 @@ internal readonly struct DispatchResult
                 w.WriteStartObject();
                 w.WriteNumber("__handle"u8, _handle);
                 w.WriteString("__type"u8,   _typeName);
+                w.WriteEndObject();
+                break;
+
+            case DispatchKind.TaskHandle:
+                w.WriteStartObject();
+                w.WriteNumber("__handle"u8, _handle);
+                w.WriteString("__type"u8,   _typeName);
+                w.WriteBoolean("__isTask"u8, true);
                 w.WriteEndObject();
                 break;
 
@@ -171,6 +182,12 @@ internal readonly struct DispatchResult
 
             case DispatchKind.Handle:
                 w.WriteByte(0x06);
+                w.WriteI32(_handle);
+                w.WriteString16(_typeName ?? "");
+                break;
+
+            case DispatchKind.TaskHandle:
+                w.WriteByte(0x0C);
                 w.WriteI32(_handle);
                 w.WriteString16(_typeName ?? "");
                 break;

@@ -42,6 +42,18 @@ public static partial class Bridge
         if (method == "__members__")
             return BuildMembersResult(type);
 
+        if (method == "__dotnet_await__" && req.Handle.HasValue)
+        {
+            var a = req.Args ?? [];
+            if (a.Length >= 2)
+            {
+                var resolveId = (int)a[0].GetInt64();
+                var rejectId  = (int)a[1].GetInt64();
+                ScheduleTaskContinuation(req.Handle.Value, resolveId, rejectId);
+            }
+            return DispatchResult.Void;
+        }
+
         if (method == ".ctor")
         {
             var argElems = req.Args ?? [];
@@ -220,6 +232,12 @@ public static partial class Bridge
             || t == typeof(TimeSpan) || t == typeof(Guid))
             return DispatchResult.Primitive(value, t);
 
+        if (t.IsEnum)
+        {
+            var ut = Enum.GetUnderlyingType(t);
+            return DispatchResult.Primitive(Convert.ChangeType(value, ut), ut);
+        }
+
         if (t.IsArray || (t != typeof(string) && value is IEnumerable))
         {
             try { return DispatchResult.Collection((IEnumerable)value); }
@@ -228,7 +246,22 @@ public static partial class Bridge
 
         var id = Interlocked.Increment(ref s_nextHandle);
         s_handles[id] = value;
-        return DispatchResult.Handle(id, t.FullName ?? t.Name);
+        var typeName = t.FullName ?? t.Name;
+        return IsAwaitable(value, t)
+            ? DispatchResult.TaskHandle(id, typeName)
+            : DispatchResult.Handle(id, typeName);
+    }
+
+    private static bool IsAwaitable(object value, Type t)
+    {
+        if (value is Task || value is ValueTask) return true;
+        if (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(ValueTask<>)) return true;
+        if ((t.FullName ?? "").StartsWith("Windows.Foundation.IAsync", StringComparison.Ordinal)) return true;
+        foreach (var iface in t.GetInterfaces())
+            if ((iface.FullName ?? "").StartsWith("Windows.Foundation.IAsync", StringComparison.Ordinal)) return true;
+        return t.GetMethod("GetAwaiter",
+                   BindingFlags.Public | BindingFlags.Instance,
+                   null, Type.EmptyTypes, null) is not null;
     }
 
     internal static DispatchResult BuildMembersResult(Type t)

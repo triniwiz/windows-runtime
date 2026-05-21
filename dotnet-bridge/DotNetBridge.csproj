@@ -16,5 +16,11 @@
          host process is already running on net10. LatestMajor accepts any version >= 9. -->
     <RollForward>LatestMajor</RollForward>
   </PropertyGroup>
-
+  <Target Name="WriteDotNetToolDone" AfterTargets="Publish">
+    <PropertyGroup>
+      <DotNetToolDoneFile>$(MSBuildProjectDirectory)\publish\.dotnet_tool_done</DotNetToolDoneFile>
+    </PropertyGroup>
+    <MakeDir Directories="$(MSBuildProjectDirectory)\publish" Condition="!Exists('$(MSBuildProjectDirectory)\publish')" />
+    <WriteLinesToFile File="$(DotNetToolDoneFile)" Lines="done" Overwrite="true" />
+  </Target>
 </Project>
