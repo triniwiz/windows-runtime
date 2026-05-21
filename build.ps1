@@ -8,7 +8,7 @@ param(
     [switch]$RunSBG = $false,
     [switch]$Clean = $false,
     [switch]$BuildNativeLibs = $true,
-    [ValidateSet("x64", "x86", "arm64", "all")]
+    [ValidateSet("x64", "arm64", "all")]
     [string]$NativeArch = "all"
 )
 
@@ -54,7 +54,6 @@ function Build-NativeLibraries {
 
     $allTargets = @(
         @{ RustTarget = "x86_64-pc-windows-msvc"; ArchFolder = "x64" },
-        @{ RustTarget = "i686-pc-windows-msvc"; ArchFolder = "x86" },
         @{ RustTarget = "aarch64-pc-windows-msvc"; ArchFolder = "arm64" }
     )
 
