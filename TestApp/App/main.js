@@ -146,3 +146,26 @@ try {
 // NSWinRT.toPromise(dialog.ShowAsync(), { timeoutMs: 10000 })
 //   .then((result) => console.log("Dialog result:", result))
 //   .catch((error) => console.log("Dialog error:", error));
+
+// Sample: exercise XAML constructor (FontFamily) on UI thread when available.
+try {
+	if (typeof __nsRunOnUIThread === 'function') {
+		__nsRunOnUIThread(function(){
+			try {
+				const ff = new Windows.UI.Xaml.Media.FontFamily('Arial');
+				console.log('FontFamily sample: created', ff && (ff.constructor && ff.constructor.name ? ff.constructor.name : ff));
+			} catch (e) {
+				console.log('FontFamily sample error (UI thread):', e && e.message ? e.message : e);
+			}
+		});
+	} else {
+		try {
+			const ff = new Windows.UI.Xaml.Media.FontFamily('Arial');
+			console.log('FontFamily sample (non-UI): created', ff && (ff.constructor && ff.constructor.name ? ff.constructor.name : ff));
+		} catch (e) {
+			console.log('FontFamily sample error (non-UI thread):', e && e.message ? e.message : e);
+		}
+	}
+} catch (e) {
+	console.log('FontFamily sample failed:', e && e.message ? e.message : e);
+}

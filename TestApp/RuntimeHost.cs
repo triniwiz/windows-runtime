@@ -39,6 +39,16 @@ namespace TestApp
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_has_devtools))]
         private static extern bool runtime_has_devtools();
 
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_pump_timers))]
+        private static extern void runtime_pump_timers();
+
+        public void PumpTimers()
+        {
+            if (!_initialized) return;
+            try { runtime_pump_timers(); }
+            catch { }
+        }
+
 #if DEBUG
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_devtools_start))]
         private static extern IntPtr runtime_devtools_start(long runtime, ushort port);

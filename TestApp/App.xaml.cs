@@ -1,146 +1,124 @@
 ﻿using System;
-using System.Diagnostics;
-using System.Runtime.InteropServices;
 using Windows.ApplicationModel;
 using Windows.ApplicationModel.Activation;
 using Windows.Storage;
 using Windows.UI.Xaml;
 using Windows.UI.Xaml.Navigation;
 
-
 namespace TestApp
 {
-    /// <summary>
-    /// Provides application-specific behavior to supplement the default Application class.
-    /// </summary>
-    /// 
-
     sealed partial class App : Application
     {
-        [DllImport("kernel32.dll")]
-        private static extern bool AttachConsole(int dwProcessId);
-        private const int ATTACH_PARENT_PROCESS = -1;
         private const string LastLaunchArgsKey = "LastLaunchArgs";
         private readonly RuntimeHost _runtimeHost = new RuntimeHost();
-        private string _lastLaunchArgs = string.Empty;
 
         public App()
         {
-            this.InitializeComponent();
+            CrashDiagnostics.InstallGlobalHandlers();
             this.Suspending += OnSuspending;
+            this.UnhandledException += OnUnhandledException;
         }
 
-        /// <summary>
-        /// Invoked when the application is launched normally by the end user.  Other entry points
-        /// will be used such as when the application is launched to open a specific file.
-        /// </summary>
-        /// <param name="e">Details about the launch request and process.</param>
-        protected override void OnLaunched(LaunchActivatedEventArgs e)
+        protected override async void OnLaunched(LaunchActivatedEventArgs e)
         {
-            _lastLaunchArgs = e.Arguments ?? string.Empty;
+            _runtimeHost.Initialize();
 
-            // Attach to parent console (if any) so early logs go to console when
-            // the app is launched from a terminal. Runtime must start on the
-            // main thread; perform synchronous startup and keep best-effort logging.
-            AttachConsole(ATTACH_PARENT_PROCESS);
-            LogSync("[TestApp] OnLaunched: starting runtime initialization");
+            // Capture before any await — continuations may resume on a thread pool thread.
+            var dispatcher = Window.Current.Dispatcher;
+
+            // Show crash report from the previous run if one exists.
             try
             {
-                _runtimeHost.Initialize();
-                LogSync("[TestApp] Runtime initialized");
+                var panicLogPath = System.IO.Path.Combine(
+                    ApplicationData.Current.LocalFolder.Path, "nativescript-panic.log");
+                if (System.IO.File.Exists(panicLogPath))
+                {
+                    var content = System.IO.File.ReadAllText(panicLogPath);
+                    System.IO.File.Delete(panicLogPath);
+                    if (!string.IsNullOrWhiteSpace(content))
+                        await CrashDiagnostics.ShowCrashDialogAsync("Crash from previous run", content);
+                }
+            }
+            catch { }
 
+            string jsError = null;
+            try
+            {
                 _runtimeHost.RunMainScript();
-                LogSync("[TestApp] RunMainScript completed");
+                jsError = _runtimeHost.GetLastJsError();
+                if (!string.IsNullOrEmpty(jsError))
+                {
+                    CrashDiagnostics.WriteMessage("JS Error", jsError);
+                    var report = CrashDiagnostics.BuildErrorReport(null, jsError);
+                    CrashDiagnostics.WriteToTraceLog(report);
+                    await CrashDiagnostics.ShowCrashDialogAsync("JavaScript Error", report);
+                }
             }
-            catch (Exception ex)
+            catch (Exception scriptEx)
             {
-                LogSync($"[TestApp] Runtime startup failed: {ex}");
+                jsError = _runtimeHost.GetLastJsError();
+                System.Diagnostics.Debug.WriteLine($"[NativeScript] Script exception: {scriptEx.Message}");
+                CrashDiagnostics.WriteExceptionReport("RunMainScript", scriptEx, null);
+                var report = CrashDiagnostics.BuildErrorReport(scriptEx, jsError);
+                CrashDiagnostics.WriteToTraceLog(report);
+                await CrashDiagnostics.ShowCrashDialogAsync("Script Execution Error", report);
             }
 
-#if DEBUG
-            Windows.UI.Xaml.Media.CompositionTarget.Rendering += OnRenderFrame;
-#endif
-
-            if (e.PreviousExecutionState == ApplicationExecutionState.Terminated
-                && ApplicationData.Current.LocalSettings.Values.TryGetValue(LastLaunchArgsKey, out object value))
+            // After any await, the continuation may run on a thread pool thread.
+            // Schedule all UI-thread-required operations through the dispatcher.
+            _ = dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
             {
-                _lastLaunchArgs = value as string ?? _lastLaunchArgs;
-            }
+                Windows.UI.Xaml.Media.CompositionTarget.Rendering += OnRenderFrame;
 
-            if (!e.PrelaunchActivated)
-            {
-                Window.Current.Activate();
-            }
+                if (Window.Current.Content == null)
+                {
+                    Window.Current.Content = new Windows.UI.Xaml.Controls.TextBlock
+                    {
+                        Text = "NativeScript runtime initialized but no UI was rendered.\n" +
+                               "Check the Output window for JS errors.",
+                        Margin = new Windows.UI.Xaml.Thickness(20),
+                        TextWrapping = Windows.UI.Xaml.TextWrapping.Wrap,
+                        FontSize = 16,
+                    };
+                }
+
+                if (!e.PrelaunchActivated)
+                {
+                    Window.Current.Activate();
+                }
+            });
         }
 
-        private static void LogSync(string message)
-        {
-            try
-            {
-                var timestamped = $"{DateTime.UtcNow:O} {message}\r\n";
-
-                // Best-effort: try app LocalFolder path, then temp folder, then Debug.
-                try
-                {
-                    var localFolder = ApplicationData.Current.LocalFolder;
-                    var localPath = localFolder.Path; // best-effort synchronous write
-                    var localFile = System.IO.Path.Combine(localPath, "ns_testapp.log");
-                    System.IO.File.AppendAllText(localFile, timestamped);
-                }
-                catch
-                {
-                    // Ignore failures to write to LocalFolder.
-                }
-
-                try
-                {
-                    var tmp = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "ns_testapp_host.log");
-                    System.IO.File.AppendAllText(tmp, timestamped);
-                }
-                catch
-                {
-                }
-
-                Debug.WriteLine(message);
-
-                try { Console.WriteLine(timestamped); } catch { }
-            }
-            catch
-            {
-                // Swallow any logging exceptions.
-            }
-        }
-
-        /// <summary>
-        /// Invoked when Navigation to a certain page fails
-        /// </summary>
-        /// <param name="sender">The Frame which failed navigation</param>
-        /// <param name="e">Details about the navigation failure</param>
-        void OnNavigationFailed(object sender, NavigationFailedEventArgs e)
-        {
-            throw new Exception("Failed to load Page " + e.SourcePageType.FullName);
-        }
-
-        /// <summary>
-        /// Invoked when application execution is being suspended.  Application state is saved
-        /// without knowing whether the application will be terminated or resumed with the contents
-        /// of memory still intact.
-        /// </summary>
-        /// <param name="sender">The source of the suspend request.</param>
-        /// <param name="e">Details about the suspend request.</param>
         private void OnSuspending(object sender, SuspendingEventArgs e)
         {
             var deferral = e.SuspendingOperation.GetDeferral();
-#if DEBUG
             Windows.UI.Xaml.Media.CompositionTarget.Rendering -= OnRenderFrame;
-#endif
-            ApplicationData.Current.LocalSettings.Values[LastLaunchArgsKey] = _lastLaunchArgs;
+            ApplicationData.Current.LocalSettings.Values[LastLaunchArgsKey] = string.Empty;
             _runtimeHost.Dispose();
             deferral.Complete();
         }
 
+        private void OnUnhandledException(object sender, Windows.UI.Xaml.UnhandledExceptionEventArgs e)
+        {
+            e.Handled = true;
+            var jsError = _runtimeHost.GetLastJsError();
+            CrashDiagnostics.WriteExceptionReport(
+                "Xaml.UnhandledException",
+                e.Exception,
+                "JsError=" + (jsError ?? "<none>"));
+
+            var report = CrashDiagnostics.BuildErrorReport(e.Exception, jsError);
+            CrashDiagnostics.WriteToTraceLog(report);
+            var _ = CrashDiagnostics.ShowCrashDialogAsync(
+                e.Message ?? "Unhandled exception", report);
+        }
+
+        private void OnRenderFrame(object sender, object e)
+        {
+            _runtimeHost.PumpTimers();
 #if DEBUG
-        private void OnRenderFrame(object sender, object e) => _runtimeHost.PumpDevtools();
+            _runtimeHost.PumpDevtools();
 #endif
+        }
     }
 }
