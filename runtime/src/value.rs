@@ -1068,4 +1068,233 @@ pub unsafe fn set_ret_val(value:*mut c_void, scope: &mut v8::PinScope<'_, '_>, m
         }
     }
 }
+
+/// Read a native value from a raw pointer and convert it to a V8 value.
+/// `ptr` must point to storage containing the native representation (e.g. u32, HSTRING, pointer, struct bytes).
+pub unsafe fn read_value_from_ptr<'a>(ptr: *const c_void, scope: &mut v8::PinScope<'a, '_>, native_type: NativeType) -> v8::Local<'a, v8::Value> {
+    match native_type {
+        NativeType::Void => v8::undefined(scope).into(),
+        NativeType::Bool => {
+            let b = std::ptr::read_unaligned(ptr as *const u8) != 0u8;
+            v8::Boolean::new(scope, b).into()
+        }
+        NativeType::U8 => {
+            let v = std::ptr::read_unaligned(ptr as *const u8);
+            v8::Integer::new_from_unsigned(scope, v as u32).into()
+        }
+        NativeType::I8 => {
+            let v = std::ptr::read_unaligned(ptr as *const i8);
+            v8::Integer::new(scope, v as i32).into()
+        }
+        NativeType::U16 => {
+            let v = std::ptr::read_unaligned(ptr as *const u16);
+            v8::Integer::new_from_unsigned(scope, v as u32).into()
+        }
+        NativeType::I16 => {
+            let v = std::ptr::read_unaligned(ptr as *const i16);
+            v8::Integer::new(scope, v as i32).into()
+        }
+        NativeType::U32 => {
+            let v = std::ptr::read_unaligned(ptr as *const u32);
+            v8::Integer::new_from_unsigned(scope, v).into()
+        }
+        NativeType::I32 => {
+            let v = std::ptr::read_unaligned(ptr as *const i32);
+            v8::Integer::new(scope, v).into()
+        }
+        NativeType::U64 => {
+            let ret = std::ptr::read_unaligned(ptr as *const u64);
+            if ret > MAX_SAFE_INTEGER as u64 {
+                v8::BigInt::new_from_u64(scope, ret).into()
+            } else {
+                v8::Number::new(scope, ret as f64).into()
+            }
+        }
+        NativeType::I64 => {
+            let ret = std::ptr::read_unaligned(ptr as *const i64);
+            if ret > MAX_SAFE_INTEGER as i64 || ret < MIN_SAFE_INTEGER as i64 {
+                v8::BigInt::new_from_i64(scope, ret).into()
+            } else {
+                v8::Number::new(scope, ret as f64).into()
+            }
+        }
+        NativeType::USize => {
+            let ret = std::ptr::read_unaligned(ptr as *const usize);
+            if ret > MAX_SAFE_INTEGER as usize {
+                v8::BigInt::new_from_u64(scope, ret as u64).into()
+            } else {
+                v8::Number::new(scope, ret as f64).into()
+            }
+        }
+        NativeType::ISize => {
+            let ret = std::ptr::read_unaligned(ptr as *const isize);
+            if !(MIN_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&ret) {
+                v8::BigInt::new_from_i64(scope, ret as i64).into()
+            } else {
+                v8::Number::new(scope, ret as f64).into()
+            }
+        }
+        NativeType::F32 => {
+            let bits = std::ptr::read_unaligned(ptr as *const u32);
+            let ret = f32::from_bits(bits);
+            v8::Number::new(scope, ret as f64).into()
+        }
+        NativeType::F64 => {
+            let bits = std::ptr::read_unaligned(ptr as *const u64);
+            let ret = f64::from_bits(bits);
+            v8::Number::new(scope, ret).into()
+        }
+        NativeType::Pointer => {
+            let p = std::ptr::read_unaligned(ptr as *const *mut c_void);
+            if p.is_null() { v8::null(scope).into() } else { v8::External::new(scope, p).into() }
+        }
+        NativeType::Buffer => {
+            let p = std::ptr::read_unaligned(ptr as *const *mut c_void);
+            if p.is_null() { v8::null(scope).into() } else { v8::External::new(scope, p).into() }
+        }
+        NativeType::Function => {
+            let p = std::ptr::read_unaligned(ptr as *const *mut c_void);
+            if p.is_null() { v8::null(scope).into() } else { v8::External::new(scope, p).into() }
+        }
+        NativeType::Struct(_) => {
+            // Expose as External pointing to the struct bytes
+            if ptr.is_null() { v8::null(scope).into() } else { v8::External::new(scope, ptr as *mut c_void).into() }
+        }
+        NativeType::String => {
+            if ptr.is_null() {
+                v8::undefined(scope).into()
+            } else {
+                let raw_usize = std::ptr::read_unaligned(ptr as *const usize);
+                let hstring: HSTRING = std::mem::transmute(raw_usize);
+                let s = hstring.to_string_lossy();
+                drop(hstring);
+                v8::String::new(scope, &s).unwrap_or_else(|| v8::String::empty(scope)).into()
+            }
+        }
+    }
+}
+
+/// Initialize caller-allocated out-slot storage from a V8 value.
+/// Writes the native representation for `native_type` into `dst`.
+/// Returns Ok(Some(parse_type)) when the slot should be treated as having that parse type
+/// for later string-cloning logic (e.g. NativeType::String), Ok(None) when no parse-type
+/// should be set, or Err(...) on parse errors.
+pub fn write_v8_value_to_ptr(
+    scope: &mut v8::PinScope<'_, '_>,
+    arg: v8::Local<v8::Value>,
+    dst: *mut c_void,
+    native_type: &NativeType,
+) -> std::result::Result<Option<NativeType>, AnyError> {
+    use std::ptr::{write_unaligned, copy_nonoverlapping};
+    match native_type {
+        NativeType::Bool => {
+            let nv = ffi_parse_bool_arg(arg)?;
+            unsafe { write_unaligned(dst as *mut u8, nv.bool_value as u8); }
+            Ok(Some(NativeType::Bool))
+        }
+        NativeType::U8 => {
+            let nv = ffi_parse_u8_arg(arg)?;
+            unsafe { write_unaligned(dst as *mut u8, nv.u8_value); }
+            Ok(Some(NativeType::U8))
+        }
+        NativeType::I8 => {
+            let nv = ffi_parse_i8_arg(arg)?;
+            unsafe { write_unaligned(dst as *mut i8, nv.i8_value); }
+            Ok(Some(NativeType::I8))
+        }
+        NativeType::U16 => {
+            let nv = ffi_parse_u16_arg(arg)?;
+            unsafe { write_unaligned(dst as *mut u16, nv.u16_value); }
+            Ok(Some(NativeType::U16))
+        }
+        NativeType::I16 => {
+            let nv = ffi_parse_i16_arg(arg)?;
+            unsafe { write_unaligned(dst as *mut i16, nv.i16_value); }
+            Ok(Some(NativeType::I16))
+        }
+        NativeType::U32 => {
+            let nv = ffi_parse_u32_arg(arg)?;
+            unsafe { write_unaligned(dst as *mut u32, nv.u32_value); }
+            Ok(Some(NativeType::U32))
+        }
+        NativeType::I32 => {
+            let nv = ffi_parse_i32_arg(arg)?;
+            unsafe { write_unaligned(dst as *mut i32, nv.i32_value); }
+            Ok(Some(NativeType::I32))
+        }
+        NativeType::U64 => {
+            let nv = ffi_parse_u64_arg(scope, arg)?;
+            unsafe { write_unaligned(dst as *mut u64, nv.u64_value); }
+            Ok(Some(NativeType::U64))
+        }
+        NativeType::I64 => {
+            let nv = ffi_parse_i64_arg(scope, arg)?;
+            unsafe { write_unaligned(dst as *mut i64, nv.i64_value); }
+            Ok(Some(NativeType::I64))
+        }
+        NativeType::USize => {
+            let nv = ffi_parse_usize_arg(scope, arg)?;
+            unsafe { write_unaligned(dst as *mut usize, nv.usize_value); }
+            Ok(Some(NativeType::USize))
+        }
+        NativeType::ISize => {
+            let nv = ffi_parse_isize_arg(scope, arg)?;
+            unsafe { write_unaligned(dst as *mut isize, nv.isize_value); }
+            Ok(Some(NativeType::ISize))
+        }
+        NativeType::F32 => {
+            let nv = ffi_parse_f32_arg(arg)?;
+            unsafe { write_unaligned(dst as *mut f32, nv.f32_value); }
+            Ok(Some(NativeType::F32))
+        }
+        NativeType::F64 => {
+            let nv = ffi_parse_f64_arg(arg)?;
+            unsafe { write_unaligned(dst as *mut f64, nv.f64_value); }
+            Ok(Some(NativeType::F64))
+        }
+        NativeType::Pointer | NativeType::Buffer | NativeType::Function => {
+            let nv = ffi_parse_pointer_arg(scope, arg)?;
+            unsafe { write_unaligned(dst as *mut *mut c_void, nv.pointer); }
+            Ok(Some(NativeType::Pointer))
+        }
+        NativeType::Struct(_) => {
+            // Copy struct bytes from an ArrayBuffer/ArrayBufferView or other struct source
+            let nv = ffi_parse_struct_arg(scope, arg)?;
+            let src = unsafe { nv.pointer as *const u8 };
+            let size = native_type.size();
+            unsafe { copy_nonoverlapping(src, dst as *mut u8, size); }
+            Ok(Some(native_type.clone()))
+        }
+        NativeType::String => {
+            // If the JS object carries an __hstring_ptr External, clone it.
+            if arg.is_object() {
+                if let Some(obj) = arg.to_object(scope) {
+                    if let Some(key) = v8::String::new(scope, "__hstring_ptr") {
+                        if let Some(val) = obj.get(scope, key.into()) {
+                            if let Ok(ext) = v8::Local::<v8::External>::try_from(val) {
+                                let raw = ext.value() as *const HSTRING;
+                                if !raw.is_null() {
+                                    let hclone = unsafe { (*raw).clone() };
+                                    let raw_usize: usize = unsafe { std::mem::transmute(hclone) };
+                                    unsafe { write_unaligned(dst as *mut usize, raw_usize); }
+                                    return Ok(Some(NativeType::String));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Fallback: convert JS string -> HSTRING and store raw handle (transfer ownership)
+            let s = v8::Local::<v8::String>::try_from(arg)
+                .map_err(|_| type_error("Invalid FFI String type, expected String"))?;
+            let rust = s.to_rust_string_lossy(scope);
+            let h: HSTRING = HSTRING::from(rust.as_str());
+            let raw_usize: usize = unsafe { std::mem::transmute(h) };
+            unsafe { write_unaligned(dst as *mut usize, raw_usize); }
+            Ok(Some(NativeType::String))
+        }
+        NativeType::Void => Ok(None),
+    }
+}
     

@@ -32,7 +32,7 @@ use crate::value::{
     ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg,
     ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg,
     ffi_parse_u8_arg, ffi_parse_usize_arg, set_ret_val, NativeType, NativeValue,
-    MAX_SAFE_INTEGER, MIN_SAFE_INTEGER,
+    MAX_SAFE_INTEGER, MIN_SAFE_INTEGER, read_value_from_ptr,
 };
 use crate::class_helpers::{
     class_has_member_named, collect_class_methods, collect_class_properties, find_class_method,
@@ -201,7 +201,7 @@ pub(crate) fn handle_named_property_getter(
 
                             let builder = v8::Function::builder(|scope: &mut v8::PinScope<'_, '_>,
                                                                  args: v8::FunctionCallbackArguments,
-                                                                 _retval: v8::ReturnValue| {
+                                                                 mut retval: v8::ReturnValue| {
                                 let dec = unsafe { args.data().cast::<v8::External>() };
                                 let dec = dec.value() as *mut DeclarationFFI;
                                 let dec = unsafe { &*dec };
@@ -209,7 +209,66 @@ pub(crate) fn handle_named_property_getter(
                                 let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
                                 let instance = dec.instance.clone().unwrap();
                                 let mut method = MethodCall::new(method, method.is_sealed(), instance, false);
-                                let (_ret, _result) = method.call(scope, &args);
+                                let (ret, result, _outs) = method.call(scope, &args);
+
+                                if ret.is_err() {
+                                    let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                    let msg = v8::String::new(scope, &detail).unwrap();
+                                    let err = v8::Exception::error(scope, msg);
+                                    scope.throw_exception(err);
+                                    return;
+                                }
+
+                                if method.is_void() {
+                                    retval.set_undefined();
+                                    return;
+                                }
+
+                                let return_sig = method.return_type().to_string();
+                                let mut return_value_opt: Option<Local<v8::Value>> = None;
+
+                                if return_sig.contains('.') {
+                                    if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
+                                        if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                            let obj = crate::create_struct_object_from_raw(declaration, result, scope).into();
+                                            return_value_opt = Some(obj);
+                                        } else if !result.is_null() {
+                                            let instance = unsafe { IUnknown::from_raw(result) };
+                                            let ret: Local<v8::Value> = create_ns_ctor_instance_object(
+                                                return_sig.as_str(), None, dec.parent.clone(), declaration, Some(instance), scope,
+                                            ).into();
+                                            return_value_opt = Some(ret);
+                                        } else {
+                                            return_value_opt = Some(v8::null(scope).into());
+                                        }
+                                    }
+                                }
+
+                                if return_value_opt.is_none() {
+                                    if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+                                        let v = unsafe { read_value_from_ptr(result as *const c_void, scope, return_type) };
+                                        return_value_opt = Some(v);
+                                    }
+                                }
+
+                                if !_outs.is_empty() {
+                                    let mut arr_len = _outs.len();
+                                    if return_value_opt.is_some() { arr_len += 1; }
+                                    let arr = v8::Array::new(scope, arr_len as i32);
+                                    let mut idx = 0u32;
+                                    if let Some(rv) = return_value_opt {
+                                        arr.set_index(scope, idx, rv);
+                                        idx += 1;
+                                    }
+                                    for outv in _outs.into_iter() {
+                                        arr.set_index(scope, idx, outv);
+                                        idx += 1;
+                                    }
+                                    retval.set(arr.into());
+                                    return;
+                                }
+
+                                if let Some(rv) = return_value_opt { retval.set(rv); }
                             })
                             .data(ext.into())
                             .build(scope);
@@ -416,7 +475,8 @@ fn instance_method_dispatch(
     let lock = dec.read();
     let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
     let mut method = MethodCall::new(method, method.is_sealed(), dec.instance.clone().unwrap(), false);
-    let (ret, result) = method.call(scope, &args);
+    let (ret, result, _outs) = method.call(scope, &args);
+    crate::debug_output(&format!("[NativeScript] instance_method_dispatch: ret.ok={} outs.len={} result={:p}\n", ret.is_ok(), _outs.len(), result));
 
     if ret.is_err() {
         let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
@@ -432,31 +492,54 @@ fn instance_method_dispatch(
     }
 
     let return_sig = method.return_type().to_string();
+    let mut return_value_opt: Option<Local<v8::Value>> = None;
+
     if return_sig.contains('.') {
         // Dotted return signatures may be either COM reference types or value
         // structs. Prefer struct wrapping when metadata says so.
         if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
             if matches!(declaration.read().kind(), DeclarationKind::Struct) {
                 let obj = crate::create_struct_object_from_raw(declaration, result, scope).into();
-                retval.set(obj);
-                return;
+                return_value_opt = Some(obj);
             } else if !result.is_null() {
                 let instance = unsafe { IUnknown::from_raw(result) };
                 let ret: Local<v8::Value> = create_ns_ctor_instance_object(
                     return_sig.as_str(), None, dec.parent.clone(), declaration, Some(instance), scope,
                 ).into();
-                retval.set(ret);
-                return;
+                return_value_opt = Some(ret);
             } else {
-                retval.set(v8::null(scope).into());
-                return;
+                return_value_opt = Some(v8::null(scope).into());
             }
         }
     }
 
-    if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
-        unsafe { set_ret_val(result, scope, retval, return_type); }
+    if return_value_opt.is_none() {
+        if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+            let v = unsafe { read_value_from_ptr(result as *const c_void, scope, return_type) };
+            return_value_opt = Some(v);
+        }
     }
+
+    // If there are any out-parameters, return an array containing the primary
+    // return (if present) followed by the out-values in declaration order.
+    if !_outs.is_empty() {
+        let mut arr_len = _outs.len();
+        if return_value_opt.is_some() { arr_len += 1; }
+        let arr = v8::Array::new(scope, arr_len as i32);
+        let mut idx = 0u32;
+        if let Some(rv) = return_value_opt {
+            arr.set_index(scope, idx, rv);
+            idx += 1;
+        }
+        for outv in _outs.into_iter() {
+            arr.set_index(scope, idx, outv);
+            idx += 1;
+        }
+        retval.set(arr.into());
+        return;
+    }
+
+    if let Some(rv) = return_value_opt { retval.set(rv); }
 }
 
 /// Named property getter for WinRT instance objects (ClassDeclaration wrappers).
@@ -495,7 +578,7 @@ pub(crate) fn handle_instance_property_getter(
             return v8::Intercepted::kNo;
         };
 
-        let (ret, result) = property_call.call_with_values(scope, &[]);
+        let (ret, result, _outs) = property_call.call_with_values(scope, &[]);
 
         if ret.is_err() {
             let detail = format!("Property get '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
@@ -638,7 +721,7 @@ pub(crate) fn handle_instance_property_setter(
             let Some(mut property_call) = PropertyCall::new_for_interface(
                 &property, true, instance.clone(), false, iid, type_args,
             ) else { return v8::Intercepted::kNo; };
-            let (ret, _) = property_call.call_with_values(scope, &[value]);
+            let (ret, _, _outs) = property_call.call_with_values(scope, &[value]);
             if ret.is_err() {
                 let detail = format!("Property set '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
                 let message = v8::String::new(scope, &detail).unwrap();
@@ -663,7 +746,7 @@ pub(crate) fn handle_instance_property_setter(
         let Some(mut property_call) = PropertyCall::new(&property, true, dec.instance.clone().unwrap(), false) else {
             return v8::Intercepted::kNo;
         };
-        let (ret, _) = property_call.call_with_values(scope, &[value]);
+            let (ret, _, _outs) = property_call.call_with_values(scope, &[value]);
         if ret.is_err() {
             let detail = format!("Property set '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
             let message = v8::String::new(scope, &detail).unwrap();
@@ -910,7 +993,7 @@ pub(crate) unsafe fn raw_result_to_local<'s>(
     let raw = result as usize;
     match signature {
         "Void" => None,
-        "Guid" => Some(guid_ptr_to_js_object(result, scope).into()),
+        "Guid" => Some(unsafe { guid_ptr_to_js_object(result, scope) }.into()),
         _ if !signature.contains('.') => {
             let native_type = NativeType::try_from(signature).ok()?;
             let v: Local<v8::Value> = match native_type {
@@ -1115,7 +1198,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let mut method = MethodCall::new(
                             method, method.is_sealed(), dec.instance.clone().unwrap(), false,
                         );
-                        let (ret, result) = method.call(scope, &args);
+                        let (ret, result, _outs) = method.call(scope, &args);
 
                         if ret.is_err() {
                             let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
@@ -1125,7 +1208,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                             return;
                         } else if !method.is_void() {
                             let return_sig = method.return_type().to_string();
-                            if return_sig == "Guid" {
+                                if return_sig == "Guid" {
                                 let obj = unsafe { guid_ptr_to_js_object(result, scope) };
                                 retval.set(obj.into());
                             } else {
@@ -1193,7 +1276,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let Some(mut method) = PropertyCall::new(method, false, dec.instance.clone().unwrap(), false) else {
                             return;
                         };
-                        let (ret, result) = method.call(scope, &args);
+                        let (ret, result, _outs) = method.call(scope, &args);
                         if ret.is_err() {
                             let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
                             let msg = v8::String::new(scope, &detail).unwrap();
@@ -1242,7 +1325,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                             let lock = dec.read();
                             let prop = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
                             let Some(mut method) = PropertyCall::new(prop, true, dec.instance.clone().unwrap(), false) else { return; };
-                            let (ret, _) = method.call(scope, &args);
+                            let (ret, _, _outs) = method.call(scope, &args);
                             if ret.is_err() {
                                 let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
                                 let msg = v8::String::new(scope, &detail).unwrap();
@@ -1311,7 +1394,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let lock = dec.read();
                                     let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
                                     let mut method = MethodCall::new(method, method.is_sealed(), dec.instance.clone().unwrap(), false);
-                                    let (ret, result) = method.call(scope, &args);
+                                    let (ret, result, _outs) = method.call(scope, &args);
                                     if ret.is_err() {
                                         let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
                                         let msg = v8::String::new(scope, &detail).unwrap();
@@ -1358,7 +1441,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let lock = dec.read();
                                     let method = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
                                     let mut method = MethodCall::new(method.getter(), false, dec.instance.clone().unwrap(), false);
-                                    let (ret, result) = method.call(scope, &args);
+                                    let (ret, result, _outs) = method.call(scope, &args);
                                     if ret.is_err() {
                                         let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
                                         let msg = v8::String::new(scope, &detail).unwrap();
@@ -1428,7 +1511,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let lock = dec.read();
                                     let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
                                     let mut method = MethodCall::new(method, method.is_sealed(), dec.instance.clone().unwrap(), false);
-                                    let (ret, result) = method.call(scope, &args);
+                                    let (ret, result, _outs) = method.call(scope, &args);
                                     if ret.is_err() {
                                         let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
                                         let msg = v8::String::new(scope, &detail).unwrap();
@@ -1477,7 +1560,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let Some(mut method) = PropertyCall::new(method, false, dec.instance.clone().unwrap(), false) else {
                                         return;
                                     };
-                                    let (ret, result) = method.call(scope, &args);
+                                    let (ret, result, _outs) = method.call(scope, &args);
                                     if ret.is_err() {
                                         let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
                                         let msg = v8::String::new(scope, &detail).unwrap();
@@ -1554,7 +1637,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let lock = dec.read();
                                     let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
                                     let mut method = MethodCall::new(method, method.is_sealed(), dec.instance.clone().unwrap(), false);
-                                    let (ret, result) = method.call(scope, &args);
+                                    let (ret, result, _outs) = method.call(scope, &args);
                                     if ret.is_err() {
                                         let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
                                         let msg = v8::String::new(scope, &detail).unwrap();
@@ -1600,7 +1683,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let lock = dec.read();
                         let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
                         let mut method = MethodCall::new(method, method.is_sealed(), dec.instance.clone().unwrap(), false);
-                        let (ret, result) = method.call(scope, &args);
+                        let (ret, result, _outs) = method.call(scope, &args);
                         if ret.is_err() {
                             let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
                             let msg = v8::String::new(scope, &detail).unwrap();
@@ -1649,7 +1732,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let Some(mut method) = PropertyCall::new(method, false, dec.instance.clone().unwrap(), false) else {
                             return;
                         };
-                                    let (ret, result) = method.call(scope, &args);
+                                    let (ret, result, _outs) = method.call(scope, &args);
                                     if ret.is_err() {
                                         let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
                                         let msg = v8::String::new(scope, &detail).unwrap();
@@ -1683,7 +1766,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                             let prop = lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
                             let setter = prop.setter().unwrap();
                             let mut method = MethodCall::new(setter, false, dec.instance.clone().unwrap(), false);
-                            let (ret, _) = method.call(scope, &args);
+                            let (ret, _, _outs) = method.call(scope, &args);
                             if ret.is_err() {
                                 let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
                                 let msg = v8::String::new(scope, &detail).unwrap();
@@ -1751,7 +1834,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let mut method = GenericMethodCall::new(
                             parent, method, method.is_sealed(), dec.instance.clone().unwrap(), false, return_type, type_args,
                         );
-                        let (ret, result) = method.call(scope, &args);
+                        let (ret, result, _outs) = method.call(scope, &args);
                         if ret.is_err() {
                             let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
                             let msg = v8::String::new(scope, &detail).unwrap();
@@ -1949,7 +2032,7 @@ pub(crate) fn create_ns_ctor_object<'a>(
                         let number_of_parameters = ctor.number_of_parameters();
                         if number_of_parameters != length as usize { continue; }
                         let mut method = MethodCall::new(ctor, is_sealed, clazz_factory.clone(), true);
-                        let (ret, result) = method.call(scope, &args);
+                        let (ret, result, _outs) = method.call(scope, &args);
 
                         if ret.is_ok() {
                             if result.is_null() {
@@ -2134,25 +2217,26 @@ pub(crate) fn create_ns_ctor_object<'a>(
                 };
 
                 let mut method = MethodCall::new(method, method.is_sealed(), factory, false);
-                let (ret, result) = method.call(scope, &args);
+                let (ret, result, _outs) = method.call(scope, &args);
 
                 if ret.is_ok() {
+                    let mut return_value_opt: Option<Local<v8::Value>> = None;
                     unsafe {
                         match signature.as_str() {
-                            "Boolean" => { retval.set_bool(*(result as *mut bool)) }
+                            "Boolean" => { return_value_opt = Some(v8::Boolean::new(scope, *(result as *mut bool)).into()); }
                             "Guid" => {
                                 let obj = guid_ptr_to_js_object(result, scope);
-                                retval.set(obj.into());
+                                return_value_opt = Some(obj.into());
                             }
                             _ if !signature.contains('.') => {
                                 match NativeType::try_from(signature.as_str()) {
-                                    Ok(return_type) => { set_ret_val(result, scope, retval, return_type); }
-                                    Err(_) => { retval.set_undefined(); }
+                                    Ok(return_type) => { let v = read_value_from_ptr(result as *const c_void, scope, return_type); return_value_opt = Some(v); }
+                                    Err(_) => { return_value_opt = None; }
                                 }
                             }
                             _ => {
                                 if result.is_null() {
-                                    retval.set(v8::null(scope).into());
+                                    return_value_opt = Some(v8::null(scope).into());
                                 } else {
                                     let instance = IUnknown::from_raw(result);
                                     let Some(declaration) = MetadataReader::find_by_name(signature.as_str()) else {
@@ -2168,10 +2252,28 @@ pub(crate) fn create_ns_ctor_object<'a>(
                                         signature.as_str(), dec.instance.clone(), dec.parent.clone(),
                                         declaration, Some(instance), scope,
                                     ).into();
-                                    retval.set(ret.into());
+                                    return_value_opt = Some(ret.into());
                                 }
                             }
                         }
+                    }
+
+                    if !_outs.is_empty() {
+                        let mut arr_len = _outs.len();
+                        if return_value_opt.is_some() { arr_len += 1; }
+                        let arr = v8::Array::new(scope, arr_len as i32);
+                        let mut idx = 0u32;
+                        if let Some(rv) = return_value_opt {
+                            arr.set_index(scope, idx, rv);
+                            idx += 1;
+                        }
+                        for outv in _outs.into_iter() {
+                            arr.set_index(scope, idx, outv);
+                            idx += 1;
+                        }
+                        retval.set(arr.into());
+                    } else if let Some(rv) = return_value_opt {
+                        retval.set(rv);
                     }
                 } else {
                     let message = ret.message().to_string();
@@ -2230,7 +2332,7 @@ pub(crate) fn create_ns_ctor_object<'a>(
                 };
 
                 let Some(mut prop_call) = PropertyCall::new(property, false, factory, false) else { return };
-                let (hresult, result) = prop_call.call_with_values(scope, &[]);
+                let (hresult, result, _outs) = prop_call.call_with_values(scope, &[]);
 
                 if hresult.is_ok() {
                     unsafe {

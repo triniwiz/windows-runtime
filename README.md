@@ -30,8 +30,7 @@ Install these before building the full workspace:
   - `rustup target add aarch64-pc-windows-msvc`
 - .NET SDK, currently needed for the C# bridge, tests, demo apps, and template projects.
 - PowerShell 7+ (`pwsh`) for the build scripts.
-- Node.js/npm when working on NativeScript app templates, package scripts, or JavaScript demo apps.
-
+ 
 Open a Visual Studio Developer PowerShell when building native libraries so `cl.exe`
 and the Windows SDK tools are on `PATH`.
 

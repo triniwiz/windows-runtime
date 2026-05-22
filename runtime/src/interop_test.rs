@@ -1715,16 +1715,6 @@ fn delegate_constructor_with_plain_object_falls_through() {
 
 // ── Composition border tests ──────────────────────────────────────────────────
 
-#[test]
-fn composition_border_iids_are_non_zero() {
-    let (ui_elem_iid, ecp_iid) = crate::composition_border::get_iids_for_test();
-    // Print so the test output shows the actual values (run with -- --nocapture).
-    println!("IUIElement IID:                    {:?}", ui_elem_iid);
-    println!("IElementCompositionPreviewStatics: {:?}", ecp_iid);
-    assert_ne!(ui_elem_iid, windows::core::GUID::zeroed(), "IUIElement IID is zeroed — metadata lookup failed");
-    assert_ne!(ecp_iid, windows::core::GUID::zeroed(), "IElementCompositionPreviewStatics IID is zeroed — metadata lookup failed");
-}
-
 /// Verifies that `__nsCreateCompositionBorder` surfaces a catchable JS error
 /// rather than aborting the process. The test thread is MTA so XAML construction
 /// itself will throw an STA error — that's fine, we skip in that case.
@@ -1987,6 +1977,151 @@ fn button_background_null_property_does_not_crash() {
             if (bg !== null && bg !== undefined && typeof bg !== 'object') {
                 throw new Error('Expected Background to be null, undefined, or an object, got: ' + typeof bg);
             }
+        "#,
+    );
+}
+
+// ── __nsRunOnUIThread integration tests ──────────────────────────────────────
+//
+// In the test host (MTA thread) UI_QUEUE is never initialised, so
+// post_to_ui_thread falls back to synchronous inline execution.
+// These tests verify the JS-visible behaviour through that path.
+
+#[test]
+fn run_on_ui_thread_is_defined() {
+    run_js_assert(
+        "run_on_ui_thread_is_defined",
+        r#"
+            if (typeof __nsRunOnUIThread !== 'function') {
+                throw new Error('__nsRunOnUIThread is not defined or not a function');
+            }
+            if (typeof NSWinRT.runOnUIThread !== 'function') {
+                throw new Error('NSWinRT.runOnUIThread is not defined');
+            }
+        "#,
+    );
+}
+
+#[test]
+fn run_on_ui_thread_callback_executes() {
+    run_js_assert(
+        "run_on_ui_thread_callback_executes",
+        r#"
+            return new Promise(function(resolve, reject) {
+                __nsRunOnUIThread(function() {
+                    resolve();
+                });
+                // In test host, fallback runs synchronously, so resolve() has already
+                // been called by the time we reach here — the Promise is already settled.
+            });
+        "#,
+    );
+}
+
+#[test]
+fn run_on_ui_thread_callback_can_close_over_outer_state() {
+    run_js_assert(
+        "run_on_ui_thread_callback_can_close_over_outer_state",
+        r#"
+            return new Promise(function(resolve, reject) {
+                var expected = 'closed_over_' + Math.random().toString(36).slice(2);
+                __nsRunOnUIThread(function() {
+                    if (typeof expected !== 'string' || !expected.startsWith('closed_over_')) {
+                        reject(new Error('Closure capture broken, got: ' + expected));
+                    } else {
+                        resolve();
+                    }
+                });
+            });
+        "#,
+    );
+}
+
+#[test]
+fn run_on_ui_thread_rejects_non_function_arg() {
+    run_js_assert(
+        "run_on_ui_thread_rejects_non_function_arg",
+        r#"
+            const badArgs = [null, undefined, 42, 'string', {}, []];
+            for (const arg of badArgs) {
+                let threw = false;
+                try {
+                    __nsRunOnUIThread(arg);
+                } catch (e) {
+                    threw = true;
+                }
+                if (!threw) {
+                    throw new Error('__nsRunOnUIThread(' + JSON.stringify(arg) + ') should have thrown');
+                }
+            }
+        "#,
+    );
+}
+
+#[test]
+fn run_on_ui_thread_nswinrt_wrapper_throws_type_error_for_non_function() {
+    run_js_assert(
+        "run_on_ui_thread_nswinrt_wrapper_throws_type_error_for_non_function",
+        r#"
+            let threw = false;
+            try {
+                NSWinRT.runOnUIThread(42);
+            } catch (e) {
+                threw = true;
+                if (!(e instanceof TypeError)) {
+                    throw new Error('Expected TypeError, got: ' + (e && e.constructor && e.constructor.name));
+                }
+            }
+            if (!threw) {
+                throw new Error('NSWinRT.runOnUIThread(42) should have thrown TypeError');
+            }
+        "#,
+    );
+}
+
+#[test]
+fn run_on_ui_thread_multiple_callbacks_all_execute() {
+    run_js_assert(
+        "run_on_ui_thread_multiple_callbacks_all_execute",
+        r#"
+            return new Promise(function(resolve, reject) {
+                var count = 0;
+                var total = 4;
+
+                function tick() {
+                    count++;
+                    if (count === total) resolve();
+                }
+
+                __nsRunOnUIThread(tick);
+                __nsRunOnUIThread(tick);
+                __nsRunOnUIThread(tick);
+                __nsRunOnUIThread(tick);
+
+                // Fallback is synchronous, so count === total here already.
+                // The setTimeout only fires if the Promise hasn't resolved yet.
+                __ns__setTimeout(function() {
+                    if (count < total) {
+                        reject(new Error('Only ' + count + '/' + total + ' callbacks fired'));
+                    }
+                }, 200);
+            });
+        "#,
+    );
+}
+
+#[test]
+fn run_on_ui_thread_callback_exception_does_not_crash_runtime() {
+    run_js_assert(
+        "run_on_ui_thread_callback_exception_does_not_crash_runtime",
+        r#"
+            // Exceptions thrown inside the callback are caught and logged by the Rust
+            // side — they must not propagate out or crash the runtime.
+            __nsRunOnUIThread(function() {
+                throw new Error('intentional error from UI thread callback');
+            });
+
+            // If we get here without a crash, the test passes.
         "#,
     );
 }

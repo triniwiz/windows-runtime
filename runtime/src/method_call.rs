@@ -21,7 +21,8 @@ use metadata::meta_data_reader::MetadataReader;
 use metadata::signature::Signature;
 use crate::error::AnyError;
 use crate::helpers::{ffi_native_type_from_signature, strip_generic_suffix};
-use crate::value::{append_struct_field_bytes, ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_query_interface_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use crate::value::{append_struct_field_bytes, ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_query_interface_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue, read_value_from_ptr, write_v8_value_to_ptr};
 use crate::DeclarationFFI;
 
 pub struct MethodCall {
@@ -243,6 +244,7 @@ impl MethodCall {
             };
 
             let signature = Signature::to_string(metadata, &type_);
+            crate::debug_output(&format!("[NativeScript] Method '{}' param sig='{}' is_out={}\n", method.name(), signature, parameter.is_out()));
 
             let parse_native_type = match NativeType::try_from(signature.as_str()) {
                 Ok(value) => value,
@@ -258,17 +260,24 @@ impl MethodCall {
             };
             parse_parameter_types.push(parse_native_type.clone());
             let abi_native = ffi_native_type_from_signature(signature.as_str());
-            // If the parsed parameter is a WinRT `String`, treat its ABI as
-            // `NativeType::String` (handle-sized) rather than the generic
-            // pointer returned by the signature helper. This ensures the
-            // libffi CIF is constructed with the correct usize-sized type.
-            if matches!(parse_native_type, NativeType::String) {
-                parameter_types.push(NativeType::String);
-            } else if matches!(abi_native, NativeType::Buffer) {
-                parameter_types.push(NativeType::U32);
-                parameter_types.push(NativeType::Buffer);
+            // If this parameter is an out (ByRef) parameter, represent its
+            // ABI as a pointer to the underlying storage so callers allocate
+            // space and pass the address for the callee to write into.
+            if parameter.is_out() {
+                parameter_types.push(NativeType::Pointer);
             } else {
-                parameter_types.push(abi_native);
+                // If the parsed parameter is a WinRT `String`, treat its ABI as
+                // `NativeType::String` (handle-sized) rather than the generic
+                // pointer returned by the signature helper. This ensures the
+                // libffi CIF is constructed with the correct usize-sized type.
+                if matches!(parse_native_type, NativeType::String) {
+                    parameter_types.push(NativeType::String);
+                } else if matches!(abi_native, NativeType::Buffer) {
+                    parameter_types.push(NativeType::U32);
+                    parameter_types.push(NativeType::Buffer);
+                } else {
+                    parameter_types.push(abi_native);
+                }
             }
         }
 
@@ -380,14 +389,14 @@ impl MethodCall {
 
     
 
-    pub fn call(
+    pub fn call<'s>(
         &mut self,
-        scope: &mut v8::PinScope<'_, '_>,
+        scope: &mut v8::PinScope<'s, '_>,
         args: &v8::FunctionCallbackArguments,
-    ) -> (HRESULT, *mut c_void) {
+    ) -> (HRESULT, *mut c_void, Vec<v8::Local<'s, v8::Value>>) {
 
         if self.init_error.is_some() {
-            return (HRESULT(0x8000_4005u32 as i32), std::ptr::null_mut()); // E_FAIL
+            return (HRESULT(0x8000_4005u32 as i32), std::ptr::null_mut(), Vec::new()); // E_FAIL
         }
 
         // Snapshot fields before the mutable borrow of argument_buf begins.
@@ -412,16 +421,67 @@ impl MethodCall {
         self.argument_parse_types.clear();
         let mut queried_interfaces: Vec<IUnknown> = Vec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
+        // Track out-parameter slots: (argument_buf index, parse_native_type, optional signature)
+        let mut out_slots: Vec<(usize, NativeType, Option<String>)> = Vec::new();
 
         self.argument_buf.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
         self.argument_parse_types.push(None);
 
         for (i, native_type) in self.parse_parameter_types.iter().enumerate() {
+            let parameter = &self.parameters[i];
+            // Determine whether the parameter's signature is a ByRef type
+            let param_sig_opt = parameter.metadata().map(|m| Signature::to_string(m, &parameter.type_()));
+            let is_sig_byref = param_sig_opt.as_ref().map_or(false, |s| s.starts_with("ByRef "));
+
+            // Handle out (ByRef) parameters by allocating stable storage that
+            // the callee can write into. Also treat a missing caller argument
+            // for a `ByRef` signature as an implicit out-slot (e.g. TryParse).
+            if parameter.is_out() || (is_sig_byref && (args.length() as usize) <= i) {
+                let slot_index = self.argument_buf.len();
+                let slot_size = match native_type {
+                    NativeType::Struct(_) => native_type.size(),
+                    NativeType::Pointer | NativeType::Buffer | NativeType::Function | NativeType::String => std::mem::size_of::<usize>(),
+                    _ => native_type.size(),
+                };
+                let mut buf: Vec<u8> = vec![0u8; slot_size];
+                let ptr = buf.as_mut_ptr() as *mut c_void;
+                struct_scratch.push(buf);
+                self.argument_buf.push(NativeValue { pointer: ptr });
+                // Default parse type is None (out-only). If we initialized
+                // from the caller's JS value below, we'll set it accordingly.
+                self.argument_parse_types.push(None);
+
+                // Try to initialize from caller-provided argument if present.
+                if (args.length() as usize) > i {
+                    let init_val = args.get(i as i32);
+                    if !init_val.is_undefined() && !init_val.is_null() {
+                        match write_v8_value_to_ptr(scope, init_val, ptr, native_type) {
+                            Ok(parse_opt) => {
+                                if let Some(pt) = parse_opt {
+                                    // Update parse-type for this slot so string handling
+                                    // in prepare_string_storage can detect it.
+                                    if let Some(slot) = self.argument_parse_types.get_mut(slot_index) {
+                                        *slot = Some(pt);
+                                    }
+                                }
+                            }
+                            Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
+                        }
+                    }
+                }
+
+                // Capture the parameter signature so we can create proper WinRT
+                // wrapper objects for out-pointer returns (e.g. IJsonValue).
+                let sig = param_sig_opt;
+                out_slots.push((slot_index, native_type.clone(), sig));
+                continue;
+            }
+
             let value = args.get(i as i32);
 
             let value = match *native_type {
                 NativeType::Void => {
-                    return (call_failure(), std::ptr::null_mut())
+                    return (call_failure(), std::ptr::null_mut(), Vec::new())
                 }
                 NativeType::Bool => {
                     ffi_parse_bool_arg(value)
@@ -644,11 +704,11 @@ impl MethodCall {
                         ffi_parse_pointer_arg(scope, value)
                     }
                 }
-                NativeType::Buffer => {
+                    NativeType::Buffer => {
                     let parsed = ffi_parse_buffer_arg_with_length(scope, value);
                     let (buffer_value, byte_length) = match parsed {
                         Ok(value) => value,
-                        Err(_) => return (call_failure(), std::ptr::null_mut()),
+                        Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
                     };
 
                     self.argument_buf.push(NativeValue { u32_value: byte_length });
@@ -670,7 +730,7 @@ impl MethodCall {
 
             let value = match value {
                 Ok(value) => value,
-                Err(_) => return (call_failure(), std::ptr::null_mut()),
+                Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
             };
 
             self.argument_buf.push(value);
@@ -711,13 +771,60 @@ impl MethodCall {
 
         let prep = match crate::ffi::prepare_string_storage(&self.argument_buf, &self.parameter_types, &self.argument_parse_types) {
             Ok(value) => value,
-            Err(_) => return (call_failure(), std::ptr::null_mut()),
+            Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
         };
 
         let func_to_call = self.func;
 
         let call_args = crate::ffi::build_call_args(&prep, &self.argument_buf, &self.argument_parse_types);
-        let ret = unsafe { self.cif.call(CodePtr::from_ptr(func_to_call), &call_args) };
+
+        // Guard against Rust panics crossing the FFI boundary and log common
+        // COM HRESULTs (e.g. RPC_E_WRONG_THREAD) so callers can surface a
+        // diagnostic to JS before a late destructor or release triggers a
+        // process-level failure.
+        let ret_i32_res = catch_unwind(AssertUnwindSafe(|| unsafe {
+            self.cif.call(CodePtr::from_ptr(func_to_call), &call_args)
+        }));
+
+        let ret = match ret_i32_res {
+            Ok(code) => code,
+            Err(_) => {
+                let method_display = if self.method_name == ".ctor" {
+                    "constructor"
+                } else if self.method_name == ".cctor" {
+                    "static constructor"
+                } else {
+                    self.method_name.as_str()
+                };
+                let msg = format!("WinRT call panicked during invocation of '{}': returning E_FAIL", method_display);
+                crate::debug_output(&format!("[NativeScript] {}\n", msg));
+                crate::store_last_js_error(msg);
+                return (HRESULT(0x8000_4005u32 as i32), std::ptr::null_mut(), Vec::new()); // E_FAIL
+            }
+        };
+
+        // If the call returned RPC_E_WRONG_THREAD, format the canonical OS
+        // message and surface it both in logs/last-error and as a V8 exception
+        // so embedders/tests can catch it directly.
+        let hr = HRESULT(ret);
+        const RPC_E_WRONG_THREAD: u32 = 0x8001010E;
+        if (hr.0 as u32) == RPC_E_WRONG_THREAD {
+            let method_display = if self.method_name == ".ctor" {
+                "constructor"
+            } else if self.method_name == ".cctor" {
+                "static constructor"
+            } else {
+                self.method_name.as_str()
+            };
+            let os_msg = crate::error::format_hresult_message(hr);
+            let msg = format!("{} when invoking '{}'. HRESULT 0x{:08X}", os_msg, method_display, hr.0 as u32);
+            crate::debug_output(&format!("[NativeScript] {}\n", msg));
+            crate::store_last_js_error(msg.clone());
+            if let Some(vmstr) = v8::String::new(scope, &msg) {
+                let err = v8::Exception::error(scope, vmstr);
+                scope.throw_exception(err);
+            }
+        }
 
         if is_initializer && !is_sealed && result.is_null() {
             if !composition_inner.is_null() {
@@ -733,7 +840,73 @@ impl MethodCall {
             result = self.return_value_buf.as_mut_ptr() as *mut c_void;
         }
 
-        (HRESULT(ret), result)
+        // Marshal out-parameters back into V8 values using the recorded slots.
+        let mut out_values: Vec<v8::Local<'s, v8::Value>> = Vec::new();
+        for (slot_index, parse_native_type, sig_opt) in out_slots.into_iter() {
+            let storage_ptr = unsafe { self.argument_buf.get(slot_index).map(|v| v.pointer).unwrap_or(std::ptr::null_mut()) };
+            if storage_ptr.is_null() {
+                out_values.push(v8::null(scope).into());
+                continue;
+            }
+            unsafe {
+                crate::debug_output(&format!("[NativeScript] out_slot[{}] sig={:?} storage_ptr={:?}\n", slot_index, sig_opt, storage_ptr));
+                let v = match parse_native_type {
+                    NativeType::Pointer | NativeType::Buffer | NativeType::Function => {
+                        // Storage holds a pointer-sized value; read the inner pointer.
+                        let inner = std::ptr::read_unaligned(storage_ptr as *const usize) as *mut c_void;
+                        crate::debug_output(&format!("[NativeScript] out_slot[{}] inner={:p}\n", slot_index, inner));
+                        if inner.is_null() {
+                            v8::null(scope).into()
+                        } else if let Some(sig) = sig_opt.as_ref() {
+                            // If the original parameter signature names a WinRT type,
+                            // construct the proper JS WinRT wrapper (structs or ns objects).
+                            if sig.contains('.') {
+                                let mut lookup = sig.as_str();
+                                if let Some(stripped) = lookup.strip_prefix("ByRef ") {
+                                    lookup = stripped;
+                                }
+                                let lookup = crate::helpers::strip_generic_suffix(lookup);
+                                crate::debug_output(&format!("[NativeScript] out_slot[{}] metadata_lookup='{}'\n", slot_index, lookup));
+                                if let Some(declaration) = MetadataReader::find_by_name(lookup) {
+                                    crate::debug_output(&format!("[NativeScript] out_slot[{}] metadata found: kind={:?}\n", slot_index, declaration.read().kind()));
+                                    if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                        crate::debug_output(&format!("[NativeScript] out_slot[{}] creating struct wrapper\n", slot_index));
+                                        crate::create_struct_object_from_raw(declaration, inner, scope).into()
+                                    } else {
+                                        // Attempt to inspect runtime identity via IInspectable
+                                        let instance = unsafe { IUnknown::from_raw(inner) };
+                                        match instance.clone().cast::<IInspectable>() {
+                                            Ok(ins) => {
+                                                match ins.GetRuntimeClassName() {
+                                                    Ok(name) => crate::debug_output(&format!("[NativeScript] out_slot[{}] runtime class name='{}'\n", slot_index, name.to_string())),
+                                                    Err(e) => crate::debug_output(&format!("[NativeScript] out_slot[{}] GetRuntimeClassName failed: {} (0x{:08X})\n", slot_index, e.message().to_string(), e.code().0 as u32)),
+                                                }
+                                            }
+                                            Err(e) => {
+                                                crate::debug_output(&format!("[NativeScript] out_slot[{}] QI to IInspectable failed: {} (0x{:08X})\n", slot_index, e.message().to_string(), e.code().0 as u32));
+                                            }
+                                        }
+                                        crate::debug_output(&format!("[NativeScript] out_slot[{}] creating ns instance wrapper\n", slot_index));
+                                        crate::ns_proxy::create_ns_ctor_instance_object(sig.as_str(), None, None, declaration, Some(instance), scope).into()
+                                    }
+                                } else {
+                                    crate::debug_output(&format!("[NativeScript] out_slot[{}] metadata lookup failed for '{}', falling back to pointer read\n", slot_index, lookup));
+                                    read_value_from_ptr(inner as *const c_void, scope, NativeType::Pointer)
+                                }
+                            } else {
+                                read_value_from_ptr(inner as *const c_void, scope, NativeType::Pointer)
+                            }
+                        } else {
+                            read_value_from_ptr(inner as *const c_void, scope, NativeType::Pointer)
+                        }
+                    }
+                    _ => read_value_from_ptr(storage_ptr as *const c_void, scope, parse_native_type.clone()),
+                };
+                out_values.push(v);
+            }
+        }
+
+        (HRESULT(ret), result, out_values)
     }
 
     /// Call an event add-method with a raw COM delegate pointer.
@@ -754,7 +927,15 @@ impl MethodCall {
             };
             call_args.push(unsafe { v.as_arg(native_type) });
         }
-        let ret: i32 = unsafe { self.cif.call(CodePtr::from_ptr(self.func), &call_args) };
+        let ret: i32 = match catch_unwind(AssertUnwindSafe(|| unsafe { self.cif.call(CodePtr::from_ptr(self.func), &call_args) })) {
+            Ok(code) => code,
+            Err(_) => {
+                let msg = format!("WinRT event call panicked during invocation: returning E_FAIL");
+                crate::debug_output(&format!("[NativeScript] {}\n", msg));
+                crate::store_last_js_error(msg);
+                return (call_failure(), 0);
+            }
+        };
         // result's bytes were overwritten by WinRT with the EventRegistrationToken (i64).
         let token = result as i64;
         (HRESULT(ret), token)
@@ -773,7 +954,15 @@ impl MethodCall {
             };
             call_args.push(unsafe { v.as_arg(native_type) });
         }
-        let ret: i32 = unsafe { self.cif.call(CodePtr::from_ptr(self.func), &call_args) };
+        let ret: i32 = match catch_unwind(AssertUnwindSafe(|| unsafe { self.cif.call(CodePtr::from_ptr(self.func), &call_args) })) {
+            Ok(code) => code,
+            Err(_) => {
+                let msg = format!("WinRT event remove call panicked during invocation: returning E_FAIL");
+                crate::debug_output(&format!("[NativeScript] {}\n", msg));
+                crate::store_last_js_error(msg);
+                return call_failure();
+            }
+        };
         HRESULT(ret)
     }
 }

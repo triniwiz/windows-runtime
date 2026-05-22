@@ -21,6 +21,27 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::core::{PCSTR, PCWSTR};
 
+/// Mode for initializing .NET host. Controlled by `NS_DOTNET_MODE` env var.
+#[derive(PartialEq, Eq)]
+enum DotnetMode {
+    Auto,
+    InProc,
+    OutProc,
+    Disabled,
+}
+
+fn get_dotnet_mode() -> DotnetMode {
+    match std::env::var("NS_DOTNET_MODE") {
+        Ok(s) => match s.to_ascii_lowercase().as_str() {
+            "inproc" => DotnetMode::InProc,
+            "outproc" => DotnetMode::OutProc,
+            "disabled" | "none" | "0" => DotnetMode::Disabled,
+            _ => DotnetMode::Auto,
+        },
+        Err(_) => DotnetMode::Auto,
+    }
+}
+
 // ── hostfxr ABI ───────────────────────────────────────────────────────────────
 
 type FnInitForRuntimeConfig = unsafe extern "C" fn(
@@ -93,6 +114,11 @@ unsafe impl Send for DotNetHost {}
 unsafe impl Sync for DotNetHost {}
 
 static DOTNET_HOST: OnceLock<Result<DotNetHost, String>> = OnceLock::new();
+static DOTNET_APP_ROOT: OnceLock<String> = OnceLock::new();
+
+pub(crate) fn set_app_root(app_root: &str) {
+    let _ = DOTNET_APP_ROOT.get_or_init(|| app_root.to_string());
+}
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -240,30 +266,105 @@ fn build_host(bridge_dll: &str, runtime_config: &str) -> Result<DotNetHost, Stri
     })
 }
 
+// Search for the bridge DLL + runtimeconfig in a set of common locations.
+fn find_bridge_and_config(app_root: &str) -> Option<(PathBuf, PathBuf)> {
+    let root = PathBuf::from(app_root);
+
+    // Prefer the explicit bridge publish folder where dotnet-tool writes its outputs.
+    let mut candidates = vec![
+        root.join("dotnet-bridge").join("publish"),
+        root.join("dotnet-bridge"),
+        root.join("publish").join("dotnet-bridge"),
+        root.join("bin"),
+        root.clone(),
+    ];
+
+    // Add the bridge folder at repo root (useful when running from template)
+    if let Some(parent) = root.parent() {
+        candidates.push(parent.join("dotnet-bridge").join("publish"));
+    }
+
+    // Depth-limited DFS to avoid scanning large trees.
+    for base in candidates.into_iter() {
+        if !base.exists() {
+            continue;
+        }
+        let mut stack = vec![(base.clone(), 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            if depth > 6 {
+                continue;
+            }
+            if !dir.is_dir() { continue; }
+
+            let dll = dir.join("DotNetBridge.dll");
+            let cfg = dir.join("DotNetBridge.runtimeconfig.json");
+            if dll.exists() && cfg.exists() {
+                return Some((dll, cfg));
+            }
+
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push((p, depth + 1));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 // ── public API ────────────────────────────────────────────────────────────────
 
 pub(crate) fn try_init_dotnet(app_root: &str) {
-    DOTNET_HOST.get_or_init(|| {
-        let bridge = PathBuf::from(app_root)
-            .join("dotnet-bridge").join("publish").join("DotNetBridge.dll");
-        let config = PathBuf::from(app_root)
-            .join("dotnet-bridge").join("publish").join("DotNetBridge.runtimeconfig.json");
+    // Respect NS_DOTNET_MODE so embedders can disable or choose out-of-proc.
+    let mode = get_dotnet_mode();
+    if mode == DotnetMode::Disabled {
+        crate::debug_output("[NativeScript] .NET host disabled via NS_DOTNET_MODE; skipping initialization\n");
+        // Record a stable error so callers know dotnet is intentionally disabled.
+        let _ = DOTNET_HOST.get_or_init(|| Err("DotNet disabled via NS_DOTNET_MODE".to_string()));
+        return;
+    }
 
-        if !bridge.exists() {
-            return Err(format!(
-                "DotNetBridge.dll not found at {path} — run `dotnet publish` in dotnet-bridge/",
-                path = bridge.display()
-            ));
-        }
-        if !config.exists() {
-            return Err(format!(
-                "DotNetBridge.runtimeconfig.json not found at {}",
-                config.display()
-            ));
-        }
+    crate::debug_output(&format!("[NativeScript] initializing .NET host (mode={:?})\n", match mode {
+        DotnetMode::Auto => "auto",
+        DotnetMode::InProc => "inproc",
+        DotnetMode::OutProc => "outproc",
+        DotnetMode::Disabled => "disabled",
+    }));
 
-        build_host(&bridge.to_string_lossy(), &config.to_string_lossy())
+    let res = DOTNET_HOST.get_or_init(|| {
+        match find_bridge_and_config(app_root) {
+            Some((bridge, config)) => {
+                crate::debug_output(&format!("[NativeScript] found DotNetBridge at {} and config at {}\n", bridge.display(), config.display()));
+                build_host(&bridge.to_string_lossy(), &config.to_string_lossy())
+            }
+            None => Err(format!(
+                "DotNetBridge.dll and/or runtimeconfig not found under {} — run `dotnet publish` in dotnet-bridge/",
+                app_root
+            )),
+        }
     });
+
+    match res {
+        Ok(_) => crate::debug_output("[NativeScript] .NET host initialized successfully\n"),
+        Err(e) => crate::debug_output(&format!("[NativeScript] .NET host initialization failed: {}\n", e)),
+    }
+}
+
+/// Ensure the DotNet host is initialised (lazy). Uses stored `DOTNET_APP_ROOT` or
+/// falls back to current directory when app root is not set.
+fn ensure_dotnet_initialized() {
+    if DOTNET_HOST.get().is_some() { return; }
+    let app_root = DOTNET_APP_ROOT.get().map(|s| s.as_str()).unwrap_or(".");
+    try_init_dotnet(app_root);
+    // If initialisation succeeded, register the JS callback function so managed
+    // delegates can call back into V8. This is idempotent because init_js_callbacks
+    // is a no-op when the host isn't available.
+    if DOTNET_HOST.get().and_then(|r| r.as_ref().ok()).is_some() {
+        init_js_callbacks(crate::global_fns::invoke_dotnet_js_callback);
+    }
 }
 
 /// Calls the managed bridge with a JSON request string and returns the JSON
@@ -271,9 +372,10 @@ pub(crate) fn try_init_dotnet(app_root: &str) {
 /// (`as_bytes()` — no allocation), response is decoded with
 /// `from_utf8_unchecked` (the bridge always outputs valid JSON UTF-8).
 pub(crate) fn call_dotnet(request_json: &str) -> Result<String, String> {
+    ensure_dotnet_initialized();
     let host = DOTNET_HOST
         .get()
-        .ok_or_else(|| "DotNet host not yet initialised".to_string())?
+        .ok_or_else(|| "DotNet host not available".to_string())?
         .as_ref()
         .map_err(|e| e.clone())?;
 
@@ -318,9 +420,10 @@ pub(crate) fn init_js_callbacks(callback: FnJsCallback) {
 /// Calls the managed bridge with a pre-built binary request packet and returns
 /// the raw binary response bytes.  No JSON involved on either side.
 pub(crate) fn call_dotnet_binary(request: &[u8]) -> Result<Vec<u8>, String> {
+    ensure_dotnet_initialized();
     let host = DOTNET_HOST
         .get()
-        .ok_or_else(|| "DotNet host not yet initialised".to_string())?
+        .ok_or_else(|| "DotNet host not available".to_string())?
         .as_ref()
         .map_err(|e| e.clone())?;
 
@@ -346,5 +449,64 @@ pub(crate) fn call_dotnet_binary(request: &[u8]) -> Result<Vec<u8>, String> {
     let result = slice.to_vec();
     unsafe { (host.free)(resp_ptr) };
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{create_dir_all, File};
+    use std::io::Write;
+    use std::env;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn make_temp_dir() -> std::path::PathBuf {
+        let mut base = env::temp_dir();
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        base.push(format!("ns_dotnet_test_{}", nanos));
+        base
+    }
+
+    #[test]
+    fn find_bridge_in_publish() {
+        let dir = make_temp_dir();
+        let pubdir = dir.join("dotnet-bridge").join("publish");
+        create_dir_all(&pubdir).unwrap();
+        let dll = pubdir.join("DotNetBridge.dll");
+        let cfg = pubdir.join("DotNetBridge.runtimeconfig.json");
+        File::create(&dll).unwrap();
+        let mut f = File::create(&cfg).unwrap();
+        writeln!(f, "{{}}\n").unwrap();
+
+        let found = find_bridge_and_config(dir.to_str().unwrap());
+        assert!(found.is_some());
+        let (found_dll, found_cfg) = found.unwrap();
+        assert_eq!(found_dll, dll);
+        assert_eq!(found_cfg, cfg);
+
+        let _ = std::fs::remove_file(found_dll);
+        let _ = std::fs::remove_file(found_cfg);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn find_bridge_in_publish_parent() {
+        let dir = make_temp_dir();
+        create_dir_all(dir.join("publish").join("dotnet-bridge")).unwrap();
+        let pubdir = dir.join("publish").join("dotnet-bridge");
+        let dll = pubdir.join("DotNetBridge.dll");
+        let cfg = pubdir.join("DotNetBridge.runtimeconfig.json");
+        File::create(&dll).unwrap();
+        File::create(&cfg).unwrap();
+
+        let found = find_bridge_and_config(dir.to_str().unwrap());
+        assert!(found.is_some());
+        let (found_dll, found_cfg) = found.unwrap();
+        assert_eq!(found_dll, dll);
+        assert_eq!(found_cfg, cfg);
+
+        let _ = std::fs::remove_file(found_dll);
+        let _ = std::fs::remove_file(found_cfg);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 

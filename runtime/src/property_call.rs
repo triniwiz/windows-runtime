@@ -20,7 +20,8 @@ use metadata::meta_data_reader::MetadataReader;
 use metadata::signature::Signature;
 use crate::error::AnyError;
 use crate::helpers::{ffi_native_type_from_signature, strip_generic_suffix};
-use crate::value::{append_struct_field_bytes, ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_query_interface_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use crate::value::{append_struct_field_bytes, ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_query_interface_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue, read_value_from_ptr, write_v8_value_to_ptr};
 
 fn substitute_type_vars(s: &str, type_args: &[String]) -> String {
     if type_args.is_empty() {
@@ -571,11 +572,11 @@ impl PropertyCall {
         })
     }
 
-    pub fn call(
+    pub fn call<'s>(
         &mut self,
-        scope: &mut v8::PinScope<'_, '_>,
+        scope: &mut v8::PinScope<'s, '_>,
         args: &v8::FunctionCallbackArguments,
-    ) -> (HRESULT, *mut c_void) {
+    ) -> (HRESULT, *mut c_void, Vec<v8::Local<'s, v8::Value>>) {
         let mut values = Vec::with_capacity(self.parse_parameter_types.len());
         for index in 0..self.parse_parameter_types.len() {
             values.push(args.get(index as i32));
@@ -584,11 +585,11 @@ impl PropertyCall {
         self.call_with_values(scope, &values)
     }
 
-    pub fn call_with_values(
+    pub fn call_with_values<'s>(
         &mut self,
-        scope: &mut v8::PinScope<'_, '_>,
+        scope: &mut v8::PinScope<'s, '_>,
         values: &[v8::Local<v8::Value>],
-    ) -> (HRESULT, *mut c_void) {
+    ) -> (HRESULT, *mut c_void, Vec<v8::Local<'s, v8::Value>>) {
         let is_void = self.is_void;
 
         let is_value_type = if self.return_type == "Guid" {
@@ -616,58 +617,65 @@ impl PropertyCall {
         self.argument_parse_types.clear();
         let mut queried_interfaces: Vec<IUnknown> = Vec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
+        let mut out_slots: Vec<(usize, NativeType, Option<String>)> = Vec::new();
 
         self.argument_buf.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
         self.argument_parse_types.push(None);
 
         for (i, native_type) in self.parse_parameter_types.iter().enumerate() {
-            let Some(value) = values.get(i).copied() else {
-                return (call_failure(), std::ptr::null_mut());
-            };
+            let value = values.get(i).copied().unwrap_or_else(|| v8::undefined(scope).into());
+
+            let parameter = &self.parameters[i];
+            let param_sig_opt = parameter.metadata().map(|m| Signature::to_string(m, &parameter.type_()));
+            let is_sig_byref = param_sig_opt.as_ref().map_or(false, |s| s.starts_with("ByRef "));
+            if parameter.is_out() || (is_sig_byref && values.get(i).is_none()) {
+                let slot_index = self.argument_buf.len();
+                let slot_size = match native_type {
+                    NativeType::Struct(_) => native_type.size(),
+                    NativeType::Pointer | NativeType::Buffer | NativeType::Function | NativeType::String => std::mem::size_of::<usize>(),
+                    _ => native_type.size(),
+                };
+                let mut buf: Vec<u8> = vec![0u8; slot_size];
+                let ptr = buf.as_mut_ptr() as *mut c_void;
+                struct_scratch.push(buf);
+                self.argument_buf.push(NativeValue { pointer: ptr });
+                self.argument_parse_types.push(None);
+                // Initialize from caller-provided value if present (in/out semantics).
+                if let Some(init_val) = values.get(i).copied() {
+                    if !init_val.is_undefined() && !init_val.is_null() {
+                        match write_v8_value_to_ptr(scope, init_val, ptr, native_type) {
+                            Ok(parse_opt) => {
+                                if let Some(pt) = parse_opt {
+                                    if let Some(slot) = self.argument_parse_types.get_mut(slot_index) {
+                                        *slot = Some(pt);
+                                    }
+                                }
+                            }
+                            Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
+                        }
+                    }
+                }
+
+                let sig = param_sig_opt;
+                out_slots.push((slot_index, native_type.clone(), sig));
+                continue;
+            }
 
             let value = match *native_type {
-                NativeType::Void => {
-                    return (call_failure(), std::ptr::null_mut())
-                }
-                NativeType::Bool => {
-                    ffi_parse_bool_arg(value)
-                }
-                NativeType::U8 => {
-                    ffi_parse_u8_arg(value)
-                }
-                NativeType::I8 => {
-                    ffi_parse_i8_arg(value)
-                }
-                NativeType::U16 => {
-                    ffi_parse_u16_arg(value)
-                }
-                NativeType::I16 => {
-                    ffi_parse_i16_arg(value)
-                }
-                NativeType::U32 => {
-                    ffi_parse_u32_arg(value)
-                }
-                NativeType::I32 => {
-                    ffi_parse_i32_arg(value)
-                }
-                NativeType::U64 => {
-                    ffi_parse_u64_arg(scope, value)
-                }
-                NativeType::I64 => {
-                    ffi_parse_i64_arg(scope, value)
-                }
-                NativeType::USize => {
-                    ffi_parse_usize_arg(scope, value)
-                }
-                NativeType::ISize => {
-                    ffi_parse_isize_arg(scope, value)
-                }
-                NativeType::F32 => {
-                    ffi_parse_f32_arg(value)
-                }
-                NativeType::F64 => {
-                    ffi_parse_f64_arg(value)
-                }
+                NativeType::Void => { return (call_failure(), std::ptr::null_mut(), Vec::new()) }
+                NativeType::Bool => ffi_parse_bool_arg(value),
+                NativeType::U8 => ffi_parse_u8_arg(value),
+                NativeType::I8 => ffi_parse_i8_arg(value),
+                NativeType::U16 => ffi_parse_u16_arg(value),
+                NativeType::I16 => ffi_parse_i16_arg(value),
+                NativeType::U32 => ffi_parse_u32_arg(value),
+                NativeType::I32 => ffi_parse_i32_arg(value),
+                NativeType::U64 => ffi_parse_u64_arg(scope, value),
+                NativeType::I64 => ffi_parse_i64_arg(scope, value),
+                NativeType::USize => ffi_parse_usize_arg(scope, value),
+                NativeType::ISize => ffi_parse_isize_arg(scope, value),
+                NativeType::F32 => ffi_parse_f32_arg(value),
+                NativeType::F64 => ffi_parse_f64_arg(value),
                 NativeType::Pointer => {
                     let parameter = &self.parameters[i];
                     let parameter_signature = substitute_type_vars(
@@ -818,7 +826,7 @@ impl PropertyCall {
                     let parsed = ffi_parse_buffer_arg_with_length(scope, value);
                     let (buffer_value, byte_length) = match parsed {
                         Ok(value) => value,
-                        Err(_) => return (call_failure(), std::ptr::null_mut()),
+                        Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
                     };
 
                     self.argument_buf.push(NativeValue { u32_value: byte_length });
@@ -827,20 +835,14 @@ impl PropertyCall {
                     self.argument_parse_types.push(Some(native_type.clone()));
                     continue;
                 }
-                NativeType::Function => {
-                    ffi_parse_function_arg(scope, value)
-                }
-                NativeType::Struct(_) => {
-                    ffi_parse_struct_arg(scope, value)
-                }
-                NativeType::String => {
-                    ffi_parse_string_arg(scope, value)
-                }
+                NativeType::Function => ffi_parse_function_arg(scope, value),
+                NativeType::Struct(_) => ffi_parse_struct_arg(scope, value),
+                NativeType::String => ffi_parse_string_arg(scope, value),
             };
 
             let value = match value {
                 Ok(value) => value,
-                Err(_) => return (call_failure(), std::ptr::null_mut()),
+                Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
             };
 
             self.argument_buf.push(value);
@@ -864,7 +866,7 @@ impl PropertyCall {
 
         for (i, v) in self.argument_buf.iter().enumerate() {
             let Some(abi_native) = self.parameter_types.get(i) else {
-                return (call_failure(), std::ptr::null_mut());
+                return (call_failure(), std::ptr::null_mut(), Vec::new());
             };
 
             let effective_native = if matches!(abi_native, NativeType::Pointer) {
@@ -884,12 +886,79 @@ impl PropertyCall {
             call_args.push(unsafe { v.as_arg(&effective_native) });
         }
 
-        let ret = unsafe { self.cif.call(CodePtr::from_ptr(self.func), &call_args) };
+        let ret = match catch_unwind(AssertUnwindSafe(|| unsafe { self.cif.call(CodePtr::from_ptr(self.func), &call_args) })) {
+            Ok(code) => code,
+            Err(_) => {
+                let msg = format!("WinRT property call panicked during invocation: returning E_FAIL");
+                crate::debug_output(&format!("[NativeScript] {}\n", msg));
+                crate::store_last_js_error(msg);
+                return (call_failure(), std::ptr::null_mut(), Vec::new());
+            }
+        };
+
+        // Detect RPC_E_WRONG_THREAD and surface the canonical OS message to
+        // JS/tests so embedders can catch it directly.
+        let hr = HRESULT(ret);
+        const RPC_E_WRONG_THREAD: u32 = 0x8001010E;
+        if (hr.0 as u32) == RPC_E_WRONG_THREAD {
+            let os_msg = crate::error::format_hresult_message(hr);
+            let msg = format!("{} HRESULT 0x{:08X}", os_msg, hr.0 as u32);
+            crate::debug_output(&format!("[NativeScript] {}\n", msg));
+            crate::store_last_js_error(msg.clone());
+            if let Some(vmstr) = v8::String::new(scope, &msg) {
+                let err = v8::Exception::error(scope, vmstr);
+                scope.throw_exception(err);
+            }
+        }
 
         if !self.is_initializer && !is_void && (is_value_type || is_scalar_return || is_string_return) {
             result = self.return_value_buf.as_mut_ptr() as *mut c_void;
         }
 
-        (HRESULT(ret), result)
+        // Marshal out-parameters back into V8 values using the recorded slots.
+        let mut out_values: Vec<v8::Local<'s, v8::Value>> = Vec::new();
+        for (slot_index, parse_native_type, sig_opt) in out_slots.into_iter() {
+            let storage_ptr = unsafe { self.argument_buf.get(slot_index).map(|v| v.pointer).unwrap_or(std::ptr::null_mut()) };
+            if storage_ptr.is_null() {
+                out_values.push(v8::null(scope).into());
+                continue;
+            }
+            unsafe {
+                let v = match parse_native_type {
+                    NativeType::Pointer | NativeType::Buffer | NativeType::Function => {
+                        let inner = std::ptr::read_unaligned(storage_ptr as *const usize) as *mut c_void;
+                        if inner.is_null() {
+                            v8::null(scope).into()
+                        } else if let Some(sig) = sig_opt.as_ref() {
+                            if sig.contains('.') {
+                                let mut lookup = sig.as_str();
+                                if let Some(stripped) = lookup.strip_prefix("ByRef ") {
+                                    lookup = stripped;
+                                }
+                                let lookup = strip_generic_suffix(lookup);
+                                if let Some(declaration) = MetadataReader::find_by_name(lookup) {
+                                    if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                        crate::create_struct_object_from_raw(declaration, inner, scope).into()
+                                    } else {
+                                        let instance = unsafe { IUnknown::from_raw(inner) };
+                                        crate::ns_proxy::create_ns_ctor_instance_object(sig.as_str(), None, None, declaration, Some(instance), scope).into()
+                                    }
+                                } else {
+                                    read_value_from_ptr(inner as *const c_void, scope, NativeType::Pointer)
+                                }
+                            } else {
+                                read_value_from_ptr(inner as *const c_void, scope, NativeType::Pointer)
+                            }
+                        } else {
+                            read_value_from_ptr(inner as *const c_void, scope, NativeType::Pointer)
+                        }
+                    }
+                    _ => read_value_from_ptr(storage_ptr as *const c_void, scope, parse_native_type.clone()),
+                };
+                out_values.push(v);
+            }
+        }
+
+        (HRESULT(ret), result, out_values)
     }
 }

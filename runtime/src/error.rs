@@ -47,3 +47,10 @@ pub fn generic_error(message: impl Into<Cow<'static, str>>) -> Error {
 pub fn type_error(message: impl Into<Cow<'static, str>>) -> Error {
     custom_error("TypeError", message)
 }
+
+/// Format an HRESULT into a human-readable message using the runtime's
+/// provided message text when available. Falls back to a hex HRESULT string.
+pub fn format_hresult_message(hr: windows::core::HRESULT) -> String {
+    let s = hr.message();
+    if s.is_empty() { format!("HRESULT 0x{:08X}", hr.0 as u32) } else { s }
+}

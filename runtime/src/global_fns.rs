@@ -15,6 +15,70 @@ pub(crate) fn value_to_string(scope: &mut v8::PinScope<'_, '_>, value: v8::Local
     Some(value.to_rust_string_lossy(scope))
 }
 
+pub(crate) fn handle_run_on_ui_thread(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut _retval: v8::ReturnValue,
+) {
+    if args.length() < 1 {
+        throw_js_error(scope, "__nsRunOnUIThread(fn): expected a function argument");
+        return;
+    }
+
+    let Ok(func) = v8::Local::<v8::Function>::try_from(args.get(0)) else {
+        throw_js_error(scope, "__nsRunOnUIThread: argument must be a function");
+        return;
+    };
+
+    // v8::Global is !Send; store it by ID so only the i32 crosses into the closure.
+    let cb_id = crate::DOTNET_NEXT_CB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::DOTNET_JS_CALLBACKS.with(|m| {
+        m.borrow_mut().insert(cb_id, v8::Global::new(scope, func));
+    });
+
+    crate::ui_dispatcher::post_to_ui_thread(move || {
+        let isolate_ptr = crate::DELEGATE_ISOLATE_PTR.with(|c| c.get());
+        if isolate_ptr.is_null() {
+            crate::DOTNET_JS_CALLBACKS.with(|m| { m.borrow_mut().remove(&cb_id); });
+            return;
+        }
+        let isolate: &mut v8::Isolate = unsafe { &mut *isolate_ptr };
+        v8::scope!(scope, isolate);
+        let ctx_global = match scope.get_slot::<v8::Global<v8::Context>>() {
+            Some(g) => g.clone(),
+            None => {
+                crate::DOTNET_JS_CALLBACKS.with(|m| { m.borrow_mut().remove(&cb_id); });
+                return;
+            }
+        };
+        let context = v8::Local::new(scope, &ctx_global);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        v8::tc_scope!(tc, scope);
+
+        let func_global = crate::DOTNET_JS_CALLBACKS.with(|m| {
+            m.borrow().get(&cb_id).cloned()
+        });
+        let Some(func_global) = func_global else {
+            return;
+        };
+
+        let func = v8::Local::new(tc, &func_global);
+        let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
+        let _ = func.call(tc, recv, &[]);
+
+        if tc.has_caught() {
+            if let Some(ex) = tc.exception() {
+                let msg = ex.to_rust_string_lossy(tc);
+                crate::debug_output(&format!("[nsRunOnUIThread] uncaught exception: {}\n", msg));
+                crate::store_last_js_error(msg);
+            }
+            tc.reset();
+        }
+
+        crate::DOTNET_JS_CALLBACKS.with(|m| { m.borrow_mut().remove(&cb_id); });
+    });
+}
+
 fn value_to_json_string(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> Option<String> {
     let json = v8::json::stringify(scope, value)?;
     Some(json.to_rust_string_lossy(scope))
@@ -780,7 +844,14 @@ const HELPER_SOURCE: &str = r#"
                     return Promise.resolve(op);
                 }
 
-                if (typeof op.then === 'function') {
+                if (op && typeof op.__handle === 'number' && op.__isTask === true
+                    && typeof globalThis.__nsDotNetAwaitTask === 'function') {
+                    return new Promise(function (resolve, reject) {
+                        globalThis.__nsDotNetAwaitTask(op.__handle, resolve, reject);
+                    });
+                }
+
+                if (typeof op.then === 'function' && !('Completed' in op)) {
                     return op;
                 }
 
@@ -2171,19 +2242,21 @@ const HELPER_SOURCE: &str = r#"
             // Makes sw.Stop() and sw.Elapsed both work naturally.
             // The proxy is registered with _dotNetFinalizers so the CLR reference
             // is released automatically when JS GC collects the proxy.
-            function _makeDotNetInstance(handle, assembly, typeName) {
+            function _makeDotNetInstance(handle, assembly, typeName, isTask) {
                 var info = _getTypeInfo(assembly, typeName);
                 var proxy = new Proxy({}, {
                     get: function (_, prop) {
                         if (typeof prop === 'symbol') return undefined;
                         if (prop === '__handle') return handle;
                         if (prop === '__type')   return typeName;
+                        if (prop === '__isTask') return isTask === true;
                         if (prop === 'release') return function () {
                             _invoke({ handle: handle, method: '__release', args: [] });
                         };
                         if (prop === 'toString') return function () {
                             return '[DotNetObject ' + typeName + ' #' + handle + ']';
                         };
+                        if (prop === 'then') return undefined;
                         // Re-read info in case it was populated after construction.
                         var i = _typeInfoCache[typeName] || _emptyInfo;
                         // Write-only: has setter but no getter — reading it is an error.
@@ -2222,7 +2295,7 @@ const HELPER_SOURCE: &str = r#"
                     var typeName = value.__type || '';
                     var root = (typeName || '').split('.')[0];
                     var assembly = _namespaceAssemblyMap[root] || '';
-                    return _makeDotNetInstance(value.__handle, assembly, typeName);
+                    return _makeDotNetInstance(value.__handle, assembly, typeName, value.__isTask === true);
                 }
                 return value;
             }
@@ -2346,6 +2419,17 @@ const HELPER_SOURCE: &str = r#"
             // Use this when the API expects a managed System.Action,
             // System.EventHandler, etc. rather than a WinRT delegate interface.
             // For WinRT delegate types use NSWinRT.asDelegate instead.
+            if (typeof globalThis.__nsDotNetAwaitTask === 'function') {
+                globalThis.NSWinRT.dotnet.taskToPromise = function (obj) {
+                    var h = obj && typeof obj.__handle === 'number' ? obj.__handle
+                          : typeof obj === 'number' ? obj : -1;
+                    if (h < 0) return Promise.resolve(obj);
+                    return new Promise(function (resolve, reject) {
+                        globalThis.__nsDotNetAwaitTask(h, resolve, reject);
+                    });
+                };
+            }
+
             if (typeof globalThis.__nsDotNetCreateDelegate === 'function') {
                 globalThis.NSWinRT.dotnet.asDelegate = function(typeNameOrFn, fn) {
                     var typeName, callback;
@@ -2363,6 +2447,13 @@ const HELPER_SOURCE: &str = r#"
                         return callback.apply(null, args);
                     };
                     return globalThis.__nsDotNetCreateDelegate(typeName, wrapped);
+                };
+            }
+
+            if (typeof globalThis.__nsRunOnUIThread === 'function') {
+                globalThis.NSWinRT.runOnUIThread = function(fn) {
+                    if (typeof fn !== 'function') throw new TypeError('NSWinRT.runOnUIThread: expected a function');
+                    return globalThis.__nsRunOnUIThread(fn);
                 };
             }
         })();
@@ -2778,6 +2869,15 @@ pub(crate) unsafe extern "C" fn invoke_dotnet_js_callback(
         }
         tc.reset();
     }
+    // If this callback was registered as a one-shot, remove it now to avoid leaks.
+    crate::DOTNET_ONESHOT_JS_CALLBACKS.with(|s| {
+        let mut set = s.borrow_mut();
+        if set.contains(&callback_id) {
+            // Remove the stored JS function and clear the oneshot marker.
+            crate::DOTNET_JS_CALLBACKS.with(|m| { m.borrow_mut().remove(&callback_id); });
+            set.remove(&callback_id);
+        }
+    });
 }
 
 fn parse_dotnet_callback_args<'s>(
@@ -2845,6 +2945,62 @@ pub(crate) fn handle_dotnet_create_delegate(
 fn bin_write_str16(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
     buf.extend_from_slice(bytes);
+}
+
+pub(crate) fn handle_dotnet_await_task(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    _retval: v8::ReturnValue,
+) {
+    if args.length() < 3 {
+        throw_js_error(scope, "__nsDotNetAwaitTask(handleId, resolve, reject): expected 3 arguments");
+        return;
+    }
+
+    let handle_id: i32 = if let Ok(n) = v8::Local::<v8::Integer>::try_from(args.get(0)) {
+        n.value() as i32
+    } else if let Ok(n) = v8::Local::<v8::Number>::try_from(args.get(0)) {
+        n.value() as i32
+    } else {
+        throw_js_error(scope, "__nsDotNetAwaitTask: first argument must be a handle id (integer)");
+        return;
+    };
+
+    let Ok(resolve_fn) = v8::Local::<v8::Function>::try_from(args.get(1)) else {
+        throw_js_error(scope, "__nsDotNetAwaitTask: second argument must be a resolve function");
+        return;
+    };
+    let Ok(reject_fn) = v8::Local::<v8::Function>::try_from(args.get(2)) else {
+        throw_js_error(scope, "__nsDotNetAwaitTask: third argument must be a reject function");
+        return;
+    };
+
+    let resolve_id = crate::DOTNET_NEXT_CB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let reject_id  = crate::DOTNET_NEXT_CB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    crate::DOTNET_JS_CALLBACKS.with(|m| {
+        let mut map = m.borrow_mut();
+        map.insert(resolve_id, v8::Global::new(scope, resolve_fn));
+        map.insert(reject_id,  v8::Global::new(scope, reject_fn));
+    });
+
+    // Binary instance call: 0x01 | handle(i32) | "__dotnet_await__"(str16) | 2 | i32 resolveId | i32 rejectId
+    let mut req: Vec<u8> = Vec::with_capacity(32);
+    req.push(0x01u8);
+    req.extend_from_slice(&handle_id.to_le_bytes());
+    bin_write_str16(&mut req, b"__dotnet_await__");
+    req.push(2u8);
+    req.push(0x03u8); req.extend_from_slice(&resolve_id.to_le_bytes());
+    req.push(0x03u8); req.extend_from_slice(&reject_id.to_le_bytes());
+
+    if let Err(e) = crate::dotnet::call_dotnet_binary(&req) {
+        crate::DOTNET_JS_CALLBACKS.with(|m| {
+            let mut map = m.borrow_mut();
+            map.remove(&resolve_id);
+            map.remove(&reject_id);
+        });
+        throw_js_error(scope, &e);
+    }
 }
 
 fn bin_write_v8_arg(buf: &mut Vec<u8>, scope: &mut v8::PinScope<'_, '_>, arg: v8::Local<v8::Value>) {
@@ -2960,7 +3116,7 @@ fn bin_read_value<'s>(
             Ok(v8::String::new(scope, s).map(Into::into).unwrap_or_else(|| v8::null(scope).into()))
         }
 
-        0x06 => { // handle → JS object {__handle, __type}
+        0x06 | 0x0C => { // handle → JS object {__handle, __type} ; 0x0C adds __isTask:true
             let id = i32::from_le_bytes(bytes[*pos..*pos+4].try_into().map_err(|_| "handle id")?);
             *pos += 4;
             let type_len = u16::from_le_bytes(bytes[*pos..*pos+2].try_into().map_err(|_| "type len")?) as usize;
@@ -2974,6 +3130,10 @@ fn bin_read_value<'s>(
             let tv = v8::String::new(scope, type_name).ok_or("v8 str")?;
             obj.set(scope, hk.into(), v8::Integer::new(scope, id).into());
             obj.set(scope, tk.into(), tv.into());
+            if tag == 0x0C {
+                let ik = v8::String::new(scope, "__isTask").ok_or("v8 str")?;
+                obj.set(scope, ik.into(), v8::Boolean::new(scope, true).into());
+            }
             Ok(obj.into())
         }
 
@@ -3091,6 +3251,70 @@ pub(crate) fn handle_ns_uuid(
         Err(_) => retval.set(v8::undefined(scope).into()),
     }
 }
+
+// ── __nsIsUiThread ───────────────────────────────────────────────────────────
+
+pub(crate) fn handle_is_ui_thread(
+    _scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let is_ui = crate::ui_dispatcher::is_ui_thread();
+    retval.set_bool(is_ui);
+}
+
+// ── __nsThreadInfo ──────────────────────────────────────────────────────────
+pub(crate) fn handle_thread_info(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let os_tid = crate::ui_dispatcher::get_ui_thread_os_tid();
+    let rust_tid = crate::ui_dispatcher::get_ui_thread_rust_tid();
+    let is_ui = crate::ui_dispatcher::is_ui_thread();
+
+    let obj = v8::Object::new(scope);
+    // osTid: number | null
+    if let Some(k) = v8::String::new(scope, "osTid") {
+        if let Some(t) = os_tid {
+            obj.set(scope, k.into(), v8::Number::new(scope, t as f64).into());
+        } else {
+            obj.set(scope, k.into(), v8::null(scope).into());
+        }
+    }
+    // rustTid: string | null
+    if let Some(k) = v8::String::new(scope, "rustTid") {
+        if let Some(s) = rust_tid {
+            if let Some(v) = v8::String::new(scope, &s) {
+                obj.set(scope, k.into(), v.into());
+            }
+        } else {
+            obj.set(scope, k.into(), v8::null(scope).into());
+        }
+    }
+    // isUiThread: bool
+    if let Some(k) = v8::String::new(scope, "isUiThread") {
+        obj.set(scope, k.into(), v8::Boolean::new(scope, is_ui).into());
+    }
+
+    retval.set(obj.into());
+}
+
+// ── __nsGetLastJsError ──────────────────────────────────────────────────────
+pub(crate) fn handle_get_last_js_error(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if let Some(err) = crate::get_last_js_error() {
+        if let Some(s) = v8::String::new(scope, &err) {
+            retval.set(s.into());
+            return;
+        }
+    }
+    retval.set(v8::null(scope).into());
+}
+
 
 // ── __nsWin32CallRaw ──────────────────────────────────────────────────────────
 
@@ -3227,6 +3451,8 @@ pub(crate) fn init_async_helpers(
     register!("__nsDotNetInvoke",               handle_dotnet_invoke);
     register!("__nsDotNetInvokeBin",            handle_dotnet_invoke_binary);
     register!("__nsDotNetCreateDelegate",       handle_dotnet_create_delegate);
+    register!("__nsDotNetAwaitTask",            handle_dotnet_await_task);
+    register!("__nsRunOnUIThread",              handle_run_on_ui_thread);
     register!("__nsWin32Call",                  handle_win32_call);
     register!("__nsWin32CallRaw",               handle_win32_call_raw);
     register!("__nsWin32Exports",               handle_win32_exports);
@@ -3236,6 +3462,9 @@ pub(crate) fn init_async_helpers(
     register!("__ns__clearInterval",            crate::timers::handle_ns_clear_interval);
     register!("__nsDwmFlush",                   handle_dwm_flush);
     register!("__nsUUID",                       handle_ns_uuid);
+    register!("__nsIsUiThread",                 handle_is_ui_thread);
+    register!("__nsThreadInfo",                 handle_thread_info);
+    register!("__nsGetLastJsError",             handle_get_last_js_error);
 
     // Initialize native timers scheduler (non-blocking). This registers a
     // pump into `ASYNC_PUMP_HOOK` so blocking waits will also process timers.
@@ -3251,12 +3480,9 @@ pub(crate) fn init_async_helpers(
         r#"{"dll":"winmm.dll","fn":"timeBeginPeriod","returnType":"u32","args":[{"type":"u32","value":1}]}"#,
     );
 
-    // Attempt to initialise the .NET BCL host in the background; failures are
-    // deferred so the runtime still starts without .NET installed.
-    crate::dotnet::try_init_dotnet(app_root);
-    // Register the V8 callback function pointer with the managed bridge so
-    // delegates created via NSWinRT.asDelegate can call back into JavaScript.
-    crate::dotnet::init_js_callbacks(invoke_dotnet_js_callback);
+    // Store app root for optional .NET initialization. Actual host initialisation
+    // is performed lazily on first .NET use.
+    crate::dotnet::set_app_root(app_root);
 
     crate::globals::url::install_url_globals(scope);
 

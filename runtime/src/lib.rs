@@ -22,6 +22,7 @@ mod ns_proxy;
 pub(crate) mod dotnet;
 pub(crate) mod win32;
 pub(crate) mod win32_known_fns;
+pub mod ui_dispatcher;
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -68,7 +69,7 @@ use metadata::declarations::struct_declaration::StructDeclaration;
 use metadata::signature::Signature;
 use metadata::value::Value;
 use runtime_binding_gen::{RuntimeExtensionMetadata, RuntimeExtensionRegistry, RuntimeMethodMetadata, RuntimeParameterMetadata, RuntimePropertyMetadata};
-use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, MAX_SAFE_INTEGER, MIN_SAFE_INTEGER, NativeType, NativeValue, set_ret_val};
+use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, MAX_SAFE_INTEGER, MIN_SAFE_INTEGER, NativeType, NativeValue, set_ret_val, read_value_from_ptr};
 use crate::proxy_manifest_loader::SbgManifestLoader;
 
 thread_local!(static ISOLATE: RefCell<Option<&'static mut v8::Isolate>> = RefCell::new(None));
@@ -82,6 +83,8 @@ thread_local!(pub(crate) static DELEGATE_ISOLATE_PTR: Cell<*mut v8::Isolate> = C
 /// Thread-local because V8 globals must be accessed on the isolate's thread.
 thread_local!(pub(crate) static DOTNET_JS_CALLBACKS: RefCell<HashMap<i32, v8::Global<v8::Function>>> = RefCell::new(HashMap::new()));
 pub(crate) static DOTNET_NEXT_CB_ID: AtomicI32 = AtomicI32::new(1);
+// JS callbacks that should be removed after a single invocation (oneshot).
+thread_local!(pub(crate) static DOTNET_ONESHOT_JS_CALLBACKS: RefCell<HashSet<i32>> = RefCell::new(HashSet::new()));
 
 /// Optional hook called from the async-wait message loop so external tools
 /// (e.g. the devtools server) can pump their own messages without the runtime
@@ -748,7 +751,13 @@ fn init_global(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, conte
 }
 
 pub fn debug_output(msg: &str) {
-    // NOTE: enable DIAG messages during test debugging.
+    // Debug output is disabled by default to avoid noisy logs in normal runs.
+    // Set `NS_DEBUG` in the environment to enable diagnostic logging.
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var("NS_DEBUG").is_ok()) {
+        return;
+    }
+
     // Send UTF-16 string to debugger for reliable Unicode output
     let mut wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe { OutputDebugStringW(PCWSTR::from_raw(wide.as_ptr())) };
@@ -757,7 +766,6 @@ pub fn debug_output(msg: &str) {
     LOG_FILE.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
-            // TEMP first because USERPROFILE writes fail in the AppX sandbox.
             static LOG_PATH: OnceLock<String> = OnceLock::new();
             let path = LOG_PATH.get_or_init(|| {
                 let mut p = std::env::temp_dir();
@@ -1948,7 +1956,10 @@ fn init_async_helpers(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>
 
                 // Match NativeScript runtime style: native objects are returned as-is.
                 // Promise conversion is opt-in via this helper.
-                if (typeof op.then === 'function') {
+                // Skip for objects with a 'Completed' property (WinRT IAsyncOperation /
+                // .NET TaskToAsyncOperationAdapter) — the proxy makes them appear thenable
+                // but calling .then(resolve, reject) on them fails at the .NET boundary.
+                if (typeof op.then === 'function' && !('Completed' in op)) {
                     return op;
                 }
 
@@ -3183,7 +3194,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let Some(mut property_call) = PropertyCall::new_for_interface(&property_clone, false, ns_instance, false, iid, type_args) else {
                             return v8::Intercepted::kNo;
                         };
-                        let (ret, result) = property_call.call_with_values(scope, &[]);
+                        let (ret, result, _outs) = property_call.call_with_values(scope, &[]);
                         if ret.is_err() {
                             let detail = format!("Property get '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
                             let message = v8::String::new(scope, &detail).unwrap();
@@ -3247,7 +3258,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                 arg_vals.push(args.get(i));
                             }
 
-                            let (ret, result) = method_call.call_with_values(scope, &arg_vals);
+                            let (ret, result, _outs) = method_call.call_with_values(scope, &arg_vals);
 
                             if ret.is_err() {
                                 let detail = format!("{} (HRESULT 0x{:08X})", ret.message(), ret.0 as u32);
@@ -3321,7 +3332,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let Some(mut property_call) = PropertyCall::new_for_interface(&property_clone, false, ns_instance, false, iid, type_args) else {
                             return v8::Intercepted::kNo;
                         };
-                        let (ret, result) = property_call.call_with_values(scope, &[]);
+                        let (ret, result, _outs) = property_call.call_with_values(scope, &[]);
                         if ret.is_err() {
                             let detail = format!("Property get '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
                             let message = v8::String::new(scope, &detail).unwrap();
@@ -3384,7 +3395,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                 arg_vals.push(args.get(i));
                             }
 
-                            let (ret, result) = method_call.call_with_values(scope, &arg_vals);
+                            let (ret, result, _outs) = method_call.call_with_values(scope, &arg_vals);
 
                             if ret.is_err() {
                                 let detail = format!("{} (HRESULT 0x{:08X})", ret.message(), ret.0 as u32);
@@ -3457,7 +3468,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     let Some(mut property_call) = PropertyCall::new(&property, false, ns_instance, false) else {
                         return v8::Intercepted::kNo;
                     };
-                    let (ret, result) = property_call.call_with_values(scope, &[]);
+                    let (ret, result, _outs) = property_call.call_with_values(scope, &[]);
 
                     if ret.is_err() {
                         let detail = format!("Property get '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
@@ -3511,13 +3522,58 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let Some(method) = lock.as_any().downcast_ref::<MethodDeclaration>() else { return; };
                         let Some(ns_instance) = dec.instance.clone() else { return; };
                         let mut method = MethodCall::new(method, method.is_sealed(), ns_instance, false);
-                        let (ret, result) = method.call(scope, &args);
+                        let (ret, result, outs) = method.call(scope, &args);
 
                         if ret.is_err() {
                             let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
                             let message = v8::String::new(scope, &detail).unwrap();
                             let error = v8::Exception::error(scope, message);
                             scope.throw_exception(error);
+                            return;
+                        }
+
+                        // If there are out-parameters, return an array containing the
+                        // primary return (if present) followed by the out-values.
+                        if !outs.is_empty() {
+                            let mut arr_len = outs.len();
+                            if !method.is_void() { arr_len += 1; }
+                            let arr = v8::Array::new(scope, arr_len as i32);
+                            let mut idx = 0u32;
+
+                            if !method.is_void() {
+                                let return_sig = method.return_type().to_string();
+                                let mut return_value_opt: Option<Local<v8::Value>> = None;
+                                if return_sig.contains('.') {
+                                    if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
+                                        if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                            let obj = crate::create_struct_object_from_raw(declaration, result, scope).into();
+                                            return_value_opt = Some(obj);
+                                        } else if !result.is_null() {
+                                            let instance = unsafe { IUnknown::from_raw(result) };
+                                            let retv: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, dec.parent.clone(), declaration, Some(instance), scope).into();
+                                            return_value_opt = Some(retv);
+                                        } else {
+                                            return_value_opt = Some(v8::null(scope).into());
+                                        }
+                                    }
+                                }
+                                if return_value_opt.is_none() {
+                                    if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+                                        let v = unsafe { read_value_from_ptr(result as *const c_void, scope, return_type) };
+                                        return_value_opt = Some(v);
+                                    }
+                                }
+                                if let Some(rv) = return_value_opt {
+                                    arr.set_index(scope, idx, rv);
+                                    idx += 1;
+                                }
+                            }
+
+                            for outv in outs.into_iter() {
+                                arr.set_index(scope, idx, outv);
+                                idx += 1;
+                            }
+                            retval.set(arr.into());
                             return;
                         }
 
@@ -3589,7 +3645,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             let Some(mut property_call) = PropertyCall::new_for_interface(&property_clone, true, ns_instance, false, iid, type_args) else {
                                 return v8::Intercepted::kNo;
                             };
-                            let (ret, _) = property_call.call_with_values(scope, &[val]);
+                            let (ret, _, _outs) = property_call.call_with_values(scope, &[val]);
                             if ret.is_err() {
                                 let detail = format!("Property set '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
                                 let message = v8::String::new(scope, &detail).unwrap();
@@ -3615,7 +3671,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                     let Some(mut property_call) = PropertyCall::new(&property, true, ns_instance, false) else {
                         return v8::Intercepted::kNo;
                     };
-                    let (ret, _) = property_call.call_with_values(scope, &[val]);
+                    let (ret, _, _outs) = property_call.call_with_values(scope, &[val]);
                     if ret.is_err() {
                         let detail = format!("Property set '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
                         let message = v8::String::new(scope, &detail).unwrap();
@@ -3754,7 +3810,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             method, method.is_sealed(), ns_instance, false,
                         );
 
-                        let (ret, result) = method.call(scope, &args);
+                        let (ret, result, outs) = method.call(scope, &args);
 
                         if ret.is_err() {
                             let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
@@ -3762,30 +3818,71 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             let err = v8::Exception::error(scope, msg.into());
                             scope.throw_exception(err);
                             return;
-                        } else if !method.is_void() {
-                            let return_sig = method.return_type().to_string();
-                            if return_sig == "Guid" {
-                                let obj = unsafe { guid_ptr_to_js_object(result, scope) };
-                                retval.set(obj.into());
-                            } else {
+                        }
+
+                        if !outs.is_empty() {
+                            let mut arr_len = outs.len();
+                            if !method.is_void() { arr_len += 1; }
+                            let arr = v8::Array::new(scope, arr_len as i32);
+                            let mut idx = 0u32;
+
+                            if !method.is_void() {
+                                let return_sig = method.return_type().to_string();
+                                let mut return_value_opt: Option<Local<v8::Value>> = None;
+                                if return_sig.contains('.') {
+                                    if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
+                                        if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                            let obj = crate::create_struct_object_from_raw(declaration, result, scope).into();
+                                            return_value_opt = Some(obj);
+                                        } else if !result.is_null() {
+                                            let instance = unsafe { IUnknown::from_raw(result) };
+                                            let retv: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, dec.parent.clone(), declaration, Some(instance), scope).into();
+                                            return_value_opt = Some(retv);
+                                        } else {
+                                            return_value_opt = Some(v8::null(scope).into());
+                                        }
+                                    }
+                                }
+                                if return_value_opt.is_none() {
+                                    if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+                                        let v = unsafe { read_value_from_ptr(result as *const c_void, scope, return_type) };
+                                        return_value_opt = Some(v);
+                                    }
+                                }
+                                if let Some(rv) = return_value_opt {
+                                    arr.set_index(scope, idx, rv);
+                                    idx += 1;
+                                }
+                            }
+
+                            for outv in outs.into_iter() {
+                                arr.set_index(scope, idx, outv);
+                                idx += 1;
+                            }
+                            retval.set(arr.into());
+                            return;
+                        }
+
+                        if method.is_void() {
+                            retval.set_undefined();
+                            return;
+                        }
+
+                        let return_sig = method.return_type().to_string();
+                        if return_sig == "Guid" {
+                            let obj = unsafe { guid_ptr_to_js_object(result, scope) };
+                            retval.set(obj.into());
+                        } else {
                             match NativeType::try_from(return_sig.as_str()) {
                                 Ok(return_type) => {
-                                    if return_sig.contains(".") {
+                                    if return_sig.contains('.') {
                                         if result.is_null() {
                                             retval.set(v8::null(scope).into());
                                             return;
                                         }
                                         let instance = unsafe { IUnknown::from_raw(result) };
-
-                                        // For generic types like IAsyncOperation`1<IUICommand>, look
-                                        // up the open generic by name and hand the instance off to
-                                        // the regular wrapper path. Async / IAsyncOperation<T>
-                                        // returns flow through here too: the wrapped object exposes
-                                        // .Status, .ErrorCode, .GetResults, .Completed, .Cancel,
-                                        // .Close
                                         let declaration = MetadataReader::find_by_name(return_sig.as_str())
                                             .unwrap_or_else(|| dec.inner.clone());
-
                                         let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, dec.parent.clone(), declaration, Some(instance), scope).into();
                                         retval.set(ret.into());
                                         return;
@@ -3794,9 +3891,6 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                 }
                                 Err(_) => {}
                             }
-                            } // end Guid else
-                        } else {
-                            retval.set_undefined();
                         }
 
                         // todo
@@ -3859,7 +3953,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             method, false, ns_instance, false,
                         ) else { return; };
 
-                        let (ret, result) = method.call(scope, &args);
+                        let (ret, result, outs) = method.call(scope, &args);
 
                         if ret.is_err() {
                             let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
@@ -3867,31 +3961,77 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             let err = v8::Exception::error(scope, msg.into());
                             scope.throw_exception(err);
                             return;
-                        } else if !method.is_void() {
-                            let return_sig = method.return_type().to_string();
-                            if return_sig.contains('.') {
-                                if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
-                                    let ret: Local<v8::Value> = if matches!(declaration.read().kind(), DeclarationKind::Struct) {
-                                        create_struct_object_from_raw(declaration, result, scope).into()
-                                    } else if result.is_null() {
-                                        v8::null(scope).into()
-                                    } else {
-                                        let instance = unsafe { IUnknown::from_raw(result) };
-                                        create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into()
-                                    };
-                                    retval.set(ret.into());
-                                    return;
+                        }
+
+                        if !outs.is_empty() {
+                            let mut arr_len = outs.len();
+                            if !method.is_void() { arr_len += 1; }
+                            let arr = v8::Array::new(scope, arr_len as i32);
+                            let mut idx = 0u32;
+
+                            if !method.is_void() {
+                                let return_sig = method.return_type().to_string();
+                                let mut return_value_opt: Option<Local<v8::Value>> = None;
+                                if return_sig.contains('.') {
+                                    if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
+                                        if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                            let obj = crate::create_struct_object_from_raw(declaration, result, scope).into();
+                                            return_value_opt = Some(obj);
+                                        } else if !result.is_null() {
+                                            let instance = unsafe { IUnknown::from_raw(result) };
+                                            let retv: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into();
+                                            return_value_opt = Some(retv);
+                                        } else {
+                                            return_value_opt = Some(v8::null(scope).into());
+                                        }
+                                    }
+                                }
+                                if return_value_opt.is_none() {
+                                    if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+                                        let v = unsafe { read_value_from_ptr(result as *const c_void, scope, return_type) };
+                                        return_value_opt = Some(v);
+                                    }
+                                }
+                                if let Some(rv) = return_value_opt {
+                                    arr.set_index(scope, idx, rv);
+                                    idx += 1;
                                 }
                             }
 
-                            match NativeType::try_from(return_sig.as_str()) {
-                                Ok(return_type) => {
-                                    unsafe { set_ret_val(result, scope, retval, return_type); }
-                                }
-                                Err(_) => {}
+                            for outv in outs.into_iter() {
+                                arr.set_index(scope, idx, outv);
+                                idx += 1;
                             }
-                        } else {
+                            retval.set(arr.into());
+                            return;
+                        }
+
+                        if method.is_void() {
                             retval.set_undefined();
+                            return;
+                        }
+
+                        let return_sig = method.return_type().to_string();
+                        if return_sig.contains('.') {
+                            if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
+                                let ret: Local<v8::Value> = if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                    create_struct_object_from_raw(declaration, result, scope).into()
+                                } else if result.is_null() {
+                                    v8::null(scope).into()
+                                } else {
+                                    let instance = unsafe { IUnknown::from_raw(result) };
+                                    create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into()
+                                };
+                                retval.set(ret.into());
+                                return;
+                            }
+                        }
+
+                        match NativeType::try_from(return_sig.as_str()) {
+                            Ok(return_type) => {
+                                unsafe { set_ret_val(result, scope, retval, return_type); }
+                            }
+                            Err(_) => {}
                         }
                     })
                         .data(getter_declaration_ext.into())
@@ -3919,7 +4059,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             let Some(prop) = lock.as_any().downcast_ref::<PropertyDeclaration>() else { return; };
                             let Some(ns_instance) = dec.instance.clone() else { return; };
                             let Some(mut method) = PropertyCall::new(prop, true, ns_instance, false) else { return; };
-                            let (ret, _) = method.call(scope, &args);
+                            let (ret, _, _outs) = method.call(scope, &args);
                             if ret.is_err() {
                                 let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
                                 let msg = v8::String::new(scope, &detail).unwrap();
@@ -4017,7 +4157,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                         method, method.is_sealed(), ns_instance, false,
                                     );
 
-                                    let (ret, result) = method.call(scope, &args);
+                                    let (ret, result, outs) = method.call(scope, &args);
 
                                     if ret.is_err() {
                                         let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
@@ -4025,15 +4165,61 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
                                         return;
-                                    } else if !method.is_void() {
-                                        match NativeType::try_from(method.return_type()) {
-                                            Ok(return_type) => {
-                                                unsafe { set_ret_val(result, scope, retval, return_type); }
+                                    }
+
+                                    if !outs.is_empty() {
+                                        let mut arr_len = outs.len();
+                                        if !method.is_void() { arr_len += 1; }
+                                        let arr = v8::Array::new(scope, arr_len as i32);
+                                        let mut idx = 0u32;
+
+                                        if !method.is_void() {
+                                            let return_sig = method.return_type().to_string();
+                                            let mut return_value_opt: Option<Local<v8::Value>> = None;
+                                            if return_sig.contains('.') {
+                                                if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
+                                                    if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                                        let obj = crate::create_struct_object_from_raw(declaration, result, scope).into();
+                                                        return_value_opt = Some(obj);
+                                                    } else if !result.is_null() {
+                                                        let instance = unsafe { IUnknown::from_raw(result) };
+                                                        let retv: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into();
+                                                        return_value_opt = Some(retv);
+                                                    } else {
+                                                        return_value_opt = Some(v8::null(scope).into());
+                                                    }
+                                                }
                                             }
-                                            Err(_) => {}
+                                            if return_value_opt.is_none() {
+                                                if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+                                                    let v = unsafe { read_value_from_ptr(result as *const c_void, scope, return_type) };
+                                                    return_value_opt = Some(v);
+                                                }
+                                            }
+                                            if let Some(rv) = return_value_opt {
+                                                arr.set_index(scope, idx, rv);
+                                                idx += 1;
+                                            }
                                         }
-                                    } else {
+
+                                        for outv in outs.into_iter() {
+                                            arr.set_index(scope, idx, outv);
+                                            idx += 1;
+                                        }
+                                        retval.set(arr.into());
+                                        return;
+                                    }
+
+                                    if method.is_void() {
                                         retval.set_undefined();
+                                        return;
+                                    }
+
+                                    match NativeType::try_from(method.return_type()) {
+                                        Ok(return_type) => {
+                                            unsafe { set_ret_val(result, scope, retval, return_type); }
+                                        }
+                                        Err(_) => {}
                                     }
 
                                     // todo
@@ -4090,7 +4276,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     );
 
 
-                                    let (ret, result) = method.call(scope, &args);
+                                    let (ret, result, outs) = method.call(scope, &args);
 
                                     if ret.is_err() {
                                         let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
@@ -4098,15 +4284,61 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
                                         return;
-                                    } else if !method.is_void() {
-                                        match NativeType::try_from(method.return_type()) {
-                                            Ok(return_type) => {
-                                                unsafe { set_ret_val(result, scope, retval, return_type); }
+                                    }
+
+                                    if !outs.is_empty() {
+                                        let mut arr_len = outs.len();
+                                        if !method.is_void() { arr_len += 1; }
+                                        let arr = v8::Array::new(scope, arr_len as i32);
+                                        let mut idx = 0u32;
+
+                                        if !method.is_void() {
+                                            let return_sig = method.return_type().to_string();
+                                            let mut return_value_opt: Option<Local<v8::Value>> = None;
+                                            if return_sig.contains('.') {
+                                                if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
+                                                    if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                                        let obj = crate::create_struct_object_from_raw(declaration, result, scope).into();
+                                                        return_value_opt = Some(obj);
+                                                    } else if !result.is_null() {
+                                                        let instance = unsafe { IUnknown::from_raw(result) };
+                                                        let retv: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into();
+                                                        return_value_opt = Some(retv);
+                                                    } else {
+                                                        return_value_opt = Some(v8::null(scope).into());
+                                                    }
+                                                }
                                             }
-                                            Err(_) => {}
+                                            if return_value_opt.is_none() {
+                                                if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+                                                    let v = unsafe { read_value_from_ptr(result as *const c_void, scope, return_type) };
+                                                    return_value_opt = Some(v);
+                                                }
+                                            }
+                                            if let Some(rv) = return_value_opt {
+                                                arr.set_index(scope, idx, rv);
+                                                idx += 1;
+                                            }
                                         }
-                                    } else {
+
+                                        for outv in outs.into_iter() {
+                                            arr.set_index(scope, idx, outv);
+                                            idx += 1;
+                                        }
+                                        retval.set(arr.into());
+                                        return;
+                                    }
+
+                                    if method.is_void() {
                                         retval.set_undefined();
+                                        return;
+                                    }
+
+                                    match NativeType::try_from(method.return_type()) {
+                                        Ok(return_type) => {
+                                            unsafe { set_ret_val(result, scope, retval, return_type); }
+                                        }
+                                        Err(_) => {}
                                     }
                                 })
                                     .data(getter_declaration_ext.into())
@@ -4188,7 +4420,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                         method, method.is_sealed(), ns_instance, false,
                                     );
 
-                                    let (ret, result) = method.call(scope, &args);
+                                    let (ret, result, outs) = method.call(scope, &args);
 
                                     if ret.is_err() {
                                         let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
@@ -4196,15 +4428,61 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
                                         return;
-                                    } else if !method.is_void() {
-                                        match NativeType::try_from(method.return_type()) {
-                                            Ok(return_type) => {
-                                                unsafe { set_ret_val(result, scope, retval, return_type); }
+                                    }
+
+                                    if !outs.is_empty() {
+                                        let mut arr_len = outs.len();
+                                        if !method.is_void() { arr_len += 1; }
+                                        let arr = v8::Array::new(scope, arr_len as i32);
+                                        let mut idx = 0u32;
+
+                                        if !method.is_void() {
+                                            let return_sig = method.return_type().to_string();
+                                            let mut return_value_opt: Option<Local<v8::Value>> = None;
+                                            if return_sig.contains('.') {
+                                                if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
+                                                    if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                                        let obj = crate::create_struct_object_from_raw(declaration, result, scope).into();
+                                                        return_value_opt = Some(obj);
+                                                    } else if !result.is_null() {
+                                                        let instance = unsafe { IUnknown::from_raw(result) };
+                                                        let retv: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into();
+                                                        return_value_opt = Some(retv);
+                                                    } else {
+                                                        return_value_opt = Some(v8::null(scope).into());
+                                                    }
+                                                }
                                             }
-                                            Err(_) => {}
+                                            if return_value_opt.is_none() {
+                                                if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+                                                    let v = unsafe { read_value_from_ptr(result as *const c_void, scope, return_type) };
+                                                    return_value_opt = Some(v);
+                                                }
+                                            }
+                                            if let Some(rv) = return_value_opt {
+                                                arr.set_index(scope, idx, rv);
+                                                idx += 1;
+                                            }
                                         }
-                                    } else {
+
+                                        for outv in outs.into_iter() {
+                                            arr.set_index(scope, idx, outv);
+                                            idx += 1;
+                                        }
+                                        retval.set(arr.into());
+                                        return;
+                                    }
+
+                                    if method.is_void() {
                                         retval.set_undefined();
+                                        return;
+                                    }
+
+                                    match NativeType::try_from(method.return_type()) {
+                                        Ok(return_type) => {
+                                            unsafe { set_ret_val(result, scope, retval, return_type); }
+                                        }
+                                        Err(_) => {}
                                     }
 
                                     // todo
@@ -4262,7 +4540,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     ) else { return; };
 
 
-                                    let (ret, result) = method.call(scope, &args);
+                                    let (ret, result, outs) = method.call(scope, &args);
 
                                     if ret.is_err() {
                                         let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
@@ -4270,15 +4548,61 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
                                         return;
-                                    } else if !method.is_void() {
-                                        match NativeType::try_from(method.return_type()) {
-                                            Ok(return_type) => {
-                                                unsafe { set_ret_val(result, scope, retval, return_type); }
+                                    }
+
+                                    if !outs.is_empty() {
+                                        let mut arr_len = outs.len();
+                                        if !method.is_void() { arr_len += 1; }
+                                        let arr = v8::Array::new(scope, arr_len as i32);
+                                        let mut idx = 0u32;
+
+                                        if !method.is_void() {
+                                            let return_sig = method.return_type().to_string();
+                                            let mut return_value_opt: Option<Local<v8::Value>> = None;
+                                            if return_sig.contains('.') {
+                                                if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
+                                                    if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                                        let obj = crate::create_struct_object_from_raw(declaration, result, scope).into();
+                                                        return_value_opt = Some(obj);
+                                                    } else if !result.is_null() {
+                                                        let instance = unsafe { IUnknown::from_raw(result) };
+                                                        let retv: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into();
+                                                        return_value_opt = Some(retv);
+                                                    } else {
+                                                        return_value_opt = Some(v8::null(scope).into());
+                                                    }
+                                                }
                                             }
-                                            Err(_) => {}
+                                            if return_value_opt.is_none() {
+                                                if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+                                                    let v = unsafe { read_value_from_ptr(result as *const c_void, scope, return_type) };
+                                                    return_value_opt = Some(v);
+                                                }
+                                            }
+                                            if let Some(rv) = return_value_opt {
+                                                arr.set_index(scope, idx, rv);
+                                                idx += 1;
+                                            }
                                         }
-                                    } else {
+
+                                        for outv in outs.into_iter() {
+                                            arr.set_index(scope, idx, outv);
+                                            idx += 1;
+                                        }
+                                        retval.set(arr.into());
+                                        return;
+                                    }
+
+                                    if method.is_void() {
                                         retval.set_undefined();
+                                        return;
+                                    }
+
+                                    match NativeType::try_from(method.return_type()) {
+                                        Ok(return_type) => {
+                                            unsafe { set_ret_val(result, scope, retval, return_type); }
+                                        }
+                                        Err(_) => {}
                                     }
                                 })
                                     .data(getter_declaration_ext.into())
@@ -4359,19 +4683,79 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                         false,
                                     );
 
-                                    let (ret, result) = method.call(scope, &args);
+                                    let (ret, result, outs) = method.call(scope, &args);
                                     if ret.is_err() {
                                         let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
                                         let msg = v8::String::new(scope, &detail).unwrap();
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
                                         return;
-                                    } else if !method.is_void() {
-                                        if let Ok(return_type) = NativeType::try_from(method.return_type()) {
-                                            unsafe { set_ret_val(result, scope, retval, return_type); }
+                                    }
+
+                                    if !outs.is_empty() {
+                                        let mut arr_len = outs.len();
+                                        if !method.is_void() { arr_len += 1; }
+                                        let arr = v8::Array::new(scope, arr_len as i32);
+                                        let mut idx = 0u32;
+
+                                        if !method.is_void() {
+                                            let return_sig = method.return_type().to_string();
+                                            let mut return_value_opt: Option<Local<v8::Value>> = None;
+                                            if return_sig.contains('.') {
+                                                if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
+                                                    if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                                        let obj = crate::create_struct_object_from_raw(declaration, result, scope).into();
+                                                        return_value_opt = Some(obj);
+                                                    } else if !result.is_null() {
+                                                        let instance = unsafe { IUnknown::from_raw(result) };
+                                                        let retv: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into();
+                                                        return_value_opt = Some(retv);
+                                                    } else {
+                                                        return_value_opt = Some(v8::null(scope).into());
+                                                    }
+                                                }
+                                            }
+                                            if return_value_opt.is_none() {
+                                                if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+                                                    let v = unsafe { read_value_from_ptr(result as *const c_void, scope, return_type) };
+                                                    return_value_opt = Some(v);
+                                                }
+                                            }
+                                            if let Some(rv) = return_value_opt {
+                                                arr.set_index(scope, idx, rv);
+                                                idx += 1;
+                                            }
                                         }
-                                    } else {
+
+                                        for outv in outs.into_iter() {
+                                            arr.set_index(scope, idx, outv);
+                                            idx += 1;
+                                        }
+                                        retval.set(arr.into());
+                                        return;
+                                    }
+
+                                    if method.is_void() {
                                         retval.set_undefined();
+                                        return;
+                                    }
+
+                                    let return_sig = method.return_type().to_string();
+                                    if return_sig.contains('.') {
+                                        if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
+                                            let ret: Local<v8::Value> = if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                                create_struct_object_from_raw(declaration, result, scope).into()
+                                            } else if result.is_null() {
+                                                v8::null(scope).into()
+                                            } else {
+                                                let instance = unsafe { IUnknown::from_raw(result) };
+                                                create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into()
+                                            };
+                                            retval.set(ret);
+                                            return;
+                                        }
+                                    } else if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+                                        unsafe { set_ret_val(result, scope, retval, return_type); }
                                     }
                                 })
                                     .data(ext.into())
@@ -4422,7 +4806,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             method, method.is_sealed(), ns_instance, false,
                         );
 
-                        let (ret, result) = method.call(scope, &args);
+                        let (ret, result, outs) = method.call(scope, &args);
 
                         if ret.is_err() {
                             let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
@@ -4430,25 +4814,71 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             let err = v8::Exception::error(scope, msg.into());
                             scope.throw_exception(err);
                             return;
-                        } else if !method.is_void() {
-                            let return_sig = method.return_type().to_string();
-                            if return_sig.contains('.') {
-                                if result.is_null() {
-                                    retval.set(v8::null(scope).into());
-                                } else {
-                                    let declaration = MetadataReader::find_by_name(return_sig.as_str())
-                                        .unwrap_or_else(|| dec.inner.clone());
-                                    let instance = unsafe { IUnknown::from_raw(result) };
-                                    let ret_val: Local<v8::Value> = create_ns_ctor_instance_object(
-                                        &return_sig, None, None, declaration, Some(instance), scope,
-                                    ).into();
-                                    retval.set(ret_val);
+                        }
+
+                        if !outs.is_empty() {
+                            let mut arr_len = outs.len();
+                            if !method.is_void() { arr_len += 1; }
+                            let arr = v8::Array::new(scope, arr_len as i32);
+                            let mut idx = 0u32;
+
+                            if !method.is_void() {
+                                let return_sig = method.return_type().to_string();
+                                let mut return_value_opt: Option<Local<v8::Value>> = None;
+                                if return_sig.contains('.') {
+                                    if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
+                                        if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                            let obj = crate::create_struct_object_from_raw(declaration, result, scope).into();
+                                            return_value_opt = Some(obj);
+                                        } else if !result.is_null() {
+                                            let instance = unsafe { IUnknown::from_raw(result) };
+                                            let retv: Local<v8::Value> = create_ns_ctor_instance_object(&return_sig, None, None, declaration, Some(instance), scope).into();
+                                            return_value_opt = Some(retv);
+                                        } else {
+                                            return_value_opt = Some(v8::null(scope).into());
+                                        }
+                                    }
                                 }
-                            } else if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
-                                unsafe { set_ret_val(result, scope, retval, return_type); }
+                                if return_value_opt.is_none() {
+                                    if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+                                        let v = unsafe { read_value_from_ptr(result as *const c_void, scope, return_type) };
+                                        return_value_opt = Some(v);
+                                    }
+                                }
+                                if let Some(rv) = return_value_opt {
+                                    arr.set_index(scope, idx, rv);
+                                    idx += 1;
+                                }
                             }
-                        } else {
+
+                            for outv in outs.into_iter() {
+                                arr.set_index(scope, idx, outv);
+                                idx += 1;
+                            }
+                            retval.set(arr.into());
+                            return;
+                        }
+
+                        if method.is_void() {
                             retval.set_undefined();
+                            return;
+                        }
+
+                        let return_sig = method.return_type().to_string();
+                        if return_sig.contains('.') {
+                            if result.is_null() {
+                                retval.set(v8::null(scope).into());
+                            } else {
+                                let declaration = MetadataReader::find_by_name(return_sig.as_str())
+                                    .unwrap_or_else(|| dec.inner.clone());
+                                let instance = unsafe { IUnknown::from_raw(result) };
+                                let ret_val: Local<v8::Value> = create_ns_ctor_instance_object(
+                                    &return_sig, None, None, declaration, Some(instance), scope,
+                                ).into();
+                                retval.set(ret_val);
+                            }
+                        } else if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+                            unsafe { set_ret_val(result, scope, retval, return_type); }
                         }
                     })
                         .data(ext.into())
@@ -4504,7 +4934,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         ) else { return; };
 
 
-                        let (ret, result) = method.call(scope, &args);
+                        let (ret, result, outs) = method.call(scope, &args);
 
                                     if ret.is_err() {
                                                 let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
@@ -4512,16 +4942,62 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                                 let err = v8::Exception::error(scope, msg.into());
                                                 scope.throw_exception(err);
                                                 return;
-                                            } else if !method.is_void() {
-                            match NativeType::try_from(method.return_type()) {
+                                            }
+
+                                    if !outs.is_empty() {
+                                        let mut arr_len = outs.len();
+                                        if !method.is_void() { arr_len += 1; }
+                                        let arr = v8::Array::new(scope, arr_len as i32);
+                                        let mut idx = 0u32;
+
+                                        if !method.is_void() {
+                                            let return_sig = method.return_type().to_string();
+                                            let mut return_value_opt: Option<Local<v8::Value>> = None;
+                                            if return_sig.contains('.') {
+                                                if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
+                                                    if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                                        let obj = crate::create_struct_object_from_raw(declaration, result, scope).into();
+                                                        return_value_opt = Some(obj);
+                                                    } else if !result.is_null() {
+                                                        let instance = unsafe { IUnknown::from_raw(result) };
+                                                        let retv: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into();
+                                                        return_value_opt = Some(retv);
+                                                    } else {
+                                                        return_value_opt = Some(v8::null(scope).into());
+                                                    }
+                                                }
+                                            }
+                                            if return_value_opt.is_none() {
+                                                if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+                                                    let v = unsafe { read_value_from_ptr(result as *const c_void, scope, return_type) };
+                                                    return_value_opt = Some(v);
+                                                }
+                                            }
+                                            if let Some(rv) = return_value_opt {
+                                                arr.set_index(scope, idx, rv);
+                                                idx += 1;
+                                            }
+                                        }
+
+                                        for outv in outs.into_iter() {
+                                            arr.set_index(scope, idx, outv);
+                                            idx += 1;
+                                        }
+                                        retval.set(arr.into());
+                                        return;
+                                    }
+
+                                    if method.is_void() {
+                                        retval.set_undefined();
+                                        return;
+                                    }
+
+                                    match NativeType::try_from(method.return_type()) {
                                 Ok(return_type) => {
                                     unsafe { set_ret_val(result, scope, retval, return_type); }
                                 }
                                 Err(_) => {}
                             }
-                        } else {
-                            retval.set_undefined();
-                        }
                     })
                         .data(getter_declaration_ext.into())
                         .build(scope);
@@ -4549,7 +5025,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             let Some(setter) = prop.setter() else { return; };
                             let Some(ns_instance) = dec.instance.clone() else { return; };
                             let mut method = MethodCall::new(setter, false, ns_instance, false);
-                            let (ret, _) = method.call(scope, &args);
+                            let (ret, _, _outs) = method.call(scope, &args);
                             if ret.is_err() {
                                 let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
                                 let msg = v8::String::new(scope, &detail).unwrap();
@@ -4653,7 +5129,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             parent, method, method.is_sealed(), ns_instance, false, return_type, type_args,
                         );
 
-                        let (ret, result) = method.call(scope, &args);
+                        let (ret, result, outs) = method.call(scope, &args);
 
                                 if ret.is_err() {
                                     let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
@@ -4661,38 +5137,90 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let err = v8::Exception::error(scope, msg.into());
                                     scope.throw_exception(err);
                                     return;
-                                } else if !method.is_void() {
-                            let return_sig = method.return_type();
-                            match NativeType::try_from(return_sig) {
-                                Ok(return_type) => {
-                                    if return_sig.contains('.') {
-                                        if let Some(declaration) = MetadataReader::find_by_name(return_sig) {
-                                            let ret: Local<v8::Value> = if matches!(declaration.read().kind(), DeclarationKind::Struct) {
-                                                create_struct_object_from_raw(declaration, result, scope).into()
-                                            } else if result.is_null() {
-                                                v8::null(scope).into()
+                                }
+
+                                if !outs.is_empty() {
+                                    let mut arr_len = outs.len();
+                                    if !method.is_void() { arr_len += 1; }
+                                    let arr = v8::Array::new(scope, arr_len as i32);
+                                    let mut idx = 0u32;
+
+                                    if !method.is_void() {
+                                        let return_sig = method.return_type();
+                                        let mut return_value_opt: Option<Local<v8::Value>> = None;
+                                        if return_sig.contains('.') {
+                                            if let Some(declaration) = MetadataReader::find_by_name(return_sig) {
+                                                if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                                    let obj = crate::create_struct_object_from_raw(declaration, result, scope).into();
+                                                    return_value_opt = Some(obj);
+                                                } else if !result.is_null() {
+                                                    let instance = unsafe { IUnknown::from_raw(*(result as *mut *mut c_void)) };
+                                                    let retv: Local<v8::Value> = create_ns_ctor_instance_object(return_sig, None, dec.parent.clone(), declaration, Some(instance), scope).into();
+                                                    return_value_opt = Some(retv);
+                                                } else {
+                                                    return_value_opt = Some(v8::null(scope).into());
+                                                }
                                             } else {
                                                 let instance = unsafe { IUnknown::from_raw(*(result as *mut *mut c_void)) };
-                                                create_ns_ctor_instance_object(return_sig, None, dec.parent.clone(), declaration, Some(instance), scope).into()
-                                            };
-                                            retval.set(ret.into());
-                                            return;
-                                        } else {
-                                            let instance = unsafe { IUnknown::from_raw(*(result as *mut *mut c_void)) };
-                                            let declaration = MetadataReader::find_by_name(return_sig)
-                                                .unwrap_or_else(|| dec.inner.clone());
-                                            let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig, None, dec.parent.clone(), declaration, Some(instance), scope).into();
-                                            retval.set(ret.into());
-                                            return;
+                                                let declaration = MetadataReader::find_by_name(return_sig)
+                                                    .unwrap_or_else(|| dec.inner.clone());
+                                                let retv: Local<v8::Value> = create_ns_ctor_instance_object(return_sig, None, dec.parent.clone(), declaration, Some(instance), scope).into();
+                                                return_value_opt = Some(retv);
+                                            }
+                                        }
+                                        if return_value_opt.is_none() {
+                                            if let Ok(return_type) = NativeType::try_from(return_sig) {
+                                                let v = unsafe { read_value_from_ptr(result as *const c_void, scope, return_type) };
+                                                return_value_opt = Some(v);
+                                            }
+                                        }
+                                        if let Some(rv) = return_value_opt {
+                                            arr.set_index(scope, idx, rv);
+                                            idx += 1;
                                         }
                                     }
-                                    unsafe { set_ret_val(result, scope, retval, return_type); }
+
+                                    for outv in outs.into_iter() {
+                                        arr.set_index(scope, idx, outv);
+                                        idx += 1;
+                                    }
+                                    retval.set(arr.into());
+                                    return;
                                 }
-                                Err(_) => {}
-                            }
-                        } else {
-                            retval.set_undefined();
-                        }
+
+                                if method.is_void() {
+                                    retval.set_undefined();
+                                    return;
+                                }
+
+                                let return_sig = method.return_type();
+                                match NativeType::try_from(return_sig) {
+                                    Ok(return_type) => {
+                                        if return_sig.contains('.') {
+                                            if let Some(declaration) = MetadataReader::find_by_name(return_sig) {
+                                                let ret: Local<v8::Value> = if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                                    crate::create_struct_object_from_raw(declaration, result, scope).into()
+                                                } else if result.is_null() {
+                                                    v8::null(scope).into()
+                                                } else {
+                                                    let instance = unsafe { IUnknown::from_raw(*(result as *mut *mut c_void)) };
+                                                    create_ns_ctor_instance_object(return_sig, None, dec.parent.clone(), declaration, Some(instance), scope).into()
+                                                };
+                                                retval.set(ret.into());
+                                                return;
+                                            } else {
+                                                let instance = unsafe { IUnknown::from_raw(*(result as *mut *mut c_void)) };
+                                                let declaration = MetadataReader::find_by_name(return_sig)
+                                                    .unwrap_or_else(|| dec.inner.clone());
+                                                let ret: Local<v8::Value> = create_ns_ctor_instance_object(return_sig, None, dec.parent.clone(), declaration, Some(instance), scope).into();
+                                                retval.set(ret.into());
+                                                return;
+                                            }
+                                        }
+                                        unsafe { set_ret_val(result, scope, retval, return_type); }
+                                    }
+                                    Err(_) => {}
+                                }
 
 
                         // todo
@@ -4773,7 +5301,7 @@ unsafe fn raw_result_to_local<'s>(
     let raw = result as usize;
     match signature {
         "Void" => None,
-        "Guid" => Some(guid_ptr_to_js_object(result, scope).into()),
+        "Guid" => Some(unsafe { guid_ptr_to_js_object(result, scope) }.into()),
         _ if !signature.contains('.') => {
             let native_type = NativeType::try_from(signature).ok()?;
             let v: Local<v8::Value> = match native_type {
@@ -4997,7 +5525,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                         continue;
                     }
                     let mut method = MethodCall::new(ctor, is_sealed, clazz_factory.clone(), true);
-                    let (ret, result) = method.call(scope, &args);
+                    let (ret, result, outs) = method.call(scope, &args);
 
                     if ret.is_ok() {
                         if result.is_null() {
@@ -5034,7 +5562,18 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                             let instance_obj = create_ns_ctor_instance_object(
                                 &full_name, Some(clazz_factory.clone()), parent.clone(), declaration, Some(result), scope,
                             );
-                            retval.set(instance_obj);
+                            if !outs.is_empty() {
+                                let mut arr = v8::Array::new(scope, (1 + outs.len()) as i32);
+                                arr.set_index(scope, 0, instance_obj);
+                                let mut idx = 1u32;
+                                for outv in outs.into_iter() {
+                                    arr.set_index(scope, idx, outv);
+                                    idx += 1;
+                                }
+                                retval.set(arr.into());
+                            } else {
+                                retval.set(instance_obj);
+                            }
                         }
                         return;
                     } else {
@@ -5222,7 +5761,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                     let Some(mut property_call) = PropertyCall::new(&property, false, ns_instance, false) else {
                         return v8::Intercepted::kNo;
                     };
-                    let (ret, result) = property_call.call_with_values(scope, &[]);
+                    let (ret, result, _outs) = property_call.call_with_values(scope, &[]);
 
                     if ret.is_err() {
                         let detail = format!("Property get '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
@@ -5276,13 +5815,56 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                         let Some(method) = lock.as_any().downcast_ref::<MethodDeclaration>() else { return; };
                         let Some(ns_instance) = dec.instance.clone() else { return; };
                         let mut method = MethodCall::new(method, method.is_sealed(), ns_instance, false);
-                        let (ret, result) = method.call(scope, &args);
+                        let (ret, result, outs) = method.call(scope, &args);
 
                         if ret.is_err() {
                             let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
                             let message = v8::String::new(scope, &detail).unwrap();
                             let error = v8::Exception::error(scope, message);
                             scope.throw_exception(error);
+                            return;
+                        }
+
+                        if !outs.is_empty() {
+                            let mut arr_len = outs.len();
+                            if !method.is_void() { arr_len += 1; }
+                            let arr = v8::Array::new(scope, arr_len as i32);
+                            let mut idx = 0u32;
+
+                            if !method.is_void() {
+                                let return_sig = method.return_type().to_string();
+                                let mut return_value_opt: Option<Local<v8::Value>> = None;
+                                if return_sig.contains('.') {
+                                    if let Some(declaration) = MetadataReader::find_by_name(return_sig.as_str()) {
+                                        if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                            let obj = crate::create_struct_object_from_raw(declaration, result, scope).into();
+                                            return_value_opt = Some(obj);
+                                        } else if !result.is_null() {
+                                            let instance = unsafe { IUnknown::from_raw(result) };
+                                            let retv: Local<v8::Value> = create_ns_ctor_instance_object(return_sig.as_str(), None, None, declaration, Some(instance), scope).into();
+                                            return_value_opt = Some(retv);
+                                        } else {
+                                            return_value_opt = Some(v8::null(scope).into());
+                                        }
+                                    }
+                                }
+                                if return_value_opt.is_none() {
+                                    if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
+                                        let v = unsafe { read_value_from_ptr(result as *const c_void, scope, return_type) };
+                                        return_value_opt = Some(v);
+                                    }
+                                }
+                                if let Some(rv) = return_value_opt {
+                                    arr.set_index(scope, idx, rv);
+                                    idx += 1;
+                                }
+                            }
+
+                            for outv in outs.into_iter() {
+                                arr.set_index(scope, idx, outv);
+                                idx += 1;
+                            }
+                            retval.set(arr.into());
                             return;
                         }
 
@@ -5430,10 +6012,59 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                     method, method.is_sealed(), factory, false,
                 );
 
-                let (ret, result) = method.call(scope, &args);
+                let (ret, result, outs) = method.call(scope, &args);
 
 
                 if ret.is_ok() {
+                    if !outs.is_empty() {
+                        let mut arr_len = outs.len();
+                        if !method.is_void() { arr_len += 1; }
+                        let arr = v8::Array::new(scope, arr_len as i32);
+                        let mut idx = 0u32;
+
+                        if !method.is_void() {
+                            let mut return_value_opt: Option<Local<v8::Value>> = None;
+                            if signature.contains('.') {
+                                if let Some(declaration) = MetadataReader::find_by_name(signature.as_str()) {
+                                    if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                        return_value_opt = Some(create_struct_object_from_raw(declaration, result, scope).into());
+                                    } else if !result.is_null() {
+                                        let instance = unsafe { IUnknown::from_raw(result) };
+                                        return_value_opt = Some(create_ns_ctor_instance_object(signature.as_str(), dec.instance.clone(), dec.parent.clone(), declaration, Some(instance), scope).into());
+                                    } else {
+                                        return_value_opt = Some(v8::null(scope).into());
+                                    }
+                                }
+                            }
+
+                            if return_value_opt.is_none() {
+                                if signature == "Boolean" {
+                                    return_value_opt = Some(v8::Boolean::new(scope, unsafe {*(result as *mut bool)}).into());
+                                } else if signature == "Guid" {
+                                    let obj = unsafe { guid_ptr_to_js_object(result, scope) };
+                                    return_value_opt = Some(obj.into());
+                                } else if !signature.contains('.') {
+                                    if let Ok(return_type) = NativeType::try_from(signature.as_str()) {
+                                        let v = unsafe { read_value_from_ptr(result as *const c_void, scope, return_type) };
+                                        return_value_opt = Some(v);
+                                    }
+                                }
+                            }
+
+                            if let Some(rv) = return_value_opt {
+                                arr.set_index(scope, idx, rv);
+                                idx += 1;
+                            }
+                        }
+
+                        for outv in outs.into_iter() {
+                            arr.set_index(scope, idx, outv);
+                            idx += 1;
+                        }
+                        retval.set(arr.into());
+                        return;
+                    }
+
                     unsafe {
                         match signature.as_str() {
                             "Boolean" => {
@@ -5442,7 +6073,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                                 )
                             }
                             "Guid" => {
-                                let obj = guid_ptr_to_js_object(result, scope);
+                                let obj = unsafe { guid_ptr_to_js_object(result, scope) };
                                 retval.set(obj.into());
                             }
                             _ if !signature.contains('.') => {
@@ -5548,7 +6179,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
 
                 let mut prop_call = prop_call_opt.unwrap();
 
-                let (hresult, result) = prop_call.call_with_values(scope, &[]);
+                let (hresult, result, _outs) = prop_call.call_with_values(scope, &[]);
 
                 // If the call failed because the process is unpackaged, do not provide a runtime shim.
                 // HRESULT 0x80073D54 = "The process has no package identity." — let callers/tests handle fallback.
@@ -5578,7 +6209,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                                 retval.set_bool(*(result as *mut bool));
                             }
                             "Guid" => {
-                                let obj = guid_ptr_to_js_object(result, scope);
+                                let obj = unsafe { guid_ptr_to_js_object(result, scope) };
                                 retval.set(obj.into());
                             }
                             _ if !signature.contains('.') => {
@@ -6510,7 +7141,7 @@ fn handle_named_property_getter(scope: &mut v8::PinScope<'_, '_>,
                                 method, method.is_sealed(), ns_instance, false,
                             );
 
-                            let (_ret, _result) = method.call(scope, &args);
+                            let (_ret, _result, _outs) = method.call(scope, &args);
                         })
                             .data(ext.into()).build(scope);
 
@@ -7022,6 +7653,10 @@ impl Runtime {
             // Skip RoUninitialize on drop rather than panicking.
             Err(_) => false,
         };
+
+        // Create the message-only HWND for native UI-thread dispatch. Must run
+        // on the UI thread (here, in Runtime::new) before any cross-thread posts.
+        crate::ui_dispatcher::init_ui_dispatcher();
 
         let params = v8::CreateParams::default();
         let mut isolate = v8::Isolate::new(params);
