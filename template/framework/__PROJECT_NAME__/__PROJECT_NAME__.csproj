@@ -114,9 +114,45 @@
       <_DotNetBridgeFiles Include="$(NSWindowsRoot)\dotnet-bridge\publish\**\*" />
     </ItemGroup>
     <Copy SourceFiles="@(_DotNetBridgeFiles)"
-          DestinationFiles="@(_DotNetBridgeFiles->'$(OutDir)dotnet-bridge\publish\%(RecursiveDir)%(Filename)%(Extension)')"
+      DestinationFiles="@(_DotNetBridgeFiles->'$(OutDir)dotnet-bridge\%(RecursiveDir)%(Filename)%(Extension)')"
           SkipUnchangedFiles="true" />
   </Target>
+
+  <!-- Ensure bridge files are included in the final `dotnet publish` output. -->
+  <Target Name="CopyDotNetBridgeToPublishDir"
+          AfterTargets="Publish"
+          Condition="Exists('$(NSWindowsRoot)\dotnet-bridge\publish')">
+      <ItemGroup>
+        <_DotNetBridgePublishFiles Include="$(NSWindowsRoot)\dotnet-bridge\publish\**\*" />
+      </ItemGroup>
+      <Copy SourceFiles="@(_DotNetBridgePublishFiles)"
+            DestinationFiles="@(_DotNetBridgePublishFiles->'$(PublishDir)dotnet-bridge\%(RecursiveDir)%(Filename)%(Extension)')"
+            SkipUnchangedFiles="true" />
+    </Target>
+
+  <!-- Inject the bridge publish files as Content before Publish so `dotnet publish` includes them automatically -->
+  <Target Name="AddDotNetBridgeContent" BeforeTargets="Publish" Condition="Exists('$(NSWindowsRoot)\dotnet-bridge\publish')">
+    <ItemGroup>
+      <Content Include="$(NSWindowsRoot)\dotnet-bridge\publish\**\*">
+        <Link>dotnet-bridge\%(RecursiveDir)%(Filename)%(Extension)</Link>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </Content>
+    </ItemGroup>
+  </Target>
+
+    <!--
+      Wait for the `dotnet-tool` sentinel marker so Build/Publish don't race with
+      the external tool that publishes/copies DotNetBridge into the repo.
+      This polls for `dotnet-bridge/publish/.dotnet_tool_done` with a short timeout.
+    -->
+    <Target Name="WaitForDotNetToolDone" BeforeTargets="Build;Publish" Condition="Exists('$(NSWindowsRoot)\dotnet-bridge')">
+      <PropertyGroup>
+        <DotNetToolMarker>$(NSWindowsRoot)\dotnet-bridge\publish\.dotnet_tool_done</DotNetToolMarker>
+        <DotNetWaitTimeout>30</DotNetWaitTimeout>
+      </PropertyGroup>
+      <Message Text="[NativeScript] Waiting for dotnet-tool marker at $(DotNetToolMarker) (timeout $(DotNetWaitTimeout)s)..." Importance="high" />
+      <Exec Command="powershell -NoProfile -Command &quot;$t=0; while(-not(Test-Path '$(DotNetToolMarker)') -and $t -lt $(DotNetWaitTimeout)) { Start-Sleep -Seconds 1; $t++; }; if(-not(Test-Path '$(DotNetToolMarker)')) { Write-Error 'dotnet-tool marker not found after timeout'; exit 1 };&quot;" />
+    </Target>
 
   <!-- Allow project-level Windows overrides: place App_Resources\Windows\app.csproj to extend/override generated settings -->
   <Import Project="App_Resources\Windows\app.csproj" Condition="Exists('App_Resources\Windows\app.csproj')" />

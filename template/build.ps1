@@ -134,6 +134,46 @@ foreach ($t in $Targets) {
     }
 }
 
+# ── dotnet-tool prebuilt binaries ────────────────────────────────────────────
+Write-Host "`n=== Build dotnet-tool prebuilt binaries ===" -ForegroundColor Cyan
+# Place prebuilt tools into the framework folder so they are included in the
+# packaged framework (npm publish copies framework/* into the package root).
+$ToolsDir = Join-Path $ScriptDir "framework\tools"
+if (-not (Test-Path $ToolsDir)) { New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null }
+
+
+foreach ($t in $Targets) {
+    $arch = $t.Arch
+    $rustTarget = $t.RustTarget
+    Write-Host "Building dotnet-tool for $arch ($rustTarget)..."
+    Push-Location $RepoRoot
+    try {
+        & cargo build -p dotnet-tool --release --target $rustTarget
+        $buildExit = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    if ($buildExit -ne 0) {
+        Write-Host "cargo build for dotnet-tool failed for target $rustTarget (exit $buildExit). Skipping copy for $arch." -ForegroundColor Yellow
+        continue
+    }
+    $candidate = Join-Path $RepoRoot "target\$rustTarget\release\dotnet-tool.exe"
+    if (Test-Path $candidate) {
+        $dest = Join-Path $ToolsDir "dotnet-tool-$arch.exe"
+        Copy-Item -Force $candidate $dest
+        Write-Host "  copied dotnet-tool -> $(Resolve-Path $dest -Relative)"
+    } else {
+        Write-Host "Expected build output not found: $candidate" -ForegroundColor Yellow
+    }
+}
+
+# Provide a generic `dotnet-tool.exe` fallback (copy x64 if available)
+$x64Path = Join-Path $ToolsDir "dotnet-tool-x64.exe"
+if (Test-Path $x64Path) {
+    Copy-Item -Force $x64Path (Join-Path $ToolsDir "dotnet-tool.exe")
+    Write-Host "  copied dotnet-tool-x64.exe -> dotnet-tool.exe"
+}
+
 Write-Host ""
 Write-Host "Done." -ForegroundColor Green
 Write-Host ""

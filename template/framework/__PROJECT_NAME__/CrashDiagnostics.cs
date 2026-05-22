@@ -28,7 +28,20 @@ namespace __PROJECT_NAME__
 
             TaskScheduler.UnobservedTaskException += (_, args) =>
             {
-                WriteExceptionReport("TaskScheduler.UnobservedTaskException", args.Exception, null);
+                // Always mark the exception as observed to prevent the finalizer
+                // from rethrowing it on the finalizer thread.
+                try { args.SetObserved(); } catch { }
+
+                // Log the exception but never allow logging failures to propagate
+                // (this handler runs on the finalizer thread in some cases).
+                try
+                {
+                    WriteExceptionReport("TaskScheduler.UnobservedTaskException", args.Exception, null);
+                }
+                catch (Exception logEx)
+                {
+                    try { WriteToTraceLog("[CrashDiagnostics] Failed to write unobserved exception: " + logEx); } catch { }
+                }
             };
         }
 

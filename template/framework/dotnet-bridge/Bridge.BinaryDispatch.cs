@@ -65,6 +65,14 @@ public static partial class Bridge
             var type   = target?.GetType() ?? throw new InvalidOperationException("Handle is null");
             var method = r.ReadString16();
             var args   = r.ReadArgs();
+
+            if (method == "__dotnet_await__" && args.Length == 2
+                && args[0] is int resolveId && args[1] is int rejectId)
+            {
+                ScheduleTaskContinuation(handle, resolveId, rejectId);
+                return DispatchResult.Void;
+            }
+
             return DispatchCallBin(target, type, method, args, isStatic: false);
         }
 
