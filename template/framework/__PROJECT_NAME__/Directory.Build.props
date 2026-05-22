@@ -1,0 +1,15 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- Default property values for manifest overrides.
+       Override these in Directory.Build.props or via /p: properties. -->
+  <PropertyGroup>
+    <AppDisplayName Condition=" '$(AppDisplayName)' == '' ">__PROJECT_NAME__</AppDisplayName>
+    <AppDescription Condition=" '$(AppDescription)' == '' ">A NativeScript Windows application</AppDescription>
+    <Square150x150Logo Condition=" '$(Square150x150Logo)' == '' ">Assets\Square150x150Logo.png</Square150x150Logo>
+    <Square44x44Logo Condition=" '$(Square44x44Logo)' == '' ">Assets\Square44x44Logo.png</Square44x44Logo>
+    <Wide310x150Logo Condition=" '$(Wide310x150Logo)' == '' ">Assets\Wide310x150Logo.png</Wide310x150Logo>
+    <StoreLogo Condition=" '$(StoreLogo)' == '' ">Assets\StoreLogo.png</StoreLogo>
+    <LockScreenLogo Condition=" '$(LockScreenLogo)' == '' ">Assets\LockScreenLogo.png</LockScreenLogo>
+    <SplashBackgroundColor Condition=" '$(SplashBackgroundColor)' == '' ">#65ADF1</SplashBackgroundColor>
+    <SplashImage Condition=" '$(SplashImage)' == '' ">Assets\SplashScreen.png</SplashImage>
+  </PropertyGroup>
+</Project>
