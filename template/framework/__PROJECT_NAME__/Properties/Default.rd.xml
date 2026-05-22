@@ -1,0 +1,9 @@
+<!--
+    Runtime Directives for .NET Native.
+    See https://go.microsoft.com/fwlink/?LinkID=391919
+-->
+<Directives xmlns="http://schemas.microsoft.com/netfx/2013/01/metadata">
+  <Application>
+    <Assembly Name="*Application*" Dynamic="Required All" />
+  </Application>
+</Directives>

@@ -1,0 +1,11 @@
+/target
+/**/*.rs.bk
+/Cargo.lock
+.DS_Store
+.vs
+
+[Bb]in/
+[Oo]bj/
+AppPackages/
+dotnet-bridge/publish/
+/dotnet-bridge-benchmarks/BenchmarkDotNet.Artifacts

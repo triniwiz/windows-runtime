@@ -1,0 +1,175 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>TestApp</RootNamespace>
+    <AssemblyName>TestApp</AssemblyName>
+    <UseUwp>true</UseUwp>
+    <Platforms>x86;x64;arm64</Platforms>
+    <RuntimeIdentifiers>win-x86;win-x64;win-arm64</RuntimeIdentifiers>
+    <DefaultLanguage>en-US</DefaultLanguage>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <GenerateAppInstallerFile>false</GenerateAppInstallerFile>
+    <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <Nullable>disable</Nullable>
+    <NSGenDir>$(BaseIntermediateOutputPath)_ns_\gen</NSGenDir>
+    <SBG_OUTPUT_DIR>$(MSBuildProjectDirectory)\$(NSGenDir)</SBG_OUTPUT_DIR>
+    <WindowsRuntimeRepoRoot>$(MSBuildProjectDirectory)\..</WindowsRuntimeRepoRoot>
+        <SBGMetadataSource>$(SBG_OUTPUT_DIR)\sbg_metadata.json</SBGMetadataSource>
+        <SBGEntryScript>$(MSBuildProjectDirectory)\App\sbg.js</SBGEntryScript>
+  </PropertyGroup>
+
+  <!--
+    BuildNativeRuntime: only runs when the Cargo workspace is present (i.e. this
+    project lives inside the windows-runtime repo). When the app template is used
+    standalone the pre-built DLLs already in libs\ are used directly and this
+    target is a no-op.
+  -->
+  <Target Name="BuildNativeRuntime" BeforeTargets="Build"
+          Condition="Exists('$(WindowsRuntimeRepoRoot)\Cargo.toml')">
+    <MakeDir Directories="$(WindowsRuntimeRepoRoot)\libs\devtools\$(Platform)" Condition="'$(Configuration)' == 'Debug'" />
+    <Exec WorkingDirectory="$(WindowsRuntimeRepoRoot)"
+          Command="cargo build --quiet --profile release-with-devtools -p nativescript --features devtools"
+          Condition="'$(Configuration)' == 'Debug'" />
+    <Copy SourceFiles="$(WindowsRuntimeRepoRoot)\target\release-with-devtools\nativescript.dll"
+          DestinationFolder="$(WindowsRuntimeRepoRoot)\libs\devtools\$(Platform)"
+          Condition="'$(Configuration)' == 'Debug'" />
+    <MakeDir Directories="$(WindowsRuntimeRepoRoot)\libs\$(Platform)" Condition="'$(Configuration)' != 'Debug'" />
+    <Exec WorkingDirectory="$(WindowsRuntimeRepoRoot)"
+          Command="cargo build --quiet --release -p nativescript"
+          Condition="'$(Configuration)' != 'Debug'" />
+    <Copy SourceFiles="$(WindowsRuntimeRepoRoot)\target\release\nativescript.dll"
+          DestinationFolder="$(WindowsRuntimeRepoRoot)\libs\$(Platform)"
+          Condition="'$(Configuration)' != 'Debug'" />
+  </Target>
+
+  <Target Name="RunStaticBindingGenerator" BeforeTargets="CoreCompile">
+    <MakeDir Directories="$(NSGenDir)" />
+    <Message Text="Skipping SBG capture: $(SBGEntryScript) not found and no pre-existing metadata at $(SBGMetadataSource)." Importance="high" Condition="!Exists('$(SBGEntryScript)') and !Exists('$(SBGMetadataSource)')" />
+    <Exec WorkingDirectory="$(WindowsRuntimeRepoRoot)"
+          Command="cargo run --quiet --manifest-path &quot;$(WindowsRuntimeRepoRoot)\Cargo.toml&quot; -p playground"
+          EnvironmentVariables="NSWINRT_AUTO_METADATA_PATH=$(SBGMetadataSource);PLAYGROUND_APP_ROOT=$(MSBuildProjectDirectory);PLAYGROUND_SCRIPT_PATH=$(SBGEntryScript);SBG_OUTPUT_DIR=$(SBG_OUTPUT_DIR)"
+          Condition="Exists('$(SBGEntryScript)')" />
+    <Exec WorkingDirectory="$(WindowsRuntimeRepoRoot)"
+          Command="cargo run --quiet --manifest-path &quot;$(WindowsRuntimeRepoRoot)\Cargo.toml&quot; -p sbg"
+          EnvironmentVariables="NSWINRT_AUTO_METADATA_PATH=$(SBGMetadataSource);SBG_OUTPUT_DIR=$(SBG_OUTPUT_DIR);SBG_METADATA_SOURCE=$(SBGMetadataSource);SBG_TARGET_FRAMEWORK=net8.0-windows10.0.19041.0;SBG_APP_CS_SOURCES_DIR=$(MSBuildProjectDirectory)"
+          Condition="Exists('$(SBGMetadataSource)')" />
+  </Target>
+
+  <Target Name="CleanStaticBindingGeneratorOutput" AfterTargets="CoreClean">
+    <RemoveDir Directories="$(NSGenDir)" Condition="Exists('$(NSGenDir)')" />
+  </Target>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Release|x86'">
+    <PublishProfile>win-x86.pubxml</PublishProfile>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Release|x64'">
+    <PublishProfile>win-x64.pubxml</PublishProfile>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Release|arm64'">
+    <PublishProfile>win-arm64.pubxml</PublishProfile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <AppxManifest Include="Package.appxmanifest" />
+    <Content Include="Properties\Default.rd.xml" />
+    <Compile Include="$(NSGenDir)\NSWinRTProxies\**\*.cs" Visible="false" Condition="Exists('$(NSGenDir)\NSWinRTProxies')" />
+
+    <Content Include="App\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="$(NSGenDir)\sbg-manifest.json" Link="sbg-manifest.json" CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(NSGenDir)\sbg-manifest.json')" />
+    <Content Include="$(NSGenDir)\NSWinRTProxies\bin\Release\**\NSWinRTProxies.dll" Link="NSWinRTProxies.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(NSGenDir)\NSWinRTProxies\bin\Release')" />
+    <!-- Debug: devtools-enabled DLL (cargo build with features=devtools) -->
+    <Content Include="..\libs\devtools\x64\nativescript.dll" Condition="'$(Platform)' == 'x64' and '$(Configuration)' == 'Debug'">
+      <Link>nativescript.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\libs\devtools\x86\nativescript.dll" Condition="'$(Platform)' == 'x86' and '$(Configuration)' == 'Debug'">
+      <Link>nativescript.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\libs\devtools\arm64\nativescript.dll" Condition="'$(Platform)' == 'arm64' and '$(Configuration)' == 'Debug'">
+      <Link>nativescript.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <!-- Release: store-clean DLL (no devtools, no debug symbols included) -->
+    <Content Include="..\libs\x64\nativescript.dll" Condition="'$(Platform)' == 'x64' and '$(Configuration)' != 'Debug'">
+      <Link>nativescript.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\libs\x86\nativescript.dll" Condition="'$(Platform)' == 'x86' and '$(Configuration)' != 'Debug'">
+      <Link>nativescript.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\libs\arm64\nativescript.dll" Condition="'$(Platform)' == 'arm64' and '$(Configuration)' != 'Debug'">
+      <Link>nativescript.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <!-- Enable CLI-friendly build behavior and publish/copy the DotNetBridge into app output -->
+  <PropertyGroup>
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
+  </PropertyGroup>
+
+  <!-- Publishes DotNetBridge before the app build when the source exists in the repo. -->
+  <Target Name="PublishDotNetBridge"
+          BeforeTargets="Build"
+          Inputs="$(WindowsRuntimeRepoRoot)\dotnet-bridge\DotNetBridge.csproj;$(WindowsRuntimeRepoRoot)\dotnet-bridge\Bridge.cs"
+          Outputs="$(WindowsRuntimeRepoRoot)\dotnet-bridge\publish\DotNetBridge.dll"
+          Condition="Exists('$(WindowsRuntimeRepoRoot)\dotnet-bridge\DotNetBridge.csproj')">
+    <Message Text="[NativeScript] Publishing DotNetBridge..." Importance="high" />
+    <Exec Command="dotnet publish &quot;$(WindowsRuntimeRepoRoot)\dotnet-bridge\DotNetBridge.csproj&quot; -c Release -o &quot;$(WindowsRuntimeRepoRoot)\dotnet-bridge\publish&quot; --no-self-contained /nologo" />
+  </Target>
+
+  <!-- Copies the published bridge files to the output directory AFTER PublishDotNetBridge runs. -->
+  <Target Name="CopyDotNetBridge"
+          AfterTargets="PublishDotNetBridge"
+          BeforeTargets="Build"
+          Condition="Exists('$(WindowsRuntimeRepoRoot)\dotnet-bridge\publish')">
+    <ItemGroup>
+      <_DotNetBridgeFiles Include="$(WindowsRuntimeRepoRoot)\dotnet-bridge\publish\**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_DotNetBridgeFiles)"
+      DestinationFiles="@(_DotNetBridgeFiles->'$(OutDir)dotnet-bridge\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+  <!-- Ensure bridge files are included in the final `dotnet publish` output. -->
+  <Target Name="CopyDotNetBridgeToPublishDir"
+          AfterTargets="Publish"
+          Condition="Exists('$(WindowsRuntimeRepoRoot)\dotnet-bridge\publish')">
+      <ItemGroup>
+        <_DotNetBridgePublishFiles Include="$(WindowsRuntimeRepoRoot)\dotnet-bridge\publish\**\*" />
+      </ItemGroup>
+      <Copy SourceFiles="@(_DotNetBridgePublishFiles)"
+            DestinationFiles="@(_DotNetBridgePublishFiles->'$(PublishDir)dotnet-bridge\%(RecursiveDir)%(Filename)%(Extension)')"
+            SkipUnchangedFiles="true" />
+    </Target>
+
+  <!-- Inject the bridge publish files as Content before Publish so `dotnet publish` includes them automatically -->
+  <Target Name="AddDotNetBridgeContent" BeforeTargets="Publish" Condition="Exists('$(WindowsRuntimeRepoRoot)\dotnet-bridge\publish')">
+    <ItemGroup>
+      <Content Include="$(WindowsRuntimeRepoRoot)\dotnet-bridge\publish\**\*">
+        <Link>dotnet-bridge\%(RecursiveDir)%(Filename)%(Extension)</Link>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </Content>
+    </ItemGroup>
+  </Target>
+
+  <!-- Wait for the `dotnet-tool` sentinel marker so Build/Publish don't race with the external tool that publishes/copies DotNetBridge into the repo. -->
+  <Target Name="WaitForDotNetToolDone" BeforeTargets="Build;Publish" Condition="Exists('$(WindowsRuntimeRepoRoot)\dotnet-bridge')">
+    <PropertyGroup>
+      <DotNetToolMarker>$(WindowsRuntimeRepoRoot)\dotnet-bridge\publish\.dotnet_tool_done</DotNetToolMarker>
+      <DotNetWaitTimeout>30</DotNetWaitTimeout>
+    </PropertyGroup>
+    <Message Text="[NativeScript] Waiting for dotnet-tool marker at $(DotNetToolMarker) (timeout $(DotNetWaitTimeout)s)..." Importance="high" />
+    <Exec Command="powershell -NoProfile -Command &quot;$t=0; while(-not(Test-Path '$(DotNetToolMarker)') -and $t -lt $(DotNetWaitTimeout)) { Start-Sleep -Seconds 1; $t++; }; if(-not(Test-Path '$(DotNetToolMarker)')) { Write-Host 'dotnet-tool marker not found after timeout'; };&quot;" />
+  </Target>
+</Project>

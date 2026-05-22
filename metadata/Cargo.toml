@@ -1,0 +1,19 @@
+[package]
+name = "metadata"
+version = "0.1.0"
+edition = "2021"
+
+#[lib]
+#crate-type = ["dylib"]
+
+
+[dependencies]
+ahash = "0.8"
+parking_lot = "0.12"
+dyn-clone = "1.0"
+sha1 = "0.10"
+
+[dependencies.windows]
+workspace = true
+features = ["Foundation", "Win32_Foundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_System_WinRT", "Win32_System_WinRT_Metadata"]
+

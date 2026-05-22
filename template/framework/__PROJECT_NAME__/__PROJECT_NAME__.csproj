@@ -1,0 +1,163 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>__PROJECT_NAME__</RootNamespace>
+    <AssemblyName>__PROJECT_NAME__</AssemblyName>
+    <UseUwp>true</UseUwp>
+    <Platforms>x64;arm64</Platforms>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+    <DefaultLanguage>en-US</DefaultLanguage>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <Nullable>disable</Nullable>
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
+    <!-- Parent of the project directory — contains the pre-built libs/ folder from the npm package -->
+    <NSWindowsRoot>$(MSBuildProjectDirectory)\..</NSWindowsRoot>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!-- Derived library platform for selecting prebuilt native libs.
+         Prefer $(Platform); fall back to trimming 'win-' from $(RuntimeIdentifier); default to x64. -->
+    <NSLibPlatform Condition="'$(Platform)' != ''">$(Platform)</NSLibPlatform>
+    <NSLibPlatform Condition="'$(NSLibPlatform)' == '' and '$(RuntimeIdentifier)' != ''">$([System.Text.RegularExpressions.Regex]::Replace('$(RuntimeIdentifier)','^win-',''))</NSLibPlatform>
+    <NSLibPlatform Condition="'$(NSLibPlatform)' == ''">x64</NSLibPlatform>
+    <!-- Windows SDK .NET runtime pack location (resolved from NuGet cache) -->
+    <_WinSdkNetRefPkg>$(NuGetPackageRoot)microsoft.windows.sdk.net.ref</_WinSdkNetRefPkg>
+    <_WinSdkNetRefVer Condition="Exists('$(_WinSdkNetRefPkg)\10.0.26100.57')">10.0.26100.57</_WinSdkNetRefVer>
+    <_WinSdkNetRefLib Condition="'$(_WinSdkNetRefVer)' != ''">$(_WinSdkNetRefPkg)\$(_WinSdkNetRefVer)\lib\net8.0</_WinSdkNetRefLib>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <AppxManifest Include="Package.appxmanifest" />
+    <Content Include="Properties\Default.rd.xml" />
+
+    <!-- App JS/resource files — copied to the output directory on every build -->
+    <Content Include="app\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+
+    <!-- App_Resources: platform-specific assets (images, fonts, etc.) -->
+    <Content Include="App_Resources\**\*" Condition="Exists('App_Resources')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+
+    <!-- UWP logo/splash assets required for Add-AppxPackage -Register -->
+    <Content Include="Assets\**\*" Condition="Exists('Assets')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+
+    <!-- Windows SDK .NET runtime pack assemblies — required when the dotnet workload
+         is not installed; copied from the NuGet package cache. -->
+    <Content Include="$(_WinSdkNetRefLib)\Microsoft.Windows.UI.Xaml.dll"
+             Condition="'$(_WinSdkNetRefLib)' != '' and Exists('$(_WinSdkNetRefLib)\Microsoft.Windows.UI.Xaml.dll')">
+      <Link>Microsoft.Windows.UI.Xaml.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="$(_WinSdkNetRefLib)\WinRT.Runtime.dll"
+             Condition="'$(_WinSdkNetRefLib)' != '' and Exists('$(_WinSdkNetRefLib)\WinRT.Runtime.dll')">
+      <Link>WinRT.Runtime.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="$(_WinSdkNetRefLib)\Microsoft.Windows.SDK.NET.dll"
+             Condition="'$(_WinSdkNetRefLib)' != '' and Exists('$(_WinSdkNetRefLib)\Microsoft.Windows.SDK.NET.dll')">
+      <Link>Microsoft.Windows.SDK.NET.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+
+    <!-- Debug: devtools-enabled runtime DLL (platform fallback via NSLibPlatform) -->
+    <Content Include="$(NSWindowsRoot)\libs\devtools\$(NSLibPlatform)\nativescript.dll"
+             Condition="'$(Configuration)' == 'Debug' and Exists('$(NSWindowsRoot)\libs\devtools\$(NSLibPlatform)\nativescript.dll')">
+      <Link>nativescript.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+
+    <!-- Release: production runtime DLL (platform fallback via NSLibPlatform) -->
+    <Content Include="$(NSWindowsRoot)\libs\$(NSLibPlatform)\nativescript.dll"
+             Condition="'$(Configuration)' != 'Debug' and Exists('$(NSWindowsRoot)\libs\$(NSLibPlatform)\nativescript.dll')">
+      <Link>nativescript.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+
+  </ItemGroup>
+
+  <!--
+    Publishes DotNetBridge.dll before the app build.
+    Inputs/Outputs make this incremental: MSBuild skips the Exec when DotNetBridge.dll
+    is already newer than both source files.
+  -->
+  <Target Name="PublishDotNetBridge"
+          BeforeTargets="Build"
+          Inputs="$(NSWindowsRoot)\dotnet-bridge\DotNetBridge.csproj;
+                  $(NSWindowsRoot)\dotnet-bridge\Bridge.cs"
+          Outputs="$(NSWindowsRoot)\dotnet-bridge\publish\DotNetBridge.dll"
+          Condition="Exists('$(NSWindowsRoot)\dotnet-bridge\DotNetBridge.csproj')">
+    <Message Text="[NativeScript] Publishing DotNetBridge..." Importance="high" />
+    <Exec Command="dotnet publish &quot;$(NSWindowsRoot)\dotnet-bridge\DotNetBridge.csproj&quot; -c Release -o &quot;$(NSWindowsRoot)\dotnet-bridge\publish&quot; --no-self-contained /nologo" />
+  </Target>
+
+  <!--
+    Copies the published bridge files to the output directory AFTER PublishDotNetBridge
+    runs, avoiding the MSBuild evaluation-order problem where Condition="Exists(...)"
+    on a static Content item is checked before the publish target creates the directory.
+    Must land at dotnet-bridge\publish\ relative to the EXE so the Rust runtime can
+    locate DotNetBridge.dll via AppContext.BaseDirectory.
+  -->
+  <Target Name="CopyDotNetBridge"
+          AfterTargets="PublishDotNetBridge"
+          BeforeTargets="Build"
+          Condition="Exists('$(NSWindowsRoot)\dotnet-bridge\publish')">
+    <ItemGroup>
+      <_DotNetBridgeFiles Include="$(NSWindowsRoot)\dotnet-bridge\publish\**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_DotNetBridgeFiles)"
+      DestinationFiles="@(_DotNetBridgeFiles->'$(OutDir)dotnet-bridge\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+  <!-- Ensure bridge files are included in the final `dotnet publish` output. -->
+  <Target Name="CopyDotNetBridgeToPublishDir"
+          AfterTargets="Publish"
+          Condition="Exists('$(NSWindowsRoot)\dotnet-bridge\publish')">
+      <ItemGroup>
+        <_DotNetBridgePublishFiles Include="$(NSWindowsRoot)\dotnet-bridge\publish\**\*" />
+      </ItemGroup>
+      <Copy SourceFiles="@(_DotNetBridgePublishFiles)"
+            DestinationFiles="@(_DotNetBridgePublishFiles->'$(PublishDir)dotnet-bridge\%(RecursiveDir)%(Filename)%(Extension)')"
+            SkipUnchangedFiles="true" />
+    </Target>
+
+  <!-- Inject the bridge publish files as Content before Publish so `dotnet publish` includes them automatically -->
+  <Target Name="AddDotNetBridgeContent" BeforeTargets="Publish" Condition="Exists('$(NSWindowsRoot)\dotnet-bridge\publish')">
+    <ItemGroup>
+      <Content Include="$(NSWindowsRoot)\dotnet-bridge\publish\**\*">
+        <Link>dotnet-bridge\%(RecursiveDir)%(Filename)%(Extension)</Link>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </Content>
+    </ItemGroup>
+  </Target>
+
+    <!--
+      Wait for the `dotnet-tool` sentinel marker so Build/Publish don't race with
+      the external tool that publishes/copies DotNetBridge into the repo.
+      This polls for `dotnet-bridge/publish/.dotnet_tool_done` with a short timeout.
+    -->
+    <Target Name="WaitForDotNetToolDone" BeforeTargets="Build;Publish" Condition="Exists('$(NSWindowsRoot)\dotnet-bridge')">
+      <PropertyGroup>
+        <DotNetToolMarker>$(NSWindowsRoot)\dotnet-bridge\publish\.dotnet_tool_done</DotNetToolMarker>
+        <DotNetWaitTimeout>30</DotNetWaitTimeout>
+      </PropertyGroup>
+      <Message Text="[NativeScript] Waiting for dotnet-tool marker at $(DotNetToolMarker) (timeout $(DotNetWaitTimeout)s)..." Importance="high" />
+      <Exec Command="powershell -NoProfile -Command &quot;$t=0; while(-not(Test-Path '$(DotNetToolMarker)') -and $t -lt $(DotNetWaitTimeout)) { Start-Sleep -Seconds 1; $t++; }; if(-not(Test-Path '$(DotNetToolMarker)')) { Write-Error 'dotnet-tool marker not found after timeout'; exit 1 };&quot;" />
+    </Target>
+
+  <!-- Allow project-level Windows overrides: place App_Resources\Windows\app.csproj to extend/override generated settings -->
+  <Import Project="App_Resources\Windows\app.csproj" Condition="Exists('App_Resources\Windows\app.csproj')" />
+
+  <!-- CLI-generated plugin imports (managed by the CLI during prepare) -->
+  <Import Project="plugins\Plugins.props" Condition="Exists('plugins\Plugins.props')" />
+  <Import Project="plugins\Plugins.targets" Condition="Exists('plugins\Plugins.targets')" />
+</Project>

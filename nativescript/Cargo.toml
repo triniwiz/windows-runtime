@@ -1,0 +1,22 @@
+[package]
+name = "nativescript"
+version = "0.1.0"
+edition = "2021"
+
+#[build]
+#rustflags = ["-Cpanic=abort", "-C target-cpu=native"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "nativescript"
+crate-type = ["cdylib", "rlib"]
+
+
+[features]
+devtools = ["dep:runtime-devtools"]
+
+[dependencies]
+runtime = { path = "../runtime" }
+ctrlc = "3.4"
+runtime-devtools = { path = "../runtime-devtools", optional = true }

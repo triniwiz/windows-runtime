@@ -1,0 +1,18 @@
+[package]
+name = "metadata-generator"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "metadata-generator"
+path = "src/main.rs"
+
+[dependencies]
+metadata = { path = "../metadata" }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+zip = "2"
+
+[dependencies.windows]
+workspace = true
+features = ["Win32_System_Com", "Win32_System_WinRT_Metadata"]
