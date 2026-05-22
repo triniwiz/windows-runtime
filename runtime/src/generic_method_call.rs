@@ -381,7 +381,6 @@ impl GenericMethodCall {
             Ok(code) => code,
             Err(_) => {
                 let msg = format!("WinRT call panicked during invocation: returning E_FAIL");
-                crate::debug_output(&format!("[NativeScript] {}\n", msg));
                 crate::store_last_js_error(msg);
                 return (HRESULT(0x8000_4005u32 as i32), std::ptr::null_mut(), Vec::new()); // E_FAIL
             }
@@ -392,7 +391,6 @@ impl GenericMethodCall {
         if (hr.0 as u32) == RPC_E_WRONG_THREAD {
             let os_msg = crate::error::format_hresult_message(hr);
             let msg = format!("{} HRESULT 0x{:08X}", os_msg, hr.0 as u32);
-            crate::debug_output(&format!("[NativeScript] {}\n", msg));
             crate::store_last_js_error(msg.clone());
             if let Some(vmstr) = v8::String::new(scope, &msg) {
                 let err = v8::Exception::error(scope, vmstr);

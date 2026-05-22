@@ -244,7 +244,6 @@ impl MethodCall {
             };
 
             let signature = Signature::to_string(metadata, &type_);
-            crate::debug_output(&format!("[NativeScript] Method '{}' param sig='{}' is_out={}\n", method.name(), signature, parameter.is_out()));
 
             let parse_native_type = match NativeType::try_from(signature.as_str()) {
                 Ok(value) => value,
@@ -797,7 +796,6 @@ impl MethodCall {
                     self.method_name.as_str()
                 };
                 let msg = format!("WinRT call panicked during invocation of '{}': returning E_FAIL", method_display);
-                crate::debug_output(&format!("[NativeScript] {}\n", msg));
                 crate::store_last_js_error(msg);
                 return (HRESULT(0x8000_4005u32 as i32), std::ptr::null_mut(), Vec::new()); // E_FAIL
             }
@@ -818,7 +816,6 @@ impl MethodCall {
             };
             let os_msg = crate::error::format_hresult_message(hr);
             let msg = format!("{} when invoking '{}'. HRESULT 0x{:08X}", os_msg, method_display, hr.0 as u32);
-            crate::debug_output(&format!("[NativeScript] {}\n", msg));
             crate::store_last_js_error(msg.clone());
             if let Some(vmstr) = v8::String::new(scope, &msg) {
                 let err = v8::Exception::error(scope, vmstr);
@@ -849,12 +846,10 @@ impl MethodCall {
                 continue;
             }
             unsafe {
-                crate::debug_output(&format!("[NativeScript] out_slot[{}] sig={:?} storage_ptr={:?}\n", slot_index, sig_opt, storage_ptr));
                 let v = match parse_native_type {
                     NativeType::Pointer | NativeType::Buffer | NativeType::Function => {
                         // Storage holds a pointer-sized value; read the inner pointer.
                         let inner = std::ptr::read_unaligned(storage_ptr as *const usize) as *mut c_void;
-                        crate::debug_output(&format!("[NativeScript] out_slot[{}] inner={:p}\n", slot_index, inner));
                         if inner.is_null() {
                             v8::null(scope).into()
                         } else if let Some(sig) = sig_opt.as_ref() {
@@ -866,31 +861,19 @@ impl MethodCall {
                                     lookup = stripped;
                                 }
                                 let lookup = crate::helpers::strip_generic_suffix(lookup);
-                                crate::debug_output(&format!("[NativeScript] out_slot[{}] metadata_lookup='{}'\n", slot_index, lookup));
                                 if let Some(declaration) = MetadataReader::find_by_name(lookup) {
-                                    crate::debug_output(&format!("[NativeScript] out_slot[{}] metadata found: kind={:?}\n", slot_index, declaration.read().kind()));
                                     if matches!(declaration.read().kind(), DeclarationKind::Struct) {
-                                        crate::debug_output(&format!("[NativeScript] out_slot[{}] creating struct wrapper\n", slot_index));
                                         crate::create_struct_object_from_raw(declaration, inner, scope).into()
                                     } else {
                                         // Attempt to inspect runtime identity via IInspectable
                                         let instance = unsafe { IUnknown::from_raw(inner) };
                                         match instance.clone().cast::<IInspectable>() {
-                                            Ok(ins) => {
-                                                match ins.GetRuntimeClassName() {
-                                                    Ok(name) => crate::debug_output(&format!("[NativeScript] out_slot[{}] runtime class name='{}'\n", slot_index, name.to_string())),
-                                                    Err(e) => crate::debug_output(&format!("[NativeScript] out_slot[{}] GetRuntimeClassName failed: {} (0x{:08X})\n", slot_index, e.message().to_string(), e.code().0 as u32)),
-                                                }
-                                            }
-                                            Err(e) => {
-                                                crate::debug_output(&format!("[NativeScript] out_slot[{}] QI to IInspectable failed: {} (0x{:08X})\n", slot_index, e.message().to_string(), e.code().0 as u32));
-                                            }
+                                            Ok(ins) => { let _ = ins.GetRuntimeClassName(); }
+                                            Err(e) => { let _ = e; }
                                         }
-                                        crate::debug_output(&format!("[NativeScript] out_slot[{}] creating ns instance wrapper\n", slot_index));
                                         crate::ns_proxy::create_ns_ctor_instance_object(sig.as_str(), None, None, declaration, Some(instance), scope).into()
                                     }
                                 } else {
-                                    crate::debug_output(&format!("[NativeScript] out_slot[{}] metadata lookup failed for '{}', falling back to pointer read\n", slot_index, lookup));
                                     read_value_from_ptr(inner as *const c_void, scope, NativeType::Pointer)
                                 }
                             } else {
@@ -931,7 +914,6 @@ impl MethodCall {
             Ok(code) => code,
             Err(_) => {
                 let msg = format!("WinRT event call panicked during invocation: returning E_FAIL");
-                crate::debug_output(&format!("[NativeScript] {}\n", msg));
                 crate::store_last_js_error(msg);
                 return (call_failure(), 0);
             }
@@ -958,7 +940,6 @@ impl MethodCall {
             Ok(code) => code,
             Err(_) => {
                 let msg = format!("WinRT event remove call panicked during invocation: returning E_FAIL");
-                crate::debug_output(&format!("[NativeScript] {}\n", msg));
                 crate::store_last_js_error(msg);
                 return call_failure();
             }

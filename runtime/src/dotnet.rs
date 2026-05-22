@@ -321,23 +321,16 @@ pub(crate) fn try_init_dotnet(app_root: &str) {
     // Respect NS_DOTNET_MODE so embedders can disable or choose out-of-proc.
     let mode = get_dotnet_mode();
     if mode == DotnetMode::Disabled {
-        crate::debug_output("[NativeScript] .NET host disabled via NS_DOTNET_MODE; skipping initialization\n");
-        // Record a stable error so callers know dotnet is intentionally disabled.
+        // Dotnet disabled by env var; skip initialization.
         let _ = DOTNET_HOST.get_or_init(|| Err("DotNet disabled via NS_DOTNET_MODE".to_string()));
         return;
     }
 
-    crate::debug_output(&format!("[NativeScript] initializing .NET host (mode={:?})\n", match mode {
-        DotnetMode::Auto => "auto",
-        DotnetMode::InProc => "inproc",
-        DotnetMode::OutProc => "outproc",
-        DotnetMode::Disabled => "disabled",
-    }));
+    // Initializing .NET host (verbosity suppressed)
 
     let res = DOTNET_HOST.get_or_init(|| {
         match find_bridge_and_config(app_root) {
-            Some((bridge, config)) => {
-                crate::debug_output(&format!("[NativeScript] found DotNetBridge at {} and config at {}\n", bridge.display(), config.display()));
+                Some((bridge, config)) => {
                 build_host(&bridge.to_string_lossy(), &config.to_string_lossy())
             }
             None => Err(format!(
@@ -347,10 +340,7 @@ pub(crate) fn try_init_dotnet(app_root: &str) {
         }
     });
 
-    match res {
-        Ok(_) => crate::debug_output("[NativeScript] .NET host initialized successfully\n"),
-        Err(e) => crate::debug_output(&format!("[NativeScript] .NET host initialization failed: {}\n", e)),
-    }
+    let _ = res;
 }
 
 /// Ensure the DotNet host is initialised (lazy). Uses stored `DOTNET_APP_ROOT` or

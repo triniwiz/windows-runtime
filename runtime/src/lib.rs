@@ -751,13 +751,7 @@ fn init_global(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, conte
 }
 
 pub fn debug_output(msg: &str) {
-    // Debug output is disabled by default to avoid noisy logs in normal runs.
-    // Set `NS_DEBUG` in the environment to enable diagnostic logging.
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var("NS_DEBUG").is_ok()) {
-        return;
-    }
-
+    // Debug output always enabled (previously gated by `NS_DEBUG`).
     // Send UTF-16 string to debugger for reliable Unicode output
     let mut wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe { OutputDebugStringW(PCWSTR::from_raw(wide.as_ptr())) };
@@ -5619,8 +5613,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                         if let Some((guid, param_types)) =
                             js_delegate_params_from_declaration(&*lock, kind)
                         {
-                            debug_output(&format!("[NativeScript] delegate ctor: created JsDelegate for {} guid={:?} params={}\n",
-                                lock.full_name(), guid, param_types.len()));
+                            
                             let global_func = v8::Global::new(scope, func);
                             let data = Box::new(JsDelegateData {
                                 js_func: global_func,
@@ -5645,12 +5638,8 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                             retval.set(result_obj.into());
                             return;
                         } else {
-                            debug_output(&format!("[NativeScript] delegate ctor: js_delegate_params_from_declaration FAILED for {} (kind={:?})\n",
-                                lock.full_name(), kind));
                         }
                     } else {
-                        debug_output(&format!("[NativeScript] delegate ctor: no callable in arg0 for {} (kind={:?})\n",
-                            lock.full_name(), kind));
                     }
                 }
             }
@@ -7464,7 +7453,6 @@ fn js_delegate_invoke_inner(
     if tc.has_caught() {
         if let Some(ex) = tc.exception() {
             let msg = ex.to_rust_string_lossy(tc);
-            debug_output(&format!("[NativeScript] delegate invoke JS error: {}\n", msg));
             store_last_js_error(msg);
         }
         tc.reset();
@@ -7801,10 +7789,14 @@ impl Runtime {
         macro_rules! check_exception {
             ($tc:ident) => {
                 if $tc.has_caught() {
+                    let mut error_report = String::new();
                     if let Some(msg) = $tc.message() {
                         let text = msg.get($tc).to_rust_string_lossy($tc);
                         let line = msg.get_line_number($tc).unwrap_or(0);
-                        debug_output(&format!("[NativeScript] ESM error at line {line}: {text}\n"));
+                        let file_name = msg.get_script_resource_name($tc)
+                            .map(|v| v.to_rust_string_lossy($tc))
+                            .unwrap_or_else(|| "<unknown>".to_string());
+                        error_report.push_str(&format!("{} ({}:{})\n", text, file_name, line));
                         if let Some(stack) = msg.get_stack_trace($tc) {
                             for i in 0..stack.get_frame_count() {
                                 if let Some(frame) = stack.get_frame($tc, i) {
@@ -7814,14 +7806,18 @@ impl Runtime {
                                     let file = frame.get_script_name($tc)
                                         .map(|s| s.to_rust_string_lossy($tc))
                                         .unwrap_or_else(|| "<unknown>".to_string());
-                                    debug_output(&format!("    at {} ({}:{}:{})\n", fn_name, file,
-                                        frame.get_line_number(), frame.get_column()));
+                                    let line_str = format!("    at {} ({}:{}:{})\n", fn_name, file,
+                                        frame.get_line_number(), frame.get_column());
+                                    error_report.push_str(&line_str);
                                 }
                             }
                         }
                     } else if let Some(exc) = $tc.exception() {
-                        debug_output(&format!("[NativeScript] ESM exception: {}\n",
-                            exc.to_rust_string_lossy($tc)));
+                        let text = exc.to_rust_string_lossy($tc);
+                        error_report.push_str(&text);
+                    }
+                    if !error_report.is_empty() {
+                        crate::store_last_js_error(error_report);
                     }
                     return;
                 }
@@ -7833,7 +7829,7 @@ impl Runtime {
 
         let root_global = ESM_MODULE_REGISTRY.with(|r| r.borrow().get(&resolved_path).cloned());
         let Some(root_global) = root_global else {
-            debug_output("[NativeScript] ESM: root module was not compiled\n");
+            crate::store_last_js_error("ESM: root module was not compiled".to_string());
             return;
         };
         let module = v8::Local::new(tc, &root_global);
@@ -7890,7 +7886,6 @@ impl Runtime {
                     .map(|v| v.to_rust_string_lossy(tc))
                     .unwrap_or_else(|| "<unknown>".to_string());
                 error_report.push_str(&format!("{} ({}:{})\n", text, file_name, line));
-                debug_output(&format!("[NativeScript] JS error at line {}: {}\n", line, text));
                 if let Some(stack) = msg.get_stack_trace(tc) {
                     for i in 0..stack.get_frame_count() {
                         if let Some(frame) = stack.get_frame(tc, i) {
@@ -7903,14 +7898,12 @@ impl Runtime {
                             let line_str = format!("    at {} ({}:{}:{})\n", fn_name, file,
                                 frame.get_line_number(), frame.get_column());
                             error_report.push_str(&line_str);
-                            debug_output(&line_str);
                         }
                     }
                 }
             } else if let Some(exc) = tc.exception() {
                 let text = exc.to_rust_string_lossy(tc);
                 error_report.push_str(&text);
-                debug_output(&format!("[NativeScript] JS exception: {}\n", text));
             }
             if !error_report.is_empty() {
                 store_last_js_error(error_report);

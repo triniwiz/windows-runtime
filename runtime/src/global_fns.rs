@@ -69,7 +69,6 @@ pub(crate) fn handle_run_on_ui_thread(
         if tc.has_caught() {
             if let Some(ex) = tc.exception() {
                 let msg = ex.to_rust_string_lossy(tc);
-                crate::debug_output(&format!("[nsRunOnUIThread] uncaught exception: {}\n", msg));
                 crate::store_last_js_error(msg);
             }
             tc.reset();
@@ -2864,7 +2863,6 @@ pub(crate) unsafe extern "C" fn invoke_dotnet_js_callback(
     if tc.has_caught() {
         if let Some(ex) = tc.exception() {
             let msg = ex.to_rust_string_lossy(tc);
-            crate::debug_output(&format!("[NativeScript] asDelegate callback error: {}\n", msg));
             crate::store_last_js_error(msg);
         }
         tc.reset();

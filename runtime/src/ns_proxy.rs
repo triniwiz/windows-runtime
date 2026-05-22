@@ -476,7 +476,6 @@ fn instance_method_dispatch(
     let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
     let mut method = MethodCall::new(method, method.is_sealed(), dec.instance.clone().unwrap(), false);
     let (ret, result, _outs) = method.call(scope, &args);
-    crate::debug_output(&format!("[NativeScript] instance_method_dispatch: ret.ok={} outs.len={} result={:p}\n", ret.is_ok(), _outs.len(), result));
 
     if ret.is_err() {
         let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
