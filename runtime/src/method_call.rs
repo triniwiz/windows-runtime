@@ -742,12 +742,15 @@ impl MethodCall {
 
         if is_initializer {
             if !is_sealed {
-                unsafe {
-                    self.argument_buf.push(NativeValue {
-                        pointer: &mut composition_outer as *mut _ as *mut c_void,
-                    })
-                };
+                // pOuter (baseInterface) must be a literal null pointer, not a pointer-to-null.
+                // Passing &mut composition_outer (a stack address) causes the factory to
+                // treat a non-null value as a valid IInspectable and crash on vtable access.
+                self.argument_buf.push(NativeValue {
+                    pointer: std::ptr::null_mut(),
+                });
                 self.argument_parse_types.push(None);
+                // ppInner is an out-slot: pass the address of our local so the factory
+                // can write the inner interface pointer through it.
                 unsafe {
                     self.argument_buf.push(NativeValue {
                         pointer: &mut composition_inner as *mut _ as *mut c_void,
