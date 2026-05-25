@@ -2318,6 +2318,37 @@ fn init_async_helpers(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>
                     asDataView(value).setFloat64(offset >>> 0, +input, littleEndian !== false);
                     return value;
                 },
+                // reference(typeName, value) — explicit IReference<T> boxing.
+                // Normally the runtime boxes
+                // automatically from the method signature; use this for advanced cases.
+                // typeName: "Double" | "Single" | "Int32" | "TimeSpan" | "Guid" | etc.
+                reference: function (typeName, value) {
+                    if (typeof globalThis.__nsCreateReference !== 'function') { return null; }
+                    return globalThis.__nsCreateReference(typeName, value);
+                },
+                // Typed concrete-value helpers
+                // These create a concrete typed IPropertyValue (not a nullable IReference)
+                // so the WinRT runtime can pick the correct overload when a parameter is
+                // typed as Object/IInspectable.  Pass the returned object directly to
+                // any WinRT method that would otherwise receive an untyped JS number.
+                float: function (n) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('Single', +n); },
+                double: function (n) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('Double', +n); },
+                int: function (n) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('Int32', +n); },
+                uint: function (n) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('UInt32', +n); },
+                long: function (n) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('Int64', +n); },
+                ulong: function (n) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('UInt64', +n); },
+                short: function (n) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('Int16', +n); },
+                ushort: function (n) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('UInt16', +n); },
+                byte: function (n) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('UInt8', +n); },
+                char: function (c) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('Char16', c); },
+                bool: function (v) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('Boolean', !!v); },
+                // Date/time helpers
+                timeSpan: function (ms) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('TimeSpan', +ms); },
+                dateTime: function (msOrDate) {
+                    var ms = (msOrDate instanceof Date) ? msOrDate.getTime() : +msOrDate;
+                    return globalThis.__nsTypedValue && globalThis.__nsTypedValue('DateTime', ms);
+                },
+                guid: function (str) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('Guid', String(str)); },
             };
 
             var proxyExtensions = [];

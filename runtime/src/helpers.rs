@@ -87,6 +87,15 @@ pub(crate) fn struct_native_type_for_sig(signature: &str) -> Option<NativeType> 
     Some(NativeType::Struct(field_types.into_boxed_slice()))
 }
 
+/// If `sig` is `Windows.Foundation.IReference`1<T>` (optionally prefixed with `ByRef `),
+/// returns the inner type name `T` as a `&str` slice into `sig`.
+/// Used to select the correct `PropertyValue::Create*` overload when boxing primitives.
+pub fn ireference_inner_type(sig: &str) -> Option<&str> {
+    let inner = sig.trim().strip_prefix("ByRef ").unwrap_or(sig.trim());
+    let rest = inner.strip_prefix("Windows.Foundation.IReference`1<")?;
+    rest.strip_suffix('>')
+}
+
 /// Shared mapping from WinRT signature string to FFI `NativeType`.
 /// Used by `MethodCall` and `PropertyCall` during construction.
 #[inline]

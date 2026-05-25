@@ -3666,6 +3666,76 @@ pub(crate) fn handle_get_last_js_error(
 }
 
 
+// ── __nsTypedValue / __nsCreateReference ─────────────────────────────────────
+//
+// __nsTypedValue(typeName, value) — box a JS value as a concrete WinRT IPropertyValue.
+//   Useful for passing typed primitives to Object/IInspectable parameters and for
+//   method overload disambiguation.
+//
+// __nsCreateReference(typeName, value) — explicit IReference<T> boxing (alias).
+//   PropertyValue::Create* produces an object implementing both IPropertyValue AND
+//   IReference<T>, so both helpers share the same Rust implementation.
+//
+// Supported type names:
+//   "Single" | "Double" | "Int32" | "UInt32" | "Int64" | "UInt64" | "Int16" |
+//   "UInt16" | "Byte"/"UInt8" | "Char16" | "Boolean" | "String" |
+//   "TimeSpan" (accepts ms number or {Duration:ticks}) |
+//   "DateTime" (accepts ms-since-epoch or {UniversalTime:ticks}) |
+//   "Guid" (accepts "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" string)
+
+fn box_and_return(
+    scope: &mut v8::PinScope<'_, '_>,
+    type_name: &str,
+    value: v8::Local<v8::Value>,
+    mut retval: v8::ReturnValue,
+) {
+    let Some(nv) = crate::value::box_as_typed_value(scope, value, type_name) else {
+        retval.set(v8::null(scope).into());
+        return;
+    };
+    let ptr = unsafe { nv.pointer };
+    let ext = v8::External::new(scope, ptr);
+    let obj = v8::Object::new(scope);
+    if let Some(k) = v8::String::new(scope, "handle") {
+        obj.set(scope, k.into(), ext.into());
+    }
+    retval.set(obj.into());
+}
+
+pub(crate) fn handle_typed_value(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    retval: v8::ReturnValue,
+) {
+    if args.length() < 2 {
+        crate::throw_js_error(scope, "__nsTypedValue(typeName, value) expects 2 arguments");
+        return;
+    }
+    let Some(tn) = args.get(0).to_string(scope) else {
+        crate::throw_js_error(scope, "__nsTypedValue: typeName must be a string");
+        return;
+    };
+    let type_name = tn.to_rust_string_lossy(scope);
+    box_and_return(scope, type_name.trim(), args.get(1), retval);
+}
+
+pub(crate) fn handle_create_reference(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    retval: v8::ReturnValue,
+) {
+    if args.length() < 2 {
+        crate::throw_js_error(scope, "__nsCreateReference(typeName, value) expects 2 arguments");
+        return;
+    }
+    let Some(tn) = args.get(0).to_string(scope) else {
+        crate::throw_js_error(scope, "__nsCreateReference: typeName must be a string");
+        return;
+    };
+    let type_name = tn.to_rust_string_lossy(scope);
+    box_and_return(scope, type_name.trim(), args.get(1), retval);
+}
+
 // ── __nsWin32CallRaw ──────────────────────────────────────────────────────────
 
 /// Fast typed Win32 dispatch — no JSON round-trip.
@@ -3817,6 +3887,8 @@ pub(crate) fn init_async_helpers(
     register!("__nsIsUiThread",                 handle_is_ui_thread);
     register!("__nsThreadInfo",                 handle_thread_info);
     register!("__nsGetLastJsError",             handle_get_last_js_error);
+    register!("__nsTypedValue",                  handle_typed_value);
+    register!("__nsCreateReference",            handle_create_reference);
 
     // DevTools host hooks: allow JS to register domain dispatchers and
     // post events/timestamps to the DevTools server when enabled.

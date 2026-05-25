@@ -870,6 +870,135 @@ fn try_get_external_handle(
     None
 }
 
+/// Box a JS value as a concrete WinRT `IPropertyValue` for the given WinRT type name.
+///
+/// `PropertyValue::Create*` produces an `IInspectable` that implements **both**
+/// `IPropertyValue` (concrete typed value) and `IReference<T>` (nullable wrapper),
+/// so this function serves two caller intents:
+///   • Overload disambiguation / typed passing to `Object` parameters.
+///   • Explicit `IReference<T>` boxing for nullable XAML parameters.
+///
+/// `type_name` is the WinRT primitive name: `"Double"`, `"Single"`, `"Int32"`,
+/// `"Char16"`, `"TimeSpan"` (accepts ms number), `"DateTime"` (accepts ms-since-epoch),
+/// `"Guid"` (accepts "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" string), etc.
+/// Returns `None` when the value/type combination cannot be boxed.
+pub fn box_as_typed_value(
+    scope: &mut v8::PinScope<'_, '_>,
+    arg: v8::Local<v8::Value>,
+    type_name: &str,
+) -> Option<NativeValue> {
+    use windows::Foundation::PropertyValue;
+    macro_rules! box_insp {
+        ($expr:expr) => {{
+            let v = $expr.ok()?;
+            let ptr = v.as_raw() as *mut std::ffi::c_void;
+            std::mem::forget(v);
+            Some(NativeValue { pointer: ptr })
+        }};
+    }
+    macro_rules! box_num {
+        ($create:expr) => {{
+            let n = arg.number_value(scope)?;
+            box_insp!($create(n))
+        }};
+    }
+    match type_name.trim() {
+        "Double"                        => box_num!(|n: f64| PropertyValue::CreateDouble(n)),
+        "Single"                        => box_num!(|n: f64| PropertyValue::CreateSingle(n as f32)),
+        "Int32" | "IntI32"              => box_num!(|n: f64| PropertyValue::CreateInt32(n as i32)),
+        "UInt32"                        => box_num!(|n: f64| PropertyValue::CreateUInt32(n as u32)),
+        "Int64"                         => box_num!(|n: f64| PropertyValue::CreateInt64(n as i64)),
+        "UInt64"                        => box_num!(|n: f64| PropertyValue::CreateUInt64(n as u64)),
+        "Int16"                         => box_num!(|n: f64| PropertyValue::CreateInt16(n as i16)),
+        "UInt16"                        => box_num!(|n: f64| PropertyValue::CreateUInt16(n as u16)),
+        "UInt8" | "Uint8" | "Byte"      => box_num!(|n: f64| PropertyValue::CreateUInt8(n as u8)),
+        // Char16: accept a JS string (takes first UTF-16 code unit) or a number.
+        "Char16" | "Char" => {
+            let ch: u16 = if arg.is_string() {
+                arg.to_rust_string_lossy(scope).encode_utf16().next().unwrap_or(0)
+            } else {
+                arg.number_value(scope)? as u16
+            };
+            box_insp!(PropertyValue::CreateChar16(ch))
+        }
+        "Boolean" => {
+            let b = arg.boolean_value(scope);
+            box_insp!(PropertyValue::CreateBoolean(b))
+        }
+        "String" => {
+            let s = arg.to_rust_string_lossy(scope);
+            let hs = windows::core::HSTRING::from(s.as_str());
+            box_insp!(PropertyValue::CreateString(&hs))
+        }
+        // TimeSpan: accept a number of milliseconds; struct { Duration } (100ns ticks) is also
+        // handled — pass the raw ticks integer directly.
+        "TimeSpan" => {
+            let ticks = if arg.is_object() {
+                let obj = arg.to_object(scope)?;
+                if let Some(k) = v8::String::new(scope, "Duration") {
+                    obj.get(scope, k.into()).and_then(|v| v.number_value(scope)).unwrap_or(0.0) as i64
+                } else { 0 }
+            } else {
+                // treat as milliseconds → convert to 100ns ticks
+                (arg.number_value(scope)? * 10_000.0) as i64
+            };
+            let ts = windows::Foundation::TimeSpan { Duration: ticks };
+            box_insp!(PropertyValue::CreateTimeSpan(ts))
+        }
+        // DateTime: accept JS milliseconds since Unix epoch; struct { UniversalTime } also works.
+        "DateTime" => {
+            let universal_time = if arg.is_object() {
+                let obj = arg.to_object(scope)?;
+                if let Some(k) = v8::String::new(scope, "UniversalTime") {
+                    obj.get(scope, k.into()).and_then(|v| v.number_value(scope)).unwrap_or(0.0) as i64
+                } else { 0 }
+            } else {
+                // JS ms since 1970-01-01 → WinRT 100ns ticks since 1601-01-01
+                const EPOCH_DIFF_TICKS: i64 = 11_644_473_600_000 * 10_000;
+                let ms = arg.number_value(scope)? as i64;
+                ms * 10_000 + EPOCH_DIFF_TICKS
+            };
+            let dt = windows::Foundation::DateTime { UniversalTime: universal_time };
+            box_insp!(PropertyValue::CreateDateTime(dt))
+        }
+        // Guid: accept "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" string.
+        "Guid" => {
+            let s = arg.to_rust_string_lossy(scope);
+            let guid = parse_guid_str(s.trim())?;
+            box_insp!(PropertyValue::CreateGuid(guid))
+        }
+        _ => None,
+    }
+}
+
+/// Keep the old name as an alias — used by method_call / property_call for IReference<T> params.
+#[inline]
+pub fn box_as_ireference(
+    scope: &mut v8::PinScope<'_, '_>,
+    arg: v8::Local<v8::Value>,
+    inner_type: &str,
+) -> Option<NativeValue> {
+    box_as_typed_value(scope, arg, inner_type)
+}
+
+/// Parse "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" into a GUID.
+fn parse_guid_str(s: &str) -> Option<windows::core::GUID> {
+    let s = s.trim_matches(|c| c == '{' || c == '}');
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 5 { return None; }
+    let data1 = u32::from_str_radix(parts[0], 16).ok()?;
+    let data2 = u16::from_str_radix(parts[1], 16).ok()?;
+    let data3 = u16::from_str_radix(parts[2], 16).ok()?;
+    let b34 = u16::from_str_radix(parts[3], 16).ok()?;
+    let b5 = u64::from_str_radix(parts[4], 16).ok()?;
+    let data4 = [
+        (b34 >> 8) as u8, b34 as u8,
+        (b5 >> 40) as u8, (b5 >> 32) as u8, (b5 >> 24) as u8,
+        (b5 >> 16) as u8, (b5 >> 8) as u8, b5 as u8,
+    ];
+    Some(windows::core::GUID { data1, data2, data3, data4 })
+}
+
 #[inline]
 pub fn ffi_parse_pointer_arg(
     scope: &mut v8::PinScope<'_, '_>,
@@ -898,6 +1027,8 @@ pub fn ffi_parse_pointer_arg(
 
     if arg.is_number() {
         let n = arg.number_value(scope).unwrap_or(0.0);
+        // For untyped Object parameters, use Int32 for whole numbers and Double otherwise.
+        // Callers that need a specific IReference<T> type call box_as_ireference() first.
         if n == n.trunc() && n >= i32::MIN as f64 && n <= i32::MAX as f64 {
             if let Ok(inspectable) = PropertyValue::CreateInt32(n as i32) {
                 let ptr = inspectable.as_raw() as *mut c_void;

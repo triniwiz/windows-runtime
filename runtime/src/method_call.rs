@@ -534,7 +534,15 @@ impl MethodCall {
                         &parameter.type_(),
                     );
 
-                    if parameter_signature.contains('.') {
+                    // IReference<T> parameters: box JS primitives with the correct Create* call
+                    // so XAML receives the right typed IPropertyValue (e.g. IReference<Double>).
+                    if let Some(inner) = crate::helpers::ireference_inner_type(&parameter_signature) {
+                        if let Some(nv) = crate::value::box_as_ireference(scope, value, inner) {
+                            Ok(nv)
+                        } else {
+                            ffi_parse_pointer_arg(scope, value)
+                        }
+                    } else if parameter_signature.contains('.') {
                         let lookup_name = crate::helpers::strip_generic_suffix(parameter_signature.as_str());
 
                         if let Some(declaration) = MetadataReader::find_by_name(lookup_name) {
