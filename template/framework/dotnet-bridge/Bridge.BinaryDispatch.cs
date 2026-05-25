@@ -1,6 +1,7 @@
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 
@@ -33,11 +34,22 @@ public static partial class Bridge
     {
         var op = r.ReadByte();
 
-        if (op == 0x04) // release
-        {
-            s_handles.TryRemove(r.ReadI32(), out _);
-            return DispatchResult.Void;
-        }
+            if (op == 0x04) // release
+            {
+                var handleToRemove = r.ReadI32();
+                s_handles.TryRemove(handleToRemove, out _);
+                if (s_nativePtrs.TryRemove(handleToRemove, out var nativePtr))
+                {
+                    try
+                    {
+                        Marshal.Release(nativePtr);
+                    }
+                    catch
+                    {
+                    }
+                }
+                return DispatchResult.Void;
+            }
 
         if (op == 0x05) // members by handle
         {
@@ -83,6 +95,14 @@ public static partial class Bridge
             return CreateJsDelegate(delTypeName, callbackId);
         }
 
+        if (op == 0x0A) // create JS-backed subclass instance
+        {
+            var assembly = r.ReadString16();
+            var typeName = r.ReadString16();
+            var callbackId = r.ReadI32();
+            return CreateJsSubclass(NullIfEmpty(assembly), typeName, callbackId);
+        }
+
         // Static ops: 0x02 = call, 0x03 = constructor
         var typeNameS = r.ReadString16();
         var assemblyS = r.ReadString16();
@@ -111,6 +131,8 @@ public static partial class Bridge
     {
         var flags = (isStatic ? BindingFlags.Static : BindingFlags.Instance) | BindingFlags.Public;
 
+        
+
         if (method.Length > 4
             && method[0] == 'g' && method[1] == 'e' && method[2] == 't' && method[3] == '_')
         {
@@ -132,11 +154,63 @@ public static partial class Bridge
 
         var entry = GetCachedMethod(type, method, args.Length, flags);
         if (entry.Invoke is null)
+        {
+            var candidates = type.GetMethods(flags).Where(m => m.Name == method && !m.IsSpecialName);
+            foreach (var m in candidates)
+            {
+                var parameters = m.GetParameters();
+                var built = BuildArgsBin(args, parameters);
+                try
+                {
+                    var res = AwaitIfTask(m.Invoke(target, built));
+                    return Box(res);
+                }
+                catch (TargetInvocationException tie) when (IsMarshaledForDifferentThread(tie.InnerException))
+                {
+                    if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected wrong-thread COM error; retrying {type.FullName}.{m.Name} on UI thread");
+                    try
+                    {
+                        var res = InvokeOnUIThread(() => AwaitIfTask(m.Invoke(target, built)));
+                        return Box(res);
+                    }
+                    catch { /* retry failed — try next candidate */ }
+                }
+                catch (System.Runtime.InteropServices.COMException ce) when (IsMarshaledForDifferentThread(ce))
+                {
+                    if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected COMException wrong-thread; retrying {type.FullName}.{m.Name} on UI thread");
+                    try
+                    {
+                        var res = InvokeOnUIThread(() => AwaitIfTask(m.Invoke(target, built)));
+                        return Box(res);
+                    }
+                    catch { /* retry failed — try next candidate */ }
+                }
+                finally { if (built.Length > 0) ReturnArgs(built); }
+            }
             throw new MissingMethodException(
                 $"Method '{method}' ({args.Length} args) not found on {type.FullName}");
+        }
 
         var builtArgs = BuildArgsBin(args, entry.Parameters);
-        try   { return Box(AwaitIfTask(entry.Invoke(target, builtArgs))); }
+        try { 
+            try
+            {
+                var res = AwaitIfTask(entry.Invoke(target, builtArgs));
+                return Box(res);
+            }
+            catch (TargetInvocationException tie) when (IsMarshaledForDifferentThread(tie.InnerException))
+            {
+                if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected wrong-thread COM error; retrying {type.FullName}.{method} on UI thread");
+                var res = InvokeOnUIThread(() => AwaitIfTask(entry.Invoke(target, builtArgs)));
+                return Box(res);
+            }
+            catch (System.Runtime.InteropServices.COMException ce) when (IsMarshaledForDifferentThread(ce))
+            {
+                if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected COMException wrong-thread; retrying {type.FullName}.{method} on UI thread");
+                var res = InvokeOnUIThread(() => AwaitIfTask(entry.Invoke(target, builtArgs)));
+                return Box(res);
+            }
+        }
         finally { if (builtArgs.Length > 0) ReturnArgs(builtArgs); }
     }
 
@@ -170,19 +244,63 @@ public static partial class Bridge
         {
             if (wr.Ptr == 0) return null;
             var nativePtr = new IntPtr((long)wr.Ptr);
+            // If this native pointer is one that we previously exported (stored
+            // in s_nativePtrs), prefer returning the original managed object
+            // to preserve identity and avoid creating a new RCW which can
+            // fail for CCW pointers. This addresses cases where the runtime
+            // round-trips a managed object's canonical IUnknown pointer.
+            try
+            {
+                var kvp = s_nativePtrs.FirstOrDefault(k => k.Value == nativePtr);
+                if (!kvp.Equals(default(KeyValuePair<int, IntPtr>)))
+                {
+                    if (s_handles.TryGetValue(kvp.Key, out var original))
+                    {
+                        return original;
+                    }
+                }
+            }
+            catch { }
             // 1. Typed QI first: works for COM/CsWinRT interface types that carry a
             //    [Guid] attribute.  More precise than a generic RCW for strongly-typed
             //    parameters such as Windows.UI.Xaml.UIElement.
             if (targetType != typeof(object) && targetType.GUID != Guid.Empty)
             {
-                try { return Marshal.GetTypedObjectForIUnknown(nativePtr, targetType); }
-                catch { }
+                try
+                {
+                    return Marshal.GetTypedObjectForIUnknown(nativePtr, targetType);
+                }
+                catch (Exception ex)
+                {
+                    if (Bridge.IsLogToConsole())
+                    {
+                        try { Console.Error.WriteLine($"[Bridge] GetTypedObjectForIUnknown failed ptr=0x{nativePtr.ToInt64():x} targetType={targetType.FullName}: {ex}"); } catch { }
+                    }
+                }
             }
-            // 2. Generic RCW: .NET WinRT interop calls IInspectable::GetRuntimeClassName
-            //    and projects to the appropriate CsWinRT type automatically.
-            //    Do NOT swallow the exception — a null return silently breaks the call
-            //    downstream; a thrown exception surfaces a meaningful error instead.
-            return Marshal.GetObjectForIUnknown(nativePtr);
+
+            try
+            {
+                return Marshal.GetObjectForIUnknown(nativePtr);
+            }
+            catch (Exception ex)
+            {
+                if (Bridge.IsLogToConsole())
+                {
+                    try
+                    {
+                        Console.Error.WriteLine($"[Bridge] GetObjectForIUnknown failed ptr=0x{nativePtr.ToInt64():x} targetType={targetType.FullName} ({targetType.GUID}): {ex}");
+                        try
+                        {
+                            var found = s_nativePtrs.FirstOrDefault(kvp => kvp.Value == nativePtr);
+                            Console.Error.WriteLine($"[Bridge] s_nativePtrs match: key={found.Key} ptr=0x{found.Value.ToInt64():x}");
+                        }
+                        catch { }
+                    }
+                    catch { }
+                }
+                throw;
+            }
         }
         if (value.GetType() == targetType) return value;
         try { return Convert.ChangeType(value, targetType); }

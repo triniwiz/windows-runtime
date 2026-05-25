@@ -244,6 +244,8 @@ pub struct DevtoolsServer {
     endpoint: DevtoolsEndpoint,
     inbound_rx: Arc<Mutex<Receiver<String>>>,
     session_ptr: Arc<AtomicUsize>,
+    outbound_tx: SyncSender<String>,
+    message_dispatcher: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
     // Declare inspector before session so session is dropped first (LIFO field drops).
     _inspector: V8Inspector,
     _session: Box<V8InspectorSession>,
@@ -260,6 +262,7 @@ impl DevtoolsServer {
         isolate: &mut v8::Isolate,
         global_context: &v8::Global<v8::Context>,
         console_forwarder: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+        message_dispatcher: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
     ) -> Result<Self> {
         let listener = TcpListener::bind(format!("{}:{}", config.host, config.port))?;
         let addr = listener.local_addr()?;
@@ -296,7 +299,7 @@ impl DevtoolsServer {
 
         let session = Box::new(inspector.connect(
             1,
-            Channel::new(Box::new(DevtoolsChannel { tx: outbound_tx, forwarder: console_forwarder.clone() })),
+            Channel::new(Box::new(DevtoolsChannel { tx: outbound_tx.clone(), forwarder: console_forwarder.clone() })),
             StringView::empty(),
             V8InspectorClientTrustLevel::FullyTrusted,
         ));
@@ -318,9 +321,20 @@ impl DevtoolsServer {
             endpoint: DevtoolsEndpoint { websocket_url, frontend_url },
             inbound_rx,
             session_ptr,
+            outbound_tx,
+            message_dispatcher,
             _inspector: inspector,
             _session: session,
         })
+    }
+
+    /// Send a pre-formed DevTools protocol message string to connected clients.
+    /// Returns an error if sending fails (e.g. channel full or no clients).
+    pub fn send(&self, message: &str) -> Result<()> {
+        match self.outbound_tx.try_send(message.to_string()) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("failed to send inspector message: {:?}", e)),
+        }
     }
 
     pub fn endpoint(&self) -> &DevtoolsEndpoint {
@@ -335,6 +349,13 @@ impl DevtoolsServer {
             return;
         }
         while let Ok(msg) = self.inbound_rx.lock().try_recv() {
+            // First allow optional embedder-provided JS dispatcher to handle
+            // the message. If it returns `true` we skip default dispatch.
+            if let Some(dispatcher) = &self.message_dispatcher {
+                if dispatcher(&msg) {
+                    continue;
+                }
+            }
             // SAFETY: same guarantee as in run_message_loop_on_pause.
             unsafe {
                 let view = StringView::from(msg.as_bytes());

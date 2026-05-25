@@ -18,11 +18,23 @@ public static partial class Bridge
     {
         var method = req.Method ?? throw new ArgumentException("Method is required");
 
-        if (method == "__release" && req.Handle.HasValue)
-        {
-            s_handles.TryRemove(req.Handle.Value, out _);
-            return DispatchResult.Void;
-        }
+            if (method == "__release" && req.Handle.HasValue)
+            {
+                var id = req.Handle.Value;
+                s_handles.TryRemove(id, out _);
+                if (s_nativePtrs.TryRemove(id, out var nativePtr))
+                {
+                    try
+                    {
+                        Marshal.Release(nativePtr);
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                return DispatchResult.Void;
+            }
 
         object? target = null;
         Type type;
@@ -90,11 +102,64 @@ public static partial class Bridge
         var args      = req.Args ?? [];
         var dispEntry = GetCachedMethod(type, method, args.Length, flags);
         if (dispEntry.Invoke is null)
+        {
+            // Fallback: try methods with the same name (different signatures).
+            var candidates = type.GetMethods(flags).Where(m => m.Name == method && !m.IsSpecialName);
+            foreach (var m in candidates)
+            {
+                var parameters = m.GetParameters();
+                var built = BuildArgs(args, parameters);
+                try
+                {
+                    var res = AwaitIfTask(m.Invoke(target, built));
+                    return Box(res);
+                }
+                catch (TargetInvocationException tie) when (IsMarshaledForDifferentThread(tie.InnerException))
+                {
+                    if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected wrong-thread COM error; retrying {type.FullName}.{m.Name} on UI thread");
+                    try
+                    {
+                        var res = InvokeOnUIThread(() => AwaitIfTask(m.Invoke(target, built)));
+                        return Box(res);
+                    }
+                    catch { /* retry failed — try next candidate */ }
+                }
+                catch (System.Runtime.InteropServices.COMException ce) when (IsMarshaledForDifferentThread(ce))
+                {
+                    if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected COMException wrong-thread; retrying {type.FullName}.{m.Name} on UI thread");
+                    try
+                    {
+                        var res = InvokeOnUIThread(() => AwaitIfTask(m.Invoke(target, built)));
+                        return Box(res);
+                    }
+                    catch { /* retry failed — try next candidate */ }
+                }
+                finally { if (built.Length > 0) ReturnArgs(built); }
+            }
             throw new MissingMethodException(
                 $"Method '{method}' ({args.Length} args) not found on {type.FullName}");
+        }
 
         var builtArgs = BuildArgs(args, dispEntry.Parameters);
-        try   { return Box(AwaitIfTask(dispEntry.Invoke(target, builtArgs))); }
+        try {
+            try
+            {
+                var res = AwaitIfTask(dispEntry.Invoke(target, builtArgs));
+                return Box(res);
+            }
+            catch (TargetInvocationException tie) when (IsMarshaledForDifferentThread(tie.InnerException))
+            {
+                if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected wrong-thread COM error; retrying {type.FullName}.{method} on UI thread");
+                var res = InvokeOnUIThread(() => AwaitIfTask(dispEntry.Invoke(target, builtArgs)));
+                return Box(res);
+            }
+            catch (System.Runtime.InteropServices.COMException ce) when (IsMarshaledForDifferentThread(ce))
+            {
+                if (Bridge.IsLogToConsole()) Console.Error.WriteLine($"[Bridge] Detected COMException wrong-thread; retrying {type.FullName}.{method} on UI thread");
+                var res = InvokeOnUIThread(() => AwaitIfTask(dispEntry.Invoke(target, builtArgs)));
+                return Box(res);
+            }
+        }
         finally { if (builtArgs.Length > 0) ReturnArgs(builtArgs); }
     }
 
@@ -225,6 +290,13 @@ public static partial class Bridge
     private static DispatchResult Box(object? value)
     {
         if (value is null) return DispatchResult.Void;
+        // Treat pointer-sized IntPtr/UIntPtr as primitive numeric returns so
+        // the runtime receives a numeric pointer value instead of a handle.
+        if (value is IntPtr ip)
+            return DispatchResult.Primitive(ip.ToInt64(), typeof(long));
+        if (value is UIntPtr up)
+            return DispatchResult.Primitive(unchecked((long)up.ToUInt64()), typeof(long));
+
         var t = value.GetType();
 
         if (t.IsPrimitive || t == typeof(string)  || t == typeof(decimal)
@@ -232,20 +304,43 @@ public static partial class Bridge
             || t == typeof(TimeSpan) || t == typeof(Guid))
             return DispatchResult.Primitive(value, t);
 
+        // Arrays and other enumerable results should be marshalled as Collections
+        // (0x07) so the runtime receives the items directly instead of a handle.
+        if (value is System.Collections.IEnumerable enumerable && !(value is string))
+        {
+            return DispatchResult.Collection(enumerable);
+        }
+
         if (t.IsEnum)
         {
             var ut = Enum.GetUnderlyingType(t);
             return DispatchResult.Primitive(Convert.ChangeType(value, ut), ut);
         }
 
-        if (t.IsArray || (t != typeof(string) && value is IEnumerable))
-        {
-            try { return DispatchResult.Collection((IEnumerable)value); }
-            catch { }
-        }
 
-        var id = Interlocked.Increment(ref s_nextHandle);
-        s_handles[id] = value;
+
+            var id = Interlocked.Increment(ref s_nextHandle);
+            s_handles[id] = value;
+
+            // Try to obtain a canonical IUnknown pointer for COM/WinRT objects so the
+            // runtime can call native vtable methods directly. We addref via
+            // Marshal.GetIUnknownForObject and store the raw pointer; it will be
+            // released on __release.
+            try
+            {
+                if (value != null)
+                {
+                    var p = Marshal.GetIUnknownForObject(value);
+                        if (p != IntPtr.Zero)
+                        {
+                        s_nativePtrs[id] = p;
+                    }
+                }
+            }
+            catch
+            {
+                // Not a COM object or failed to obtain native pointer; ignore.
+            }
         var typeName = t.FullName ?? t.Name;
         return IsAwaitable(value, t)
             ? DispatchResult.TaskHandle(id, typeName)
@@ -366,9 +461,43 @@ public static partial class Bridge
 
     private static MethodInfo? FindMethodCore(Type type, string name, int argCount, BindingFlags flags)
     {
+        // Exact match first: same name and parameter count.
         var match = Array.Find(type.GetMethods(flags),
             m => m.Name == name && !m.IsGenericMethod && m.GetParameters().Length == argCount);
-        return match ?? type.GetMethod(name, flags);
+        if (match is not null) return match;
+
+        // Fallback to GetMethod which may handle binding differently.
+        var gm = type.GetMethod(name, flags);
+        if (gm is not null && !gm.IsGenericMethod && gm.GetParameters().Length == argCount) return gm;
+
+        // WinRT method names sometimes project to different CLR names
+        // (e.g. WinRT's `Append` → CLR `Add`). Try a small alias map
+        // before giving up so common collection methods work through
+        // the dotnet bridge without extra bridge-side shims.
+        var aliases = new Dictionary<string, string[]>()
+        {
+            ["Append"] = new[] { "Add" },
+            ["InsertAt"] = new[] { "Insert" },
+            ["GetAt"] = new[] { "get_Item" , "ElementAt" },
+            ["SetAt"] = new[] { "set_Item" },
+            ["RemoveAt"] = new[] { "RemoveAt" },
+            ["ReplaceAll"] = new[] { "Clear" },
+        };
+
+        if (aliases.TryGetValue(name, out var candidates))
+        {
+            foreach (var cand in candidates)
+            {
+                var candMatch = Array.Find(type.GetMethods(flags),
+                    m => m.Name == cand && !m.IsGenericMethod && m.GetParameters().Length == argCount);
+                if (candMatch is not null) return candMatch;
+
+                var gm2 = type.GetMethod(cand, flags);
+                if (gm2 is not null && !gm2.IsGenericMethod && gm2.GetParameters().Length == argCount) return gm2;
+            }
+        }
+
+        return null;
     }
 
     internal static Exception Unwrap(Exception ex) =>

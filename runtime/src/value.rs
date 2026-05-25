@@ -3,6 +3,7 @@ use std::mem;
 use std::mem::ManuallyDrop;
 
 use crate::DeclarationFFI;
+use crate::dotnet::call_dotnet;
 use libffi::low::*;
 use libffi::middle::Arg;
 use windows::core::{IUnknown, Interface, GUID, HSTRING};
@@ -659,12 +660,59 @@ fn try_get_external_handle(
 ) -> Option<*mut c_void> {
     if let Some(handle_key) = v8::String::new(scope, "handle") {
         if let Some(handle) = arg.get(scope, handle_key.into()) {
+            // If `handle` is a function (common for managed wrappers exposing
+            // a getter), call it and attempt to parse its return value as a
+            // native handle.  Calling a small accessor here is acceptable
+            // because it's the explicit bridge contract for retrieving native
+            // identity from wrapped managed objects.
+            if handle.is_function() {
+                if let Ok(func) = v8::Local::<v8::Function>::try_from(handle) {
+                    // Call with `this` = the object so typical getters work.
+                    if let Some(ret) = func.call(scope, arg.into(), &[]) {
+                        if let Ok(ext) = v8::Local::<v8::External>::try_from(ret) {
+                            return Some(ext.value());
+                        }
+                        if ret.is_null() {
+                            return Some(std::ptr::null_mut());
+                        }
+                        if let Ok(bi) = v8::Local::<v8::BigInt>::try_from(ret) {
+                            let u = bi.u64_value().0;
+                            return Some(u as *mut c_void);
+                        }
+                        if let Ok(num) = v8::Local::<v8::Number>::try_from(ret) {
+                            if let Some(iv) = num.integer_value(scope) {
+                                return Some(iv as isize as *mut c_void);
+                            } else {
+                                let v = num.value();
+                                return Some(v as usize as *mut c_void);
+                            }
+                        }
+                    }
+                }
+            }
             if let Ok(value) = v8::Local::<v8::External>::try_from(handle) {
                 return Some(value.value());
             }
 
             if handle.is_null() {
                 return Some(std::ptr::null_mut());
+            }
+            // Fallback: some managed bridges may expose the native pointer as a
+            // numeric value (BigInt or Number). Accept those too.
+            if let Ok(bi) = v8::Local::<v8::BigInt>::try_from(handle) {
+                let u = bi.u64_value().0;
+                let ptr = u as *mut c_void;
+                return Some(ptr);
+            }
+            if let Ok(num) = v8::Local::<v8::Number>::try_from(handle) {
+                if let Some(iv) = num.integer_value(scope) {
+                    let ptr = iv as isize as *mut c_void;
+                    return Some(ptr);
+                } else {
+                    let v = num.value();
+                    let ptr = v as usize as *mut c_void;
+                    return Some(ptr);
+                }
             }
         }
     }
@@ -685,6 +733,138 @@ fn try_get_external_handle(
         }
 
         return Some(std::ptr::null_mut());
+    }
+
+    // Bridge may provide a canonical native pointer directly on the JS object
+    // via a `__native_ptr` property (written as a string or numeric value by
+    // the managed bridge). Accept hex strings, decimal strings, BigInt, and
+    // Number values here so managed-returned wrappers can expose their
+    // canonical IUnknown/IInspectable pointer identity.
+    if let Some(native_key) = v8::String::new(scope, "__native_ptr") {
+        if let Some(val) = arg.get(scope, native_key.into()) {
+            if val.is_string() {
+                if let Ok(sv) = v8::Local::<v8::String>::try_from(val) {
+                    let s = sv.to_rust_string_lossy(scope);
+                    let s_trim = s.trim_start();
+                    let parsed = if s_trim.starts_with("0x") || s_trim.starts_with("0X") {
+                        usize::from_str_radix(&s_trim[2..], 16).ok()
+                    } else {
+                        s_trim.parse::<usize>().ok()
+                    };
+                    if let Some(u) = parsed {
+                        return Some(u as *mut c_void);
+                    }
+                }
+            }
+            if let Ok(bi) = v8::Local::<v8::BigInt>::try_from(val) {
+                let u = bi.u64_value().0;
+                return Some(u as *mut c_void);
+            }
+            if let Ok(num) = v8::Local::<v8::Number>::try_from(val) {
+                if let Some(iv) = num.integer_value(scope) {
+                    return Some(iv as isize as *mut c_void);
+                } else {
+                    let v = num.value();
+                    return Some(v as usize as *mut c_void);
+                }
+            }
+            if let Ok(ext) = v8::Local::<v8::External>::try_from(val) {
+                return Some(ext.value());
+            }
+        }
+    }
+
+    // If the object exposes a managed handle id, ask the managed bridge for
+    // a canonical native pointer for that handle. This is a fallback for
+    // managed-created wrappers that did not carry an External or __native_ptr.
+    if let Some(handle_key) = v8::String::new(scope, "__handle") {
+        if let Some(val) = arg.get(scope, handle_key.into()) {
+            // extract integer handle id from various JS numeric types
+            let mut handle_id: Option<i32> = None;
+            if let Ok(v) = v8::Local::<v8::Int32>::try_from(val) {
+                handle_id = Some(v.value());
+            } else if let Ok(n) = v8::Local::<v8::Number>::try_from(val) {
+                if let Some(iv) = n.integer_value(scope) {
+                    handle_id = Some(iv as i32);
+                } else {
+                    handle_id = Some(n.value() as i32);
+                }
+            } else if let Ok(bi) = v8::Local::<v8::BigInt>::try_from(val) {
+                handle_id = Some(bi.u64_value().0 as i32);
+            } else if val.is_object() {
+                // Some bridges nest the handle in an inner __handle property.
+                if let Ok(obj) = v8::Local::<v8::Object>::try_from(val) {
+                    if let Some(inner) = obj.get(scope, handle_key.into()) {
+                        if let Ok(v) = v8::Local::<v8::Int32>::try_from(inner) {
+                            handle_id = Some(v.value());
+                        } else if let Ok(n) = v8::Local::<v8::Number>::try_from(inner) {
+                            if let Some(iv) = n.integer_value(scope) {
+                                handle_id = Some(iv as i32);
+                            } else {
+                                handle_id = Some(n.value() as i32);
+                            }
+                        } else if let Ok(bi) = v8::Local::<v8::BigInt>::try_from(inner) {
+                            handle_id = Some(bi.u64_value().0 as i32);
+                        }
+                    }
+                }
+            }
+
+            if let Some(id) = handle_id {
+                // Compose a JSON call to the managed bridge: call the static
+                // Bridge.GetNativePtrForHandle(handleId) method and parse the
+                // returned numeric pointer (0 means absent).
+                let req = format!(
+                    "{{\"assembly\":null,\"typeName\":\"NativeScriptBridge.Bridge\",\"method\":\"GetNativePtrForHandle\",\"args\":[{}]}}",
+                    id
+                );
+                // Verbose tracing — only emit when `NS_DEBUG` is set.
+                if std::env::var("NS_DEBUG").is_ok() {
+                    crate::debug_output(&format!("[RUNTIME] calling bridge for native ptr of handle {}\n", id));
+                }
+                if let Ok(resp) = call_dotnet(&req) {
+                    if std::env::var("NS_DEBUG").is_ok() {
+                        crate::debug_output(&format!("[RUNTIME] bridge resp for handle {}: {}\n", id, resp));
+                    }
+                    let trimmed = resp.trim();
+                    if !trimmed.is_empty() && trimmed != "null" {
+                        // Try parse as integer JSON (e.g. 12345)
+                                if let Ok(n) = trimmed.parse::<i64>() {
+                            if n != 0 {
+                                if std::env::var("NS_DEBUG").is_ok() {
+                                    crate::debug_output(&format!("[RUNTIME] parsed native ptr {} for handle {}\n", n, id));
+                                }
+                                return Some(n as usize as *mut c_void);
+                            }
+                        } else {
+                            // Maybe the bridge returned a quoted hex string
+                            let s = trimmed.trim_matches('"');
+                            let s_trim = s.trim_start();
+                            if s_trim.starts_with("0x") || s_trim.starts_with("0X") {
+                                if let Ok(u) = usize::from_str_radix(&s_trim[2..], 16) {
+                                    if std::env::var("NS_DEBUG").is_ok() {
+                                        crate::debug_output(&format!("[RUNTIME] parsed hex native ptr 0x{:x} for handle {}\n", u, id));
+                                    }
+                                    return Some(u as *mut c_void);
+                                }
+                            } else if let Ok(u) = s_trim.parse::<usize>() {
+                                if u != 0 {
+                                    if std::env::var("NS_DEBUG").is_ok() {
+                                        crate::debug_output(&format!("[RUNTIME] parsed native ptr {} for handle {}\n", u, id));
+                                    }
+                                    return Some(u as *mut c_void);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Only emit the failure message when verbose debug is requested.
+                    if std::env::var("NS_DEBUG").is_ok() {
+                        crate::debug_output(&format!("[RUNTIME] call_dotnet failed while requesting native ptr for handle {}\n", id));
+                    }
+                }
+            }
+        }
     }
 
     None

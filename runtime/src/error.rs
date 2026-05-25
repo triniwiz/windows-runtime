@@ -52,5 +52,9 @@ pub fn type_error(message: impl Into<Cow<'static, str>>) -> Error {
 /// provided message text when available. Falls back to a hex HRESULT string.
 pub fn format_hresult_message(hr: windows::core::HRESULT) -> String {
     let s = hr.message();
-    if s.is_empty() { format!("HRESULT 0x{:08X}", hr.0 as u32) } else { s }
+    if s.is_empty() {
+        format!("HRESULT 0x{:08X}", hr.0 as u32)
+    } else {
+        format!("{} (HRESULT 0x{:08X})", s, hr.0 as u32)
+    }
 }

@@ -1,12 +1,35 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
 use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PeekMessageW, PM_REMOVE, TranslateMessage};
+use windows::core::{IUnknown, Interface};
+use std::mem::ManuallyDrop;
 use runtime_binding_gen::{RuntimeExtensionMetadata, RuntimeExtensionRegistry};
 
 use crate::{throw_js_error, Runtime, ASYNC_PUMP_HOOK, proxy_manifests};
 use crate::type_description::build_runtime_type_descriptor;
+use std::cell::RefCell;
+use std::sync::Arc;
+use serde_json::Value as JsonValue;
+use std::ffi::c_void;
+
+extern "system" {
+    fn LocalAlloc(uFlags: u32, uBytes: usize) -> *mut c_void;
+}
+
+const LMEM_FIXED: u32 = 0x0000;
+
+#[cfg(feature = "devtools")]
+use runtime_devtools::{DevtoolsServer, DevtoolsServerConfig};
+
+#[cfg(feature = "devtools")]
+thread_local!(static DEVTOOLS_SERVER: RefCell<Option<DevtoolsServer>> = RefCell::new(None));
+
+thread_local!(static INSPECTOR_DOMAIN_DISPATCHERS: RefCell<HashMap<String, v8::Global<v8::Value>>> = RefCell::new(HashMap::new()));
+
+const INSPECTOR_DISPATCHERS_GLOBAL: &str = "__nsInspectorDomainDispatchers";
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
@@ -247,6 +270,15 @@ pub(crate) fn handle_host_wait_for_async(
         }
     }
 }
+
+// Inspector helpers moved to `inspector.rs`.
+pub(crate) use crate::inspector::{
+    handle_register_domain_dispatcher,
+    handle_inspector_send_event,
+    handle_inspector_timestamp,
+    try_dispatch_inspector_message_to_js,
+    maybe_attach_devtools,
+};
 
 pub(crate) fn handle_enqueue_microtask(
     scope: &mut v8::PinScope<'_, '_>,
@@ -594,6 +626,7 @@ pub(crate) fn handle_proxy_list_manifests(
     }
     retval.set(array.into());
 }
+
 
 pub(crate) fn handle_describe_winrt_type(
     scope: &mut v8::PinScope<'_, '_>,
@@ -1593,6 +1626,71 @@ const HELPER_SOURCE: &str = r#"
                 });
             }
 
+            // Create a managed-backed subclass factory. This returns a constructor
+            // that, when invoked, asks the managed bridge to instantiate a real
+            // C# subclass whose vtable forwards virtual calls back into the
+            // provided JS `overrides` object via the DotNet bridge.
+            function makeManagedConstructor(baseCtor, nameOrOverrides, maybeOverrides) {
+                var hasName = typeof nameOrOverrides === 'string';
+                var explicitTypeName = hasName ? nameOrOverrides : '';
+                var typeName = explicitTypeName || autoProxyTypeName(baseCtor);
+                var overrides = hasName ? maybeOverrides : nameOrOverrides;
+                if (!overrides || typeof overrides !== 'object') overrides = {};
+
+                function Managed() {
+                    var args = Array.prototype.slice.call(arguments);
+                    var obj = NSWinRT.proxy.createManagedSubclass('', typeName || '', overrides);
+                    if (typeof overrides.init === 'function') {
+                        try {
+                            var initResult = overrides.init.apply(obj, args);
+                            if (initResult && typeof initResult === 'object') obj = initResult;
+                        } catch (_) { }
+                    }
+                    return obj;
+                }
+
+                Managed.prototype = Object.create((baseCtor && baseCtor.prototype) || Object.prototype);
+                Managed.prototype.constructor = Managed;
+                Managed.extend = function (nextNameOrOverrides, nextMaybeOverrides) {
+                    return makeManagedConstructor(Managed, nextNameOrOverrides, nextMaybeOverrides);
+                };
+                try {
+                    Object.defineProperty(Managed, 'name', { value: typeName || ctorName(baseCtor), configurable: true });
+                } catch (_) { }
+                Managed.__typeName__ = typeName || ctorName(baseCtor);
+                return Managed;
+            }
+
+            if (typeof Function.prototype.extendManaged !== 'function') {
+                Object.defineProperty(Function.prototype, 'extendManaged', {
+                    value: function (nameOrOverrides, maybeOverrides) {
+                        return makeManagedConstructor(this, nameOrOverrides, maybeOverrides);
+                    },
+                    writable: true,
+                    configurable: true,
+                    enumerable: false,
+                });
+            }
+
+            if (typeof Object.extendManaged !== 'function') {
+                Object.defineProperty(Object, 'extendManaged', {
+                    value: function (nameOrOverrides, maybeOverrides) {
+                        return makeManagedConstructor(Object, nameOrOverrides, maybeOverrides);
+                    },
+                    writable: true,
+                    configurable: true,
+                    enumerable: false,
+                });
+            }
+
+            // Convenience alias for hosts that expect a global BaseClass helper.
+            globalThis.BaseClass = globalThis.BaseClass || {};
+            if (typeof globalThis.BaseClass.extend !== 'function') {
+                globalThis.BaseClass.extend = function (baseCtor, nameOrOverrides, maybeOverrides) {
+                    return makeManagedConstructor(baseCtor || Object, nameOrOverrides, maybeOverrides);
+                };
+            }
+
             function defaultProxyOutDir(meta) {
                 var typeName = (meta && meta.typeName) ? meta.typeName : 'GeneratedProxy';
                 var safe = safeIdentifier(typeName.split('.').pop());
@@ -1682,6 +1780,28 @@ const HELPER_SOURCE: &str = r#"
                 emit: emitProxy,
                 compile: compileProxy,
                 register: registerProxy,
+                createManagedSubclass: function (assembly, typeName, overrides) {
+                    if (typeof globalThis.__nsDotNetCreateJsSubclass !== 'function') {
+                        throw new Error('__nsDotNetCreateJsSubclass is not available in this runtime');
+                    }
+                    if (!overrides || typeof overrides !== 'object') overrides = {};
+                    var dispatcher = function () {
+                        var a = Array.prototype.slice.call(arguments);
+                        try {
+                            var target = _wrap(a[0]);
+                            var method = a[1];
+                            var margs = a[2] || [];
+                            if (target && typeof method === 'string') {
+                                var fn = overrides[method];
+                                if (typeof fn === 'function') return fn.apply(target, Array.isArray(margs) ? margs : []);
+                            }
+                        } catch (_) { }
+                    };
+                    var handle = globalThis.__nsDotNetCreateJsSubclass(assembly || '', typeName || '', dispatcher);
+                    var obj = _wrap(handle);
+                    ensureProxyInstance(obj, overrides, function () { });
+                    return obj;
+                },
                 invokeById: invokeProxyById,
                 listRegisteredManifests: function () {
                     if (typeof globalThis.__nsProxyListManifests === 'function') {
@@ -2859,13 +2979,49 @@ pub(crate) unsafe extern "C" fn invoke_dotnet_js_callback(
     };
     let js_args = parse_dotnet_callback_args(tc, args_slice);
 
-    let _ = func.call(tc, recv, &js_args);
+    let result_val = func.call(tc, recv, &js_args);
     if tc.has_caught() {
         if let Some(ex) = tc.exception() {
             let msg = ex.to_rust_string_lossy(tc);
             crate::store_last_js_error(msg);
         }
         tc.reset();
+    }
+    // Serialize the returned value (if any) into the binary response format
+    // and return it to managed via resp_ptr/resp_len. Managed will call
+    // Bridge.Free (Marshal.FreeHGlobal) to release this memory, so allocate
+    // with the Windows LocalAlloc/LMEM_FIXED allocator for compatibility.
+    let mut out_buf: Vec<u8> = Vec::new();
+    match result_val {
+        Some(rv) => {
+            // Convert the returned V8 value into a single tagged binary value.
+            bin_write_v8_value(&mut out_buf, tc, rv);
+        }
+        None => {
+            // No return value: null tag.
+            out_buf.push(0x00u8);
+        }
+    }
+
+    if out_buf.is_empty() {
+        // No response: leave resp pointers null / zero.
+        if !_resp_ptr.is_null() { *_resp_ptr = std::ptr::null_mut(); }
+        if !_resp_len.is_null() { *_resp_len = 0; }
+    } else {
+        // Allocate memory using LocalAlloc so managed Marshal.FreeHGlobal can free it.
+        let size = out_buf.len();
+        unsafe {
+            let p = LocalAlloc(LMEM_FIXED, size);
+            if p.is_null() {
+                if !_resp_ptr.is_null() { *_resp_ptr = std::ptr::null_mut(); }
+                if !_resp_len.is_null() { *_resp_len = 0; }
+            } else {
+                let dest = p as *mut u8;
+                std::ptr::copy_nonoverlapping(out_buf.as_ptr(), dest, size);
+                if !_resp_ptr.is_null() { *_resp_ptr = dest; }
+                if !_resp_len.is_null() { *_resp_len = size as i32; }
+            }
+        }
     }
     // If this callback was registered as a one-shot, remove it now to avoid leaks.
     crate::DOTNET_ONESHOT_JS_CALLBACKS.with(|s| {
@@ -2928,6 +3084,55 @@ pub(crate) fn handle_dotnet_create_delegate(
     // opcode 0x09 | type_name (str16) | callback_id (i32)
     let mut req: Vec<u8> = Vec::with_capacity(32);
     req.push(0x09);
+    bin_write_str16(&mut req, type_name.as_bytes());
+    req.extend_from_slice(&cb_id.to_le_bytes());
+
+    match crate::dotnet::call_dotnet_binary(&req) {
+        Ok(response) => match bin_read_response(scope, &response) {
+            Ok(v)  => retval.set(v),
+            Err(e) => throw_js_error(scope, &e),
+        },
+        Err(e) => throw_js_error(scope, &e),
+    }
+}
+
+/// Create a managed subclass instance backed by JS overrides.
+/// Args: args[0] = assembly (string or ''), args[1] = typeName (string), args[2] = function or object (callable to receive invocations)
+pub(crate) fn handle_dotnet_create_js_subclass(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 3 {
+        throw_js_error(scope, "__nsDotNetCreateJsSubclass(assembly, typeName, fn): expected 3 arguments");
+        return;
+    }
+
+    let assembly = args.get(0)
+        .to_string(scope)
+        .map(|s| s.to_rust_string_lossy(scope))
+        .unwrap_or_default();
+
+    let type_name = args.get(1)
+        .to_string(scope)
+        .map(|s| s.to_rust_string_lossy(scope))
+        .unwrap_or_default();
+
+    // Accept a function as the callback.
+    let cb_val = args.get(2);
+    let Ok(cb_fn) = v8::Local::<v8::Function>::try_from(cb_val) else {
+        throw_js_error(scope, "__nsDotNetCreateJsSubclass: third argument must be a function");
+        return;
+    };
+
+    let cb_id = crate::DOTNET_NEXT_CB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::DOTNET_JS_CALLBACKS.with(|m| {
+        m.borrow_mut().insert(cb_id, v8::Global::new(scope, cb_fn));
+    });
+
+    let mut req: Vec<u8> = Vec::with_capacity(64);
+    req.push(0x0A);
+    bin_write_str16(&mut req, assembly.as_bytes());
     bin_write_str16(&mut req, type_name.as_bytes());
     req.extend_from_slice(&cb_id.to_le_bytes());
 
@@ -3059,6 +3264,14 @@ fn bin_write_v8_arg(buf: &mut Vec<u8>, scope: &mut v8::PinScope<'_, '_>, arg: v8
                     if let Ok(bi) = v8::Local::<v8::BigInt>::try_from(pval) {
                         let (ptr, _) = bi.u64_value();
                         if ptr != 0 {
+                            // Ensure ownership semantics: AddRef the raw COM pointer
+                            // before emitting it to managed code so the managed side
+                            // can safely wrap and Release it later.
+                            unsafe {
+                                let unknown = ManuallyDrop::new(IUnknown::from_raw(ptr as *mut _));
+                                let vtable = unknown.vtable();
+                                ((*vtable).AddRef)(unknown.as_raw());
+                            }
                             buf.push(0x0A);
                             buf.extend_from_slice(&ptr.to_le_bytes());
                             return;
@@ -3067,8 +3280,111 @@ fn bin_write_v8_arg(buf: &mut Vec<u8>, scope: &mut v8::PinScope<'_, '_>, arg: v8
                 }
             }
         }
+
+        // Fallback: stringify object
+        if let Some(sv) = arg.to_string(scope) {
+            let bytes = sv.to_rust_string_lossy(scope).into_bytes();
+            buf.push(0x05);
+            bin_write_str16(buf, &bytes);
+            return;
+        }
+        }
+
+    // Final fallback: null
+    buf.push(0x00);
     }
 
+fn bin_write_str32(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn bin_write_v8_value(buf: &mut Vec<u8>, scope: &mut v8::PinScope<'_, '_>, arg: v8::Local<v8::Value>) {
+    if arg.is_null_or_undefined() { buf.push(0x00); return; }
+    if arg.is_boolean() { buf.push(if arg.is_true() { 0x02 } else { 0x01 }); return; }
+
+    // Integer before general number
+    if let Ok(n) = v8::Local::<v8::Integer>::try_from(arg) {
+        let v = n.value();
+        if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
+            buf.push(0x03);
+            buf.extend_from_slice(&(v as i32).to_le_bytes());
+            return;
+        }
+    }
+    if let Ok(n) = v8::Local::<v8::Number>::try_from(arg) {
+        buf.push(0x04);
+        buf.extend_from_slice(&n.value().to_bits().to_le_bytes());
+        return;
+    }
+
+    if arg.is_string() {
+        if let Some(s) = arg.to_string(scope) {
+            let bytes = s.to_rust_string_lossy(scope).into_bytes();
+            buf.push(0x05);
+            bin_write_str32(buf, &bytes);
+            return;
+        }
+    }
+
+    if arg.is_array() {
+        if let Some(arr) = v8::Local::<v8::Array>::try_from(arg).ok() {
+            let len = arr.length() as u32;
+            buf.push(0x07);
+            buf.extend_from_slice(&len.to_le_bytes());
+            for i in 0..len {
+                if let Some(it) = arr.get_index(scope, i) {
+                    bin_write_v8_value(buf, scope, it);
+                } else {
+                    buf.push(0x00);
+                }
+            }
+            return;
+        }
+    }
+
+    if arg.is_object() {
+        if let Some(obj) = arg.to_object(scope) {
+            // Dotnet bridge handle: { __handle: i32 }
+            if let Some(key) = v8::String::new(scope, "__handle") {
+                if let Some(hval) = obj.get(scope, key.into()) {
+                    if let Ok(n) = v8::Local::<v8::Integer>::try_from(hval) {
+                        buf.push(0x06);
+                        buf.extend_from_slice(&(n.value() as i32).to_le_bytes());
+                        return;
+                    }
+                    if let Ok(n) = v8::Local::<v8::Number>::try_from(hval) {
+                        buf.push(0x06);
+                        buf.extend_from_slice(&(n.value() as i32).to_le_bytes());
+                        return;
+                    }
+                }
+            }
+            // WinRT COM pointer: __native_ptr BigInt -> 0x0A + 8-byte u64
+            if let Some(key) = v8::String::new(scope, "__native_ptr") {
+                if let Some(pval) = obj.get(scope, key.into()) {
+                    if let Ok(bi) = v8::Local::<v8::BigInt>::try_from(pval) {
+                        let (ptr, _) = bi.u64_value();
+                        if ptr != 0 {
+                            // Emit native pointer tag (0x0A) + 8-byte pointer value.
+                            buf.push(0x0A);
+                            buf.extend_from_slice(&ptr.to_le_bytes());
+                            return;
+                        }
+                    }
+                }
+            }
+            // fallback: stringify
+            if let Some(sv) = arg.to_string(scope) {
+                let bytes = sv.to_rust_string_lossy(scope).into_bytes();
+                buf.push(0x05);
+                bin_write_str32(buf, &bytes);
+                return;
+            }
+        }
+    }
+
+    // final fallback: null
     buf.push(0x00);
 }
 
@@ -3131,6 +3447,25 @@ fn bin_read_value<'s>(
             if tag == 0x0C {
                 let ik = v8::String::new(scope, "__isTask").ok_or("v8 str")?;
                 obj.set(scope, ik.into(), v8::Boolean::new(scope, true).into());
+            }
+
+            // Optional native pointer included by the bridge.
+            // Read a presence flag byte, then a little-endian i64 pointer.
+            if bytes.len() - *pos >= 1 {
+                let flag = bytes[*pos];
+                *pos += 1;
+                if flag != 0 {
+                    if bytes.len() - *pos >= 8 {
+                        let raw = i64::from_le_bytes(bytes[*pos..*pos+8].try_into().map_err(|_| "i64 read")?);
+                        *pos += 8;
+                        let nk = v8::String::new(scope, "__native_ptr").ok_or("v8 str")?;
+                        if raw >= 0 {
+                            obj.set(scope, nk.into(), v8::BigInt::new_from_u64(scope, raw as u64).into());
+                        } else {
+                            obj.set(scope, nk.into(), v8::BigInt::new_from_i64(scope, raw).into());
+                        }
+                    }
+                }
             }
             Ok(obj.into())
         }
@@ -3220,6 +3555,19 @@ pub(crate) fn handle_dwm_flush(
     use windows::Win32::Graphics::Dwm::DwmFlush;
     // Best-effort: ignore DWM_E_COMPOSITIONDISABLED on headless systems.
     let _ = unsafe { DwmFlush() };
+    let ts = crate::globals::time::PROCESS_START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as f64 / 1_000_000.0;
+    retval.set_double(ts);
+}
+
+// ── __tns_uptime
+pub(crate) fn handle_tns_uptime(
+    _scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
     let ts = crate::globals::time::PROCESS_START
         .get_or_init(std::time::Instant::now)
         .elapsed()
@@ -3449,6 +3797,7 @@ pub(crate) fn init_async_helpers(
     register!("__nsDotNetInvoke",               handle_dotnet_invoke);
     register!("__nsDotNetInvokeBin",            handle_dotnet_invoke_binary);
     register!("__nsDotNetCreateDelegate",       handle_dotnet_create_delegate);
+    register!("__nsDotNetCreateJsSubclass",     handle_dotnet_create_js_subclass);
     register!("__nsDotNetAwaitTask",            handle_dotnet_await_task);
     register!("__nsRunOnUIThread",              handle_run_on_ui_thread);
     register!("__nsWin32Call",                  handle_win32_call);
@@ -3459,10 +3808,17 @@ pub(crate) fn init_async_helpers(
     register!("__ns__clearTimeout",             crate::timers::handle_ns_clear_timeout);
     register!("__ns__clearInterval",            crate::timers::handle_ns_clear_interval);
     register!("__nsDwmFlush",                   handle_dwm_flush);
+    register!("__tns_uptime",                   handle_tns_uptime);
     register!("__nsUUID",                       handle_ns_uuid);
     register!("__nsIsUiThread",                 handle_is_ui_thread);
     register!("__nsThreadInfo",                 handle_thread_info);
     register!("__nsGetLastJsError",             handle_get_last_js_error);
+
+    // DevTools host hooks: allow JS to register domain dispatchers and
+    // post events/timestamps to the DevTools server when enabled.
+    register!("__registerDomainDispatcher",     handle_register_domain_dispatcher);
+    register!("__inspectorSendEvent",           handle_inspector_send_event);
+    register!("__inspectorTimestamp",           handle_inspector_timestamp);
 
     // Initialize native timers scheduler (non-blocking). This registers a
     // pump into `ASYNC_PUMP_HOOK` so blocking waits will also process timers.

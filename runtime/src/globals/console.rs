@@ -45,17 +45,14 @@ fn handle_item_log(
     is_last: bool,
     rich: bool,
 ) {
-    // ── Typed arrays first ─────────────────────────────────────────────────
-    // ArrayBufferView (Uint8Array, Float32Array, DataView, …) are objects in
-    // V8 but their slot 0 is a V8-owned backing store pointer, NOT a user
-    // External.  Calling cast::<External>() on it panics with BadType.
-    // toString() on a typed array yields the comma-separated values.
+    // ── Typed arrays first
     if item.is_array_buffer_view() {
         output.push_str(&item.to_rust_string_lossy(scope));
         if !is_last { output.push(' '); }
         return;
     }
 
+    // ── Arrays
     if item.is_array() {
         if let Ok(arr) = v8::Local::<v8::Array>::try_from(item) {
             let len = arr.length() as usize;
@@ -72,14 +69,14 @@ fn handle_item_log(
         return;
     }
 
-    // ── Functions ──────────────────────────────────────────────────────────
+    // ── Functions
     if item.is_function() {
         output.push_str(&item.to_rust_string_lossy(scope));
         if !is_last { output.push(' '); }
         return;
     }
 
-    // ── Objects ────────────────────────────────────────────────────────────
+    // ── Objects
     if item.is_object() {
         let obj = match v8::Local::<v8::Object>::try_from(item) {
             Ok(o) => o,
@@ -90,7 +87,7 @@ fn handle_item_log(
             }
         };
 
-        // 1) __typeName__ set by Class.extend helpers → prefer metadata name
+        // Prefer explicit __typeName__ metadata when present
         if let Some(type_key) = v8::String::new(scope, "__typeName__") {
             if let Some(type_val) = obj.get(scope, type_key.into()) {
                 if type_val.is_string() {
@@ -129,10 +126,7 @@ fn handle_item_log(
             }
         }
 
-        // 2) WinRT native proxy: check internal field 0 for a DeclarationFFI
-        //    External.  The cast is guarded via TryFrom so non-External slots
-        //    (V8 built-in objects, SMIs, …) silently fall through rather than
-        //    panicking with BadType.
+        // WinRT native proxy
         if let Some(type_name) = winrt_type_name_from_object(scope, obj) {
             if !rich {
                 output.push_str(&type_name);
@@ -147,7 +141,7 @@ fn handle_item_log(
             return;
         }
 
-        // 3) Rich inspection for console.dir
+        // Rich inspection for console.dir
         if rich {
             if let Some(prop_names) = obj.get_own_property_names(scope, v8::GetPropertyNamesArgs::default()) {
                 output.push_str("{\n");
@@ -199,7 +193,65 @@ fn handle_item_log(
             }
         }
 
+        // Shallow summary for plain JS objects
+        {
+            v8::tc_scope!(tc, scope);
+            if let Some(prop_names) = obj.get_own_property_names(tc, v8::GetPropertyNamesArgs::default()) {
+                let mut parts: Vec<String> = Vec::new();
+                let length = prop_names.length() as usize;
+                for i in 0..length {
+                    if let Some(name_val) = prop_names.get_index(tc, i as u32) {
+                        if let Ok(name_str) = v8::Local::<v8::String>::try_from(name_val) {
+                            let key = name_str.to_rust_string_lossy(tc);
+                            let prop_val = obj.get(tc, name_str.into());
+                            if tc.has_caught() {
+                                parts.push(format!("{}: <getter threw>", key));
+                                continue;
+                            }
+                            if let Some(v) = prop_val {
+                                // Prefer short native description when available.
+                                if let Some(desc) = short_js_value_description(tc, v) {
+                                    parts.push(format!("{}: {}", key, desc));
+                                    continue;
+                                }
+                                // Fallbacks for common types
+                                if v.is_function() {
+                                    parts.push(format!("{}: ()", key));
+                                } else if v.is_string() || v.is_number() || v.is_boolean() {
+                                    if let Some(sv) = v.to_string(tc) {
+                                        parts.push(format!("{}: {}", key, sv.to_rust_string_lossy(tc)));
+                                    } else {
+                                        parts.push(format!("{}: <unavailable>", key));
+                                    }
+                                } else if v.is_object() {
+                                    if let Ok(o) = v8::Local::<v8::Object>::try_from(v) {
+                                        let s = transform_js_object(tc, o);
+                                        parts.push(format!("{}: {}", key, s));
+                                    } else {
+                                        parts.push(format!("{}: <object>", key));
+                                    }
+                                } else {
+                                    if let Some(sv) = v.to_string(tc) {
+                                        parts.push(format!("{}: {}", key, sv.to_rust_string_lossy(tc)));
+                                    } else {
+                                        parts.push(format!("{}: <unavailable>", key));
+                                    }
+                                }
+                            } else {
+                                parts.push(format!("{}: <unavailable>", key));
+                            }
+                        }
+                    }
+                }
+                if !parts.is_empty() {
+                    output.push_str(&format!("{{ {} }}", parts.join(", ")));
+                    if !is_last { output.push(' '); }
+                    return;
+                }
+            }
+        }
 
+        // Fall through to generic stringification when no short summary produced.
         v8::tc_scope!(tc, scope);
         if let Some(s) = item.to_string(tc) {
             if !tc.has_caught() {
@@ -296,7 +348,11 @@ fn write_console(value: &str) {
         let wide: Vec<u16> = value.encode_utf16().collect();
         let _ = unsafe { Console::WriteConsoleW(handle, &wide, None, None) };
     }
-    crate::debug_output(value);
+    // Write to runtime-configurable trace log if enabled. Preserve legacy
+    // `NS_DEBUG` env override for verbose debugging during development.
+    if crate::is_log_to_console() || std::env::var("NS_DEBUG").is_ok() {
+        crate::debug_output(value);
+    }
     let event_type: REPORT_EVENT_TYPE = if value.starts_with("[ERROR]") {
         EVENTLOG_ERROR_TYPE
     } else if value.starts_with("[WARN]") {
@@ -372,7 +428,24 @@ pub(crate) fn handle_console_error(
             v8::tc_scope!(tc, scope);
             let Some(stack_val) = obj.get(tc, key.into()) else { break 'stack false; };
             if tc.has_caught() || !stack_val.is_string() { break 'stack false; }
-            value.push_str(&stack_val.to_rust_string_lossy(tc));
+
+            // Prefer remapped stack if JS-side remapper is present: global.__ns_remapStack
+            let stack_str = stack_val.to_rust_string_lossy(tc);
+            let remapped_opt = (|| {
+                // Get current context and global object from the TryCatch scope
+                let context = tc.get_current_context();
+                let global = context.global(tc);
+                let remap_key = v8::String::new(tc, "__ns_remapStack")?;
+                let remap_val = global.get(tc, remap_key.into())?;
+                if !remap_val.is_function() { return None; }
+                let func = v8::Local::<v8::Function>::try_from(remap_val).ok()?;
+                let arg = v8::String::new(tc, &stack_str)?.into();
+                let this = global.into();
+                let result = func.call(tc, this, &[arg])?;
+                if result.is_string() { Some(result.to_rust_string_lossy(tc)) } else { None }
+            })();
+
+            if let Some(r) = remapped_opt { value.push_str(&r); } else { value.push_str(&stack_str); }
             if !is_last { value.push(' '); }
             true
         };
@@ -495,4 +568,58 @@ fn transform_js_object(scope: &mut v8::PinScope<'_, '_>, object: v8::Local<v8::O
         return s;
     }
     String::new()
+}
+
+/// Return a short description for a JS value when it's a native WinRT proxy
+/// or an External pointer. Examples: `StackPanel@0x12345`, `External@0xabc`.
+fn short_js_value_description(scope: &mut v8::PinScope<'_, '_>, val: v8::Local<v8::Value>) -> Option<String> {
+    if val.is_null_or_undefined() { return Some("null".to_string()); }
+    if let Ok(ext) = v8::Local::<v8::External>::try_from(val) {
+        return Some(format!("External@0x{:x}", ext.value() as usize));
+    }
+    if val.is_object() {
+        // Try to extract DotNet wrapper descriptions from their toString(),
+        // e.g. "[DotNetObject NativeScript.Widgets.FlexboxLayout #1]".
+        v8::tc_scope!(tc, scope);
+        if let Some(sv) = val.to_string(tc) {
+            let s = sv.to_rust_string_lossy(tc);
+            if s.contains("DotNetObject") {
+                let parts: Vec<&str> = s.split_whitespace().collect();
+                // Prefer the token that looks like a dotted type name
+                for p in parts.iter() {
+                    if p.contains('.') {
+                        let type_name = p.trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '_');
+                        // Try to find an ID token like "#1" following it
+                        let mut id_suffix = String::new();
+                        if let Some(pos) = parts.iter().position(|x| *x == *p) {
+                            if parts.len() > pos + 1 {
+                                let next = parts[pos + 1];
+                                if next.starts_with('#') {
+                                    let id = next.trim_matches(|c: char| !c.is_numeric());
+                                    if !id.is_empty() { id_suffix = format!("#{}", id); }
+                                }
+                            }
+                        }
+                        return Some(format!("DotNet.{}{}", type_name, id_suffix));
+                    }
+                }
+            }
+
+            // Try to extract a WinRT type name from internal slot
+            if let Ok(obj) = v8::Local::<v8::Object>::try_from(val) {
+                if let Some(name) = winrt_type_name_from_object(tc, obj) {
+                    // Try to get __native_ptr for identity if present
+                    if let Some(ptr_key) = v8::String::new(tc, "__native_ptr") {
+                        if let Some(pv) = obj.get(tc, ptr_key.into()) {
+                            if let Ok(bi) = v8::Local::<v8::BigInt>::try_from(pv) {
+                                return Some(format!("{}@0x{:x}", name, bi.u64_value().0));
+                            }
+                        }
+                    }
+                    return Some(format!("{}", name));
+                }
+            }
+                }
+    }
+    None
 }

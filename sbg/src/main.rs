@@ -282,10 +282,11 @@ fn main() -> Result<()> {
         }
     }
 
-    if config.app_cs_sources_dirs.is_empty() {
-        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        config.app_cs_sources_dirs = discover_app_source_dirs(&workspace_root);
-    }
+    // Do not automatically discover app C# source directories by default.
+    // Copying arbitrary app sources into the generated project often pulls in
+    // platform-specific XAML and test files which prevent compilation. If the
+    // caller wants app sources included, they should set
+    // `SBG_APP_CS_SOURCES_DIR` explicitly (semicolon-separated list).
 
     let sbg = StaticBindingGenerator::new(config);
     let _manifest = sbg.generate()?;

@@ -212,7 +212,7 @@ pub(crate) fn handle_named_property_getter(
                                 let (ret, result, _outs) = method.call(scope, &args);
 
                                 if ret.is_err() {
-                                    let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                    let detail = crate::error::format_hresult_message(ret);
                                     let msg = v8::String::new(scope, &detail).unwrap();
                                     let err = v8::Exception::error(scope, msg);
                                     scope.throw_exception(err);
@@ -478,7 +478,7 @@ fn instance_method_dispatch(
     let (ret, result, _outs) = method.call(scope, &args);
 
     if ret.is_err() {
-        let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+        let detail = crate::error::format_hresult_message(ret);
         let msg = v8::String::new(scope, &detail).unwrap();
         let err = v8::Exception::error(scope, msg);
         scope.throw_exception(err);
@@ -821,9 +821,8 @@ pub(crate) fn handle_instance_property_setter(
                 match ps.Insert(&key_h, &inspectable) {
                     Ok(_) => return v8::Intercepted::kYes,
                     Err(e) => {
-                        let msg = e.message().to_string();
                         let code = e.code();
-                        let detail = format!("IPropertySet.Insert failed: {} (HRESULT 0x{:08X})", msg, code.0 as u32);
+                        let detail = format!("IPropertySet.Insert failed: {}", crate::error::format_hresult_message(code));
                         let v8_msg = v8::String::new(scope, &detail).unwrap();
                         let err = v8::Exception::error(scope, v8_msg);
                         scope.throw_exception(err);
@@ -1087,12 +1086,78 @@ pub(crate) fn create_ns_object<'a>(
     object_tmpl.set_internal_field_count(2);
 
     let object = object_tmpl.new_instance(scope).unwrap();
-    let declaration = Box::new(DeclarationFFI::new(declaration));
-    let ext = v8::External::new(scope, Box::into_raw(declaration) as _);
+    let declaration_box = Box::new(DeclarationFFI::new(declaration));
+    let declaration_ptr = Box::into_raw(declaration_box);
+    let ext = v8::External::new(scope, declaration_ptr as _);
     object.set_internal_field(0, ext.into());
+    // Borrow a temporary reference to the leaked Box via the raw pointer so
+    // we can inspect the declaration before handing ownership to V8.
+    let declaration_ref: &DeclarationFFI = unsafe { &*declaration_ptr };
 
     let object_store = v8::Map::new(scope);
     object.set_internal_field(1, object_store.into());
+
+    // If this proxy represents an interface (including generic instances),
+    // pre-populate the instance backing store with method functions so
+    // callers can access methods (e.g. IVector.Append) directly on the
+    // proxied object without needing a separate implementation object.
+    {
+                let decl_lock = declaration_ref.read();
+        match decl_lock.kind() {
+            DeclarationKind::Interface
+            | DeclarationKind::GenericInterface
+            | DeclarationKind::GenericInterfaceInstance => {
+                // Treat the declaration as a BaseClassDeclarationImpl to access methods.
+                let methods: Vec<MethodDeclaration> = {
+                    // Downcast to the appropriate concrete type and collect methods.
+                    if let DeclarationKind::Interface = decl_lock.kind() {
+                        let iface = decl_lock.as_any().downcast_ref::<InterfaceDeclaration>().unwrap();
+                        iface.methods().to_vec()
+                    } else if let DeclarationKind::GenericInterface = decl_lock.kind() {
+                        let g = decl_lock.as_any().downcast_ref::<GenericInterfaceDeclaration>().unwrap();
+                        g.methods().to_vec()
+                    } else {
+                        let gi = decl_lock.as_any().downcast_ref::<GenericInterfaceInstanceDeclaration>().unwrap();
+                        gi.methods().to_vec()
+                    }
+                };
+
+                drop(decl_lock);
+
+                // Install each method as a bound function on the instance store.
+                for method in methods.iter() {
+                    let method_name = if method.overload_name().is_empty() {
+                        method.name().to_string()
+                    } else {
+                        method.overload_name().to_string()
+                    };
+
+                    if let Some(k) = v8::String::new(scope, method_name.as_str()) {
+                        // Skip if already present.
+                        if let Some(existing) = object_store.get(scope, k.into()) {
+                            if !existing.is_null_or_undefined() { continue; }
+                        }
+
+                        let declaration_ffi = DeclarationFFI::new_with_instance(
+                            Arc::new(RwLock::new(method.clone())),
+                            None,
+                        );
+                        let declaration_ffi = Box::into_raw(Box::new(declaration_ffi));
+                        let ext = v8::External::new(scope, declaration_ffi as _);
+
+                        let builder = v8::Function::builder(instance_method_dispatch)
+                            .data(ext.into())
+                            .build(scope)
+                            .unwrap();
+
+                        let func: Local<v8::Value> = builder.into();
+                        object_store.set(scope, k.into(), func);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 
     object.into()
 }
@@ -1200,7 +1265,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let (ret, result, _outs) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                            let detail = crate::error::format_hresult_message(ret);
                             let msg = v8::String::new(scope, &detail).unwrap();
                             let err = v8::Exception::error(scope, msg.into());
                             scope.throw_exception(err);
@@ -1277,7 +1342,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         };
                         let (ret, result, _outs) = method.call(scope, &args);
                         if ret.is_err() {
-                            let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                            let detail = crate::error::format_hresult_message(ret);
                             let msg = v8::String::new(scope, &detail).unwrap();
                             let err = v8::Exception::error(scope, msg.into());
                             scope.throw_exception(err);
@@ -1326,7 +1391,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                             let Some(mut method) = PropertyCall::new(prop, true, dec.instance.clone().unwrap(), false) else { return; };
                             let (ret, _, _outs) = method.call(scope, &args);
                             if ret.is_err() {
-                                let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                let detail = crate::error::format_hresult_message(ret);
                                 let msg = v8::String::new(scope, &detail).unwrap();
                                 let err = v8::Exception::error(scope, msg);
                                 scope.throw_exception(err);
@@ -1395,7 +1460,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let mut method = MethodCall::new(method, method.is_sealed(), dec.instance.clone().unwrap(), false);
                                     let (ret, result, _outs) = method.call(scope, &args);
                                     if ret.is_err() {
-                                        let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                        let detail = crate::error::format_hresult_message(ret);
                                         let msg = v8::String::new(scope, &detail).unwrap();
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
@@ -1442,7 +1507,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let mut method = MethodCall::new(method.getter(), false, dec.instance.clone().unwrap(), false);
                                     let (ret, result, _outs) = method.call(scope, &args);
                                     if ret.is_err() {
-                                        let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                        let detail = crate::error::format_hresult_message(ret);
                                         let msg = v8::String::new(scope, &detail).unwrap();
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
@@ -1512,7 +1577,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let mut method = MethodCall::new(method, method.is_sealed(), dec.instance.clone().unwrap(), false);
                                     let (ret, result, _outs) = method.call(scope, &args);
                                     if ret.is_err() {
-                                        let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                        let detail = crate::error::format_hresult_message(ret);
                                         let msg = v8::String::new(scope, &detail).unwrap();
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
@@ -1561,7 +1626,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     };
                                     let (ret, result, _outs) = method.call(scope, &args);
                                     if ret.is_err() {
-                                        let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                        let detail = crate::error::format_hresult_message(ret);
                                         let msg = v8::String::new(scope, &detail).unwrap();
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
@@ -1638,7 +1703,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     let mut method = MethodCall::new(method, method.is_sealed(), dec.instance.clone().unwrap(), false);
                                     let (ret, result, _outs) = method.call(scope, &args);
                                     if ret.is_err() {
-                                        let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                        let detail = crate::error::format_hresult_message(ret);
                                         let msg = v8::String::new(scope, &detail).unwrap();
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
@@ -1684,7 +1749,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let mut method = MethodCall::new(method, method.is_sealed(), dec.instance.clone().unwrap(), false);
                         let (ret, result, _outs) = method.call(scope, &args);
                         if ret.is_err() {
-                            let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                            let detail = crate::error::format_hresult_message(ret);
                             let msg = v8::String::new(scope, &detail).unwrap();
                             let err = v8::Exception::error(scope, msg.into());
                             scope.throw_exception(err);
@@ -1733,7 +1798,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         };
                                     let (ret, result, _outs) = method.call(scope, &args);
                                     if ret.is_err() {
-                                        let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                        let detail = crate::error::format_hresult_message(ret);
                                         let msg = v8::String::new(scope, &detail).unwrap();
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
@@ -1767,7 +1832,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                             let mut method = MethodCall::new(setter, false, dec.instance.clone().unwrap(), false);
                             let (ret, _, _outs) = method.call(scope, &args);
                             if ret.is_err() {
-                                let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                let detail = crate::error::format_hresult_message(ret);
                                 let msg = v8::String::new(scope, &detail).unwrap();
                                 let err = v8::Exception::error(scope, msg);
                                 scope.throw_exception(err);
@@ -1835,7 +1900,7 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         );
                         let (ret, result, _outs) = method.call(scope, &args);
                         if ret.is_err() {
-                            let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                            let detail = crate::error::format_hresult_message(ret);
                             let msg = v8::String::new(scope, &detail).unwrap();
                             let err = v8::Exception::error(scope, msg.into());
                             scope.throw_exception(err);
@@ -1976,12 +2041,39 @@ pub(crate) fn create_ns_ctor_object<'a>(
             DeclarationKind::Class => {
                 let clazz = lock.as_any().downcast_ref::<ClassDeclaration>().unwrap();
 
-                let clazz_factory = match class_activation_factory(clazz.full_name()) {
-                    Ok(factory) => factory,
-                    Err(error) => {
-                        throw_js_error(scope, &format!(
-                            "Failed to activate WinRT class {}: {}", clazz.full_name(), error.message()
-                        ));
+                // Attempt activation using several candidate type names derived
+                // from metadata (full name, stripped-generic, simple name).
+                // This allows trying alternate activators when the default
+                // `RoGetActivationFactory` lookup for `full_name` doesn't work
+                // (observed with some XAML types such as FontFamily).
+                let mut clazz_factory_opt: Option<IUnknown> = None;
+                let mut last_err: Option<windows::core::Error> = None;
+                let mut candidates: Vec<String> = Vec::new();
+                candidates.push(clazz.full_name().to_string());
+                let stripped = crate::helpers::strip_generic_suffix(clazz.full_name()).to_string();
+                if stripped != candidates[0] {
+                    candidates.push(stripped);
+                }
+                let simple = clazz.name().to_string();
+                if !simple.is_empty() && !candidates.contains(&simple) {
+                    candidates.push(simple);
+                }
+
+                for candidate in candidates.iter() {
+                    match class_activation_factory(candidate.as_str()) {
+                        Ok(factory) => { clazz_factory_opt = Some(factory); break; }
+                        Err(e) => { last_err = Some(e); }
+                    }
+                }
+
+                let clazz_factory = match clazz_factory_opt {
+                    Some(f) => f,
+                    None => {
+                        if let Some(e) = last_err {
+                            throw_js_error(scope, format!("Failed to activate WinRT class {}: {}", clazz.full_name(), e.message()).as_str());
+                        } else {
+                            throw_js_error(scope, format!("Failed to activate WinRT class {}", clazz.full_name()).as_str());
+                        }
                         return;
                     }
                 };
@@ -2387,6 +2479,41 @@ pub(crate) fn create_ns_ctor_object<'a>(
             let key = v8::String::new(scope, "__typeName__").unwrap();
             let value = v8::String::new(scope, full_name.as_str()).unwrap();
             func.set(scope, key.into(), value.into());
+        }
+    }
+
+    // Collect a small list of candidate activation names from metadata and
+    // attach them to the constructor function so callers (or later runtime
+    // logic) can attempt alternate activation factories when the default
+    // `RoGetActivationFactory` result does not work (observed with FontFamily).
+    {
+        let lock = declaration.read();
+        if let Some(clazz) = lock.as_any().downcast_ref::<ClassDeclaration>() {
+            let mut activators: Vec<String> = Vec::new();
+            let full_name = clazz.full_name().to_string();
+            activators.push(full_name.clone());
+
+            // Add a generic-stripped variant when present (e.g. remove `<T>` suffixes).
+            let stripped = crate::helpers::strip_generic_suffix(full_name.as_str()).to_string();
+            if stripped != full_name {
+                activators.push(stripped);
+            }
+
+            // Also include the simple class name as a last-resort candidate.
+            let simple = clazz.name().to_string();
+            if !simple.is_empty() && !activators.contains(&simple) {
+                activators.push(simple);
+            }
+
+            if let Some(key) = v8::String::new(scope, "__activators__") {
+                let arr = v8::Array::new(scope, activators.len() as i32);
+                for (i, s) in activators.iter().enumerate() {
+                    if let Some(vs) = v8::String::new(scope, s.as_str()) {
+                        arr.set_index(scope, i as u32, vs.into());
+                    }
+                }
+                func.set(scope, key.into(), arr.into());
+            }
         }
     }
 

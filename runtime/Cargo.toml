@@ -19,6 +19,7 @@ metadata = { path = "../metadata" }
 runtime-binding-gen = { path = "../runtime-binding-gen" }
 parking_lot = "0.12"
 libc = "0.2"
+runtime-devtools = { path = "../runtime-devtools", optional = true }
 
 [dependencies.windows]
 workspace = true
@@ -49,6 +50,7 @@ features = [
 
 [features]
 default = []
+devtools = ["runtime-devtools"]
 
 [dev-dependencies]
 criterion = "0.5"

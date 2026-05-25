@@ -62,6 +62,22 @@ internal ref struct BinReader(ReadOnlySpan<byte> buf)
         return string.Intern(s);
     }
 
+    public string ReadString32()
+    {
+        var len = BinaryPrimitives.ReadUInt32LittleEndian(_buf.Slice(_pos, 4));
+        _pos += 4;
+        var s = Encoding.UTF8.GetString(_buf.Slice(_pos, (int)len));
+        _pos += (int)len;
+        return string.Intern(s);
+    }
+
+    public uint ReadU32()
+    {
+        var v = BinaryPrimitives.ReadUInt32LittleEndian(_buf.Slice(_pos, 4));
+        _pos += 4;
+        return v;
+    }
+
     public object?[] ReadArgs()
     {
         var count = ReadByte();

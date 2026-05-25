@@ -19,7 +19,7 @@ use std::sync::OnceLock;
 
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
-use windows::core::{PCSTR, PCWSTR};
+use windows::core::{PCSTR, PCWSTR, HRESULT};
 
 /// Mode for initializing .NET host. Controlled by `NS_DOTNET_MODE` env var.
 #[derive(PartialEq, Eq)]
@@ -214,13 +214,17 @@ fn build_host(bridge_dll: &str, runtime_config: &str) -> Result<DotNetHost, Stri
     let mut ctx: *mut c_void = std::ptr::null_mut();
     let hr = unsafe { fn_init(config_wide.as_ptr(), std::ptr::null(), &mut ctx) };
     if hr < 0 {
-        return Err(format!("hostfxr_initialize_for_runtime_config: HRESULT 0x{:08X}", hr as u32));
+        let h = HRESULT(hr);
+        let os_msg = crate::error::format_hresult_message(h);
+        return Err(format!("hostfxr_initialize_for_runtime_config: {}", os_msg));
     }
 
     let mut load_fn_ptr: *mut c_void = std::ptr::null_mut();
     let hr = unsafe { fn_get_delegate(ctx, 5, &mut load_fn_ptr) };
     if hr < 0 {
-        return Err(format!("hostfxr_get_runtime_delegate: HRESULT 0x{:08X}", hr as u32));
+        let h = HRESULT(hr);
+        let os_msg = crate::error::format_hresult_message(h);
+        return Err(format!("hostfxr_get_runtime_delegate: {}", os_msg));
     }
     let load_asm: FnLoadAsmAndGetFnPtr = unsafe { std::mem::transmute(load_fn_ptr) };
 
@@ -247,7 +251,9 @@ fn build_host(bridge_dll: &str, runtime_config: &str) -> Result<DotNetHost, Stri
             )
         };
         if hr < 0 {
-            return Err(format!("load_assembly_and_get_function_pointer({method}): HRESULT 0x{hr:08X}"));
+            let h = HRESULT(hr);
+            let os_msg = crate::error::format_hresult_message(h);
+            return Err(format!("load_assembly_and_get_function_pointer({method}): {}", os_msg));
         }
         if fn_out.is_null() {
             return Err(format!("load_assembly_and_get_function_pointer({method}): returned null"));
@@ -383,7 +389,11 @@ pub(crate) fn call_dotnet(request_json: &str) -> Result<String, String> {
         )
     };
     if hr < 0 {
-        return Err(format!("DotNetBridge.Invoke HRESULT 0x{:08X}", hr as u32));
+        let h = HRESULT(hr);
+        let os_msg = crate::error::format_hresult_message(h);
+        let msg = format!("DotNetBridge.Invoke: {}", os_msg);
+        crate::debug_output(&format!("[DOTNET] Invoke error: {}\n", msg));
+        return Err(msg);
     }
     if resp_ptr.is_null() || resp_len < 0 {
         return Err("DotNetBridge.Invoke returned null/empty response".to_string());
@@ -393,6 +403,15 @@ pub(crate) fn call_dotnet(request_json: &str) -> Result<String, String> {
     // SAFETY: the bridge serialises JSON which is always valid UTF-8.
     let result = unsafe { std::str::from_utf8_unchecked(slice) }.to_owned();
     unsafe { (host.free)(resp_ptr) };
+    // Trace pointer lookup calls to help debugging missing native ptrs.
+    if request_json.contains("GetNativePtrForHandle") {
+        // These request/response traces are very verbose — only emit when
+        // explicit verbose debugging is requested via `NS_DEBUG`.
+        if std::env::var("NS_DEBUG").is_ok() {
+            crate::debug_output(&format!("[DOTNET] request: {}\n[DOTNET] response: {}\n", request_json, result));
+        }
+    }
+
     Ok(result)
 }
 
@@ -429,7 +448,9 @@ pub(crate) fn call_dotnet_binary(request: &[u8]) -> Result<Vec<u8>, String> {
         )
     };
     if hr < 0 {
-        return Err(format!("DotNetBridge.InvokeBinary HRESULT 0x{:08X}", hr as u32));
+        let h = HRESULT(hr);
+        let os_msg = crate::error::format_hresult_message(h);
+        return Err(format!("DotNetBridge.InvokeBinary: {}", os_msg));
     }
     if resp_ptr.is_null() || resp_len < 0 {
         return Err("DotNetBridge.InvokeBinary returned null/empty response".to_string());

@@ -17,6 +17,7 @@ mod livesync;
 mod class_helpers;
 mod type_description;
 mod global_fns;
+pub mod inspector;
 pub mod timers;
 mod ns_proxy;
 pub(crate) mod dotnet;
@@ -35,7 +36,7 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Once, OnceLock};
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 use parking_lot::{Mutex, RawRwLock, RwLock};
 use parking_lot::lock_api::{MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLockReadGuard, RwLockWriteGuard};
@@ -211,6 +212,7 @@ pub struct Runtime {
 
 static INIT: Once = Once::new();
 static PROXY_MANIFESTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static LOG_TO_CONSOLE: OnceLock<AtomicBool> = OnceLock::new();
 
 /// COM identity → JS wrapper object cache. Keyed on the canonical IUnknown pointer
 /// (obtained via QueryInterface(IID_IUnknown)), so the same underlying COM object
@@ -751,7 +753,19 @@ fn init_global(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, conte
 }
 
 pub fn debug_output(msg: &str) {
-    // Debug output always enabled (previously gated by `NS_DEBUG`).
+    // Only emit verbose debug logs when `NS_DEBUG` is present. Always allow
+    // important severities through (ERROR/WARN/DEVTOOLS/NativeScript).
+    let important = msg.starts_with("[ERROR]")
+        || msg.starts_with("[WARN]")
+        || msg.starts_with("[DEVTOOLS]")
+        || msg.starts_with("[NativeScript]");
+    // Runtime-configurable flag: default true.
+    let enabled = LOG_TO_CONSOLE.get_or_init(|| AtomicBool::new(true)).load(AtomicOrdering::Relaxed);
+
+    if !enabled && !important {
+        return;
+    }
+
     // Send UTF-16 string to debugger for reliable Unicode output
     let mut wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe { OutputDebugStringW(PCWSTR::from_raw(wide.as_ptr())) };
@@ -763,12 +777,12 @@ pub fn debug_output(msg: &str) {
             static LOG_PATH: OnceLock<String> = OnceLock::new();
             let path = LOG_PATH.get_or_init(|| {
                 let mut p = std::env::temp_dir();
-                p.push("ns_trace.log");
+                p.push("console.log");
                 let chosen = if std::fs::OpenOptions::new().create(true).append(true).open(&p).is_ok() {
                     p.to_string_lossy().into_owned()
                 } else {
                     let base = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\fortu".into());
-                    format!("{}\\ns_trace.log", base)
+                    format!("{}\\console.log", base)
                 };
                 let banner = format!("[NativeScript] log file: {}\n", chosen);
                 let mut wide_banner: Vec<u16> = banner.encode_utf16().chain(std::iter::once(0)).collect();
@@ -799,6 +813,28 @@ pub fn debug_output(msg: &str) {
                 }
             }
         }
+    }
+}
+
+/// Enable or disable logging to console at runtime. Default is `true`.
+pub fn set_log_to_console(enabled: bool) {
+    LOG_TO_CONSOLE.get_or_init(|| AtomicBool::new(true)).store(enabled, AtomicOrdering::Relaxed);
+}
+
+/// Query whether logging to console is enabled.
+pub fn is_log_to_console() -> bool {
+    LOG_TO_CONSOLE.get_or_init(|| AtomicBool::new(true)).load(AtomicOrdering::Relaxed)
+}
+
+/// C ABI: toggle logging to console from native hosts (e.g. C# P/Invoke).
+/// Returns 1 on success (toggle applied), 0 if toggling is disabled (release builds).
+#[no_mangle]
+pub extern "C" fn ns_set_log_to_console(enabled: std::os::raw::c_int) -> std::os::raw::c_int {
+    if cfg!(debug_assertions) {
+        set_log_to_console(enabled != 0);
+        1
+    } else {
+        0
     }
 }
 
@@ -1841,6 +1877,25 @@ fn init_async_helpers(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>
     if let Some(livesync_copy_name) = v8::String::new(scope, "__nsLiveSyncCopyFile") {
         if let Some(livesync_copy_fn) = v8::Function::new(scope, handle_livesync_copy_file) {
             global.define_own_property(scope, livesync_copy_name.into(), livesync_copy_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    // DevTools inspector host functions exposed to JS.
+    if let Some(reg_name) = v8::String::new(scope, "__registerDomainDispatcher") {
+        if let Some(reg_fn) = v8::Function::new(scope, global_fns::handle_register_domain_dispatcher) {
+            global.define_own_property(scope, reg_name.into(), reg_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    if let Some(send_name) = v8::String::new(scope, "__inspectorSendEvent") {
+        if let Some(send_fn) = v8::Function::new(scope, global_fns::handle_inspector_send_event) {
+            global.define_own_property(scope, send_name.into(), send_fn.into(), v8::PropertyAttribute::READ_ONLY);
+        }
+    }
+
+    if let Some(ts_name) = v8::String::new(scope, "__inspectorTimestamp") {
+        if let Some(ts_fn) = v8::Function::new(scope, global_fns::handle_inspector_timestamp) {
+            global.define_own_property(scope, ts_name.into(), ts_fn.into(), v8::PropertyAttribute::READ_ONLY);
         }
     }
 
@@ -2968,6 +3023,8 @@ fn init_async_helpers(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>
         worker_support::install_worker_runtime(scope);
         hmr_support::install_hmr_support(scope);
         livesync::install_livesync_support(scope);
+        // Attempt to attach the DevTools server (no-op if built without `devtools`).
+        global_fns::maybe_attach_devtools(scope);
 }
 
 fn create_ns_object<'a>(name: &str, declaration: Arc<RwLock<dyn Declaration>>, scope: &mut v8::PinScope<'a, '_>) -> Local<'a, v8::Value> {
@@ -3255,7 +3312,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             let (ret, result, _outs) = method_call.call_with_values(scope, &arg_vals);
 
                             if ret.is_err() {
-                                let detail = format!("{} (HRESULT 0x{:08X})", ret.message(), ret.0 as u32);
+                                let detail = crate::error::format_hresult_message(ret);
                                 let msg = v8::String::new(scope, &detail).unwrap();
                                 let err = v8::Exception::error(scope, msg);
                                 scope.throw_exception(err);
@@ -3392,7 +3449,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             let (ret, result, _outs) = method_call.call_with_values(scope, &arg_vals);
 
                             if ret.is_err() {
-                                let detail = format!("{} (HRESULT 0x{:08X})", ret.message(), ret.0 as u32);
+                                let detail = crate::error::format_hresult_message(ret);
                                 let msg = v8::String::new(scope, &detail).unwrap();
                                 let err = v8::Exception::error(scope, msg);
                                 scope.throw_exception(err);
@@ -3519,7 +3576,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result, outs) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                            let detail = crate::error::format_hresult_message(ret);
                             let message = v8::String::new(scope, &detail).unwrap();
                             let error = v8::Exception::error(scope, message);
                             scope.throw_exception(error);
@@ -3807,7 +3864,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result, outs) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                            let detail = crate::error::format_hresult_message(ret);
                             let msg = v8::String::new(scope, &detail).unwrap();
                             let err = v8::Exception::error(scope, msg.into());
                             scope.throw_exception(err);
@@ -3950,7 +4007,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result, outs) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                            let detail = crate::error::format_hresult_message(ret);
                             let msg = v8::String::new(scope, &detail).unwrap();
                             let err = v8::Exception::error(scope, msg.into());
                             scope.throw_exception(err);
@@ -4055,7 +4112,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             let Some(mut method) = PropertyCall::new(prop, true, ns_instance, false) else { return; };
                             let (ret, _, _outs) = method.call(scope, &args);
                             if ret.is_err() {
-                                let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                let detail = crate::error::format_hresult_message(ret);
                                 let msg = v8::String::new(scope, &detail).unwrap();
                                 let err = v8::Exception::error(scope, msg);
                                 scope.throw_exception(err);
@@ -4154,7 +4211,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let (ret, result, outs) = method.call(scope, &args);
 
                                     if ret.is_err() {
-                                        let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                        let detail = crate::error::format_hresult_message(ret);
                                         let msg = v8::String::new(scope, &detail).unwrap();
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
@@ -4273,7 +4330,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let (ret, result, outs) = method.call(scope, &args);
 
                                     if ret.is_err() {
-                                        let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                        let detail = crate::error::format_hresult_message(ret);
                                         let msg = v8::String::new(scope, &detail).unwrap();
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
@@ -4417,7 +4474,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let (ret, result, outs) = method.call(scope, &args);
 
                                     if ret.is_err() {
-                                        let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                        let detail = crate::error::format_hresult_message(ret);
                                         let msg = v8::String::new(scope, &detail).unwrap();
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
@@ -4537,7 +4594,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                                     let (ret, result, outs) = method.call(scope, &args);
 
                                     if ret.is_err() {
-                                        let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                        let detail = crate::error::format_hresult_message(ret);
                                         let msg = v8::String::new(scope, &detail).unwrap();
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
@@ -4679,7 +4736,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
 
                                     let (ret, result, outs) = method.call(scope, &args);
                                     if ret.is_err() {
-                                        let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                        let detail = crate::error::format_hresult_message(ret);
                                         let msg = v8::String::new(scope, &detail).unwrap();
                                         let err = v8::Exception::error(scope, msg.into());
                                         scope.throw_exception(err);
@@ -4803,7 +4860,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result, outs) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                            let detail = crate::error::format_hresult_message(ret);
                             let msg = v8::String::new(scope, &detail).unwrap();
                             let err = v8::Exception::error(scope, msg.into());
                             scope.throw_exception(err);
@@ -4931,7 +4988,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result, outs) = method.call(scope, &args);
 
                                     if ret.is_err() {
-                                                let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                                let detail = crate::error::format_hresult_message(ret);
                                                 let msg = v8::String::new(scope, &detail).unwrap();
                                                 let err = v8::Exception::error(scope, msg.into());
                                                 scope.throw_exception(err);
@@ -5021,7 +5078,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                             let mut method = MethodCall::new(setter, false, ns_instance, false);
                             let (ret, _, _outs) = method.call(scope, &args);
                             if ret.is_err() {
-                                let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                let detail = crate::error::format_hresult_message(ret);
                                 let msg = v8::String::new(scope, &detail).unwrap();
                                 let err = v8::Exception::error(scope, msg);
                                 scope.throw_exception(err);
@@ -5126,7 +5183,7 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                         let (ret, result, outs) = method.call(scope, &args);
 
                                 if ret.is_err() {
-                                    let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                                    let detail = crate::error::format_hresult_message(ret);
                                     let msg = v8::String::new(scope, &detail).unwrap();
                                     let err = v8::Exception::error(scope, msg.into());
                                     scope.throw_exception(err);
@@ -5455,13 +5512,45 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                 }
                 drop(lock);
 
-                let clazz_factory = match class_activation_factory(&full_name) {
-                    Ok(factory) => factory,
-                    Err(error) => {
-                        throw_js_error(
-                            scope,
-                            format!("Failed to activate WinRT class {}: {}", full_name, error.message()).as_str(),
-                        );
+                // Attempt activation using several candidate type names derived
+                // from metadata (full name, stripped-generic, simple name).
+                // This allows trying alternate activators when the default
+                // `RoGetActivationFactory` lookup for `full_name` doesn't work
+                // (observed with some XAML types such as FontFamily).
+                let mut clazz_factory_opt: Option<IUnknown> = None;
+                let mut last_err: Option<windows::core::Error> = None;
+                let mut candidates: Vec<String> = Vec::new();
+                candidates.push(full_name.clone());
+                let stripped = crate::helpers::strip_generic_suffix(full_name.as_str()).to_string();
+                if stripped != candidates[0] {
+                    candidates.push(stripped);
+                }
+                let (_ns, simple_name) = split_type_name(full_name.as_str());
+                if !simple_name.is_empty() && !candidates.contains(&simple_name) {
+                    candidates.push(simple_name.clone());
+                }
+
+                for candidate in candidates.iter() {
+                    match class_activation_factory(candidate.as_str()) {
+                        Ok(factory) => { clazz_factory_opt = Some(factory); break; }
+                        Err(e) => { last_err = Some(e); }
+                    }
+                }
+
+                let clazz_factory = match clazz_factory_opt {
+                    Some(f) => f,
+                    None => {
+                        if let Some(e) = last_err {
+                            throw_js_error(
+                                scope,
+                                format!("Failed to activate WinRT class {}: {}", full_name, e.message()).as_str(),
+                            );
+                        } else {
+                            throw_js_error(
+                                scope,
+                                format!("Failed to activate WinRT class {}", full_name).as_str(),
+                            );
+                        }
                         return;
                     }
                 };
@@ -5571,8 +5660,8 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                         }
                         return;
                     } else {
-                        let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
-                        let message = v8::String::new(scope, detail.as_str()).unwrap();
+                        let detail = crate::error::format_hresult_message(ret);
+                        let message = v8::String::new(scope, &detail).unwrap();
                         let error = v8::Exception::error(scope, message.into());
                         scope.throw_exception(error);
                         return;
@@ -5807,7 +5896,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                         let (ret, result, outs) = method.call(scope, &args);
 
                         if ret.is_err() {
-                            let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
+                            let detail = crate::error::format_hresult_message(ret);
                             let message = v8::String::new(scope, &detail).unwrap();
                             let error = v8::Exception::error(scope, message);
                             scope.throw_exception(error);
@@ -6099,8 +6188,8 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
                         } // end match signature
                     } // end unsafe
                 } else {
-                    let detail = format!("{} (HRESULT 0x{:08X})", ret.message().to_string(), ret.0 as u32);
-                    let message = v8::String::new(scope, detail.as_str()).unwrap();
+                    let detail = crate::error::format_hresult_message(ret);
+                    let message = v8::String::new(scope, &detail).unwrap();
                     let error = v8::Exception::error(scope, message.into());
                     scope.throw_exception(error);
                 }

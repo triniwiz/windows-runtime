@@ -203,8 +203,8 @@ impl MethodCall {
         if result.is_err() || interface_ptr.is_null() {
             let hr = if result.is_err() { result.0 } else { 0x8000_4002u32 as i32 }; // E_NOINTERFACE
             let error_msg = format!(
-                "QueryInterface failed for IID {:?}: HRESULT 0x{:08X}",
-                iid, hr as u32
+                "QueryInterface failed for IID {:?}: {}",
+                iid, crate::error::format_hresult_message(HRESULT(hr))
             );
             return Self::new_init_error(interface, is_initializer, is_sealed, iid, error_msg);
         }
@@ -814,8 +814,8 @@ impl MethodCall {
             } else {
                 self.method_name.as_str()
             };
-            let os_msg = crate::error::format_hresult_message(hr);
-            let msg = format!("{} when invoking '{}'. HRESULT 0x{:08X}", os_msg, method_display, hr.0 as u32);
+            let detail = crate::error::format_hresult_message(hr);
+            let msg = format!("{} when invoking '{}'", detail, method_display);
             crate::store_last_js_error(msg.clone());
             if let Some(vmstr) = v8::String::new(scope, &msg) {
                 let err = v8::Exception::error(scope, vmstr);

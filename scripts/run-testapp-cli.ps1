@@ -62,16 +62,17 @@ if ($Mode -eq 'exe') {
     Write-Host "Launching EXE: $exe"
     Start-Process -FilePath $exe -WorkingDirectory $publishDir
 
-    # Tail runtime trace log in system temp
-    $log = Join-Path $env:TEMP 'ns_trace.log'
-    Write-Host "Tailing runtime trace log at: $log"
+    # Tail runtime trace log in system temp (prefer console.log, fallback to legacy ns_trace.log)
+    $consoleLog = Join-Path $env:TEMP 'console.log'
+    $legacyLog = Join-Path $env:TEMP 'ns_trace.log'
+    Write-Host "Tailing runtime trace log (console.log preferred) at: $consoleLog (legacy: $legacyLog)"
     $wait = $TimeoutSeconds
-    while (-not (Test-Path $log) -and $wait -gt 0) { Start-Sleep -Seconds 1; $wait-- }
-    if (Test-Path $log) {
-        Get-Content -Path $log -Wait -Tail 0
-    } else {
-        Write-Warning "Trace log did not appear within timeout ($TimeoutSeconds s)."
+    while ($wait -gt 0) {
+        if (Test-Path $consoleLog) { Get-Content -Path $consoleLog -Wait -Tail 0; exit 0 }
+        if (Test-Path $legacyLog)  { Get-Content -Path $legacyLog -Wait -Tail 0; exit 0 }
+        Start-Sleep -Seconds 1; $wait--
     }
+    Write-Warning "Trace log did not appear within timeout ($TimeoutSeconds s)."
     exit 0
 }
 
@@ -132,9 +133,14 @@ if (-not $pfn) { $pfn = $appName }
 Write-Host "Launching UWP: $pfn!App"
 Start-Process -FilePath 'explorer.exe' -ArgumentList "shell:AppsFolder\$pfn!App"
 
-# Tail container trace log (UWP)
-$log = Join-Path $env:LOCALAPPDATA "Packages\$pfn\AC\Temp\ns_trace.log"
-Write-Host "Tailing runtime trace log at: $log"
+# Tail container trace log (UWP) — prefer console.log, fallback to legacy ns_trace.log
+$consoleLog = Join-Path $env:LOCALAPPDATA "Packages\$pfn\AC\Temp\console.log"
+$legacyLog = Join-Path $env:LOCALAPPDATA "Packages\$pfn\AC\Temp\ns_trace.log"
+Write-Host "Tailing runtime trace log (console.log preferred) at: $consoleLog (legacy: $legacyLog)"
 $wait = 30
-while (-not (Test-Path $log) -and $wait -gt 0) { Start-Sleep -Seconds 1; $wait-- }
-if (Test-Path $log) { Get-Content -Path $log -Wait -Tail 0 } else { Write-Warning "Trace log not found." }
+while ($wait -gt 0) {
+    if (Test-Path $consoleLog) { Get-Content -Path $consoleLog -Wait -Tail 0; exit 0 }
+    if (Test-Path $legacyLog)  { Get-Content -Path $legacyLog -Wait -Tail 0; exit 0 }
+    Start-Sleep -Seconds 1; $wait--
+}
+Write-Warning "Trace log not found."

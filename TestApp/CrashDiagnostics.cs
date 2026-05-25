@@ -219,8 +219,16 @@ namespace TestApp
         {
             try
             {
-                var tracePath = Path.Combine(System.IO.Path.GetTempPath(), "ns_trace.log");
-                File.AppendAllText(tracePath, message, Encoding.UTF8);
+                var temp = System.IO.Path.GetTempPath();
+                var consolePath = Path.Combine(temp, "console.log");
+                File.AppendAllText(consolePath, message, Encoding.UTF8);
+
+                // Maintain legacy compatibility: also append to ns_trace.log if it already exists
+                var legacyPath = Path.Combine(temp, "ns_trace.log");
+                if (File.Exists(legacyPath))
+                {
+                    File.AppendAllText(legacyPath, message, Encoding.UTF8);
+                }
             }
             catch { }
         }

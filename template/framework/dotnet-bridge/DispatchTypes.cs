@@ -115,10 +115,23 @@ internal readonly struct DispatchResult
                 break;
 
             case DispatchKind.Handle:
-                w.WriteStartObject();
-                w.WriteNumber("__handle"u8, _handle);
-                w.WriteString("__type"u8,   _typeName);
-                w.WriteEndObject();
+                    w.WriteStartObject();
+                    w.WriteNumber("__handle"u8, _handle);
+                    w.WriteString("__type"u8,   _typeName);
+                    // If the bridge has a canonical native pointer for this handle,
+                    // expose it as a hex string so the runtime can detect and use it.
+                    if (Bridge.s_nativePtrs.TryGetValue(_handle, out var nativePtr))
+                    {
+                        try
+                        {
+                            w.WriteString("__native_ptr"u8, nativePtr.ToInt64().ToString("x"));
+                        }
+                        catch
+                        {
+                            // ignore formatting errors
+                        }
+                    }
+                    w.WriteEndObject();
                 break;
 
             case DispatchKind.TaskHandle:
@@ -184,12 +197,27 @@ internal readonly struct DispatchResult
                 w.WriteByte(0x06);
                 w.WriteI32(_handle);
                 w.WriteString16(_typeName ?? "");
+                // Optionally include a canonical native pointer for this handle
+                // so binary clients (Rust runtime) can avoid an extra bridge
+                // round-trip when a COM pointer is available.
+                if (Bridge.s_nativePtrs.TryGetValue(_handle, out var nativePtr)) {
+                    w.WriteByte(1);
+                    w.WriteI64(nativePtr.ToInt64());
+                } else {
+                    w.WriteByte(0);
+                }
                 break;
 
             case DispatchKind.TaskHandle:
                 w.WriteByte(0x0C);
                 w.WriteI32(_handle);
                 w.WriteString16(_typeName ?? "");
+                if (Bridge.s_nativePtrs.TryGetValue(_handle, out var nativePtr2)) {
+                    w.WriteByte(1);
+                    w.WriteI64(nativePtr2.ToInt64());
+                } else {
+                    w.WriteByte(0);
+                }
                 break;
 
             case DispatchKind.Collection:

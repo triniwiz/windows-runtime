@@ -167,7 +167,11 @@ pub extern "C" fn runtime_devtools_start(runtime: i64, port: u16) -> *mut c_char
         runtime::debug_output(s);
     }));
 
-    match DevtoolsServer::attach(&config, rt.isolate_mut(), &global_ctx, forwarder) {
+    let dispatcher: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>> = Some(Arc::new(|msg: &str| {
+        runtime::inspector::try_dispatch_inspector_message_to_js(msg)
+    }));
+
+    match DevtoolsServer::attach(&config, rt.isolate_mut(), &global_ctx, forwarder, dispatcher) {
         Err(_) => std::ptr::null_mut(),
         Ok(server) => {
             let ws_url = server.endpoint().websocket_url.clone();

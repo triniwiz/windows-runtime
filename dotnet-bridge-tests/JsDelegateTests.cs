@@ -265,6 +265,7 @@ public sealed class JsDelegateTests : IDisposable
 
         handler(sender, args);
 
+        
         Assert.Equal(id, s_capturedId);
         Assert.Equal(2, s_capturedArgs[0]); // two args
 
@@ -273,7 +274,8 @@ public sealed class JsDelegateTests : IDisposable
 
         // arg1 offset: 1 (count) + 1 (tag) + 4 (handle id) + 2 (type len) + type_len
         var senderTypeLen = BinaryPrimitives.ReadUInt16LittleEndian(s_capturedArgs.AsSpan(6));
-        int arg1Start     = 8 + senderTypeLen;
+        // account for the extra native-pointer presence flag byte after the type name
+        int arg1Start     = 9 + senderTypeLen;
         Assert.Equal(0x06, s_capturedArgs[arg1Start]); // EventArgs → handle tag
     }
 

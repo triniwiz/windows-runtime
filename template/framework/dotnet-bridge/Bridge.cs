@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -48,8 +49,26 @@ public static partial class Bridge
         s_propCache.Clear();
         s_ctorCache.Clear();
         s_handles.Clear();
+        s_nativePtrs.Clear();
         s_nextHandle = 0;
     }
+
+    // Optional mapping from exported handle id -> native IUnknown pointer (IntPtr)
+    // Populated when a managed object can yield a native COM pointer via
+    // Marshal.GetIUnknownForObject. Cleared and released on __release.
+    internal static readonly ConcurrentDictionary<int, IntPtr> s_nativePtrs = new();
+
+    // Runtime-configurable logging toggle. Default to true in DEBUG builds so
+    // developers get verbose diagnostics without setting environment vars.
+#if DEBUG
+    internal static bool s_logToConsole = true;
+#else
+    internal static bool s_logToConsole = false;
+#endif
+
+    public static void SetLogToConsole(bool enabled) => s_logToConsole = enabled;
+
+    internal static bool IsLogToConsole() => s_logToConsole;
 
     // Returns a JSON object mapping top-level namespace roots (e.g. "NativeScript")
     // to the assembly simple-name that most likely contains that namespace's types.
@@ -273,6 +292,128 @@ public static partial class Bridge
         return null;
     }
 
+    public static object? InvokeOnUIThread(Func<object?> callback)
+    {
+        var mre = new ManualResetEventSlim(false);
+        object? result = null;
+        var wrapped = new Action(() => { try { result = callback(); } finally { mre.Set(); } });
+
+        try
+        {
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                var coreAppType = asm.GetType("Windows.ApplicationModel.Core.CoreApplication");
+                if (coreAppType == null) continue;
+                var mainViewProp = coreAppType.GetProperty("MainView", BindingFlags.Public | BindingFlags.Static);
+                var mainView = mainViewProp?.GetValue(null);
+                if (mainView == null) continue;
+                var dispatcherProp = mainView.GetType().GetProperty("Dispatcher", BindingFlags.Public | BindingFlags.Instance);
+                var dispatcher = dispatcherProp?.GetValue(mainView);
+                if (dispatcher == null) continue;
+
+                var hasAccessProp = dispatcher.GetType().GetProperty("HasThreadAccess", BindingFlags.Public | BindingFlags.Instance);
+                if (hasAccessProp?.GetValue(dispatcher) is true)
+                {
+                    wrapped();
+                    return result;
+                }
+
+                foreach (var m in dispatcher.GetType().GetMethods().Where(m => m.Name == "RunAsync"))
+                {
+                    var parameters = m.GetParameters();
+                    if (parameters.Length != 2) continue;
+                    var enumType = parameters[0].ParameterType;
+                    object priority = enumType.IsEnum ? Enum.ToObject(enumType, 0) : Activator.CreateInstance(enumType)!;
+                    var handlerType = parameters[1].ParameterType;
+                    try
+                    {
+                        var d = Delegate.CreateDelegate(handlerType, wrapped.Target, wrapped.Method);
+                        m.Invoke(dispatcher, new object[] { priority, d });
+                        mre.Wait();
+                        return result;
+                    }
+                    catch { }
+                }
+                break;
+            }
+        }
+        catch { }
+
+        try
+        {
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                var dqType = asm.GetType("Microsoft.UI.Dispatching.DispatcherQueue");
+                if (dqType == null) continue;
+                var getForCurrent = dqType.GetMethod("GetForCurrentThread", BindingFlags.Public | BindingFlags.Static);
+                var dq = getForCurrent?.Invoke(null, null);
+                if (dq == null) continue;
+
+                if (dq.GetType().GetProperty("HasThreadAccess")?.GetValue(dq) is true)
+                {
+                    wrapped();
+                    return result;
+                }
+                break;
+            }
+        }
+        catch { }
+
+        try
+        {
+            var wpfDispatcherType = AppDomain.CurrentDomain.GetAssemblies()
+                .Select(a => a.GetType("System.Windows.Threading.Dispatcher"))
+                .FirstOrDefault(t => t != null);
+            if (wpfDispatcherType != null)
+            {
+                var currentDispatcherProp = wpfDispatcherType.GetProperty("CurrentDispatcher", BindingFlags.Public | BindingFlags.Static);
+                var dispatcher = currentDispatcherProp?.GetValue(null);
+                if (dispatcher != null)
+                {
+                    var checkAccess = dispatcher.GetType().GetMethod("CheckAccess");
+                    if (checkAccess?.Invoke(dispatcher, null) is true)
+                    {
+                        wrapped();
+                        return result;
+                    }
+                    var beginInvoke = dispatcher.GetType().GetMethod("BeginInvoke", new[] { typeof(Action) })
+                        ?? dispatcher.GetType().GetMethods().FirstOrDefault(m => m.Name == "BeginInvoke" && m.GetParameters().Length == 1);
+                    if (beginInvoke != null)
+                    {
+                        var mre2 = new ManualResetEventSlim(false);
+                        beginInvoke.Invoke(dispatcher, new object[] { new Action(() => { try { wrapped(); } finally { mre2.Set(); } }) });
+                        mre2.Wait();
+                        return result;
+                    }
+                }
+            }
+        }
+        catch { }
+
+        wrapped();
+        return result;
+    }
+
+    private static bool RequiresUiThread(Type t)
+    {
+        var ns = t.Namespace ?? string.Empty;
+        return ns.StartsWith("Windows.UI.Xaml", StringComparison.Ordinal) || ns.StartsWith("Microsoft.UI.Xaml", StringComparison.Ordinal);
+    }
+
+    internal static bool IsMarshaledForDifferentThread(Exception? ex)
+    {
+        if (ex == null) return false;
+        // Unwrap TargetInvocationException if present.
+        if (ex is TargetInvocationException tie) return IsMarshaledForDifferentThread(tie.InnerException);
+        if (ex is System.Runtime.InteropServices.COMException ce)
+        {
+            uint h = (uint)ce.HResult;
+            // RPC_E_WRONG_THREAD = 0x8001010E, E_FAIL = 0x80004005
+            if (h == 0x8001010E || h == 0x80004005) return true;
+        }
+        return IsMarshaledForDifferentThread(ex.InnerException);
+    }
+
     private static Assembly? OnAssemblyResolve(object? sender, ResolveEventArgs args)
     {
         try
@@ -324,6 +465,132 @@ public static partial class Bridge
     {
         s_jsInvoker = callback;
         return 0;
+    }
+
+    // Callback id registered by the runtime/JS that should receive unhandled
+    // managed exceptions and unobserved task exceptions.
+    private static int s_unhandledExceptionCallbackId = -1;
+
+    // Called from JS/Rust to request that managed unhandled exceptions be
+    // forwarded to the registered JS callback id.  The callback id must have
+    // been created on the Rust side and point to a JS function stored in the
+    // runtime's `DOTNET_JS_CALLBACKS` map.
+    public static int RegisterUnhandledExceptionCallback(int callbackId)
+    {
+        s_unhandledExceptionCallbackId = callbackId;
+
+        // Subscribe once (idempotent).
+        try
+        {
+            AppDomain.CurrentDomain.UnhandledException -= OnAppDomainUnhandledException;
+            AppDomain.CurrentDomain.UnhandledException += OnAppDomainUnhandledException;
+
+            TaskScheduler.UnobservedTaskException -= OnUnobservedTaskException;
+            TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
+
+            // Try to subscribe to Windows.CoreApplication.UnhandledErrorDetected if available
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                var coreAppType = asm.GetType("Windows.ApplicationModel.Core.CoreApplication");
+                if (coreAppType == null) continue;
+                var ev = coreAppType.GetEvent("UnhandledErrorDetected");
+                if (ev == null) continue;
+                try
+                {
+                    var handlerType = ev.EventHandlerType;
+                    var method = typeof(Bridge).GetMethod(nameof(CoreApplicationUnhandledErrorHandler), BindingFlags.NonPublic | BindingFlags.Static);
+                    if (method != null)
+                    {
+                        var del = Delegate.CreateDelegate(handlerType, method);
+                        ev.AddEventHandler(null, del);
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { }
+
+        return 0;
+    }
+
+    // Return a canonical native pointer (IUnknown / IInspectable) for an
+    // exported handle id. Returns 0 when no pointer is available. If a
+    // pointer isn't already cached in `s_nativePtrs`, attempt to obtain one
+    // via `Marshal.GetIUnknownForObject` and cache it for subsequent calls.
+    public static IntPtr GetNativePtrForHandle(int handleId)
+    {
+        if (handleId <= 0) return IntPtr.Zero;
+        if (s_nativePtrs.TryGetValue(handleId, out var p)) {
+            return p;
+        }
+
+        if (!s_handles.TryGetValue(handleId, out var obj) || obj == null)
+            return IntPtr.Zero;
+
+        try
+        {
+            var ip = Marshal.GetIUnknownForObject(obj);
+            if (ip != IntPtr.Zero)
+            {
+                s_nativePtrs[handleId] = ip;
+                return ip;
+            }
+        }
+        catch (Exception)
+        {
+        }
+
+        return IntPtr.Zero;
+    }
+
+    private static void OnAppDomainUnhandledException(object? sender, UnhandledExceptionEventArgs e)
+    {
+        try
+        {
+            var ex = e.ExceptionObject as Exception;
+            var msg = ex?.ToString() ?? e.ExceptionObject?.ToString() ?? "(unknown)";
+            SendUnhandledToJs("unhandled", msg);
+        }
+        catch { }
+    }
+
+    private static void OnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
+    {
+        try
+        {
+            var msg = e.Exception?.ToString() ?? "(unobserved task exception)";
+            SendUnhandledToJs("unobservedTask", msg);
+        }
+        catch { }
+    }
+
+    // Fallback handler for platform-specific CoreApplication unhandled events.
+    private static void CoreApplicationUnhandledErrorHandler(object? sender, object? args)
+    {
+        try
+        {
+            var msg = args?.ToString() ?? "(core unhandled)";
+            SendUnhandledToJs("coreUnhandled", msg);
+        }
+        catch { }
+    }
+
+    private static unsafe void SendUnhandledToJs(string kind, string message)
+    {
+        try
+        {
+            if (s_jsInvoker == null || s_unhandledExceptionCallbackId <= 0) return;
+            var payload = JsonSerializer.Serialize(new { kind = kind, message = message });
+            var bytes = System.Text.Encoding.UTF8.GetBytes(payload);
+            fixed (byte* p = bytes)
+            {
+                byte* respPtr = null;
+                int respLen = 0;
+                s_jsInvoker(s_unhandledExceptionCallbackId, p, bytes.Length, &respPtr, &respLen);
+                if (respPtr != null && respLen > 0) Marshal.FreeHGlobal((IntPtr)respPtr);
+            }
+        }
+        catch { }
     }
 
     [UnmanagedCallersOnly(EntryPoint = "Invoke",

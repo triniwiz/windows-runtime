@@ -2,7 +2,7 @@
   <!-- Default property values for manifest overrides.
        Override these in Directory.Build.props or via /p: properties. -->
   <PropertyGroup>
-    <AppDisplayName Condition=" '$(AppDisplayName)' == '' ">__PROJECT_NAME__</AppDisplayName>
+  <AppDisplayName Condition=" '$(AppDisplayName)' == '' ">$(MSBuildProjectName)</AppDisplayName>
     <AppDescription Condition=" '$(AppDescription)' == '' ">A NativeScript Windows application</AppDescription>
     <Square150x150Logo Condition=" '$(Square150x150Logo)' == '' ">Assets\Square150x150Logo.png</Square150x150Logo>
     <Square44x44Logo Condition=" '$(Square44x44Logo)' == '' ">Assets\Square44x44Logo.png</Square44x44Logo>

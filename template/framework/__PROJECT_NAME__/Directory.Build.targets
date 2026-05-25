@@ -6,7 +6,7 @@
        easily overridden per-app or via MSBuild /p: properties. -->
 
   <!-- Inline merge task: will merge App_Resources/Windows/Package.appxmanifest or Package.appxmanifest.partial.xml into the generated Package.appxmanifest -->
-  <UsingTask TaskName="MergeAppxManifest" TaskFactory="CodeTaskFactory" AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+  <UsingTask TaskName="MergeAppxManifest" TaskFactory="CodeTaskFactory" AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll" Condition="'$(MSBuildRuntimeType)' != 'Core'">
     <ParameterGroup>
       <SourceManifest ParameterType="System.String" Required="true" />
       <TargetManifest ParameterType="System.String" Required="true" />
@@ -85,7 +85,7 @@
     </Task>
   </UsingTask>
 
-  <Target Name="MergeAppResourcesManifest" AfterTargets="ApplyManifestOverrides" Condition="Exists('$(MSBuildProjectDirectory)\Package.appxmanifest')">
+  <Target Name="MergeAppResourcesManifest" AfterTargets="ApplyManifestOverrides" Condition="Exists('$(MSBuildProjectDirectory)\Package.appxmanifest') and '$(MSBuildRuntimeType)' != 'Core'">
     <PropertyGroup>
       <_AppResourcesManifest>$(MSBuildProjectDirectory)\App_Resources\Windows\Package.appxmanifest</_AppResourcesManifest>
       <!-- Allow CLI or callers to override the source manifest via MSBuild property 'AppResourcesManifestPath' -->

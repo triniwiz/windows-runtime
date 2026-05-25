@@ -79,6 +79,7 @@
     <AppxManifest Include="Package.appxmanifest" />
     <Content Include="Properties\Default.rd.xml" />
     <Compile Include="$(NSGenDir)\NSWinRTProxies\**\*.cs" Visible="false" Condition="Exists('$(NSGenDir)\NSWinRTProxies')" />
+    <Compile Remove="$(NSGenDir)\NSWinRTProxies\obj\**\*.cs" Condition="Exists('$(NSGenDir)\NSWinRTProxies\obj')" />
 
     <Content Include="App\**\*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

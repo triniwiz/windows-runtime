@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 
@@ -42,6 +43,19 @@ namespace __PROJECT_NAME__
 
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_pump_timers))]
         private static extern void runtime_pump_timers();
+
+    #if DEBUG
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(ns_set_log_to_console))]
+        private static extern int ns_set_log_to_console(int enabled);
+
+        public static bool TrySetLogToConsole(bool enabled)
+        {
+            try { return ns_set_log_to_console(enabled ? 1 : 0) == 1; }
+            catch { return false; }
+        }
+    #else
+        public static bool TrySetLogToConsole(bool enabled) => false;
+    #endif
 
         public void PumpTimers()
         {
@@ -110,11 +124,36 @@ namespace __PROJECT_NAME__
         public void Initialize()
         {
             if (_initialized) return;
-            AttachConsole(ATTACH_PARENT_PROCESS);
+            bool attached = false;
+            try { attached = AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
             runtime_install_ctrlc_handler(0);
             runtime_set_local_folder(Windows.Storage.ApplicationData.Current.LocalFolder.Path);
             _runtime = runtime_init(AppContext.BaseDirectory);
 #if DEBUG
+            var trySet = TrySetLogToConsole(true);
+            System.Diagnostics.Debug.WriteLine($"[NativeScript] TrySetLogToConsole returned={trySet}");
+
+            // Also notify the managed bridge (if present) so managed-side
+            // diagnostics follow the runtime toggle. Use reflection to avoid a
+            // hard compile-time dependency on the bridge assembly.
+            try
+            {
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    try
+                    {
+                        var t = asm.GetType("NativeScriptBridge.Bridge");
+                        if (t is null) continue;
+                        var m = t.GetMethod("SetLogToConsole", BindingFlags.Public | BindingFlags.Static);
+                        if (m is null) continue;
+                        m.Invoke(null, new object[] { true });
+                        System.Diagnostics.Debug.WriteLine($"[NativeScript] Invoked Bridge.SetLogToConsole on {asm.GetName().Name}");
+                        break;
+                    }
+                    catch { }
+                }
+            }
+            catch { }
             if (ConsumeDebugBreakMarker())
                 StartDevtoolsSafely();
 #endif
