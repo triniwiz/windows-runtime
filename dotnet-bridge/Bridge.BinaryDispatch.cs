@@ -117,7 +117,8 @@ public static partial class Bridge
                 throw new MissingMethodException(
                     $"No public ctor on {typeS.FullName} for {args.Length} args");
             // ConstructorInfo.Invoke requires exact arg count — build a precise array.
-            return Box(entry.Ctor.Invoke(BuildArgsBinExact(args, entry.Parameters)));
+            var ctorArgs = BuildArgsBinExact(args, entry.Parameters);
+            return Box(entry.Ctor.Invoke(ctorArgs));
         }
 
         // op == 0x02: static call

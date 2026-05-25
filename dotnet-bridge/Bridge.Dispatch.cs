@@ -74,7 +74,8 @@ public static partial class Bridge
                 throw new MissingMethodException(
                     $"No public constructor on {type.FullName} for {argElems.Length} args");
             // ConstructorInfo.Invoke validates args.Length == paramCount exactly — no pool.
-            return Box(entry.Ctor.Invoke(BuildArgsExact(argElems, entry.Parameters)));
+            var ctorArgs = BuildArgsExact(argElems, entry.Parameters);
+            return Box(entry.Ctor.Invoke(ctorArgs));
         }
 
         var isStatic = target is null;
@@ -322,19 +323,19 @@ public static partial class Bridge
             var id = Interlocked.Increment(ref s_nextHandle);
             s_handles[id] = value;
 
-            // Try to obtain a canonical IUnknown pointer for COM/WinRT objects so the
-            // runtime can call native vtable methods directly. We addref via
-            // Marshal.GetIUnknownForObject and store the raw pointer; it will be
-            // released on __release.
+            // Try to obtain a canonical IInspectable/IUnknown pointer for COM/WinRT objects
+            // so the runtime can call native vtable methods directly.
+            // ObtainNativePtr prefers IInspectable for WinRT-compatible types and uses
+            // the C#/WinRT inner object for managed WinRT subclasses (e.g. FlexboxLayout
+            // subclasses), ensuring QI succeeds for all inherited WinRT interfaces.
+            // The pointer is addref'd here and released on __release.
             try
             {
                 if (value != null)
                 {
-                    var p = Marshal.GetIUnknownForObject(value);
-                        if (p != IntPtr.Zero)
-                        {
+                    var p = ObtainNativePtr(value);
+                    if (p != IntPtr.Zero)
                         s_nativePtrs[id] = p;
-                    }
                 }
             }
             catch

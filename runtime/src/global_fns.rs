@@ -1639,7 +1639,10 @@ const HELPER_SOURCE: &str = r#"
 
                 function Managed() {
                     var args = Array.prototype.slice.call(arguments);
-                    var obj = NSWinRT.proxy.createManagedSubclass('', typeName || '', overrides);
+                    // Pass the actual base ctor type name as the assembly param so the
+                    // bridge can fall back to it when no static proxy exists for typeName.
+                    var baseTypeName = ctorName(baseCtor) || '';
+                    var obj = NSWinRT.proxy.createManagedSubclass(baseTypeName, typeName || '', overrides);
                     if (typeof overrides.init === 'function') {
                         try {
                             var initResult = overrides.init.apply(obj, args);
@@ -2361,7 +2364,7 @@ const HELPER_SOURCE: &str = r#"
             // Makes sw.Stop() and sw.Elapsed both work naturally.
             // The proxy is registered with _dotNetFinalizers so the CLR reference
             // is released automatically when JS GC collects the proxy.
-            function _makeDotNetInstance(handle, assembly, typeName, isTask) {
+            function _makeDotNetInstance(handle, assembly, typeName, isTask, nativePtr) {
                 var info = _getTypeInfo(assembly, typeName);
                 var proxy = new Proxy({}, {
                     get: function (_, prop) {
@@ -2369,6 +2372,7 @@ const HELPER_SOURCE: &str = r#"
                         if (prop === '__handle') return handle;
                         if (prop === '__type')   return typeName;
                         if (prop === '__isTask') return isTask === true;
+                        if (prop === '__native_ptr') return nativePtr;
                         if (prop === 'release') return function () {
                             _invoke({ handle: handle, method: '__release', args: [] });
                         };
@@ -2414,7 +2418,7 @@ const HELPER_SOURCE: &str = r#"
                     var typeName = value.__type || '';
                     var root = (typeName || '').split('.')[0];
                     var assembly = _namespaceAssemblyMap[root] || '';
-                    return _makeDotNetInstance(value.__handle, assembly, typeName, value.__isTask === true);
+                    return _makeDotNetInstance(value.__handle, assembly, typeName, value.__isTask === true, value.__native_ptr);
                 }
                 return value;
             }

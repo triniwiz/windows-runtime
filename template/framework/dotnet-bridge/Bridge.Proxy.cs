@@ -331,8 +331,21 @@ public static partial class Bridge
         Type? t = FindGeneratedProxyType(typeName);
         if (t is null)
         {
+            // When typeName is an auto-generated proxy name (com.tns.gen.winrt.*),
+            // the caller puts the real base type name in assemblyName so we can
+            // look up or dynamically emit a proxy for the correct base class.
+            string? resolveFrom = typeName;
+            if (!string.IsNullOrEmpty(assemblyName)
+                && typeName != null
+                && typeName.StartsWith("com.tns.gen.winrt.", StringComparison.Ordinal))
+            {
+                resolveFrom = assemblyName;
+            }
+
             // Resolve the WinRT/base type and optionally emit a dynamic proxy (dev-only).
-            var baseType = ResolveType(assemblyName, typeName) ?? throw new TypeLoadException($"Type not found: {typeName} (assembly: {assemblyName})");
+            var baseType = ResolveType(null, resolveFrom)
+                ?? ResolveType(assemblyName, typeName)
+                ?? throw new TypeLoadException($"Type not found: {resolveFrom} (proxy: {typeName}, assembly: {assemblyName})");
             
             if (baseType.IsClass && !baseType.IsSealed)
             {
@@ -348,7 +361,9 @@ public static partial class Bridge
         // Create the managed instance. Generated classes should call
         // ProxyDispatcher.InitializeInstance(this, typeName) in their constructor,
         // which will invoke our ProxyInitializeInstance and capture the pending callback id.
-        var instance = Activator.CreateInstance(t) ?? throw new InvalidOperationException("Failed to instantiate proxy type.");
+        object? instance = Activator.CreateInstance(t);
+        if (instance is null)
+            throw new InvalidOperationException($"Failed to instantiate proxy type {t.FullName}.");
 
         // Ensure there's a mapping for this instance immediately to avoid any
         // early virtual calls from constructors reaching the JS side before
@@ -405,15 +420,16 @@ public static partial class Bridge
     private static object? ProxyGetProperty(object instance, string propertyName)
     {
         if (!s_proxyCallbacks.TryGetValue(instance, out var holder)) throw new InvalidOperationException("No JS callback registered for proxy instance.");
-        var payload = new object?[] { new HandleRef(holder.HandleId), propertyName };
-        CallJsCallback(holder.CallbackId, payload);
-        return null;
+        // Tag "get:" prefix so the JS dispatcher can distinguish getter from method call.
+        var payload = new object?[] { new HandleRef(holder.HandleId), "get:" + propertyName };
+        return CallJsCallback(holder.CallbackId, payload);
     }
 
     private static void ProxySetProperty(object instance, string propertyName, object? value)
     {
         if (!s_proxyCallbacks.TryGetValue(instance, out var holder)) throw new InvalidOperationException("No JS callback registered for proxy instance.");
-        var payload = new object?[] { new HandleRef(holder.HandleId), propertyName, value };
+        // Tag "set:" prefix so the JS dispatcher can distinguish setter from method call.
+        var payload = new object?[] { new HandleRef(holder.HandleId), "set:" + propertyName, value };
         CallJsCallback(holder.CallbackId, payload);
     }
 }

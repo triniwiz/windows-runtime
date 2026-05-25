@@ -264,7 +264,10 @@ impl DevtoolsServer {
         console_forwarder: Option<Arc<dyn Fn(&str) + Send + Sync>>,
         message_dispatcher: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
     ) -> Result<Self> {
-        let listener = TcpListener::bind(format!("{}:{}", config.host, config.port))?;
+        // Try the configured port first; if it is already in use (e.g. from a
+        // previous run that did not shut down cleanly), scan upward for a free
+        // one so the runtime does not crash on reconnect.
+        let listener = Self::bind_listener(&config.host, config.port)?;
         let addr = listener.local_addr()?;
 
         let websocket_url = format!("ws://{}/devtools/page/runtime", addr);
@@ -326,6 +329,33 @@ impl DevtoolsServer {
             _inspector: inspector,
             _session: session,
         })
+    }
+
+    /// Try to bind a TCP listener on `host:port`, falling back to up to 10
+    /// subsequent ports if the preferred port is already in use.
+    fn bind_listener(host: &str, port: u16) -> Result<TcpListener> {
+        for offset in 0u16..=10 {
+            let p = port.saturating_add(offset);
+            match TcpListener::bind(format!("{}:{}", host, p)) {
+                Ok(l) => {
+                    if offset > 0 {
+                        eprintln!(
+                            "[devtools] port {} in use, bound to {}:{} instead",
+                            port, host, p
+                        );
+                    }
+                    return Ok(l);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(anyhow::anyhow!(
+            "Could not bind devtools listener: ports {}–{} on {} are all in use",
+            port,
+            port.saturating_add(10),
+            host
+        ))
     }
 
     /// Send a pre-formed DevTools protocol message string to connected clients.
@@ -418,7 +448,7 @@ fn handle_connection(
 
 fn serve_json(mut stream: TcpStream, path: &str, ws_url: &str) {
     let body = if path == "/json/version" {
-        build_version_json()
+        build_version_json(ws_url)
     } else {
         build_list_json(ws_url)
     };
@@ -464,12 +494,12 @@ fn handle_ws(
 
 // ─── CDP discovery JSON ───────────────────────────────────────────────────────
 
-fn build_version_json() -> String {
+fn build_version_json(ws_url: &str) -> String {
     serde_json::json!({
         "Browser": "NativeScript/1.0",
         "Protocol-Version": "1.3",
         "V8-Version": "14.7",
-        "webSocketDebuggerUrl": ""
+        "webSocketDebuggerUrl": ws_url
     })
     .to_string()
 }
@@ -506,9 +536,11 @@ mod tests {
 
     #[test]
     fn version_json_is_valid() {
-        let v: serde_json::Value = serde_json::from_str(&build_version_json()).unwrap();
+        let ws = "ws://127.0.0.1:42000/devtools/page/runtime";
+        let v: serde_json::Value = serde_json::from_str(&build_version_json(ws)).unwrap();
         assert!(v.get("Browser").is_some());
         assert!(v.get("Protocol-Version").is_some());
+        assert_eq!(v.get("webSocketDebuggerUrl").and_then(|u| u.as_str()), Some(ws));
     }
 
     #[test]

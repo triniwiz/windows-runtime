@@ -513,6 +513,11 @@ public static partial class Bridge
         return 0;
     }
 
+    // IInspectable IID — the common interface for all WinRT objects.
+    // WinRT APIs typically QI for IInspectable (not just IUnknown) when they
+    // accept a polymorphic `object` parameter or need runtime class identity.
+    private static Guid s_iidIInspectable = new Guid("AF86E2E0-B12D-4C6A-9C5A-D7AA65101E90");
+
     // Return a canonical native pointer (IUnknown / IInspectable) for an
     // exported handle id. Returns 0 when no pointer is available. If a
     // pointer isn't already cached in `s_nativePtrs`, attempt to obtain one
@@ -529,18 +534,75 @@ public static partial class Bridge
 
         try
         {
-            var ip = Marshal.GetIUnknownForObject(obj);
+            var ip = ObtainNativePtr(obj);
             if (ip != IntPtr.Zero)
             {
                 s_nativePtrs[handleId] = ip;
                 return ip;
             }
         }
-        catch (Exception)
+        catch
         {
         }
 
         return IntPtr.Zero;
+    }
+
+    // Obtain a WinRT-usable native pointer for a managed object.
+    // Prefers IInspectable over bare IUnknown because WinRT runtime class
+    // identity and interface lookup go through IInspectable.  If the managed
+    // object itself implements IWinRTObject (C#/WinRT projection), its inner
+    // native object is used directly so that QI succeeds for all inherited
+    // WinRT interfaces (e.g. IUIElement for a FlexboxLayout subclass).
+    private static IntPtr ObtainNativePtr(object obj)
+    {
+        // Path 1 — C#/WinRT IWinRTObject: use the projected inner object's pointer.
+        // This gives the real native WinRT pointer, not the managed CCW, so
+        // QueryInterface will succeed for all WinRT interfaces inherited by the type.
+        try
+        {
+            var winrtObjType = obj.GetType().GetInterface("WinRT.IWinRTObject");
+            if (winrtObjType != null)
+            {
+                var nativeObjProp = winrtObjType.GetProperty("NativeObject");
+                var nativeObj = nativeObjProp?.GetValue(obj);
+                if (nativeObj != null)
+                {
+                    var thisPtrProp = nativeObj.GetType().GetProperty("ThisPtr");
+                    if (thisPtrProp?.GetValue(nativeObj) is IntPtr thisPtr && thisPtr != IntPtr.Zero)
+                    {
+                        Marshal.AddRef(thisPtr);
+                        return thisPtr;
+                    }
+                }
+            }
+        }
+        catch { }
+
+        IntPtr iunknown = IntPtr.Zero;
+        try
+        {
+            iunknown = Marshal.GetIUnknownForObject(obj);
+        }
+        catch { }
+
+        if (iunknown == IntPtr.Zero) return IntPtr.Zero;
+
+        // Path 2 — QI for IInspectable so WinRT runtime class identity works.
+        try
+        {
+            var iidLocal = s_iidIInspectable;
+            var hr = Marshal.QueryInterface(iunknown, ref iidLocal, out var inspectable);
+            if (hr == 0 && inspectable != IntPtr.Zero)
+            {
+                Marshal.Release(iunknown);
+                return inspectable;
+            }
+        }
+        catch { }
+
+        // Path 3 — bare IUnknown fallback.
+        return iunknown;
     }
 
     private static void OnAppDomainUnhandledException(object? sender, UnhandledExceptionEventArgs e)

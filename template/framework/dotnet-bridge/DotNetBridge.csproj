@@ -21,6 +21,10 @@
       <DotNetToolDoneFile>$(MSBuildProjectDirectory)\publish\.dotnet_tool_done</DotNetToolDoneFile>
     </PropertyGroup>
     <MakeDir Directories="$(MSBuildProjectDirectory)\publish" Condition="!Exists('$(MSBuildProjectDirectory)\publish')" />
+    <!-- Copy published output to the local publish/ staging directory that tns deploys from -->
+    <Copy SourceFiles="$(PublishDir)DotNetBridge.dll" DestinationFolder="$(MSBuildProjectDirectory)\publish" SkipUnchangedFiles="false" />
+    <Copy SourceFiles="$(PublishDir)DotNetBridge.pdb" DestinationFolder="$(MSBuildProjectDirectory)\publish" SkipUnchangedFiles="false" Condition="Exists('$(PublishDir)DotNetBridge.pdb')" />
+    <Copy SourceFiles="$(PublishDir)DotNetBridge.runtimeconfig.json" DestinationFolder="$(MSBuildProjectDirectory)\publish" SkipUnchangedFiles="false" Condition="Exists('$(PublishDir)DotNetBridge.runtimeconfig.json')" />
     <WriteLinesToFile File="$(DotNetToolDoneFile)" Lines="done" Overwrite="true" />
   </Target>
 </Project>

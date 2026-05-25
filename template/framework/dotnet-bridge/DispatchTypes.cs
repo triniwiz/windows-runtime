@@ -286,6 +286,7 @@ internal readonly struct DispatchResult
         w.WriteByte(0x06);
         w.WriteI32(id);
         w.WriteString16(t.FullName ?? t.Name);
+        w.WriteByte(0); // no native ptr
     }
 
     private static void WriteStringArrayBin(ref BinWriter w, string[] arr)
