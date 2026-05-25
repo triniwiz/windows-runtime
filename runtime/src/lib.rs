@@ -744,6 +744,105 @@ use crate::generic_method_call::GenericMethodCall;
 use crate::method_call::MethodCall;
 use crate::property_call::PropertyCall;
 
+struct HasInstanceData {
+    /// IID used for the COM QueryInterface check.  `None` for classes and open
+    /// generic interfaces that don't have a concrete parameterised IID.
+    iid: Option<GUID>,
+    /// Full WinRT type name used for an exact-name match before QI is attempted.
+    full_name: String,
+}
+
+unsafe impl Send for HasInstanceData {}
+unsafe impl Sync for HasInstanceData {}
+
+fn symbol_has_instance_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let arg = args.get(0);
+    if !arg.is_object() {
+        retval.set_bool(false);
+        return;
+    }
+    let Some(obj) = arg.to_object(scope) else {
+        retval.set_bool(false);
+        return;
+    };
+
+    let Some(dec_field) = obj.get_internal_field(scope, 0) else {
+        retval.set_bool(false);
+        return;
+    };
+    let Ok(dec_ext) = v8::Local::<v8::External>::try_from(dec_field) else {
+        retval.set_bool(false);
+        return;
+    };
+    let dec_ptr = dec_ext.value() as *mut DeclarationFFI;
+    if dec_ptr.is_null() {
+        retval.set_bool(false);
+        return;
+    }
+    let dec = unsafe { &*dec_ptr };
+
+    let data_ext = unsafe { args.data().cast::<v8::External>() };
+    let data_ptr = data_ext.value() as *const HasInstanceData;
+    let data = unsafe { &*data_ptr };
+
+    {
+        let lock = dec.read();
+        if lock.full_name() == data.full_name.as_str() {
+            retval.set_bool(true);
+            return;
+        }
+    }
+
+    // QI path: try QueryInterface on the underlying COM object for the target IID.
+    let Some(iid) = data.iid else {
+        retval.set_bool(false);
+        return;
+    };
+    let Some(instance) = dec.instance.clone() else {
+        retval.set_bool(false);
+        return;
+    };
+
+    let vtable = instance.vtable();
+    let mut qi_ptr: *mut c_void = std::ptr::null_mut();
+    let hr = unsafe {
+        ((*vtable).QueryInterface)(
+            instance.as_raw(),
+            &iid,
+            std::mem::transmute(&mut qi_ptr),
+        )
+    };
+    let implements = hr.is_ok() && !qi_ptr.is_null();
+    if !qi_ptr.is_null() {
+        // Release the AddRef from QueryInterface.
+        drop(unsafe { IUnknown::from_raw(qi_ptr) });
+    }
+    retval.set_bool(implements);
+}
+
+
+fn attach_has_instance_to_template(
+    scope: &mut v8::PinScope<'_, '_>,
+    ctor_tmpl: v8::Local<v8::FunctionTemplate>,
+    iid: Option<GUID>,
+    full_name: &str,
+) {
+    let data = Box::into_raw(Box::new(HasInstanceData {
+        iid,
+        full_name: full_name.to_string(),
+    }));
+    let data_ext = v8::External::new(scope, data as _);
+    let has_instance_tmpl = v8::FunctionTemplate::builder(symbol_has_instance_callback)
+        .data(data_ext.into())
+        .build(scope);
+    let sym = v8::Symbol::get_has_instance(scope);
+    ctor_tmpl.set_with_attr(sym.into(), has_instance_tmpl.into(), v8::PropertyAttribute::DONT_ENUM);
+}
+
 fn init_global(scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>, context: v8::Local<v8::Context>) {
     let global = context.global(scope);
     let value = v8::String::new(
@@ -6035,6 +6134,20 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
         let lock = declaration.read();
 
         if lock.kind() != DeclarationKind::Class {
+            let iid = match lock.kind() {
+                DeclarationKind::Interface => lock
+                    .as_any()
+                    .downcast_ref::<InterfaceDeclaration>()
+                    .map(|d| d.id()),
+                DeclarationKind::GenericInterfaceInstance => lock
+                    .as_any()
+                    .downcast_ref::<GenericInterfaceInstanceDeclaration>()
+                    .map(|d| d.id()),
+                _ => None,
+            };
+            let full_name = lock.full_name().to_string();
+            drop(lock);
+            attach_has_instance_to_template(scope, tmpl, iid, &full_name);
             let Some(func) = tmpl.get_function(scope) else {
                 CREATING_CTORS.with(|set| { set.borrow_mut().remove(name_str); });
                 return v8::undefined(scope).into();
@@ -6376,6 +6489,7 @@ fn create_ns_ctor_object<'a>(name: &str, parent: Option<Arc<RwLock<dyn Declarati
             );
         }
 
+        attach_has_instance_to_template(scope, tmpl, None, &clazz.full_name().to_string());
     }
 
     let Some(func) = tmpl.get_function(scope) else {
