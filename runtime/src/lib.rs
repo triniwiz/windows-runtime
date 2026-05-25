@@ -770,58 +770,133 @@ fn symbol_has_instance_callback(
         return;
     };
 
-    let Some(dec_field) = obj.get_internal_field(scope, 0) else {
-        retval.set_bool(false);
-        return;
-    };
-    let Ok(dec_ext) = v8::Local::<v8::External>::try_from(dec_field) else {
-        retval.set_bool(false);
-        return;
-    };
-    let dec_ptr = dec_ext.value() as *mut DeclarationFFI;
-    if dec_ptr.is_null() {
-        retval.set_bool(false);
-        return;
-    }
-    let dec = unsafe { &*dec_ptr };
-
     let data_ext = unsafe { args.data().cast::<v8::External>() };
     let data_ptr = data_ext.value() as *const HasInstanceData;
     let data = unsafe { &*data_ptr };
 
-    {
-        let lock = dec.read();
-        if lock.full_name() == data.full_name.as_str() {
-            retval.set_bool(true);
-            return;
+    if let Some(dec_field) = obj.get_internal_field(scope, 0) {
+        if let Ok(dec_ext) = v8::Local::<v8::External>::try_from(dec_field) {
+            let dec_ptr = dec_ext.value() as *mut DeclarationFFI;
+            if !dec_ptr.is_null() {
+                let dec = unsafe { &*dec_ptr };
+
+                {
+                    let lock = dec.read();
+                    if lock.full_name() == data.full_name.as_str() {
+                        retval.set_bool(true);
+                        return;
+                    }
+                }
+
+                let Some(iid) = data.iid else {
+                    retval.set_bool(false);
+                    return;
+                };
+                let Some(instance) = dec.instance.clone() else {
+                    retval.set_bool(false);
+                    return;
+                };
+
+                let vtable = instance.vtable();
+                let mut qi_ptr: *mut c_void = std::ptr::null_mut();
+                let hr = unsafe {
+                    ((*vtable).QueryInterface)(
+                        instance.as_raw(),
+                        &iid,
+                        std::mem::transmute(&mut qi_ptr),
+                    )
+                };
+                let implements = hr.is_ok() && !qi_ptr.is_null();
+                if !qi_ptr.is_null() {
+                    drop(unsafe { IUnknown::from_raw(qi_ptr) });
+                }
+                retval.set_bool(implements);
+                return;
+            }
         }
     }
 
-    // QI path: try QueryInterface on the underlying COM object for the target IID.
+    if let Some(type_key) = v8::String::new(scope, "__type") {
+        if let Some(tv) = obj.get(scope, type_key.into()) {
+            if let Ok(ts) = v8::Local::<v8::String>::try_from(tv) {
+                if ts.to_rust_string_lossy(scope) == data.full_name {
+                    retval.set_bool(true);
+                    return;
+                }
+            }
+        }
+    }
+
     let Some(iid) = data.iid else {
         retval.set_bool(false);
         return;
     };
-    let Some(instance) = dec.instance.clone() else {
+    let raw_ptr = dotnet_proxy_native_ptr(scope, obj);
+    if raw_ptr.is_null() {
         retval.set_bool(false);
         return;
-    };
+    }
 
-    let vtable = instance.vtable();
+    let unk = std::mem::ManuallyDrop::new(unsafe { IUnknown::from_raw(raw_ptr) });
+    let vtable = unk.vtable();
     let mut qi_ptr: *mut c_void = std::ptr::null_mut();
     let hr = unsafe {
         ((*vtable).QueryInterface)(
-            instance.as_raw(),
+            unk.as_raw(),
             &iid,
             std::mem::transmute(&mut qi_ptr),
         )
     };
     let implements = hr.is_ok() && !qi_ptr.is_null();
     if !qi_ptr.is_null() {
-        // Release the AddRef from QueryInterface.
         drop(unsafe { IUnknown::from_raw(qi_ptr) });
     }
     retval.set_bool(implements);
+}
+
+fn dotnet_proxy_native_ptr(
+    scope: &mut v8::PinScope<'_, '_>,
+    obj: v8::Local<v8::Object>,
+) -> *mut c_void {
+    if let Some(k) = v8::String::new(scope, "__native_ptr") {
+        if let Some(pval) = obj.get(scope, k.into()) {
+            if let Ok(bi) = v8::Local::<v8::BigInt>::try_from(pval) {
+                let p = bi.u64_value().0 as *mut c_void;
+                if !p.is_null() {
+                    return p;
+                }
+            }
+        }
+    }
+
+    if let Some(hk) = v8::String::new(scope, "__handle") {
+        if let Some(hval) = obj.get(scope, hk.into()) {
+            let id: Option<i32> = if let Ok(v) = v8::Local::<v8::Int32>::try_from(hval) {
+                Some(v.value())
+            } else if let Ok(n) = v8::Local::<v8::Number>::try_from(hval) {
+                n.integer_value(scope).map(|v| v as i32)
+            } else {
+                None
+            };
+            if let Some(id) = id {
+                let req = format!(
+                    "{{\"assembly\":null,\"typeName\":\"NativeScriptBridge.Bridge\",\"method\":\"GetNativePtrForHandle\",\"args\":[{}]}}",
+                    id
+                );
+                if let Ok(resp) = crate::dotnet::call_dotnet(&req) {
+                    let trimmed = resp.trim();
+                    if !trimmed.is_empty() && trimmed != "null" {
+                        if let Ok(n) = trimmed.parse::<i64>() {
+                            if n != 0 {
+                                return n as usize as *mut c_void;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    std::ptr::null_mut()
 }
 
 
