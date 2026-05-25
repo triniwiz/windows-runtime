@@ -2711,6 +2711,30 @@ pub(crate) fn ns_struct_field_setter(
     v8::Intercepted::kYes
 }
 
+pub(crate) fn ns_struct_field_enumerator(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::PropertyCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Array>,
+) {
+    let this = args.data();
+    let dec = unsafe { this.cast::<v8::External>() };
+    let dec = dec.value() as *mut DeclarationFFI;
+    let dec = unsafe { &*dec };
+    let field_names: Vec<String> = {
+        let lock = dec.read();
+        match lock.as_any().downcast_ref::<StructDeclaration>() {
+            Some(s) => s.fields().iter().map(|f| f.name().to_string()).collect(),
+            None => return,
+        }
+    };
+    let elements: Vec<v8::Local<v8::Value>> = field_names
+        .iter()
+        .filter_map(|name| v8::String::new(scope, name.as_str()).map(|s| s.into()))
+        .collect();
+    let array = v8::Array::new_with_elements(scope, &elements);
+    rv.set(array);
+}
+
 pub(crate) fn create_ns_struct_ctor_object<'a>(
     name: &str,
     declaration: Arc<RwLock<dyn Declaration>>,
@@ -2738,15 +2762,26 @@ pub(crate) fn create_ns_struct_ctor_object<'a>(
         let mut field_types: Vec<NativeType> = Vec::new();
 
         let struct_dec = lock.as_any().downcast_ref::<StructDeclaration>().unwrap();
-        let object = args.get(0).to_object(scope).unwrap();
 
-        for field in struct_dec.fields() {
+        let field_count = struct_dec.fields().len();
+        let arg_count = args.length() as usize;
+        // Positional mode: new Vector3(1, 2, 3)  — arg count matches field count and
+        // the first arg is not a plain object.  Object-literal mode: new Vector3({X:1,...})
+        let use_positional = arg_count == field_count
+            && (arg_count > 1 || (arg_count == 1 && !args.get(0).is_object()));
+
+        for (idx, field) in struct_dec.fields().iter().enumerate() {
             let field_type = Signature::to_string(field.base().metadata().unwrap(), &field.type_());
             let native_type = NativeType::try_from(field_type.as_str()).unwrap();
             field_types.push(native_type.clone());
 
-            let name = v8::String::new(scope, field.name()).unwrap();
-            let field_value = object.get(scope, name.into());
+            let field_value = if use_positional {
+                Some(args.get(idx as i32))
+            } else {
+                let object = args.get(0).to_object(scope).unwrap();
+                let name = v8::String::new(scope, field.name()).unwrap();
+                object.get(scope, name.into())
+            };
 
             match field_value {
                 None => {
@@ -2824,6 +2859,7 @@ pub(crate) fn create_ns_struct_ctor_object<'a>(
             v8::NamedPropertyHandlerConfiguration::new()
                 .getter(ns_struct_field_getter)
                 .setter(ns_struct_field_setter)
+                .enumerator(ns_struct_field_enumerator)
                 .data(ext)
         );
 

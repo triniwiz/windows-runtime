@@ -1,6 +1,9 @@
 use std::sync::OnceLock;
 use regex::Regex;
 use crate::value::NativeType;
+use metadata::meta_data_reader::MetadataReader;
+use metadata::declarations::struct_declaration::StructDeclaration;
+use metadata::signature::Signature;
 
 static RE_GENERIC_COUNT: OnceLock<Regex> = OnceLock::new();
 static RE_GENERIC_PARAMS: OnceLock<Regex> = OnceLock::new();
@@ -49,6 +52,39 @@ pub fn get_generic_return_types(name: &str) -> GenericReturnTypes<'_> {
         .unwrap_or_default();
 
     GenericReturnTypes { names, types }
+}
+
+/// Returns `Some(NativeType::Struct([field_types...]))` when `signature` names a WinRT struct
+/// that must be passed by value in the FFI call frame, or `None` for classes/interfaces/enums.
+///
+/// WinRT structs are passed by value (not by pointer) as IN parameters. Using `NativeType::Pointer`
+/// for them causes libffi to pass the heap address instead of the struct bytes, yielding garbage.
+pub(crate) fn struct_native_type_for_sig(signature: &str) -> Option<NativeType> {
+    let sig = signature.trim();
+    // Out (ByRef) parameters are always passed as a caller-allocated pointer.
+    if sig.starts_with("ByRef ") {
+        return None;
+    }
+    // Only fully-qualified dotted names can be struct types.
+    if !sig.contains('.') {
+        return None;
+    }
+    // Strip any closed generic arguments ("IFoo`1<T>" → "IFoo`1").
+    let lookup = strip_generic_suffix(sig);
+    let declaration = MetadataReader::find_by_name(lookup)?;
+    let lock = declaration.read();
+    let struct_dec = lock.as_any().downcast_ref::<StructDeclaration>()?;
+    let mut field_types: Vec<NativeType> = Vec::new();
+    for field in struct_dec.fields() {
+        let metadata = field.base().metadata()?;
+        let field_type_str = Signature::to_string(metadata, &field.type_());
+        let native_type = NativeType::try_from(field_type_str.as_str()).ok()?;
+        field_types.push(native_type);
+    }
+    if field_types.is_empty() {
+        return None;
+    }
+    Some(NativeType::Struct(field_types.into_boxed_slice()))
 }
 
 /// Shared mapping from WinRT signature string to FFI `NativeType`.

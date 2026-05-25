@@ -258,7 +258,6 @@ impl MethodCall {
                 }
             };
             parse_parameter_types.push(parse_native_type.clone());
-            let abi_native = ffi_native_type_from_signature(signature.as_str());
             // If this parameter is an out (ByRef) parameter, represent its
             // ABI as a pointer to the underlying storage so callers allocate
             // space and pass the address for the callee to write into.
@@ -271,11 +270,18 @@ impl MethodCall {
                 // libffi CIF is constructed with the correct usize-sized type.
                 if matches!(parse_native_type, NativeType::String) {
                     parameter_types.push(NativeType::String);
-                } else if matches!(abi_native, NativeType::Buffer) {
-                    parameter_types.push(NativeType::U32);
-                    parameter_types.push(NativeType::Buffer);
                 } else {
-                    parameter_types.push(abi_native);
+                    // WinRT structs are passed by value; resolve to a proper struct
+                    // type so libffi dereferences the data pointer instead of
+                    // forwarding the raw heap address as the argument value.
+                    let abi_native = crate::helpers::struct_native_type_for_sig(signature.as_str())
+                        .unwrap_or_else(|| ffi_native_type_from_signature(signature.as_str()));
+                    if matches!(abi_native, NativeType::Buffer) {
+                        parameter_types.push(NativeType::U32);
+                        parameter_types.push(NativeType::Buffer);
+                    } else {
+                        parameter_types.push(abi_native);
+                    }
                 }
             }
         }

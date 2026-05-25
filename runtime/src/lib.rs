@@ -6927,6 +6927,7 @@ pub(crate) fn create_struct_object_from_raw<'a>(
         v8::NamedPropertyHandlerConfiguration::new()
             .getter(crate::ns_proxy::ns_struct_field_getter)
             .setter(crate::ns_proxy::ns_struct_field_setter)
+            .enumerator(crate::ns_proxy::ns_struct_field_enumerator)
             .data(ext.into())
     );
     let Some(object) = tmpl.new_instance(scope) else { return fallback; };
@@ -8163,6 +8164,9 @@ impl Runtime {
         tc.perform_microtask_checkpoint();
     }
 }
+
+#[cfg(test)]
+mod color_test;
 
 #[cfg(test)]
 mod error_handling_test;

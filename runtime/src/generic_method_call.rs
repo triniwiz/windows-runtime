@@ -155,7 +155,8 @@ impl GenericMethodCall {
             };
             parameter_arg_iids.push(arg_iid);
             parse_parameter_types.push(parse_native_type);
-            let abi_native = ffi_native_type_from_signature(signature.as_str());
+            let abi_native = crate::helpers::struct_native_type_for_sig(signature.as_str())
+                .unwrap_or_else(|| ffi_native_type_from_signature(signature.as_str()));
             if matches!(abi_native, NativeType::Buffer) {
                 parameter_types.push(NativeType::U32);
                 parameter_types.push(NativeType::Buffer);

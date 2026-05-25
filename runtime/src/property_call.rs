@@ -212,7 +212,8 @@ impl PropertyCall {
 
             let parse_native_type = NativeType::try_from(signature.as_str()).ok()?;
             parse_parameter_types.push(parse_native_type);
-            let abi_native = ffi_native_type_from_signature(signature.as_str());
+            let abi_native = crate::helpers::struct_native_type_for_sig(signature.as_str())
+                .unwrap_or_else(|| ffi_native_type_from_signature(signature.as_str()));
             if matches!(abi_native, NativeType::Buffer) {
                 parameter_types.push(NativeType::U32);
                 parameter_types.push(NativeType::Buffer);
@@ -370,7 +371,8 @@ impl PropertyCall {
 
             let parse_native_type = NativeType::try_from(signature.as_str()).ok()?;
             parse_parameter_types.push(parse_native_type);
-            let abi_native = crate::helpers::ffi_native_type_from_signature(signature.as_str());
+            let abi_native = crate::helpers::struct_native_type_for_sig(signature.as_str())
+                .unwrap_or_else(|| crate::helpers::ffi_native_type_from_signature(signature.as_str()));
             if matches!(abi_native, NativeType::Buffer) {
                 parameter_types.push(NativeType::U32);
                 parameter_types.push(NativeType::Buffer);
@@ -499,7 +501,8 @@ impl PropertyCall {
             let sig = substitute_type_vars(&raw_sig, &type_args);
             let parse_native_type = NativeType::try_from(sig.as_str()).ok()?;
             parse_parameter_types.push(parse_native_type);
-            let abi_native = crate::helpers::ffi_native_type_from_signature(sig.as_str());
+            let abi_native = crate::helpers::struct_native_type_for_sig(sig.as_str())
+                .unwrap_or_else(|| crate::helpers::ffi_native_type_from_signature(sig.as_str()));
             if matches!(abi_native, NativeType::Buffer) {
                 parameter_types.push(NativeType::U32);
                 parameter_types.push(NativeType::Buffer);
