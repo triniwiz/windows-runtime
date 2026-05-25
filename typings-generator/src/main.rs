@@ -751,19 +751,51 @@ fn render_enum(name: &str, enum_decl: &EnumDeclaration) -> String {
     out
 }
 
+fn pascal_to_camel(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_lowercase().collect::<String>() + chars.as_str(),
+    }
+}
+
 fn render_struct(name: &str, struct_decl: &StructDeclaration) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("interface {} {{\n", name));
+    // Collect fields once so we can use them for both the interface and the constructor var.
+    let mut fields: Vec<(String, String)> = Vec::new();
     for field in struct_decl.fields() {
         let Some(md) = field.base().metadata() else { continue };
         let field_ty = Signature::to_string(md, &field.type_());
-        out.push_str(&format!(
-            "  {}: {};\n",
-            field.name(),
-            map_type_to_ts(field_ty.as_str())
-        ));
+        fields.push((field.name().to_string(), map_type_to_ts(field_ty.as_str())));
     }
-    out.push_str("}\n\n");
+
+    let mut out = String::new();
+
+    // Instance type as an interface (keeps compatibility with object-literal assignments).
+    out.push_str(&format!("interface {} {{\n", name));
+    for (fname, ftype) in &fields {
+        out.push_str(&format!("  {}: {};\n", fname, ftype));
+    }
+    out.push_str("}\n");
+
+    // Constructor var with two overloads:
+    //   new(x: T, y: T, ...): Name   — positional
+    //   new(fields: { X?: T; ... }): Name — object-literal
+    let positional: String = fields.iter()
+        .map(|(fname, ftype)| format!("{}: {}", pascal_to_camel(fname), ftype))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let obj_fields: String = fields.iter()
+        .map(|(fname, ftype)| format!("{}?: {}", fname, ftype))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    out.push_str(&format!("var {}: {{\n", name));
+    if !fields.is_empty() {
+        out.push_str(&format!("  new({}): {};\n", positional, name));
+    }
+    out.push_str(&format!("  new(fields: {{ {} }}): {};\n", obj_fields, name));
+    out.push_str("};\n\n");
+
     out
 }
 
@@ -1111,6 +1143,16 @@ fn well_known_anchors_for_root(root: &str) -> Vec<String> {
         "ValueSet",
         "IClosable",
         "IStringable",
+        // Extra anchors for namespaces that lack the common Foundation types above.
+        // Windows.UI base namespace has Color (struct), Colors, ColorHelper (classes).
+        "Color",
+        "Colors",
+        "ColorHelper",
+        // Windows.Foundation.Numerics structs (covered by Deferral via Foundation.winmd
+        // but listed here as fallback in case the BFS root is Numerics directly).
+        "Vector2",
+        "Vector3",
+        "Matrix4x4",
     ] {
         anchors.push(format!("{}.{}", root, suffix));
     }
@@ -1145,6 +1187,14 @@ fn metadata_from_anchor(anchor_name: &str) -> Option<IMetaDataImport2> {
             .as_any()
             .downcast_ref::<GenericDelegateDeclaration>()
             .and_then(|item| item.base().metadata().cloned()),
+        DeclarationKind::Struct => lock
+            .as_any()
+            .downcast_ref::<StructDeclaration>()
+            .and_then(|item| item.metadata().cloned()),
+        DeclarationKind::Enum => lock
+            .as_any()
+            .downcast_ref::<EnumDeclaration>()
+            .and_then(|item| item.metadata().cloned()),
         _ => None,
     }
 }
@@ -1156,9 +1206,14 @@ fn metadata_from_anchor(anchor_name: &str) -> Option<IMetaDataImport2> {
 /// 2. Anchor lookup using the file's namespace stem — for registered WinRT types.
 /// 3. Regex scan of raw bytes — legacy fallback.
 fn collect_candidates_from_file(path: &PathBuf, root: &str) -> BTreeSet<String> {
+    let mut candidates = BTreeSet::new();
+
     // Strategy 1: Direct file open via IMetaDataDispenserEx.
+    // Merges into candidates rather than returning early — system WinMD files can
+    // have some TypeDefs directly in the PE (forwarding entries) while other types
+    // in sub-namespaces live only in the WinRT catalog and are found by Strategy 2.
     if let Some(metadata) = metadata::open_metadata_scope_from_file(path) {
-        return enumerate_from_metadata(&metadata, root);
+        candidates.extend(enumerate_from_metadata(&metadata, root));
     }
 
     // Strategy 2: Anchor-based lookup.  Works for registered WinRT types without
@@ -1176,12 +1231,18 @@ fn collect_candidates_from_file(path: &PathBuf, root: &str) -> BTreeSet<String> 
 
     for anchor in &all_anchors {
         if let Some(metadata) = metadata_from_anchor(anchor) {
-            return enumerate_from_metadata(&metadata, root);
+            candidates.extend(enumerate_from_metadata(&metadata, root));
+            // One successful anchor gives us the complete scope for this file.
+            break;
         }
     }
 
-    // Strategy 3: Regex scan — last resort for files that resist both approaches.
-    scan_winmd_candidates(path, root)
+    // Strategy 3: Regex scan — only if neither metadata strategy found anything.
+    if candidates.is_empty() {
+        candidates.extend(scan_winmd_candidates(path, root));
+    }
+
+    candidates
 }
 
 /// Regex-based binary scan (legacy fallback).  Reads the file bytes and looks
