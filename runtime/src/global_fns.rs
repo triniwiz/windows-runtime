@@ -538,6 +538,54 @@ pub(crate) fn handle_read_text_file(
     }
 }
 
+static PACKAGE_ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+fn package_root() -> Option<&'static PathBuf> {
+    PACKAGE_ROOT.get_or_init(|| {
+        std::env::current_exe().ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+    }).as_ref()
+}
+
+/// `__nsMsAppxResolve(uri)` — synchronously resolve a `ms-appx:///` URI to a
+/// real filesystem path. Returns the path string if the file exists, or null.
+///
+/// Strips the `ms-appx:///` prefix and joins against the package install root
+/// (the directory containing the app executable). Useful for synchronous
+/// resource probing where async WinRT APIs are not available.
+pub(crate) fn handle_ms_appx_resolve(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let Some(uri) = value_to_string(scope, args.get(0)) else {
+        retval.set_null();
+        return;
+    };
+
+    const PREFIX: &str = "ms-appx:///";
+    let relative = if uri.len() >= PREFIX.len() && uri[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+        &uri[PREFIX.len()..]
+    } else {
+        uri.as_str()
+    };
+
+    let Some(root) = package_root() else {
+        retval.set_null();
+        return;
+    };
+
+    let full_path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+    if full_path.exists() {
+        match full_path.to_str().and_then(|s| v8::String::new(scope, s)) {
+            Some(s) => retval.set(s.into()),
+            None => retval.set_null(),
+        }
+    } else {
+        retval.set_null();
+    }
+}
+
 pub(crate) fn handle_livesync_copy_file(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -3889,6 +3937,7 @@ pub(crate) fn init_async_helpers(
     register!("__nsGetLastJsError",             handle_get_last_js_error);
     register!("__nsTypedValue",                  handle_typed_value);
     register!("__nsCreateReference",            handle_create_reference);
+    register!("__nsMsAppxResolve",              handle_ms_appx_resolve);
 
     // DevTools host hooks: allow JS to register domain dispatchers and
     // post events/timestamps to the DevTools server when enabled.

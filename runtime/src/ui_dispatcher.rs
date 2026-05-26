@@ -91,6 +91,13 @@ pub fn get_ui_thread_rust_tid() -> Option<String> {
     UI_THREAD_ID.get().map(|id| format!("{:?}", id))
 }
 
+/// Returns true when the runtime owns its own `DispatcherQueueController` (i.e. no XAML
+/// host is present). In that case the caller is responsible for pumping Win32 messages
+/// so that WinRT async `Completed` callbacks can fire.
+pub fn needs_win32_pump() -> bool {
+    UI_DQ_CONTROLLER.get().is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -207,14 +207,41 @@ pub extern "C" fn runtime_devtools_pump(_runtime: i64) {
 
 /// Drain the JS timer queue on the calling thread.
 ///
-/// Must be called regularly on the V8/UI thread (e.g. every render frame) so
-/// that `setTimeout` / `setInterval` callbacks fire.  The C# host wires this
-/// to `CompositionTarget.Rendering` which fires at the display refresh rate.
+/// Must be called regularly on the V8/UI thread so that `setTimeout` /
+/// `setInterval` callbacks fire. XAML hosts wire this to
+/// `CompositionTarget.Rendering`; console hosts call it in their own loop.
+///
+/// Automatically detects context:
+/// - XAML host: flushes V8 microtasks only (Win32 messages are pumped by XAML).
+/// - Console/self-hosted: also drains Win32 messages so WinRT async `Completed`
+///   callbacks (e.g. `BitmapImage.SetSourceAsync`) can fire.
 #[no_mangle]
 pub extern "C" fn runtime_pump_timers() {
     let _ = std::panic::catch_unwind(|| {
         runtime::timers::pump();
+        if runtime::ui_dispatcher::needs_win32_pump() {
+            runtime::pump_messages();
+        } else {
+            runtime::pump_dispatcher();
+        }
     });
+}
+
+/// Pump Win32 messages and flush V8 microtasks.
+///
+/// For console apps and other hosts that have no XAML event loop.
+/// Call this in a tight loop (e.g. `MsgWaitForMultipleObjects` or plain sleep loop)
+/// to let WinRT async `Completed` callbacks (e.g. `BitmapImage.SetSourceAsync`)
+/// fire and their Promise continuations run.
+///
+/// Do NOT call from `CompositionTarget.Rendering` — use `runtime_pump_timers` there.
+///
+/// Returns `true` if at least one Win32 message was dispatched.
+#[no_mangle]
+pub extern "C" fn runtime_pump_messages() -> bool {
+    std::panic::catch_unwind(|| {
+        runtime::pump_messages()
+    }).unwrap_or(false)
 }
 
 /// Free a string previously returned by `runtime_devtools_start`.

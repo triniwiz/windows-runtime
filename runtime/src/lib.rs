@@ -115,6 +115,59 @@ pub fn store_last_js_error(error: String) {
     LAST_JS_ERROR.with(|e| { *e.borrow_mut() = Some(error); });
 }
 
+/// Flush any V8 microtasks (Promise continuations) that were queued by
+/// `JsDelegate::Invoke` callbacks fired from XAML's own event loop between
+/// frames.
+///
+/// XAML dispatches `Completed` notifications for async operations (e.g.
+/// `BitmapImage.SetSourceAsync`) via `CoreDispatcher`/`CoreWindow` between
+/// render frames. When those fire, `JsDelegate::Invoke` calls into V8 and
+/// queues a microtask (Promise resolution), but V8 may not run it immediately
+/// if microtask policy is explicit. This function drains the microtask queue
+/// so Promise continuations run at the next frame boundary rather than stalling.
+///
+/// NOTE: Do NOT call `PeekMessageW + DispatchMessageW` here. This function is
+/// called from `CompositionTarget.Rendering` via `runtime_pump_timers`, and
+/// pumping Win32 messages inside a XAML rendering callback causes reentrancy
+/// in XAML's internal rendering state machine.
+pub fn pump_dispatcher() {
+    let isolate_ptr = DELEGATE_ISOLATE_PTR.with(|c| c.get());
+    if isolate_ptr.is_null() {
+        return;
+    }
+    let isolate: &mut v8::Isolate = unsafe { &mut *isolate_ptr };
+    v8::scope!(scope, isolate);
+    let ctx = match scope.get_slot::<v8::Global<v8::Context>>() {
+        Some(g) => g.clone(),
+        None => return,
+    };
+    let ctx = v8::Local::new(scope, &ctx);
+    let scope = &mut v8::ContextScope::new(scope, ctx);
+    v8::tc_scope!(tc, scope);
+    tc.perform_microtask_checkpoint();
+}
+
+/// Pump Win32 messages and flush V8 microtasks.
+///
+/// Safe to call from a console app's own event loop (no XAML renderer active).
+/// Do NOT call this from `CompositionTarget.Rendering` — use `pump_dispatcher()`
+/// there instead, which skips `PeekMessageW` to avoid XAML reentrancy.
+///
+/// Returns `true` if at least one Win32 message was dispatched.
+pub fn pump_messages() -> bool {
+    let mut msg = MSG::default();
+    let mut dispatched = false;
+    unsafe {
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+            dispatched = true;
+        }
+    }
+    pump_dispatcher();
+    dispatched
+}
+
 /// Retrieve (and clear) the last stored JS error.
 pub fn get_last_js_error() -> Option<String> {
     LAST_JS_ERROR.with(|e| e.borrow_mut().take())
@@ -3891,6 +3944,32 @@ fn create_ns_ctor_instance_object<'a>(name: &str, factory: Option<IUnknown>, par
                 if let Some(iface) = lock.as_any().downcast_ref::<GenericInterfaceInstanceDeclaration>() {
                     let iid = iface.id();
                     let type_args = extract_generic_type_args(iface.full_name());
+                    if let Some(property) = iface.properties().iter().find(|p| p.name() == name.as_str()) {
+                        if property.setter().is_some() {
+                            let property_clone = property.clone();
+                            drop(lock);
+                            let Some(ns_instance) = dec.instance.clone() else {
+                                return v8::Intercepted::kNo;
+                            };
+                            let Some(mut property_call) = PropertyCall::new_for_interface(&property_clone, true, ns_instance, false, iid, type_args) else {
+                                return v8::Intercepted::kNo;
+                            };
+                            let (ret, _, _outs) = property_call.call_with_values(scope, &[val]);
+                            if ret.is_err() {
+                                let detail = format!("Property set '{}' failed: {} (0x{:08X})", name, ret.message(), ret.0 as u32);
+                                let message = v8::String::new(scope, &detail).unwrap();
+                                let error = v8::Exception::error(scope, message);
+                                scope.throw_exception(error);
+                            }
+                            return v8::Intercepted::kYes;
+                        }
+                    }
+                    return v8::Intercepted::kNo;
+                }
+
+                if let Some(iface) = lock.as_any().downcast_ref::<InterfaceDeclaration>() {
+                    let iid = iface.id();
+                    let type_args: Vec<String> = vec![];
                     if let Some(property) = iface.properties().iter().find(|p| p.name() == name.as_str()) {
                         if property.setter().is_some() {
                             let property_clone = property.clone();
