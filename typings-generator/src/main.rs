@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use parking_lot::RwLock;
 use regex::Regex;
 
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
@@ -17,11 +19,14 @@ use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::declarations::namespace_declaration::NamespaceDeclaration;
 use metadata::declarations::struct_declaration::StructDeclaration;
 use metadata::meta_data_reader::MetadataReader;
-use metadata::prelude::get_type_name;
+use metadata::prelude::{
+    get_type_name, is_td_class, is_td_interface, type_from_token,
+    SYSTEM_ENUM, SYSTEM_MULTICASTDELEGATE, SYSTEM_VALUETYPE, MAX_IDENTIFIER_LENGTH,
+};
 use metadata::signature::Signature;
 use metadata::value::Value;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
+use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2, mdtTypeDef, mdtTypeRef};
 
 // ---------------------------------------------------------------------------
 // TypeScript type mapping
@@ -1206,6 +1211,14 @@ fn metadata_from_anchor(anchor_name: &str) -> Option<IMetaDataImport2> {
 /// 2. Anchor lookup using the file's namespace stem — for registered WinRT types.
 /// 3. Regex scan of raw bytes — legacy fallback.
 fn collect_candidates_from_file(path: &PathBuf, root: &str) -> BTreeSet<String> {
+    collect_candidates_with_tokens(path, root, None)
+}
+
+fn collect_candidates_with_tokens(
+    path: &PathBuf,
+    root: &str,
+    mut token_map: Option<&mut BTreeMap<String, (IMetaDataImport2, CorTokenType)>>,
+) -> BTreeSet<String> {
     let mut candidates = BTreeSet::new();
 
     // Strategy 1: Direct file open via IMetaDataDispenserEx.
@@ -1213,7 +1226,28 @@ fn collect_candidates_from_file(path: &PathBuf, root: &str) -> BTreeSet<String> 
     // have some TypeDefs directly in the PE (forwarding entries) while other types
     // in sub-namespaces live only in the WinRT catalog and are found by Strategy 2.
     if let Some(metadata) = metadata::open_metadata_scope_from_file(path) {
-        candidates.extend(enumerate_from_metadata(&metadata, root));
+        let mut enumerator = std::ptr::null_mut();
+        loop {
+            let mut tokens = [0u32; 256];
+            let mut fetched = 0u32;
+            let result = unsafe {
+                metadata.EnumTypeDefs(&mut enumerator, tokens.as_mut_ptr(), tokens.len() as u32, &mut fetched)
+            };
+            if result.is_err() || fetched == 0 { break; }
+            for &raw in &tokens[..fetched as usize] {
+                let token = CorTokenType(raw as i32);
+                let name = get_type_name(&metadata, token);
+                if !name.is_empty() && is_in_requested_root(&name, root) {
+                    candidates.insert(name.clone());
+                    if let Some(ref mut tmap) = token_map.as_deref_mut() {
+                        tmap.entry(name).or_insert_with(|| (metadata.clone(), token));
+                    }
+                }
+            }
+        }
+        if !enumerator.is_null() {
+            unsafe { metadata.CloseEnum(enumerator) };
+        }
     }
 
     // Strategy 2: Anchor-based lookup.  Works for registered WinRT types without
@@ -1676,6 +1710,67 @@ fn collect_scan_paths(roots: &[String], input: Option<&PathBuf>, lib_paths: &[Pa
     scan_paths
 }
 
+/// Creates a Declaration directly from a metadata scope + token pair, without going
+/// through `RoGetMetaDataFile`. Used as a fallback for types that exist in WinMD
+/// files on disk but are not registered in the WinRT catalog (e.g. Windows.Web.*
+/// on some Windows configurations where RoResolveNamespace omits that namespace).
+fn make_declaration_from_token(
+    metadata: &IMetaDataImport2,
+    token: CorTokenType,
+) -> Option<Arc<RwLock<dyn Declaration>>> {
+    let mut parent_token = 0u32;
+    let mut raw_flags = 0u32;
+    if unsafe {
+        metadata.GetTypeDefProps(token.0 as u32, None, 0 as _, &mut raw_flags, &mut parent_token)
+    }.is_err() {
+        return None;
+    }
+    let flags = raw_flags as i32;
+
+    if is_td_class(flags) {
+        let pt = CorTokenType(parent_token as i32);
+        let tt = type_from_token(pt);
+        let mut parent_name = [0_u16; MAX_IDENTIFIER_LENGTH];
+        let mut size = 0_u32;
+        let parent_ok = match CorTokenType(tt) {
+            mdtTypeDef => unsafe {
+                metadata.GetTypeDefProps(parent_token, Some(&mut parent_name), &mut size, 0 as _, 0 as _)
+            }.is_ok(),
+            mdtTypeRef => unsafe {
+                metadata.GetTypeRefProps(parent_token, 0 as _, Some(&mut parent_name), &mut size)
+            }.is_ok(),
+            _ => return None,
+        };
+        if !parent_ok { return None; }
+        let parent_str = String::from_utf16_lossy(&parent_name[..size.saturating_sub(1) as usize]);
+        return if parent_str == SYSTEM_ENUM {
+            Some(Arc::new(RwLock::new(EnumDeclaration::new(Some(metadata), token))))
+        } else if parent_str == SYSTEM_VALUETYPE {
+            Some(Arc::new(RwLock::new(StructDeclaration::new(Some(metadata), token))))
+        } else if parent_str == SYSTEM_MULTICASTDELEGATE {
+            let name = get_type_name(metadata, token);
+            if name.contains('`') {
+                Some(Arc::new(RwLock::new(GenericDelegateDeclaration::new(Some(metadata), token))))
+            } else {
+                Some(Arc::new(RwLock::new(DelegateDeclaration::new(Some(metadata), token))))
+            }
+        } else {
+            Some(Arc::new(RwLock::new(ClassDeclaration::new(Some(metadata), token))))
+        };
+    }
+
+    if is_td_interface(flags) {
+        let name = get_type_name(metadata, token);
+        return if name.contains('`') {
+            Some(Arc::new(RwLock::new(GenericInterfaceDeclaration::new(Some(metadata), token))))
+        } else {
+            Some(Arc::new(RwLock::new(InterfaceDeclaration::new(Some(metadata), token))))
+        };
+    }
+
+    None
+}
+
 /// Augments `modules` with types discovered by scanning metadata files.
 /// Replaces the legacy enumerate-then-regex approach with a unified
 /// `collect_candidates_from_file` strategy that prefers the metadata API.
@@ -1688,6 +1783,8 @@ fn augment_modules_from_files(
     let scan_paths = collect_scan_paths(roots, input, lib_paths);
 
     for root in roots {
+        let mut file_type_map: BTreeMap<String, (IMetaDataImport2, CorTokenType)> = BTreeMap::new();
+
         let mut pending: VecDeque<String> = VecDeque::new();
         let mut visited: BTreeSet<String> = BTreeSet::new();
         // Candidates discovered by the initial file scan (not from scope re-enumeration).
@@ -1696,7 +1793,8 @@ fn augment_modules_from_files(
         let mut from_file_scan: BTreeSet<String> = BTreeSet::new();
 
         for path in &scan_paths {
-            for candidate in collect_candidates_from_file(path, root) {
+            let candidates = collect_candidates_with_tokens(path, root, Some(&mut file_type_map));
+            for candidate in candidates {
                 from_file_scan.insert(candidate.clone());
                 pending.push_back(candidate);
             }
@@ -1706,7 +1804,14 @@ fn augment_modules_from_files(
             if !visited.insert(candidate.clone()) {
                 continue;
             }
-            let Some(dec) = MetadataReader::find_by_name(&candidate) else { continue };
+            let dec = MetadataReader::find_by_name(&candidate).or_else(|| {
+                file_type_map.get(&candidate).and_then(|(scope, token)| {
+                    make_declaration_from_token(scope, *token)
+                })
+            });
+            let Some(dec) = dec else {
+                continue;
+            };
             let lock = dec.read();
 
             // When a candidate came from the file scan (not a sibling we added below),
