@@ -9366,20 +9366,10 @@ pub(crate) fn handle_as_delegate(
         return;
     };
 
-    let Some(declaration) = MetadataReader::find_by_name(&type_name) else {
+    let Some((guid, param_types)) = delegate_info_from_type_sig(&type_name) else {
         throw_js_error(
             scope,
-            &format!("Type not found in WinRT metadata: {}", type_name),
-        );
-        return;
-    };
-    let lock = declaration.read();
-    let kind = lock.kind();
-
-    let Some((guid, param_types)) = js_delegate_params_from_declaration(&*lock, kind) else {
-        throw_js_error(
-            scope,
-            &format!("{} is not a WinRT delegate type", type_name),
+            &format!("{} is not a known WinRT delegate type", type_name),
         );
         return;
     };
