@@ -247,6 +247,81 @@ fn dotnet_stopwatch_start_new_via_natural_namespace() {
 }
 
 #[test]
+fn winrt_jsonarray_indexof_out_wrapper() {
+    let mut rt = Runtime::new(".");
+
+    // Exercise IndexOf with omitted out arg, undefined, and explicit out wrapper.
+    // JsonArray is non-UI, so this runs in headless CI.
+    let script = r#"
+        (function(){
+            try {
+                var collection = null;
+                var item = null;
+
+                if (typeof Windows !== 'undefined' && Windows.Data && Windows.Data.Json && typeof Windows.Data.Json.JsonArray === 'function' && typeof Windows.Data.Json.JsonValue === 'function') {
+                    try {
+                        collection = new Windows.Data.Json.JsonArray();
+                        item = Windows.Data.Json.JsonValue.CreateStringValue('Test');
+                        if (collection && typeof collection.Append === 'function' && typeof collection.IndexOf === 'function') {
+                            collection.Append(item);
+                        } else {
+                            collection = null; item = null;
+                        }
+                    } catch (e) {
+                        collection = null; item = null;
+                    }
+                }
+
+                if (!collection) {
+                    return JSON.stringify({available:false});
+                }
+
+                var r1 = collection.IndexOf(item);
+                var found1 = false, idx1 = -1;
+                if (Array.isArray(r1)) { found1 = !!r1[0]; idx1 = r1[1]; } else { found1 = !!r1; }
+
+                var r2 = collection.IndexOf(item, undefined);
+                var found2 = false, idx2 = -1;
+                if (Array.isArray(r2)) { found2 = !!r2[0]; idx2 = r2[1]; } else { found2 = !!r2; }
+
+                var out = NSWinRT.interop.out('Int32');
+                var r3 = collection.IndexOf(item, out);
+                var found3 = Array.isArray(r3) ? !!r3[0] : !!r3;
+                var outv = out && out.value;
+
+                return JSON.stringify({
+                    available: true,
+                    found1: !!found1, idx1: (typeof idx1 === 'number' ? idx1 : null),
+                    found2: !!found2, idx2: (typeof idx2 === 'number' ? idx2 : null),
+                    found3: !!found3, r3IsArray: Array.isArray(r3),
+                    outvType: (typeof outv), outv: outv
+                });
+            } catch (e) {
+                return JSON.stringify({ error: String(e) });
+            }
+        })()
+    "#;
+
+    let result = eval(&mut rt, script);
+    if result.contains("\"available\":false") {
+        eprintln!("SKIP: JsonArray not available: {}", result);
+        return;
+    }
+    if result.contains("marshalled for a different thread") || result.contains("ActivateInstance failed") || result.contains("apartment") {
+        eprintln!("SKIP: JsonArray activation failed due to apartment state: {}", result);
+        return;
+    }
+
+    assert!(result.contains("\"available\":true"), "JsonArray APIs not available: {}", result);
+    assert!(result.contains("\"found1\":true"), "IndexOf omitted-out failed: {}", result);
+    assert!(result.contains("\"found2\":true"), "IndexOf undefined-out failed: {}", result);
+    assert!(result.contains("\"found3\":true"), "IndexOf wrapper-out failed: {}", result);
+    assert!(result.contains("\"r3IsArray\":false"), "Explicit out wrapper should not return a tuple: {}", result);
+    assert!(result.contains("\"outvType\":\"number\""), "Out wrapper type not number: {}", result);
+    assert!(result.contains("\"outv\":0"), "Out wrapper value should be index 0: {}", result);
+}
+
+#[test]
 fn dotnet_stopwatch_elapsed_is_numeric() {
     if !dotnet_bridge_available() { return; }
     let mut rt = Runtime::new(".");

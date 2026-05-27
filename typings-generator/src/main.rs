@@ -216,6 +216,20 @@ fn map_type_to_ts_with_generics(value: &str, generic_params: &[String]) -> Strin
         };
     }
 
+    // WinRT uses `IReference<T>` to represent nullable value types. Emit a
+    // TypeScript union `T | null` for ergonomics so consumers can assign
+    // `null` directly (e.g. `someObj.someNullable = null`).
+    if base_no_arity == "IReference" || base_no_arity.ends_with(".IReference") {
+        if let Some(inner) = value.find('<').and_then(|s| {
+            let inner = &value[s + 1..value.len().saturating_sub(1)];
+            if inner.is_empty() { None } else { Some(inner) }
+        }) {
+            let inner_ts = map_type_to_ts_with_generics(inner, generic_params);
+            return format!("{} | null", inner_ts);
+        }
+        return "unknown | null".to_string();
+    }
+
     if base_no_arity == "IVector" || base_no_arity.ends_with(".IVector") ||
        base_no_arity == "IReadOnlyList" || base_no_arity.ends_with(".IReadOnlyList") ||
        base_no_arity == "IIterable" || base_no_arity.ends_with(".IIterable") ||
@@ -606,8 +620,10 @@ fn render_interface(name: &str, interface: &InterfaceDeclaration) -> String {
     }
 
     for event in interface.events().iter().filter(|e| e.is_exported()) {
+        let ety = event_type_name(event, &[]);
+        let ety_nullable = format!("{} | null", ety);
         out.push_str(&format!("  {}: {};\n",
-            sanitize_member(event.name()), event_type_name(event, &[])));
+            sanitize_member(event.name()), ety_nullable));
     }
 
     // Emit an indexer for well-known map-like interfaces so TS consumers can
@@ -623,7 +639,13 @@ fn render_interface(name: &str, interface: &InterfaceDeclaration) -> String {
         _ => {}
     }
 
-    out.push_str("}\n\n");
+    out.push_str("}\n");
+    // Companion value declaration so the interface name is also a runtime reference.
+    // Without this, `interface IFoo {}` only creates a TS type, not a namespace value,
+    // which makes `@Interfaces([Windows.UI.Xaml.IFoo])` fail with TS2339.
+    out.push_str(&format!(
+        "var {name}: abstract new (...args: any[]) => {name};\n\n"
+    ));
     out
 }
 
@@ -706,10 +728,11 @@ fn render_class(name: &str, class_decl: &ClassDeclaration) -> String {
     for event in class_decl.events().iter().filter(|e| e.is_exported()) {
         let ename = sanitize_member(event.name());
         let ety   = event_type_name(event, &[]);
+        let ety_nullable = format!("{} | null", ety);
         if event.is_static() {
-            out.push_str(&format!("  static {ename}: {ety};\n"));
+            out.push_str(&format!("  static {ename}: {ety_nullable};\n"));
         } else {
-            out.push_str(&format!("  {ename}: {ety};\n"));
+            out.push_str(&format!("  {ename}: {ety_nullable};\n"));
         }
     }
 
@@ -863,7 +886,9 @@ fn render_generic_interface(interface: &GenericInterfaceDeclaration) -> String {
     }
 
     for event in interface.events().iter().filter(|e| e.is_exported()) {
-        out.push_str(&format!("  {}: {};\n", event.name(), event_type_name(event, &generic_params)));
+        let ety = event_type_name(event, &generic_params);
+        let ety_nullable = format!("{} | null", ety);
+        out.push_str(&format!("  {}: {};\n", event.name(), ety_nullable));
     }
 
     // Emit an indexer for well-known map-like interfaces so TS consumers can

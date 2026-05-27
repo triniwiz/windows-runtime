@@ -14,15 +14,25 @@ const GENERATED_FILE_HEADER: &str = "/* AUTO-GENERATED FILE. DO NOT MODIFY.\n * 
 pub struct Generator {
     output_dir: PathBuf,
     target_framework: String,
+    target_platform_min_version: Option<String>,
+    use_uwp: bool,
     app_sources_dirs: Vec<PathBuf>,
 }
 
 impl Generator {
     /// Create a new generator
-    pub fn new(output_dir: &Path, target_framework: &str, app_sources_dirs: Vec<PathBuf>) -> Self {
+    pub fn new(
+        output_dir: &Path,
+        target_framework: &str,
+        target_platform_min_version: Option<&str>,
+        use_uwp: bool,
+        app_sources_dirs: Vec<PathBuf>,
+    ) -> Self {
         Self {
             output_dir: output_dir.to_path_buf(),
             target_framework: target_framework.to_string(),
+            target_platform_min_version: target_platform_min_version.map(str::to_string),
+            use_uwp,
             app_sources_dirs,
         }
     }
@@ -49,17 +59,32 @@ impl Generator {
     }
 
     fn generate_csproj(&self, project_dir: &Path) -> Result<()> {
+        let target_platform_min_version = self
+            .target_platform_min_version
+            .as_ref()
+            .map(|version| {
+                format!(
+                    "    <TargetPlatformMinVersion>{}</TargetPlatformMinVersion>\n",
+                    version
+                )
+            })
+            .unwrap_or_default();
+        let use_uwp = if self.use_uwp {
+            "    <UseUwp>true</UseUwp>\n"
+        } else {
+            ""
+        };
         let csproj_content = format!(
-            r#"<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
+            r#"<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>{}</TargetFramework>
-    <OutputType>Library</OutputType>
+{}{}    <OutputType>Library</OutputType>
     <RootNamespace>NSWinRTProxies</RootNamespace>
     <AssemblyName>NSWinRTProxies</AssemblyName>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
-        <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
   </PropertyGroup>
 
   <ItemGroup>
@@ -68,7 +93,7 @@ impl Generator {
 
 </Project>
 "#,
-            self.target_framework
+            self.target_framework, target_platform_min_version, use_uwp
         );
 
         fs::write(project_dir.join("NSWinRTProxies.csproj"), csproj_content)?;
@@ -82,24 +107,22 @@ impl Generator {
             .type_name
             .clone()
             .unwrap_or_else(|| format!("{}.{}", namespace, class_name));
-        let filename = format!(
-            "{}_{}.g.cs",
-            namespace.replace('.', "_"),
-            class_name
-        );
+        let filename = format!("{}_{}.g.cs", namespace.replace('.', "_"), class_name);
         let filepath = project_dir.join(&filename);
 
         let base_type = proxy_base_type(ext_meta);
         let base_clause = format!(" : {}", base_type);
         let type_name_literal = csharp_string_literal(js_type_name.as_str());
         let class_name_literal = csharp_string_literal(class_name.as_str());
-        let method_modifier = if base_type == "object" { "public" } else { "public override" };
+        let method_modifier = if base_type == "object" {
+            "public"
+        } else {
+            "public override"
+        };
         let property_modifier = method_modifier;
 
         // Pre-size the buffer: header ~400 bytes + ~150 per method + ~120 per property
-        let capacity = 400
-            + ext_meta.methods.len() * 150
-            + ext_meta.properties.len() * 120;
+        let capacity = 400 + ext_meta.methods.len() * 150 + ext_meta.properties.len() * 120;
         let mut class_code = String::with_capacity(capacity);
         class_code.push_str(GENERATED_FILE_HEADER);
         class_code.push_str("using System;\nusing NativeScriptGeneratedProxies;\n\n");
@@ -131,7 +154,10 @@ impl Generator {
     fn generate_property(&self, prop: &PropertyMetadata, modifier: &str) -> String {
         let prop_type = normalize_csharp_type(prop.prop_type.as_str());
         let property_name = sanitize_identifier(prop.name.as_str());
-        let mut code = format!("        {} {} {}\n        {{\n", modifier, prop_type, property_name);
+        let mut code = format!(
+            "        {} {} {}\n        {{\n",
+            modifier, prop_type, property_name
+        );
 
         if prop.is_readable {
             code.push_str(&format!(
@@ -150,7 +176,8 @@ impl Generator {
         code
     }
 
-    fn generate_method(&self, method: &MethodMetadata, modifier: &str) -> String {
+    fn generate_method(&self, method: &MethodMetadata, _modifier: &str) -> String {
+        let modifier = method.modifier.as_str();
         let params = method
             .parameters
             .iter()
@@ -242,17 +269,31 @@ impl Generator {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
-                let folder_name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
-                if matches!(folder_name, "bin" | "obj" | "target" | "sbg_output" | ".git") {
+                let folder_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                if matches!(
+                    folder_name,
+                    "bin" | "obj" | "target" | "sbg_output" | ".git"
+                ) {
                     continue;
                 }
                 self.copy_cs_recursive(root, &path, destination_root, copied)?;
                 continue;
             }
 
-            if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("cs")) {
+            if path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("cs"))
+            {
                 // Skip SDK/legacy assembly info files to avoid duplicate assembly attributes
-                if path.file_name().and_then(|n| n.to_str()).map(|s| s.eq_ignore_ascii_case("AssemblyInfo.cs")).unwrap_or(false) {
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("AssemblyInfo.cs"))
+                    .unwrap_or(false)
+                {
                     continue;
                 }
                 let relative = path.strip_prefix(root).unwrap_or(path.as_path());
@@ -274,9 +315,10 @@ fn proxy_namespace(ext_meta: &ExtensionMetadata) -> String {
         .namespace
         .clone()
         .or_else(|| {
-            ext_meta.type_name.as_ref().and_then(|name| {
-                name.rfind('.').map(|index| name[..index].to_string())
-            })
+            ext_meta
+                .type_name
+                .as_ref()
+                .and_then(|name| name.rfind('.').map(|index| name[..index].to_string()))
         })
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "NativeScriptGeneratedProxies".to_string())

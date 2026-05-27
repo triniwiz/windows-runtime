@@ -1185,9 +1185,62 @@ const HELPER_SOURCE: &str = r#"
                 return pointerBufferRegistry.get(String(key));
             }
 
+            var outParamMarker = '__nswinrt_out_param__';
+
+            function looksLikeType(value) {
+                return typeof value === 'string' || typeof value === 'function';
+            }
+
+            function typeNameOf(value) {
+                if (typeof value === 'string') {
+                    return value;
+                }
+                if (typeof value === 'function') {
+                    return value.__typeName__ || value.name || '';
+                }
+                return '';
+            }
+
+            function OutParam(typeOrValue, initialValue, hasInitialValue) {
+                var typeName = looksLikeType(typeOrValue) ? typeNameOf(typeOrValue) : '';
+                Object.defineProperty(this, outParamMarker, {
+                    value: true,
+                    enumerable: false,
+                    configurable: false
+                });
+                Object.defineProperty(this, 'type', {
+                    value: typeName,
+                    enumerable: true,
+                    configurable: true,
+                    writable: true
+                });
+                this.value = hasInitialValue ? initialValue : undefined;
+            }
+
+            OutParam.prototype.out = function (value) {
+                return out(this.type || undefined, arguments.length > 0 ? value : this.value);
+            };
+
+            function out(typeOrValue, initialValue) {
+                if (arguments.length > 1) {
+                    return new OutParam(typeOrValue, initialValue, true);
+                }
+                if (looksLikeType(typeOrValue)) {
+                    return new OutParam(typeOrValue, undefined, false);
+                }
+                return new OutParam(undefined, typeOrValue, arguments.length > 0);
+            }
+
+            function isOut(value) {
+                return !!(value && typeof value === 'object' && value[outParamMarker] === true);
+            }
+
             globalThis.NSWinRT.interop = {
                 Pointer: Pointer,
+                OutParam: OutParam,
                 pointer: asPointer,
+                out: out,
+                isOut: isOut,
                 isPointer: function (value) {
                     return value instanceof Pointer;
                 },
@@ -1257,7 +1310,7 @@ const HELPER_SOURCE: &str = r#"
             var nextProxyId = 1;
 
             function ctorName(ctor) {
-                return (ctor && (ctor.__typeName__ || ctor.name)) || 'Object';
+                return (ctor && (ctor.__winrtProxyName__ || ctor.__typeName__ || ctor.name)) || 'Object';
             }
 
             var typeDescriptorCache = Object.create(null);
@@ -1386,15 +1439,7 @@ const HELPER_SOURCE: &str = r#"
             function autoProxyTypeName(baseCtor) {
                 var baseType = ctorName(baseCtor) || 'Object';
                 var baseShort = safeIdentifier(baseType.split('.').pop());
-                var baseNamespace = 'windows';
-                var namespaceIndex = baseType.lastIndexOf('.');
-                if (namespaceIndex >= 0) {
-                    baseNamespace = baseType
-                        .slice(0, namespaceIndex)
-                        .toLowerCase()
-                        .replace(/[^a-z0-9_.]/g, '_');
-                }
-                return 'com.tns.gen.winrt.' + baseNamespace + '.' + baseShort + '_AutoProxy_' + (proxyExtensions.length + 1);
+                return 'NativeScript.Gen.' + baseShort + '_' + (proxyExtensions.length + 1);
             }
 
             function renderProxyCSharp(meta) {
@@ -1504,6 +1549,14 @@ const HELPER_SOURCE: &str = r#"
                         globalThis.__nsProxyAutoCapture(JSON.stringify(proxyExtensions));
                     } catch (_) {
                         // Capture is best-effort; runtime behavior should remain unaffected.
+                    }
+                }
+               
+                if (meta.interfaces.length > 0) {
+                    if (typeof globalThis.__nsProxyCompileProject === 'function') {
+                        try { registerProxy(meta); } catch (_) { }
+                    } else if (typeof globalThis.__nsProxyWriteTextFile === 'function') {
+                        try { emitProxy(meta); } catch (_) { }
                     }
                 }
                 return meta;
@@ -1628,6 +1681,7 @@ const HELPER_SOURCE: &str = r#"
                 }
 
                 Extended.__typeName__ = typeName || ctorName(baseCtor);
+                Extended.__nsWinRTClass__ = true;
                 var metadata = buildProxyMetadata(baseCtor, typeName, overrides, Extended);
 
                 Extended.extend = function (nextNameOrOverrides, nextMaybeOverrides) {
@@ -1655,7 +1709,7 @@ const HELPER_SOURCE: &str = r#"
             if (typeof Function.prototype.extend !== 'function') {
                 Object.defineProperty(Function.prototype, 'extend', {
                     value: function (nameOrOverrides, maybeOverrides) {
-                        return makeExtendedConstructor(this, nameOrOverrides, maybeOverrides);
+                        return makeManagedConstructor(this, nameOrOverrides, maybeOverrides);
                     },
                     writable: true,
                     configurable: true,
@@ -1666,7 +1720,7 @@ const HELPER_SOURCE: &str = r#"
             if (typeof Object.extend !== 'function') {
                 Object.defineProperty(Object, 'extend', {
                     value: function (nameOrOverrides, maybeOverrides) {
-                        return makeExtendedConstructor(Object, nameOrOverrides, maybeOverrides);
+                        return makeManagedConstructor(Object, nameOrOverrides, maybeOverrides);
                     },
                     writable: true,
                     configurable: true,
@@ -1709,6 +1763,18 @@ const HELPER_SOURCE: &str = r#"
                     Object.defineProperty(Managed, 'name', { value: typeName || ctorName(baseCtor), configurable: true });
                 } catch (_) { }
                 Managed.__typeName__ = typeName || ctorName(baseCtor);
+                Managed.__nsWinRTClass__ = true;
+                var meta = buildProxyMetadata(baseCtor, typeName, overrides, Managed);
+                try {
+                    Object.defineProperty(Managed, 'emitProxy', {
+                        value: function (outDir) { return NSWinRT.proxy.emit(meta, outDir); },
+                        writable: true,
+                        configurable: true,
+                        enumerable: false,
+                    });
+                } catch (_) {
+                    Managed.emitProxy = function (outDir) { return NSWinRT.proxy.emit(meta, outDir); };
+                }
                 return Managed;
             }
 
@@ -1740,6 +1806,136 @@ const HELPER_SOURCE: &str = r#"
                 globalThis.BaseClass.extend = function (baseCtor, nameOrOverrides, maybeOverrides) {
                     return makeManagedConstructor(baseCtor || Object, nameOrOverrides, maybeOverrides);
                 };
+            }
+
+            // Registry mapping each WinRT-extended prototype to its lazy factory.
+            // Keyed by the new Child.prototype created in __extends_winrt so that
+            // the Parent.apply override can look up the right factory per subclass.
+            var __nsExtendRegistry__ = new WeakMap();
+
+            function __extends_winrt(Child, Parent) {
+                var extendStatics = Object.setPrototypeOf || function (d, b) { d.__proto__ = b; };
+                extendStatics(Child, Parent);
+
+                // Lazy factory: deferred until first `new Child()` so that TypeScript
+                // has had a chance to populate Child.prototype with override methods.
+                var _extended = null;
+                var getExtended = function () {
+                    if (!_extended) {
+                        var overrides = {};
+                        var interfaces = [];
+                        var proto = Child.prototype;
+                        if (proto) {
+                            Object.getOwnPropertyNames(proto).forEach(function (key) {
+                                if (key === 'constructor') return;
+                                if (key === 'interfaces') {
+                                    var iv = proto[key];
+                                    if (Array.isArray(iv)) interfaces = iv;
+                                    return;
+                                }
+                                overrides[key] = proto[key];
+                            });
+                        }
+                        if (interfaces.length) overrides.interfaces = interfaces;
+                        var name = Child.__winrtProxyName__ || Child.name || '';
+                        var hasBridge = typeof globalThis.__nsDotNetCreateJsSubclass === 'function';
+                        if (Child.__winrtProxyName__ || (interfaces.length > 0 && hasBridge)) {
+                            _extended = makeManagedConstructor(Parent, name, overrides);
+                        } else {
+                            // No bridge or no interfaces: pure JS proxy via Reflect.construct.
+                            _extended = makeExtendedConstructor(Parent, name, overrides);
+                        }
+                    }
+                    return _extended;
+                };
+
+                var newProto = Object.create((Parent && Parent.prototype) || Object.prototype);
+                newProto.constructor = Child;
+                Child.prototype = newProto;
+                __nsExtendRegistry__.set(newProto, getExtended);
+
+                // Patch Parent.apply/call once per parent class.  The WeakMap lookup
+                // inside the override picks the correct factory per subclass so that
+                // multiple classes extending the same parent coexist correctly.
+                if (!Parent.__nsApplyPatched__) {
+                    Parent.__nsApplyPatched__ = true;
+
+                    Parent.apply = function (thiz, args) {
+                        if (thiz && thiz.__nsContainer__) return;
+                        var factory = __nsExtendRegistry__.get(Object.getPrototypeOf(thiz));
+                        if (!factory) return;
+                        thiz.__nsContainer__ = true;
+                        try {
+                            var Extended = factory();
+                            var argArr = Array.isArray(args) ? args : (args ? Array.prototype.slice.call(args) : []);
+                            if (argArr.length > 0) {
+                                thiz.__proto__ = new (Function.prototype.bind.apply(Extended, [null].concat(argArr)))();
+                            } else {
+                                thiz.__proto__ = new Extended();
+                            }
+                            return thiz.__proto__;
+                        } finally {
+                            delete thiz.__nsContainer__;
+                        }
+                    };
+
+                    Parent.call = function (thiz) {
+                        return Parent.apply(thiz, Array.prototype.slice.call(arguments, 1));
+                    };
+                }
+            }
+
+            // Global __extends that TypeScript compiled output resolves via
+            // `var __extends = (this && this.__extends) || ...`.
+            // Intercepts WinRT parent classes; falls back to standard TS behaviour.
+            if (typeof globalThis.__extends !== 'function') {
+                var __extends_ts_inner = function (d, b) {
+                    if (b !== null && typeof b !== 'function') {
+                        throw new TypeError('Class extends value ' + String(b) + ' is not a constructor or null');
+                    }
+                    var extendStatics = Object.setPrototypeOf || function (d, b) { d.__proto__ = b; };
+                    extendStatics(d, b);
+                    function __() { this.constructor = d; }
+                    d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
+                };
+
+                globalThis.__extends = function (d, b) {
+                    if (b && b.__nsWinRTClass__) {
+                        __extends_winrt(d, b);
+                    } else {
+                        __extends_ts_inner(d, b);
+                    }
+                };
+            }
+
+            // @Interfaces([IFoo, IBar]) — attach WinRT interface list to a class.
+            if (typeof globalThis.Interfaces !== 'function') {
+                Object.defineProperty(globalThis, 'Interfaces', {
+                    value: function Interfaces(interfacesList) {
+                        return function (target) {
+                            target.prototype.interfaces = Array.isArray(interfacesList) ? interfacesList.slice() : [];
+                            return target;
+                        };
+                    },
+                    writable: true,
+                    configurable: true,
+                    enumerable: false,
+                });
+            }
+
+         
+            if (typeof globalThis.CSharpProxy !== 'function') {
+                Object.defineProperty(globalThis, 'CSharpProxy', {
+                    value: function CSharpProxy(name) {
+                        return function (target) {
+                            target.__winrtProxyName__ = typeof name === 'string' ? name : '';
+                            return target;
+                        };
+                    },
+                    writable: true,
+                    configurable: true,
+                    enumerable: false,
+                });
             }
 
             function defaultProxyOutDir(meta) {

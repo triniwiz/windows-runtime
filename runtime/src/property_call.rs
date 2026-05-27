@@ -21,7 +21,7 @@ use metadata::signature::Signature;
 use crate::error::AnyError;
 use crate::helpers::{ffi_native_type_from_signature, strip_generic_suffix};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use crate::value::{append_struct_field_bytes, ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_query_interface_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue, read_value_from_ptr, write_v8_value_to_ptr};
+use crate::value::{append_struct_field_bytes, ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_query_interface_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue, read_value_from_ptr, set_out_param_value, try_unwrap_out_param, write_v8_value_to_ptr};
 
 fn substitute_type_vars(s: &str, type_args: &[String]) -> String {
     if type_args.is_empty() {
@@ -212,13 +212,17 @@ impl PropertyCall {
 
             let parse_native_type = NativeType::try_from(signature.as_str()).ok()?;
             parse_parameter_types.push(parse_native_type);
-            let abi_native = crate::helpers::struct_native_type_for_sig(signature.as_str())
-                .unwrap_or_else(|| ffi_native_type_from_signature(signature.as_str()));
-            if matches!(abi_native, NativeType::Buffer) {
-                parameter_types.push(NativeType::U32);
-                parameter_types.push(NativeType::Buffer);
+            if parameter.is_out() || signature.trim().starts_with("ByRef ") {
+                parameter_types.push(NativeType::Pointer);
             } else {
-                parameter_types.push(abi_native);
+                let abi_native = crate::helpers::struct_native_type_for_sig(signature.as_str())
+                    .unwrap_or_else(|| ffi_native_type_from_signature(signature.as_str()));
+                if matches!(abi_native, NativeType::Buffer) {
+                    parameter_types.push(NativeType::U32);
+                    parameter_types.push(NativeType::Buffer);
+                } else {
+                    parameter_types.push(abi_native);
+                }
             }
         }
 
@@ -371,13 +375,17 @@ impl PropertyCall {
 
             let parse_native_type = NativeType::try_from(signature.as_str()).ok()?;
             parse_parameter_types.push(parse_native_type);
-            let abi_native = crate::helpers::struct_native_type_for_sig(signature.as_str())
-                .unwrap_or_else(|| crate::helpers::ffi_native_type_from_signature(signature.as_str()));
-            if matches!(abi_native, NativeType::Buffer) {
-                parameter_types.push(NativeType::U32);
-                parameter_types.push(NativeType::Buffer);
+            if parameter.is_out() || signature.trim().starts_with("ByRef ") {
+                parameter_types.push(NativeType::Pointer);
             } else {
-                parameter_types.push(abi_native);
+                let abi_native = crate::helpers::struct_native_type_for_sig(signature.as_str())
+                    .unwrap_or_else(|| crate::helpers::ffi_native_type_from_signature(signature.as_str()));
+                if matches!(abi_native, NativeType::Buffer) {
+                    parameter_types.push(NativeType::U32);
+                    parameter_types.push(NativeType::Buffer);
+                } else {
+                    parameter_types.push(abi_native);
+                }
             }
         }
 
@@ -501,13 +509,17 @@ impl PropertyCall {
             let sig = substitute_type_vars(&raw_sig, &type_args);
             let parse_native_type = NativeType::try_from(sig.as_str()).ok()?;
             parse_parameter_types.push(parse_native_type);
-            let abi_native = crate::helpers::struct_native_type_for_sig(sig.as_str())
-                .unwrap_or_else(|| crate::helpers::ffi_native_type_from_signature(sig.as_str()));
-            if matches!(abi_native, NativeType::Buffer) {
-                parameter_types.push(NativeType::U32);
-                parameter_types.push(NativeType::Buffer);
+            if parameter.is_out() || sig.trim().starts_with("ByRef ") {
+                parameter_types.push(NativeType::Pointer);
             } else {
-                parameter_types.push(abi_native);
+                let abi_native = crate::helpers::struct_native_type_for_sig(sig.as_str())
+                    .unwrap_or_else(|| crate::helpers::ffi_native_type_from_signature(sig.as_str()));
+                if matches!(abi_native, NativeType::Buffer) {
+                    parameter_types.push(NativeType::U32);
+                    parameter_types.push(NativeType::Buffer);
+                } else {
+                    parameter_types.push(abi_native);
+                }
             }
         }
 
@@ -620,7 +632,7 @@ impl PropertyCall {
         self.argument_parse_types.clear();
         let mut queried_interfaces: Vec<IUnknown> = Vec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
-        let mut out_slots: Vec<(usize, NativeType, Option<String>)> = Vec::new();
+        let mut out_slots: Vec<(usize, NativeType, Option<String>, Option<v8::Local<'s, v8::Object>>)> = Vec::new();
 
         self.argument_buf.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
         self.argument_parse_types.push(None);
@@ -631,7 +643,7 @@ impl PropertyCall {
             let parameter = &self.parameters[i];
             let param_sig_opt = parameter.metadata().map(|m| Signature::to_string(m, &parameter.type_()));
             let is_sig_byref = param_sig_opt.as_ref().map_or(false, |s| s.starts_with("ByRef "));
-            if parameter.is_out() || (is_sig_byref && values.get(i).is_none()) {
+            if parameter.is_out() || is_sig_byref {
                 let slot_index = self.argument_buf.len();
                 let slot_size = match native_type {
                     NativeType::Struct(_) => native_type.size(),
@@ -643,24 +655,25 @@ impl PropertyCall {
                 struct_scratch.push(buf);
                 self.argument_buf.push(NativeValue { pointer: ptr });
                 self.argument_parse_types.push(None);
+                let raw_init_val = value;
+                let out_wrapper = try_unwrap_out_param(scope, raw_init_val);
+                let (wrapper_obj, init_val) = match out_wrapper {
+                    Some((obj, value)) => (Some(obj), value),
+                    None => (None, raw_init_val),
+                };
+
                 // Initialize from caller-provided value if present (in/out semantics).
-                if let Some(init_val) = values.get(i).copied() {
+                if values.get(i).is_some() {
                     if !init_val.is_undefined() && !init_val.is_null() {
                         match write_v8_value_to_ptr(scope, init_val, ptr, native_type) {
-                            Ok(parse_opt) => {
-                                if let Some(pt) = parse_opt {
-                                    if let Some(slot) = self.argument_parse_types.get_mut(slot_index) {
-                                        *slot = Some(pt);
-                                    }
-                                }
-                            }
+                            Ok(_) => {}
                             Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
                         }
                     }
                 }
 
                 let sig = param_sig_opt;
-                out_slots.push((slot_index, native_type.clone(), sig));
+                out_slots.push((slot_index, native_type.clone(), sig, wrapper_obj));
                 continue;
             }
 
@@ -925,10 +938,15 @@ impl PropertyCall {
 
         // Marshal out-parameters back into V8 values using the recorded slots.
         let mut out_values: Vec<v8::Local<'s, v8::Value>> = Vec::new();
-        for (slot_index, parse_native_type, sig_opt) in out_slots.into_iter() {
+        for (slot_index, parse_native_type, sig_opt, wrapper_obj) in out_slots.into_iter() {
             let storage_ptr = unsafe { self.argument_buf.get(slot_index).map(|v| v.pointer).unwrap_or(std::ptr::null_mut()) };
             if storage_ptr.is_null() {
-                out_values.push(v8::null(scope).into());
+                let v: v8::Local<v8::Value> = v8::null(scope).into();
+                if let Some(wrapper) = wrapper_obj {
+                    let _ = set_out_param_value(scope, wrapper, v);
+                } else {
+                    out_values.push(v);
+                }
                 continue;
             }
             unsafe {
@@ -963,7 +981,11 @@ impl PropertyCall {
                     }
                     _ => read_value_from_ptr(storage_ptr as *const c_void, scope, parse_native_type.clone()),
                 };
-                out_values.push(v);
+                if let Some(wrapper) = wrapper_obj {
+                    let _ = set_out_param_value(scope, wrapper, v);
+                } else {
+                    out_values.push(v);
+                }
             }
         }
 

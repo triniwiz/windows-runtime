@@ -13,13 +13,13 @@ use std::path::Path;
 pub struct ProxyManifest {
     /// Version of the manifest format
     pub version: String,
-    
+
     /// Path to the compiled proxy assembly
     pub assembly_path: Option<String>,
-    
+
     /// List of proxy classes available in the assembly
     pub proxy_classes: Vec<ProxyClass>,
-    
+
     /// Timestamp of generation
     pub generated_at: String,
 }
@@ -35,19 +35,19 @@ pub struct ProxyClass {
 
     /// Whether the JS-visible type name was synthesized automatically
     pub is_auto_generated_name: bool,
-    
+
     /// Base class (if any)
     pub base_class: Option<String>,
-    
+
     /// Fully qualified namespace
     pub namespace: String,
-    
+
     /// Available methods
     pub methods: Vec<ProxyMethod>,
-    
+
     /// Available properties
     pub properties: Vec<ProxyProperty>,
-    
+
     /// Interfaces implemented
     pub interfaces: Vec<String>,
 }
@@ -57,10 +57,10 @@ pub struct ProxyClass {
 pub struct ProxyMethod {
     /// Method name
     pub name: String,
-    
+
     /// Return type
     pub return_type: String,
-    
+
     /// Parameter list
     pub parameters: Vec<(String, String)>,
 }
@@ -70,13 +70,13 @@ pub struct ProxyMethod {
 pub struct ProxyProperty {
     /// Property name
     pub name: String,
-    
+
     /// Property type
     pub prop_type: String,
-    
+
     /// Can be read
     pub readable: bool,
-    
+
     /// Can be written
     pub writable: bool,
 }
@@ -101,7 +101,9 @@ impl ProxyManifest {
                 type_name: ext.type_name.clone(),
                 is_auto_generated_name: ext.is_auto_generated_name,
                 base_class: ext.base_class,
-                namespace: ext.namespace.unwrap_or_else(|| "NSWinRTProxies".to_string()),
+                namespace: ext
+                    .namespace
+                    .unwrap_or_else(|| "NSWinRTProxies".to_string()),
                 methods: ext
                     .methods
                     .into_iter()

@@ -22,7 +22,7 @@ use metadata::signature::Signature;
 use crate::error::AnyError;
 use crate::helpers::{ffi_native_type_from_signature, strip_generic_suffix};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use crate::value::{append_struct_field_bytes, ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_query_interface_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue, read_value_from_ptr, write_v8_value_to_ptr};
+use crate::value::{append_struct_field_bytes, ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_query_interface_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue, read_value_from_ptr, set_out_param_value, try_unwrap_out_param, write_v8_value_to_ptr};
 use crate::DeclarationFFI;
 
 pub struct MethodCall {
@@ -261,7 +261,7 @@ impl MethodCall {
             // If this parameter is an out (ByRef) parameter, represent its
             // ABI as a pointer to the underlying storage so callers allocate
             // space and pass the address for the callee to write into.
-            if parameter.is_out() {
+            if parameter.is_out() || signature.trim().starts_with("ByRef ") {
                 parameter_types.push(NativeType::Pointer);
             } else {
                 // If the parsed parameter is a WinRT `String`, treat its ABI as
@@ -427,7 +427,7 @@ impl MethodCall {
         let mut queried_interfaces: Vec<IUnknown> = Vec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
         // Track out-parameter slots: (argument_buf index, parse_native_type, optional signature)
-        let mut out_slots: Vec<(usize, NativeType, Option<String>)> = Vec::new();
+        let mut out_slots: Vec<(usize, NativeType, Option<String>, Option<v8::Local<'s, v8::Object>>)> = Vec::new();
 
         self.argument_buf.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
         self.argument_parse_types.push(None);
@@ -441,7 +441,7 @@ impl MethodCall {
             // Handle out (ByRef) parameters by allocating stable storage that
             // the callee can write into. Also treat a missing caller argument
             // for a `ByRef` signature as an implicit out-slot (e.g. TryParse).
-            if parameter.is_out() || (is_sig_byref && (args.length() as usize) <= i) {
+            if parameter.is_out() || is_sig_byref {
                 let slot_index = self.argument_buf.len();
                 let slot_size = match native_type {
                     NativeType::Struct(_) => native_type.size(),
@@ -456,20 +456,18 @@ impl MethodCall {
                 // from the caller's JS value below, we'll set it accordingly.
                 self.argument_parse_types.push(None);
 
+                let raw_init_val = args.get(i as i32);
+                let out_wrapper = try_unwrap_out_param(scope, raw_init_val);
+                let (wrapper_obj, init_val) = match out_wrapper {
+                    Some((obj, value)) => (Some(obj), value),
+                    None => (None, raw_init_val),
+                };
+
                 // Try to initialize from caller-provided argument if present.
                 if (args.length() as usize) > i {
-                    let init_val = args.get(i as i32);
                     if !init_val.is_undefined() && !init_val.is_null() {
                         match write_v8_value_to_ptr(scope, init_val, ptr, native_type) {
-                            Ok(parse_opt) => {
-                                if let Some(pt) = parse_opt {
-                                    // Update parse-type for this slot so string handling
-                                    // in prepare_string_storage can detect it.
-                                    if let Some(slot) = self.argument_parse_types.get_mut(slot_index) {
-                                        *slot = Some(pt);
-                                    }
-                                }
-                            }
+                            Ok(_) => {}
                             Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
                         }
                     }
@@ -478,7 +476,7 @@ impl MethodCall {
                 // Capture the parameter signature so we can create proper WinRT
                 // wrapper objects for out-pointer returns (e.g. IJsonValue).
                 let sig = param_sig_opt;
-                out_slots.push((slot_index, native_type.clone(), sig));
+                out_slots.push((slot_index, native_type.clone(), sig, wrapper_obj));
                 continue;
             }
 
@@ -856,10 +854,15 @@ impl MethodCall {
 
         // Marshal out-parameters back into V8 values using the recorded slots.
         let mut out_values: Vec<v8::Local<'s, v8::Value>> = Vec::new();
-        for (slot_index, parse_native_type, sig_opt) in out_slots.into_iter() {
+        for (slot_index, parse_native_type, sig_opt, wrapper_obj) in out_slots.into_iter() {
             let storage_ptr = unsafe { self.argument_buf.get(slot_index).map(|v| v.pointer).unwrap_or(std::ptr::null_mut()) };
             if storage_ptr.is_null() {
-                out_values.push(v8::null(scope).into());
+                let v: v8::Local<v8::Value> = v8::null(scope).into();
+                if let Some(wrapper) = wrapper_obj {
+                    let _ = set_out_param_value(scope, wrapper, v);
+                } else {
+                    out_values.push(v);
+                }
                 continue;
             }
             unsafe {
@@ -902,7 +905,11 @@ impl MethodCall {
                     }
                     _ => read_value_from_ptr(storage_ptr as *const c_void, scope, parse_native_type.clone()),
                 };
-                out_values.push(v);
+                if let Some(wrapper) = wrapper_obj {
+                    let _ = set_out_param_value(scope, wrapper, v);
+                } else {
+                    out_values.push(v);
+                }
             }
         }
 

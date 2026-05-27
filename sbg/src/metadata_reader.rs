@@ -1,5 +1,5 @@
 //! Metadata reader for SBG
-//! 
+//!
 //! Reads extension metadata from various sources:
 //! - Extension JSON files
 //! - WinRT metadata files
@@ -31,6 +31,12 @@ pub struct MethodMetadata {
     pub name: String,
     pub return_type: String,
     pub parameters: Vec<(String, String)>, // (name, type)
+    #[serde(default = "default_method_modifier")]
+    pub modifier: String,
+}
+
+fn default_method_modifier() -> String {
+    "public override".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,8 +92,8 @@ impl MetadataReader {
             return Ok(Vec::new());
         }
 
-        for entry in fs::read_dir(&self.source)
-            .map_err(|e| anyhow!("Failed to read directory: {}", e))?
+        for entry in
+            fs::read_dir(&self.source).map_err(|e| anyhow!("Failed to read directory: {}", e))?
         {
             let entry = entry?;
             let path = entry.path();
@@ -167,13 +173,21 @@ fn parse_runtime_entry(item: &Value) -> Option<ExtensionMetadata> {
     let methods = obj
         .get("methods")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(parse_runtime_method).collect::<Vec<_>>())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(parse_runtime_method)
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
 
     let properties = obj
         .get("properties")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(parse_runtime_property).collect::<Vec<_>>())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(parse_runtime_property)
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
 
     let interfaces = obj
@@ -208,6 +222,7 @@ fn parse_runtime_method(entry: &Value) -> Option<MethodMetadata> {
             name: name.to_string(),
             return_type: "void".to_string(),
             parameters: Vec::new(),
+            modifier: default_method_modifier(),
         });
     }
 
@@ -224,11 +239,17 @@ fn parse_runtime_method(entry: &Value) -> Option<MethodMetadata> {
         .and_then(|value| value.as_array())
         .map(|entries| entries.iter().filter_map(parse_runtime_parameter).collect())
         .unwrap_or_default();
+    let modifier = obj
+        .get("modifier")
+        .and_then(|value| value.as_str())
+        .unwrap_or("public override")
+        .to_string();
 
     Some(MethodMetadata {
         name,
         return_type,
         parameters,
+        modifier,
     })
 }
 

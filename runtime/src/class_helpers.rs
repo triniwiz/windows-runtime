@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration::Declaration;
@@ -6,6 +5,7 @@ use metadata::declarations::event_declaration::EventDeclaration;
 use metadata::declarations::method_declaration::MethodDeclaration;
 use metadata::declarations::property_declaration::PropertyDeclaration;
 use metadata::meta_data_reader::MetadataReader;
+use std::collections::HashSet;
 
 pub(crate) fn split_type_name(type_name: &str) -> (Option<String>, String) {
     match type_name.rsplit_once('.') {
@@ -54,7 +54,9 @@ pub(crate) fn extend_class_methods(
     }
 
     if !class_declaration.base_full_name().is_empty() {
-        if let Some(base_declaration) = MetadataReader::find_by_name(class_declaration.base_full_name()) {
+        if let Some(base_declaration) =
+            MetadataReader::find_by_name(class_declaration.base_full_name())
+        {
             let base_lock = base_declaration.read();
             if let Some(base_class) = base_lock.as_any().downcast_ref::<ClassDeclaration>() {
                 extend_class_methods(base_class, methods, seen);
@@ -91,7 +93,9 @@ pub(crate) fn extend_class_properties(
     }
 
     if !class_declaration.base_full_name().is_empty() {
-        if let Some(base_declaration) = MetadataReader::find_by_name(class_declaration.base_full_name()) {
+        if let Some(base_declaration) =
+            MetadataReader::find_by_name(class_declaration.base_full_name())
+        {
             let base_lock = base_declaration.read();
             if let Some(base_class) = base_lock.as_any().downcast_ref::<ClassDeclaration>() {
                 extend_class_properties(base_class, properties, seen);
@@ -100,14 +104,18 @@ pub(crate) fn extend_class_properties(
     }
 }
 
-pub(crate) fn collect_class_methods(class_declaration: &ClassDeclaration) -> Vec<MethodDeclaration> {
+pub(crate) fn collect_class_methods(
+    class_declaration: &ClassDeclaration,
+) -> Vec<MethodDeclaration> {
     let mut methods = Vec::new();
     let mut seen = HashSet::new();
     extend_class_methods(class_declaration, &mut methods, &mut seen);
     methods
 }
 
-pub(crate) fn collect_class_properties(class_declaration: &ClassDeclaration) -> Vec<PropertyDeclaration> {
+pub(crate) fn collect_class_properties(
+    class_declaration: &ClassDeclaration,
+) -> Vec<PropertyDeclaration> {
     let mut properties = Vec::new();
     let mut seen = HashSet::new();
     extend_class_properties(class_declaration, &mut properties, &mut seen);
@@ -118,8 +126,15 @@ pub(crate) fn collect_class_properties(class_declaration: &ClassDeclaration) -> 
 /// implemented interfaces, and base-class chain — returning as soon as one
 /// matches. Used on every property write, so it skips the `Vec` allocation
 /// and full hierarchy walk that `collect_class_properties` does.
-pub(crate) fn find_class_property(class_declaration: &ClassDeclaration, name: &str) -> Option<PropertyDeclaration> {
-    if let Some(p) = class_declaration.properties().iter().find(|p| p.name() == name) {
+pub(crate) fn find_class_property(
+    class_declaration: &ClassDeclaration,
+    name: &str,
+) -> Option<PropertyDeclaration> {
+    if let Some(p) = class_declaration
+        .properties()
+        .iter()
+        .find(|p| p.name() == name)
+    {
         return Some(p.clone());
     }
     if let Some(di) = class_declaration.default_interface() {
@@ -133,7 +148,9 @@ pub(crate) fn find_class_property(class_declaration: &ClassDeclaration, name: &s
         }
     }
     if !class_declaration.base_full_name().is_empty() {
-        if let Some(base_declaration) = MetadataReader::find_by_name(class_declaration.base_full_name()) {
+        if let Some(base_declaration) =
+            MetadataReader::find_by_name(class_declaration.base_full_name())
+        {
             let base_lock = base_declaration.read();
             if let Some(base_class) = base_lock.as_any().downcast_ref::<ClassDeclaration>() {
                 return find_class_property(base_class, name);
@@ -146,7 +163,10 @@ pub(crate) fn find_class_property(class_declaration: &ClassDeclaration, name: &s
 /// Look up a method by name. Matches the overload name when present, falling
 /// back to the plain name. Walks the class hierarchy and returns the first
 /// match. Same hot-path benefit as `find_class_property`.
-pub(crate) fn find_class_method(class_declaration: &ClassDeclaration, name: &str) -> Option<MethodDeclaration> {
+pub(crate) fn find_class_method(
+    class_declaration: &ClassDeclaration,
+    name: &str,
+) -> Option<MethodDeclaration> {
     let matches = |m: &MethodDeclaration| {
         let on = m.overload_name();
         (!on.is_empty() && on == name) || m.name() == name
@@ -165,7 +185,9 @@ pub(crate) fn find_class_method(class_declaration: &ClassDeclaration, name: &str
         }
     }
     if !class_declaration.base_full_name().is_empty() {
-        if let Some(base_declaration) = MetadataReader::find_by_name(class_declaration.base_full_name()) {
+        if let Some(base_declaration) =
+            MetadataReader::find_by_name(class_declaration.base_full_name())
+        {
             let base_lock = base_declaration.read();
             if let Some(base_class) = base_lock.as_any().downcast_ref::<ClassDeclaration>() {
                 return find_class_method(base_class, name);
@@ -181,14 +203,20 @@ pub(crate) fn class_method_matches(class_declaration: &ClassDeclaration, name: &
         (!on.is_empty() && on == name) || m.name() == name
     };
 
-    if class_declaration.methods().iter().any(method_match) { return true; }
+    if class_declaration.methods().iter().any(method_match) {
+        return true;
+    }
 
     if let Some(di) = class_declaration.default_interface() {
-        if di.methods().iter().any(method_match) { return true; }
+        if di.methods().iter().any(method_match) {
+            return true;
+        }
     }
 
     for iface in class_declaration.implemented_interfaces() {
-        if iface.methods().iter().any(method_match) { return true; }
+        if iface.methods().iter().any(method_match) {
+            return true;
+        }
     }
 
     if !class_declaration.base_full_name().is_empty() {
@@ -203,14 +231,24 @@ pub(crate) fn class_method_matches(class_declaration: &ClassDeclaration, name: &
 }
 
 pub(crate) fn class_property_matches(class_declaration: &ClassDeclaration, name: &str) -> bool {
-    if class_declaration.properties().iter().any(|p| p.name() == name) { return true; }
+    if class_declaration
+        .properties()
+        .iter()
+        .any(|p| p.name() == name)
+    {
+        return true;
+    }
 
     if let Some(di) = class_declaration.default_interface() {
-        if di.properties().iter().any(|p| p.name() == name) { return true; }
+        if di.properties().iter().any(|p| p.name() == name) {
+            return true;
+        }
     }
 
     for iface in class_declaration.implemented_interfaces() {
-        if iface.properties().iter().any(|p| p.name() == name) { return true; }
+        if iface.properties().iter().any(|p| p.name() == name) {
+            return true;
+        }
     }
 
     if !class_declaration.base_full_name().is_empty() {
@@ -228,6 +266,83 @@ pub(crate) fn class_has_member_named(class_declaration: &ClassDeclaration, name:
     class_method_matches(class_declaration, name) || class_property_matches(class_declaration, name)
 }
 
+/// Collects all properties in the class hierarchy, each paired with the full
+/// name of the WinRT class that declares that property. For static properties
+/// this lets callers retrieve the correct activation factory (e.g. UIElement's
+/// factory, not Panel's, for `UIElement.PointerPressedEvent`).
+pub(crate) fn collect_class_properties_with_declaring(
+    class_declaration: &ClassDeclaration,
+) -> Vec<(PropertyDeclaration, String)> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    extend_properties_with_declaring(
+        class_declaration,
+        class_declaration.full_name(),
+        &mut result,
+        &mut seen,
+    );
+    result
+}
+
+fn extend_properties_with_declaring(
+    class_declaration: &ClassDeclaration,
+    declaring_name: &str,
+    result: &mut Vec<(PropertyDeclaration, String)>,
+    seen: &mut HashSet<String>,
+) {
+    for property in class_declaration.properties() {
+        if seen.insert(property.name().to_string()) {
+            result.push((property.clone(), declaring_name.to_string()));
+        }
+    }
+    if let Some(di) = class_declaration.default_interface() {
+        for property in di.properties() {
+            if seen.insert(property.name().to_string()) {
+                result.push((property.clone(), declaring_name.to_string()));
+            }
+        }
+    }
+    for iface in class_declaration.implemented_interfaces() {
+        for property in iface.properties() {
+            if seen.insert(property.name().to_string()) {
+                result.push((property.clone(), declaring_name.to_string()));
+            }
+        }
+    }
+    if !class_declaration.base_full_name().is_empty() {
+        if let Some(base_decl) = MetadataReader::find_by_name(class_declaration.base_full_name()) {
+            let base_lock = base_decl.read();
+            if let Some(base_class) = base_lock.as_any().downcast_ref::<ClassDeclaration>() {
+                extend_properties_with_declaring(base_class, base_class.full_name(), result, seen);
+            }
+        }
+    }
+}
+
+/// Walk the class hierarchy to find which WinRT class actually declares a given
+/// static property. Returns the full class name (e.g. "Windows.UI.Xaml.UIElement").
+pub(crate) fn find_static_property_declaring_class(
+    class_declaration: &ClassDeclaration,
+    name: &str,
+) -> Option<String> {
+    if class_declaration
+        .properties()
+        .iter()
+        .any(|p| p.name() == name && p.is_static())
+    {
+        return Some(class_declaration.full_name().to_string());
+    }
+    if !class_declaration.base_full_name().is_empty() {
+        if let Some(base_decl) = MetadataReader::find_by_name(class_declaration.base_full_name()) {
+            let base_lock = base_decl.read();
+            if let Some(base_class) = base_lock.as_any().downcast_ref::<ClassDeclaration>() {
+                return find_static_property_declaring_class(base_class, name);
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn find_event_methods(
     class_declaration: &ClassDeclaration,
     name: &str,
@@ -239,12 +354,18 @@ pub(crate) fn find_event_methods(
             .map(|e| (e.add_method().clone(), e.remove_method().clone()))
     };
 
-    if let Some(m) = check(class_declaration.events()) { return Some(m); }
+    if let Some(m) = check(class_declaration.events()) {
+        return Some(m);
+    }
     if let Some(di) = class_declaration.default_interface() {
-        if let Some(m) = check(di.events()) { return Some(m); }
+        if let Some(m) = check(di.events()) {
+            return Some(m);
+        }
     }
     for iface in class_declaration.implemented_interfaces() {
-        if let Some(m) = check(iface.events()) { return Some(m); }
+        if let Some(m) = check(iface.events()) {
+            return Some(m);
+        }
     }
     if !class_declaration.base_full_name().is_empty() {
         if let Some(base_decl) = MetadataReader::find_by_name(class_declaration.base_full_name()) {

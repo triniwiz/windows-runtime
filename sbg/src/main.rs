@@ -27,15 +27,21 @@ use metadata_reader::MetadataReader;
 pub struct SbgConfig {
     /// Input metadata source (path to extension metadata JSON or WinRT files)
     pub metadata_source: PathBuf,
-    
+
     /// Output directory for generated C# files
     pub output_dir: PathBuf,
-    
+
     /// Path to dotnet executable
     pub dotnet_path: String,
-    
+
     /// Target framework for generated C# (e.g., "net8.0-windows")
     pub target_framework: String,
+
+    /// Optional minimum Windows version for the generated C# project.
+    pub target_platform_min_version: Option<String>,
+
+    /// Whether the generated C# project should enable UWP support.
+    pub use_uwp: bool,
 
     /// Optional list of directories with developer-authored C# sources that should be
     /// compiled into the generated proxy assembly.
@@ -49,6 +55,8 @@ impl Default for SbgConfig {
             output_dir: PathBuf::from("./obj/_ns_/gen"),
             dotnet_path: "dotnet".to_string(),
             target_framework: "net8.0-windows10.0.19041.0".to_string(),
+            target_platform_min_version: None,
+            use_uwp: true,
             app_cs_sources_dirs: Vec::new(),
         }
     }
@@ -68,12 +76,18 @@ impl StaticBindingGenerator {
     /// Run the full SBG pipeline
     pub fn generate(&self) -> Result<ProxyManifest> {
         println!("[SBG] Static Binding Generator - Pre-build Phase");
-        println!("[SBG] Reading metadata from: {}", self.config.metadata_source.display());
+        println!(
+            "[SBG] Reading metadata from: {}",
+            self.config.metadata_source.display()
+        );
 
         // Phase 1: Read metadata
         let metadata_reader = MetadataReader::new(&self.config.metadata_source);
         let extensions_metadata = metadata_reader.read()?;
-        println!("[SBG] Phase 1: Metadata captured - {} extensions found", extensions_metadata.len());
+        println!(
+            "[SBG] Phase 1: Metadata captured - {} extensions found",
+            extensions_metadata.len()
+        );
 
         if extensions_metadata.is_empty() {
             println!("[SBG] No extensions to generate, skipping C# compilation");
@@ -87,21 +101,32 @@ impl StaticBindingGenerator {
         let generator = Generator::new(
             &self.config.output_dir,
             &self.config.target_framework,
+            self.config.target_platform_min_version.as_deref(),
+            self.config.use_uwp,
             self.config.app_cs_sources_dirs.clone(),
         );
         let (project_path, app_sources_count) = generator.generate(&extensions_metadata)?;
-        println!("[SBG] Phase 2: C# proxy code generated at: {}", project_path.display());
+        println!(
+            "[SBG] Phase 2: C# proxy code generated at: {}",
+            project_path.display()
+        );
         if app_sources_count > 0 {
             println!("[SBG] Included {app_sources_count} app C# source file(s)");
         }
 
         // Phase 3: Compile C# project
         let assembly_path = self.compile_csharp(&project_path)?;
-        println!("[SBG] Phase 3: C# compilation complete - Assembly: {}", assembly_path.display());
+        println!(
+            "[SBG] Phase 3: C# compilation complete - Assembly: {}",
+            assembly_path.display()
+        );
 
         // Phase 4: Create manifest for runtime linking
         let manifest = ProxyManifest::from_extensions(extensions_metadata, &assembly_path)?;
-        println!("[SBG] Phase 4: Manifest created - {} proxy classes", manifest.proxy_classes.len());
+        println!(
+            "[SBG] Phase 4: Manifest created - {} proxy classes",
+            manifest.proxy_classes.len()
+        );
 
         // Write manifest as JSON for runtime consumption
         let manifest_path = self.config.output_dir.join("sbg-manifest.json");
@@ -126,8 +151,13 @@ impl StaticBindingGenerator {
             .map_err(|e| anyhow!("Failed to run dotnet: {}", e))?;
 
         if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("C# compilation failed:\n{}", stderr));
+            return Err(anyhow!(
+                "C# compilation failed:\nstdout:\n{}\nstderr:\n{}",
+                stdout,
+                stderr
+            ));
         }
 
         // Determine assembly output path (convention: bin/Release/<target framework>/ProjectName.dll)
@@ -170,7 +200,10 @@ fn include_to_source_dir(csproj_dir: &Path, include: &str) -> Option<PathBuf> {
         }
     } else {
         let include_path = PathBuf::from(normalized);
-        if include_path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("cs")) {
+        if include_path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cs"))
+        {
             csproj_dir.join(include_path.parent().unwrap_or_else(|| Path::new("")))
         } else {
             csproj_dir.join(include_path)
@@ -193,7 +226,10 @@ fn discover_csproj_files(root: &Path, output: &mut Vec<PathBuf>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
             if matches!(name, ".git" | "target" | "sbg_output" | "bin" | "obj") {
                 continue;
             }
@@ -201,7 +237,10 @@ fn discover_csproj_files(root: &Path, output: &mut Vec<PathBuf>) {
             continue;
         }
 
-        if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("csproj")) {
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("csproj"))
+        {
             output.push(path);
         }
     }
@@ -212,7 +251,9 @@ fn discover_app_source_dirs(workspace_root: &Path) -> Vec<PathBuf> {
 
     let conventional_lower = workspace_root.join("app").join("CSharp");
     if conventional_lower.exists() {
-        let path = conventional_lower.canonicalize().unwrap_or(conventional_lower);
+        let path = conventional_lower
+            .canonicalize()
+            .unwrap_or(conventional_lower);
         discovered.insert(path);
     } else {
         let conventional = workspace_root.join("App").join("CSharp");
@@ -245,7 +286,9 @@ fn discover_app_source_dirs(workspace_root: &Path) -> Vec<PathBuf> {
         }
 
         if !includes_found {
-            let fallback = csproj_dir.canonicalize().unwrap_or_else(|_| csproj_dir.to_path_buf());
+            let fallback = csproj_dir
+                .canonicalize()
+                .unwrap_or_else(|_| csproj_dir.to_path_buf());
             discovered.insert(fallback);
         }
     }
@@ -274,6 +317,18 @@ fn main() -> Result<()> {
     }
     if let Ok(framework) = std::env::var("SBG_TARGET_FRAMEWORK") {
         config.target_framework = framework;
+    }
+    if let Ok(min_version) = std::env::var("SBG_TARGET_PLATFORM_MIN_VERSION") {
+        let min_version = min_version.trim();
+        if !min_version.is_empty() {
+            config.target_platform_min_version = Some(min_version.to_string());
+        }
+    }
+    if let Ok(use_uwp) = std::env::var("SBG_USE_UWP") {
+        config.use_uwp = !matches!(
+            use_uwp.trim().to_ascii_lowercase().as_str(),
+            "" | "false" | "0" | "no"
+        );
     }
     if let Ok(app_sources) = std::env::var("SBG_APP_CS_SOURCES_DIR") {
         let parsed = parse_source_dirs_from_env(app_sources.as_str());

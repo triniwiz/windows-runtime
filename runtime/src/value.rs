@@ -1608,4 +1608,40 @@ pub fn write_v8_value_to_ptr(
         NativeType::Void => Ok(None),
     }
 }
-    
+
+const OUT_PARAM_MARKER: &str = "__nswinrt_out_param__";
+
+/// Detects an `NSWinRT.interop.out(...)` wrapper and returns its object plus
+/// the wrapped `value` that should initialize the native byref slot.
+pub fn try_unwrap_out_param<'scope, 'value>(
+    scope: &mut v8::PinScope<'scope, '_>,
+    arg: v8::Local<'value, v8::Value>,
+) -> Option<(v8::Local<'scope, v8::Object>, v8::Local<'scope, v8::Value>)> {
+    if !arg.is_object() {
+        return None;
+    }
+
+    let object = arg.to_object(scope)?;
+    let marker_key = v8::String::new(scope, OUT_PARAM_MARKER)?;
+    let marker = object.get(scope, marker_key.into())?;
+    if !marker.boolean_value(scope) {
+        return None;
+    }
+
+    let value_key = v8::String::new(scope, "value")?;
+    let value = object
+        .get(scope, value_key.into())
+        .unwrap_or_else(|| v8::undefined(scope).into());
+    Some((object, value))
+}
+
+pub fn set_out_param_value<'a>(
+    scope: &mut v8::PinScope<'a, '_>,
+    wrapper: v8::Local<'a, v8::Object>,
+    value: v8::Local<'a, v8::Value>,
+) -> bool {
+    let Some(value_key) = v8::String::new(scope, "value") else {
+        return false;
+    };
+    wrapper.set(scope, value_key.into(), value).unwrap_or(false)
+}
