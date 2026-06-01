@@ -80,19 +80,14 @@ namespace __PROJECT_NAME__
                 CompositionTarget.Rendering -= OnRenderFrame;
                 CompositionTarget.Rendering += OnRenderFrame;
 
-                if (CurrentWindow.Content == null)
+                try
                 {
-                    CurrentWindow.Content = new TextBlock
+                    if (CurrentWindow?.Content != null)
                     {
-                        Text = "NativeScript runtime initialized but no UI was rendered.\n" +
-                               "Check the Output window for JS errors.",
-                        Margin = new Thickness(20),
-                        TextWrapping = TextWrapping.Wrap,
-                        FontSize = 16,
-                    };
+                        CurrentWindow.Activate();
+                    }
                 }
-
-                CurrentWindow.Activate();
+                catch { }
             }
 
             // After any await, the continuation may run on a thread pool thread.
@@ -110,13 +105,11 @@ namespace __PROJECT_NAME__
         private void OnWindowClosed(object sender, WindowEventArgs e)
         {
             CompositionTarget.Rendering -= OnRenderFrame;
-            // Fire the JS `exit` event while the V8 isolate is still alive (before Dispose).
             _runtimeHost.NotifyAppEvent("{\"kind\":\"exit\"}");
             ApplicationData.Current.LocalSettings.Values[LastLaunchArgsKey] = string.Empty;
             _runtimeHost.Dispose();
         }
 
-        // WindowActivationState.Deactivated → lost focus (background); otherwise foreground/resume.
         private void OnWindowActivated(object sender, WindowActivatedEventArgs e)
         {
             var kind = e.WindowActivationState == WindowActivationState.Deactivated ? "deactivated" : "activated";
@@ -133,7 +126,6 @@ namespace __PROJECT_NAME__
             e.Handled = true;
             var jsError = _runtimeHost.GetLastJsError();
 
-            // Surface to the JS `uncaughtError` application event before reporting.
             try
             {
                 var payload = JsonSerializer.Serialize(new { kind = "uncaughtError", message = e.Message ?? jsError ?? "Unhandled exception" });

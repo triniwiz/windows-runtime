@@ -80,19 +80,17 @@ namespace NativeScriptWindowsDemo
                 CompositionTarget.Rendering -= OnRenderFrame;
                 CompositionTarget.Rendering += OnRenderFrame;
 
-                if (CurrentWindow.Content == null)
+                // NativeScript (JS) creates, populates and activates the application Window.
+                // Only activate this host-owned window if JS put content on it; otherwise leave it
+                // hidden so we don't pop an empty second window.
+                try
                 {
-                    CurrentWindow.Content = new TextBlock
+                    if (CurrentWindow?.Content != null)
                     {
-                        Text = "NativeScript runtime initialized but no UI was rendered.\n" +
-                               "Check the Output window for JS errors.",
-                        Margin = new Thickness(20),
-                        TextWrapping = TextWrapping.Wrap,
-                        FontSize = 16,
-                    };
+                        CurrentWindow.Activate();
+                    }
                 }
-
-                CurrentWindow.Activate();
+                catch { /* JS owns its own Window */ }
             }
 
             // After any await, the continuation may run on a thread pool thread.
