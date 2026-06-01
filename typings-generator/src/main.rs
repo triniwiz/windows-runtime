@@ -2251,17 +2251,69 @@ fn is_dotnet_mode(config: &GeneratorConfig) -> bool {
     !config.roots.iter().any(|r| r == "Windows" || r.starts_with("Windows."))
 }
 
-fn run_dotnet_typings_gen(config: &GeneratorConfig) {
-    // The C# sub-tool lives next to this source file's project directory.
+/// Command that launches the C# `dotnet-typings-gen` sub-tool (callers append its args last).
+/// Prefers a published build next to this exe (`dotnet <dll>`, then apphost `.exe`); falls back
+/// to `dotnet run --project` from the source tree (CARGO_MANIFEST_DIR — dev only).
+fn dotnet_typings_gen_command() -> std::process::Command {
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            // Arch-agnostic via `dotnet <dll>`.
+            for dll in [
+                dir.join("dotnet-typings-gen").join("dotnet-typings-gen.dll"),
+                dir.join("dotnet-typings-gen.dll"),
+            ] {
+                if dll.exists() {
+                    let mut cmd = std::process::Command::new("dotnet");
+                    cmd.arg(dll);
+                    return cmd;
+                }
+            }
+            // Self-contained / apphost executable fallback.
+            for tool_exe in [
+                dir.join("dotnet-typings-gen").join("dotnet-typings-gen.exe"),
+                dir.join("dotnet-typings-gen.exe"),
+            ] {
+                if tool_exe.exists() {
+                    return std::process::Command::new(tool_exe);
+                }
+            }
+        }
+    }
+
+    // Dev fallback: compile & run the sub-tool from source.
     let this_manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let sub_proj = this_manifest.join("dotnet-src").join("dotnet-typings-gen.csproj");
-
     let mut cmd = std::process::Command::new("dotnet");
-    cmd.arg("run")
-        .arg("--project").arg(&sub_proj)
-        .arg("--")
-        .arg("--input").arg(config.input.as_ref().unwrap())
-        .arg("--out").arg(&config.out);
+    cmd.arg("run").arg("--project").arg(&sub_proj).arg("--");
+    cmd
+}
+
+fn run_dotnet_typings_gen(config: &GeneratorConfig) {
+    // Sub-tool emits a single `--out` file; when `--out-dir` was given, write into it.
+    let out_path = match &config.out_dir {
+        Some(dir) => {
+            let _ = fs::create_dir_all(dir);
+            let stem = config
+                .roots
+                .iter()
+                .find(|r| !r.starts_with("Windows"))
+                .cloned()
+                .or_else(|| {
+                    config
+                        .input
+                        .as_ref()
+                        .and_then(|p| p.file_stem())
+                        .map(|s| s.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| "dotnet".to_string());
+            dir.join(format!("{}.d.ts", stem))
+        }
+        None => config.out.clone(),
+    };
+
+    let mut cmd = dotnet_typings_gen_command();
+    cmd.arg("--input").arg(config.input.as_ref().unwrap())
+        .arg("--out").arg(&out_path);
 
     for root in &config.roots {
         cmd.arg("--root").arg(root);
@@ -2275,19 +2327,29 @@ fn run_dotnet_typings_gen(config: &GeneratorConfig) {
 }
 
 fn main() {
-    // Initialize COM MTA so that CoCreateInstance(CLSID_CorMetaDataDispenser) works
-    // in OpenMetadataScope (used by open_metadata_scope_from_file in Phase 2).
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() };
 
     let config = parse_args();
 
-    // Dotnet mode: delegate to the C# reflection-based sub-tool.
     if is_dotnet_mode(&config) {
         run_dotnet_typings_gen(&config);
         return;
     }
 
-    // Phase 1: BFS namespace walk — discovers types reachable via RoResolveNamespace.
+    if let Some(input) = &config.input {
+        let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        let only_windows_roots = config.roots.iter().all(|r| r == "Windows" || r.starts_with("Windows."));
+        if ext == "winmd" && !config.roots.is_empty() && !only_windows_roots {
+            eprintln!(
+                "[typings-generator] Refusing to render non-Windows namespaces ({}) from a raw .winmd — \
+the COM metadata path is unreliable for cross-assembly references. Pass the CsWinRT-projected .dll \
+instead (e.g. Microsoft.WinUI.dll / *.Projection.dll); it uses the safe reflection path.",
+                config.roots.join(", ")
+            );
+            std::process::exit(2);
+        }
+    }
+
     let mut modules: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for root in &config.roots {
         let generated = walk_namespace(root.as_str());
@@ -2296,8 +2358,6 @@ fn main() {
         }
     }
 
-    // Phase 2: Metadata file scan — picks up types (like IClosable) that are not
-    // namespaces themselves and therefore never appear in the BFS queue.
     augment_modules_from_files(
         &config.roots,
         config.input.as_ref(),

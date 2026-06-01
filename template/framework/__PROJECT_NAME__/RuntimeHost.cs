@@ -44,6 +44,17 @@ namespace __PROJECT_NAME__
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_pump_timers))]
         private static extern void runtime_pump_timers();
 
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_notify_app_event))]
+        private static extern void runtime_notify_app_event(long runtime, [MarshalAs(UnmanagedType.LPUTF8Str)] string payload);
+
+        // Forwards a lifecycle event to JS (globalThis.__nsOnAppEvent). UI-thread only.
+        public void NotifyAppEvent(string payloadJson)
+        {
+            if (!_initialized || string.IsNullOrEmpty(payloadJson)) return;
+            try { runtime_notify_app_event(_runtime, payloadJson); }
+            catch { }
+        }
+
     #if DEBUG
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(ns_set_log_to_console))]
         private static extern int ns_set_log_to_console(int enabled);

@@ -1,7 +1,7 @@
 {
   "name": "@nativescript/windows",
-  "version": "0.1.0-alpha.122",
-  "description": "NativeScript for using Windows v8",
+  "version": "0.1.0-alpha.123",
+  "description": "NativeScript Windows runtime with a WinUI 3 app template",
   "repository": {
         "type": "git",
         "url": "https://github.com/NativeScript/windows.git"
@@ -11,7 +11,7 @@
     "build:x64": "pwsh -File build.ps1 -SkipArm64",
     "build:nodotnet": "pwsh -File build.ps1 -SkipDotnet"
   },
-  "keywords": ["nativescript", "windows", "winrt", "uwp"],
+  "keywords": ["nativescript", "windows", "winrt", "winui3", "windows-app-sdk"],
   "license": "Apache-2.0",
   "files": [
     "**/*"

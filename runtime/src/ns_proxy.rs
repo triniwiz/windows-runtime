@@ -714,11 +714,19 @@ pub(crate) fn handle_instance_property_getter(
                         v8::null(scope).into()
                     } else {
                         let instance = unsafe { IUnknown::from_raw(result) };
+                        let (name, decl) = instance
+                            .cast::<IInspectable>()
+                            .ok()
+                            .and_then(|insp| insp.GetRuntimeClassName().ok())
+                            .map(|cn| cn.to_string())
+                            .and_then(|n| MetadataReader::find_by_name(&n).map(|d| (n, d)))
+                            .filter(|(_, d)| !matches!(d.read().kind(), DeclarationKind::Struct))
+                            .unwrap_or_else(|| (return_sig.clone(), declaration.clone()));
                         create_ns_ctor_instance_object(
-                            return_sig.as_str(),
+                            name.as_str(),
                             None,
                             None,
-                            declaration,
+                            decl,
                             Some(instance),
                             scope,
                         )
@@ -1399,6 +1407,23 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
         }
     }
 
+    let resolved_concrete: Option<(String, Arc<RwLock<dyn Declaration>>)> = if name.contains('<') {
+        None
+    } else {
+        instance
+            .as_ref()
+            .and_then(|unk| unk.cast::<IInspectable>().ok())
+            .and_then(|insp| insp.GetRuntimeClassName().ok())
+            .map(|cn| cn.to_string())
+            .filter(|cn| !cn.is_empty() && cn != name && !cn.contains('<'))
+            .and_then(|cn| MetadataReader::find_by_name(&cn).map(|d| (cn, d)))
+            .filter(|(_, d)| !matches!(d.read().kind(), DeclarationKind::Struct))
+    };
+    let (name, declaration): (&str, Arc<RwLock<dyn Declaration>>) = match &resolved_concrete {
+        Some((cn, d)) => (cn.as_str(), d.clone()),
+        None => (name, declaration),
+    };
+
     let class_name = v8::String::new(scope, name).unwrap();
 
     let tmpl = FunctionTemplate::new(scope, handle_ns_func);
@@ -1589,11 +1614,6 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                     }
 
                     let name = v8::String::new(scope, property_name.as_str());
-                    // Static properties inherited from a base class (e.g. UIElement.PointerPressedEvent
-                    // accessed via Panel) must use the *declaring* class's activation factory, not the
-                    // current class factory — otherwise the ABI call fails with E_NOINTERFACE.
-                    // Lazy: for inherited statics we store the declaring class name and call
-                    // RoGetActivationFactory only on first property access via resolve_class_factory_from_parent.
                     let (effective_instance, static_factory_cls) = if is_static {
                         if declaring_class_name.as_str() == clazz.full_name() {
                             (factory.clone(), None)

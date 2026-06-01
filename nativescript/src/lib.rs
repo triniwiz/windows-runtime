@@ -129,6 +129,20 @@ pub extern "C" fn runtime_runscript(runtime: i64, script: *const c_char, filenam
     }
 }
 
+/// Forward a host lifecycle event into JS via `globalThis.__nsOnAppEvent(payload)`.
+/// `payload` is JSON like `{"kind":"activated"}`. Must be called on the V8/UI thread.
+#[no_mangle]
+pub extern "C" fn runtime_notify_app_event(runtime: i64, payload: *const c_char) {
+    if runtime != 0 && !payload.is_null() {
+        let _ = std::panic::catch_unwind(|| {
+            let runtime: *mut Runtime = runtime as _;
+            let runtime = unsafe { &mut *runtime };
+            let payload = unsafe { CStr::from_ptr(payload) }.to_string_lossy();
+            runtime.notify_app_event(payload.as_ref());
+        });
+    }
+}
+
 /// Returns the last JS error (message + stack) or NULL. Caller must free with `runtime_free_js_error`.
 #[no_mangle]
 pub extern "C" fn runtime_get_last_js_error() -> *mut c_char {

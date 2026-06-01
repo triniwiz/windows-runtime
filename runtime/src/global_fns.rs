@@ -2550,10 +2550,23 @@ const HELPER_SOURCE: &str = r#"
             // Populated lazily on first access; avoids repeated bridge round-trips.
             var _typeInfoCache = {};
             var _emptyInfo = { methods: [], properties: [], staticMethods: [], staticProperties: [], readonlyProperties: [], readonlyStaticProperties: [], writeonlyProperties: [], writeonlyStaticProperties: [] };
-            // Optional mapping for namespace root → assembly simple-name. Use
-            // NSWinRT.dotnet.registerNamespace('com', 'My.Assembly.Name') to map
-            // top-level roots (e.g. `com`) to the assembly that contains types.
+            // Optional mapping for namespace prefixes -> assembly simple-name.
+            // Exact namespaces are preferred first, then progressively shorter
+            // prefixes are tried as a fallback.
             var _namespaceAssemblyMap = Object.create(null);
+
+            function _resolveAssembly(typeName) {
+                if (!typeName || typeof typeName !== 'string') return '';
+                var probe = String(typeName);
+                while (probe) {
+                    var assembly = _namespaceAssemblyMap[probe];
+                    if (typeof assembly === 'string' && assembly) return assembly;
+                    var lastDot = probe.lastIndexOf('.');
+                    if (lastDot < 0) break;
+                    probe = probe.substring(0, lastDot);
+                }
+                return '';
+            }
 
             // ── Auto-release via FinalizationRegistry ────────────────────────
             // When the JS GC collects a DotNet proxy the registry fires the
@@ -2660,8 +2673,7 @@ const HELPER_SOURCE: &str = r#"
                 if (Array.isArray(value)) return value.map(_wrap);
                 if (typeof value === 'object' && typeof value.__handle === 'number') {
                     var typeName = value.__type || '';
-                    var root = (typeName || '').split('.')[0];
-                    var assembly = _namespaceAssemblyMap[root] || '';
+                    var assembly = _resolveAssembly(typeName);
                     return _makeDotNetInstance(value.__handle, assembly, typeName, value.__isTask === true, value.__native_ptr);
                 }
                 return value;
@@ -2675,17 +2687,20 @@ const HELPER_SOURCE: &str = r#"
                     return _wrap(_invoke({ assembly: assembly, typeName: typeName, method: 'get_' + prop, args: [] }));
                 },
                 fromHandle: function (handle, typeName) {
-                    var root = (typeName || '').split('.')[0];
-                    var assembly = _namespaceAssemblyMap[root] || '';
+                    var assembly = _resolveAssembly(typeName || '');
                     return _makeDotNetInstance(handle, assembly, typeName || '');
                 },
-                // Lazily register a top-level namespace root and optional assembly mapping.
+                // Lazily register a namespace prefix and optional assembly mapping.
                 // Example: NSWinRT.dotnet.registerNamespace('com', 'NativeScript');
                 registerNamespace: function(rootName, assemblyName) {
                     if (!rootName || typeof rootName !== 'string') return;
-                    var root = String(rootName).split('.')[0];
+                    var name = String(rootName);
+                    var root = name.split('.')[0];
                     if (assemblyName && typeof assemblyName === 'string') {
-                        _namespaceAssemblyMap[root] = assemblyName;
+                        _namespaceAssemblyMap[name] = assemblyName;
+                        if (!_namespaceAssemblyMap[root]) {
+                            _namespaceAssemblyMap[root] = assemblyName;
+                        }
                     }
                     if (root in globalThis) return;
                     try {
@@ -2725,8 +2740,7 @@ const HELPER_SOURCE: &str = r#"
                         // type name, producing a spurious "Type not found" bridge error.
                         if (prop === 'toString' || prop === 'valueOf')
                             return function() { return '[.NET ' + path + ']'; };
-                        var root = path.split('.')[0];
-                        var assembly = _namespaceAssemblyMap[root] || '';
+                        var assembly = _resolveAssembly(path);
                         var info = _getTypeInfo(assembly, path);
                         // Write-only static property — reading it is an error.
                         if (info.writeonlyStaticProperties && info.writeonlyStaticProperties.indexOf(prop) >= 0)
@@ -2746,8 +2760,7 @@ const HELPER_SOURCE: &str = r#"
                     },
                     set: function (_, prop, value) {
                         if (typeof prop === 'symbol') return true;
-                        var root = path.split('.')[0];
-                        var assembly = _namespaceAssemblyMap[root] || '';
+                        var assembly = _resolveAssembly(path);
                         var info = _getTypeInfo(assembly, path);
                         // Read-only static property — assignment is an error.
                         if (info.readonlyStaticProperties && info.readonlyStaticProperties.indexOf(prop) >= 0)
@@ -2766,13 +2779,11 @@ const HELPER_SOURCE: &str = r#"
                         if (lastDot <= 0) return undefined;
                         var typeName = path.substring(0, lastDot);
                         var method   = path.substring(lastDot + 1);
-                        var root = typeName.split('.')[0];
-                        var assembly = _namespaceAssemblyMap[root] || '';
+                        var assembly = _resolveAssembly(typeName);
                         return _wrap(_invoke({ assembly: assembly, typeName: typeName, method: method, args: args.map(_unwrap) }));
                     },
                     construct: function (_, args) {
-                        var root = path.split('.')[0];
-                        var assembly = _namespaceAssemblyMap[root] || '';
+                        var assembly = _resolveAssembly(path);
                         return _wrap(_invoke({ assembly: assembly, typeName: path, method: '.ctor', args: args.map(_unwrap) }));
                     },
                 });
@@ -2961,6 +2972,13 @@ const HELPER_SOURCE: &str = r#"
                     return typeNameOrFn.invoke.bind(typeNameOrFn);
                 }
                 throw new TypeError('NSWinRT.asDelegate: expected a function, { invoke() } object, or (typeName, fn) pair');
+            };
+            // Build a native WinRT IVector<IInspectable> of `count` boxed Int32 indices,
+            // suitable for assigning to a XAML ItemsSource (enables WinUI virtualization).
+            globalThis.NSWinRT.makeItemsSource = function(count) {
+                if (typeof globalThis.__nsMakeItemsSource === 'function')
+                    return globalThis.__nsMakeItemsSource(count >>> 0);
+                return null;
             };
         })();
 
@@ -4112,6 +4130,7 @@ pub(crate) fn init_async_helpers(
     register!("__nsWorkerPollMessagesBlocking", handle_worker_poll_messages_blocking);
     register!("__nsLiveSyncCopyFile",           handle_livesync_copy_file);
     register!("__nsAsDelegate",                 crate::handle_as_delegate);
+    register!("__nsMakeItemsSource",            crate::handle_make_items_source);
     register!("__nsDotNetInvoke",               handle_dotnet_invoke);
     register!("__nsDotNetInvokeBin",            handle_dotnet_invoke_binary);
     register!("__nsDotNetCreateDelegate",       handle_dotnet_create_delegate);

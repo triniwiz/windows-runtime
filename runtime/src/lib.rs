@@ -9,6 +9,7 @@ mod helpers;
 mod hmr_support;
 pub mod inspector;
 mod interop;
+mod js_observable_vector;
 mod livesync;
 mod message_port;
 mod method_call;
@@ -92,6 +93,10 @@ thread_local!(static ISOLATE: RefCell<Option<&'static mut v8::Isolate>> = RefCel
 /// Raw pointer to the V8 isolate, set once during Runtime::new so that
 /// JS delegate Invoke trampolines can enter V8 without a scope on the stack.
 thread_local!(pub(crate) static DELEGATE_ISOLATE_PTR: Cell<*mut v8::Isolate> = Cell::new(std::ptr::null_mut()));
+/// Re-entrancy depth for JsDelegate::Invoke. When > 0 a delegate is firing while we're
+/// already inside a V8 scope (e.g. XAML re-entering ContainerContentChanging), so we must
+/// adopt the active scope instead of pushing a new root HandleScope from the raw isolate.
+thread_local!(pub(crate) static DELEGATE_DEPTH: Cell<u32> = Cell::new(0));
 
 /// JS functions registered via NSWinRT.asDelegate so managed .NET delegates can
 /// call back into V8. Keyed by the integer id sent to C# as the callback id.
@@ -9143,16 +9148,62 @@ fn js_delegate_invoke_inner(this: *mut JsDelegate, p0: usize, p1: usize, p2: usi
         return HRESULT(0x80004005u32 as i32);
     }
 
-    let isolate: &mut v8::Isolate = unsafe { &mut *isolate_ptr };
-    v8::scope!(scope, isolate);
-    let ctx_global = {
-        let Some(g) = scope.get_slot::<v8::Global<v8::Context>>() else {
-            return HRESULT(0x80004005u32 as i32);
+    // Re-entrancy guard (see DELEGATE_DEPTH). Mutating XAML inside a delegate (e.g. setting
+    // Content in ContainerContentChanging) can synchronously re-fire another delegate while
+    // this V8 scope is still active; pushing a fresh root HandleScope from the raw isolate
+    // then corrupts the scope stack ("HandleScope and Context do not belong to the same
+    // Isolate"). On re-entry we adopt the already-active scope via CallbackScope instead.
+    let reentrant = DELEGATE_DEPTH.with(|c| {
+        let d = c.get();
+        c.set(d + 1);
+        d > 0
+    });
+    struct DepthGuard;
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            DELEGATE_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+        }
+    }
+    let _depth_guard = DepthGuard;
+
+    if reentrant {
+        let isolate: &mut v8::Isolate = unsafe { &mut *isolate_ptr };
+        // CallbackScope adopts the currently-entered handle scope (no new root scope).
+        let mut cb = unsafe { v8::CallbackScope::new(isolate) };
+        let mut base = {
+            let pinned = unsafe { std::pin::Pin::new_unchecked(&mut cb) };
+            pinned.init()
         };
-        g.clone()
-    };
-    let context = v8::Local::new(scope, &ctx_global);
-    let scope = &mut v8::ContextScope::new(scope, context);
+        let base = &mut base;
+        let ctx_global = match base.get_slot::<v8::Global<v8::Context>>() {
+            Some(g) => g.clone(),
+            None => return HRESULT(0x80004005u32 as i32),
+        };
+        let context = v8::Local::new(base, &ctx_global);
+        let scope = &mut v8::ContextScope::new(base, context);
+        js_delegate_run(data, scope, p0, p1, p2)
+    } else {
+        let isolate: &mut v8::Isolate = unsafe { &mut *isolate_ptr };
+        v8::scope!(base, isolate);
+        let ctx_global = match base.get_slot::<v8::Global<v8::Context>>() {
+            Some(g) => g.clone(),
+            None => return HRESULT(0x80004005u32 as i32),
+        };
+        let context = v8::Local::new(base, &ctx_global);
+        let scope = &mut v8::ContextScope::new(base, context);
+        js_delegate_run(data, scope, p0, p1, p2)
+    }
+}
+
+/// Builds the JS argument list and invokes the delegate function within an already
+/// context-entered scope. Shared by both the top-level and re-entrant paths above.
+fn js_delegate_run(
+    data: &JsDelegateData,
+    scope: &mut v8::PinScope<'_, '_>,
+    p0: usize,
+    p1: usize,
+    p2: usize,
+) -> HRESULT {
     // TryCatch so JS exceptions don't escape into WinRT C++ frames.
     v8::tc_scope!(tc, scope);
 
@@ -9391,6 +9442,34 @@ pub(crate) fn handle_as_delegate(
         result_obj.set(scope, key.into(), v8::External::new(scope, raw).into());
     }
     retval.set(result_obj.into());
+}
+
+/// __nsMakeItemsSource(count) → { handle } wrapping a native IVector<IInspectable>
+/// of `count` boxed Int32 indices, assignable to a XAML ItemsSource so WinUI virtualizes.
+pub(crate) fn handle_make_items_source(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    let count = if args.length() >= 1 {
+        args.get(0).integer_value(scope).unwrap_or(0).max(0) as u32
+    } else {
+        0
+    };
+
+    match crate::js_observable_vector::make_index_vector(count) {
+        Ok(inspectable) => {
+            let raw = windows_core::Interface::into_raw(inspectable) as *mut c_void;
+            let result_obj = v8::Object::new(scope);
+            if let Some(key) = v8::String::new(scope, "handle") {
+                result_obj.set(scope, key.into(), v8::External::new(scope, raw).into());
+            }
+            retval.set(result_obj.into());
+        }
+        Err(_e) => {
+            throw_js_error(scope, "NSWinRT.makeItemsSource: failed to build native vector");
+        }
+    }
 }
 
 impl Runtime {
@@ -9757,6 +9836,38 @@ impl Runtime {
         tc.perform_microtask_checkpoint();
 
         value.to_string(tc).map(|s| s.to_rust_string_lossy(tc))
+    }
+
+    /// Invokes the JS global `__nsOnAppEvent(payloadJson)` if defined. Called by the host
+    /// (via `runtime_notify_app_event`) to forward lifecycle events; runs on the V8/UI thread.
+    pub fn notify_app_event(&mut self, payload: &str) {
+        v8::scope!(scope, &mut self.isolate);
+        let context = v8::Local::new(scope, &self.global_context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        v8::tc_scope!(tc, scope);
+
+        let global = context.global(tc);
+        let Some(key) = v8::String::new(tc, "__nsOnAppEvent") else {
+            return;
+        };
+        let Some(value) = global.get(tc, key.into()) else {
+            return;
+        };
+        let Ok(func) = v8::Local::<v8::Function>::try_from(value) else {
+            return; // handler not registered (yet) — nothing to do
+        };
+        let Some(arg) = v8::String::new(tc, payload) else {
+            return;
+        };
+        let recv: v8::Local<v8::Value> = global.into();
+        func.call(tc, recv, &[arg.into()]);
+
+        // Swallow handler errors: no outer TryCatch here (see run_script).
+        if tc.has_caught() {
+            let _ = tc.exception();
+        } else {
+            tc.perform_microtask_checkpoint();
+        }
     }
 
     pub fn dispose(&self) {}

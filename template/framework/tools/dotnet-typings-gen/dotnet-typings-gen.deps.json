@@ -1,0 +1,23 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v10.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v10.0": {
+      "dotnet-typings-gen/1.0.0": {
+        "runtime": {
+          "dotnet-typings-gen.dll": {}
+        }
+      }
+    }
+  },
+  "libraries": {
+    "dotnet-typings-gen/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}

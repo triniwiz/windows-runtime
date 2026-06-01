@@ -21,6 +21,9 @@ parking_lot = "0.12"
 libc = "0.2"
 runtime-devtools = { path = "../runtime-devtools", optional = true }
 
+windows-core = "0.62.2"
+windows-collections = "0.3.2"
+
 [dependencies.windows]
 workspace = true
 features = [

@@ -717,40 +717,30 @@ impl PropertyCall {
                                     ffi_parse_struct_arg(scope, value)
                                 } else if value.is_object() {
                                     let obj = value.to_object(scope).unwrap();
-                                    // Struct instance created by `new T(...)` has an internal field
-                                    let has_internal = obj.get_internal_field(scope, 0)
-                                        .map(|f| !unsafe { f.cast::<v8::External>() }.value().is_null())
-                                        .unwrap_or(false);
-                                    if has_internal {
-                                        // Already a struct instance — extract the bytes pointer
-                                        ffi_parse_pointer_arg(scope, value)
-                                    } else {
-                                        // Plain JS object {A:255, R:0, G:0, B:0} — build bytes from named fields
-                                        let fields_info: Vec<(String, NativeType)> = {
-                                            let lock = declaration.read();
-                                            lock.as_any().downcast_ref::<StructDeclaration>()
-                                                .map(|sd| {
-                                                    sd.fields().iter().filter_map(|f| {
-                                                        let m = f.base().metadata()?;
-                                                        let ts = Signature::to_string(m, &f.type_());
-                                                        let nt = NativeType::try_from(ts.as_str()).ok()?;
-                                                        Some((f.name().to_string(), nt))
-                                                    }).collect()
-                                                })
-                                                .unwrap_or_default()
-                                        };
-                                        let mut sbuf: Vec<u8> = Vec::new();
-                                        for (fname, fnt) in &fields_info {
-                                            if let Some(key) = v8::String::new(scope, fname.as_str()) {
-                                                let fv = obj.get(scope, key.into())
-                                                    .unwrap_or_else(|| v8::undefined(scope).into());
-                                                append_struct_field_bytes(&mut sbuf, scope, fv, &fnt);
-                                            }
+                                    let fields_info: Vec<(String, NativeType)> = {
+                                        let lock = declaration.read();
+                                        lock.as_any().downcast_ref::<StructDeclaration>()
+                                            .map(|sd| {
+                                                sd.fields().iter().filter_map(|f| {
+                                                    let m = f.base().metadata()?;
+                                                    let ts = Signature::to_string(m, &f.type_());
+                                                    let nt = NativeType::try_from(ts.as_str()).ok()?;
+                                                    Some((f.name().to_string(), nt))
+                                                }).collect()
+                                            })
+                                            .unwrap_or_default()
+                                    };
+                                    let mut sbuf: Vec<u8> = Vec::new();
+                                    for (fname, fnt) in &fields_info {
+                                        if let Some(key) = v8::String::new(scope, fname.as_str()) {
+                                            let fv = obj.get(scope, key.into())
+                                                .unwrap_or_else(|| v8::undefined(scope).into());
+                                            append_struct_field_bytes(&mut sbuf, scope, fv, &fnt);
                                         }
-                                        let ptr = sbuf.as_mut_ptr() as *mut c_void;
-                                        struct_scratch.push(sbuf);
-                                        Ok(NativeValue { pointer: ptr })
                                     }
+                                    let ptr = sbuf.as_mut_ptr() as *mut c_void;
+                                    struct_scratch.push(sbuf);
+                                    Ok(NativeValue { pointer: ptr })
                                 } else {
                                     ffi_parse_pointer_arg(scope, value)
                                 }
