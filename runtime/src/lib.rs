@@ -302,6 +302,11 @@ pub struct Runtime {
 static INIT: Once = Once::new();
 static PROXY_MANIFESTS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static LOG_TO_CONSOLE: OnceLock<AtomicBool> = OnceLock::new();
+/// Directory for the runtime trace log (`console.log`). Set by the host via
+/// `runtime_set_local_folder` to the app's LocalState folder so the trace log sits next to the
+/// crash/panic logs (and the CLI can tail a deterministic path). Falls back to the
+/// process temp dir when unset (e.g. console/unpackaged hosts).
+static LOG_DIR: OnceLock<String> = OnceLock::new();
 
 /// COM identity → JS wrapper object cache. Keyed on the canonical IUnknown pointer
 /// (obtained via QueryInterface(IID_IUnknown)), so the same underlying COM object
@@ -315,6 +320,11 @@ pub(crate) const INSTANCE_CACHE_GC_THRESHOLD: usize = 512;
 /// Set when the cache grows past INSTANCE_CACHE_GC_THRESHOLD. Cleared after the
 /// GC nudge is delivered. Using Cell<bool> avoids RefCell overhead on the fast path.
 thread_local!(pub(crate) static GC_NUDGE_PENDING: std::cell::Cell<bool> = std::cell::Cell::new(false));
+
+/// IActivationFactory cache: RoGetActivationFactory is expensive (COM broker round-trip) but factories
+/// are app-lifetime singletons — same class name always returns the same factory pointer.
+/// Keyed on the WinRT class full name (e.g. "Microsoft.UI.Xaml.Controls.TextBlock").
+thread_local!(static ACTIVATION_FACTORY_CACHE: RefCell<HashMap<String, IUnknown>> = RefCell::new(HashMap::new()));
 
 /// Called with an active isolate reference after inserting into the cache.
 /// Requests an incremental V8 GC when the soft threshold is exceeded.
@@ -872,6 +882,49 @@ fn handle_describe_winrt_type(
 }
 
 #[derive(Clone)]
+pub(crate) enum ReturnKind {
+    Void,
+    Primitive(crate::value::NativeType),
+    /// GUID uses value-type ABI but a dedicated JS conversion.
+    Guid,
+    Struct(Arc<RwLock<dyn Declaration>>),
+    /// Concrete class return — GetRuntimeClassName not needed.
+    Object { decl: Arc<RwLock<dyn Declaration>>, type_name: Arc<str> },
+    /// Interface return — GetRuntimeClassName resolves the concrete class at runtime.
+    InterfaceObject { decl: Arc<RwLock<dyn Declaration>>, type_name: Arc<str> },
+    /// Return type is `Object`/IInspectable — concrete type only known at runtime.
+    DynamicObject,
+}
+
+pub(crate) fn classify_return(return_type: &str, is_void: bool) -> ReturnKind {
+    if is_void { return ReturnKind::Void; }
+    if return_type == "Guid" { return ReturnKind::Guid; }
+    if return_type == "Object" { return ReturnKind::DynamicObject; }
+    if return_type.contains('.') {
+        let lookup = crate::helpers::strip_generic_suffix(return_type);
+        match MetadataReader::find_by_name(lookup) {
+            Some(decl) if matches!(decl.read().kind(), DeclarationKind::Struct) => {
+                ReturnKind::Struct(decl)
+            }
+            Some(decl) if matches!(decl.read().kind(), DeclarationKind::Class) => {
+                ReturnKind::Object { decl, type_name: Arc::from(return_type) }
+            }
+            Some(decl) => ReturnKind::InterfaceObject {
+                decl,
+                type_name: Arc::from(return_type),
+            },
+            None => crate::value::NativeType::try_from(return_type)
+                .map(ReturnKind::Primitive)
+                .unwrap_or(ReturnKind::Void),
+        }
+    } else {
+        crate::value::NativeType::try_from(return_type)
+            .map(ReturnKind::Primitive)
+            .unwrap_or(ReturnKind::Void)
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct DeclarationFFI {
     pub(crate) inner: Arc<RwLock<dyn Declaration>>,
     pub(crate) instance: Option<IUnknown>,
@@ -1153,13 +1206,30 @@ pub fn debug_output(msg: &str) {
         if slot.is_none() {
             static LOG_PATH: OnceLock<String> = OnceLock::new();
             let path = LOG_PATH.get_or_init(|| {
-                let mut p = std::env::temp_dir();
-                p.push("console.log");
-                let chosen = if std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&p)
-                    .is_ok()
+                // Prefer the host-provided LocalState folder so the trace log is deterministic and
+                // sits beside the crash/panic logs; fall back to the process temp dir,
+                // then USERPROFILE, if it isn't set or isn't writable.
+                let mut p = match LOG_DIR.get() {
+                    Some(dir) => {
+                        let mut pb = std::path::PathBuf::from(dir);
+                        pb.push("console.log");
+                        pb
+                    }
+                    None => {
+                        let mut t = std::env::temp_dir();
+                        t.push("console.log");
+                        t
+                    }
+                };
+                let writable = |path: &std::path::Path| {
+                    std::fs::OpenOptions::new().create(true).append(true).open(path).is_ok()
+                };
+                if !writable(&p) {
+                    let mut t = std::env::temp_dir();
+                    t.push("console.log");
+                    p = t;
+                }
+                let chosen = if writable(&p)
                 {
                     p.to_string_lossy().into_owned()
                 } else {
@@ -1206,6 +1276,12 @@ pub fn debug_output(msg: &str) {
     }
 }
 
+/// Set the directory for the runtime trace log (`console.log`). Called by the host with the app's
+/// LocalState folder. Idempotent (first value wins) — must be set before the first `debug_output`.
+pub fn set_log_dir(dir: String) {
+    let _ = LOG_DIR.set(dir);
+}
+
 /// Enable or disable logging to console at runtime. Default is `true`.
 pub fn set_log_to_console(enabled: bool) {
     LOG_TO_CONSOLE
@@ -1242,8 +1318,15 @@ pub(crate) fn throw_js_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
 }
 
 pub(crate) fn class_activation_factory(full_name: &str) -> windows::core::Result<IUnknown> {
+    // Fast path: factories are app-lifetime singletons — cache avoids a COM broker round-trip per call.
+    let cached = ACTIVATION_FACTORY_CACHE.with(|c| c.borrow().get(full_name).cloned());
+    if let Some(factory) = cached {
+        return Ok(factory);
+    }
     let clazz_name = HSTRING::from(full_name);
-    unsafe { RoGetActivationFactory::<IUnknown>(&clazz_name) }
+    let factory = unsafe { RoGetActivationFactory::<IUnknown>(&clazz_name) }?;
+    ACTIVATION_FACTORY_CACHE.with(|c| c.borrow_mut().insert(full_name.to_string(), factory.clone()));
+    Ok(factory)
 }
 
 pub(crate) fn resolve_class_factory_from_parent(
@@ -4756,6 +4839,17 @@ fn create_ns_ctor_instance_object<'a>(
                                                     mc.call_with_raw_ptr(delegate_ptr);
                                                 if ret.is_ok() {
                                                     dec.event_tokens.insert(name, token);
+                                                } else {
+                                                    let detail = format!(
+                                                        "Event add '{}' failed: {} (0x{:08X})",
+                                                        name,
+                                                        ret.message(),
+                                                        ret.0 as u32
+                                                    );
+                                                    let message =
+                                                        v8::String::new(scope, &detail).unwrap();
+                                                    let error = v8::Exception::error(scope, message);
+                                                    scope.throw_exception(error);
                                                 }
                                             }
                                         }
@@ -4957,6 +5051,43 @@ fn create_ns_ctor_instance_object<'a>(
                         if return_sig == "Guid" {
                             let obj = unsafe { guid_ptr_to_js_object(result, scope) };
                             retval.set(obj.into());
+                        } else if return_sig == "Object" && !result.is_null() {
+                            // Methods declared to return `Object`/IInspectable (e.g. XamlReader.Load)
+                            // hand back an opaque pointer whose concrete type is only known at runtime.
+                            // Resolve it via GetRuntimeClassName and wrap as a full typed proxy so
+                            // property/event interceptors work — otherwise the caller gets a
+                            // non-extensible object that can't subscribe to events.
+                            let instance = unsafe { IUnknown::from_raw(result) };
+                            let resolved = instance
+                                .cast::<IInspectable>()
+                                .ok()
+                                .and_then(|insp| insp.GetRuntimeClassName().ok())
+                                .map(|cn| cn.to_string())
+                                .and_then(|n| MetadataReader::find_by_name(&n).map(|d| (n, d)))
+                                .filter(|(_, d)| {
+                                    !matches!(d.read().kind(), DeclarationKind::Struct)
+                                });
+                            match resolved {
+                                Some((cname, decl)) => {
+                                    let ret: Local<v8::Value> = create_ns_ctor_instance_object(
+                                        cname.as_str(),
+                                        None,
+                                        dec.parent.clone(),
+                                        decl,
+                                        Some(instance),
+                                        scope,
+                                    )
+                                    .into();
+                                    retval.set(ret.into());
+                                }
+                                None => {
+                                    // Keep the ref alive; fall back to the generic pointer wrapper.
+                                    let _ = std::mem::ManuallyDrop::new(instance);
+                                    unsafe {
+                                        set_ret_val(result, scope, retval, NativeType::Pointer);
+                                    }
+                                }
+                            }
                         } else {
                             match NativeType::try_from(return_sig.as_str()) {
                                 Ok(return_type) => {
@@ -5404,6 +5535,35 @@ fn create_ns_ctor_instance_object<'a>(
                                         return;
                                     }
 
+                                    let return_sig = method.return_type().to_string();
+                                    if return_sig == "Object" && !result.is_null() {
+                                        // Methods declared to return `Object`/IInspectable (e.g.
+                                        // XamlReader.Load) hand back an opaque pointer whose concrete
+                                        // type is only known at runtime. Resolve via GetRuntimeClassName
+                                        // and wrap as a full typed proxy so property/event interceptors
+                                        // work — otherwise the caller gets a non-extensible object that
+                                        // can't subscribe to events.
+                                        let instance = unsafe { IUnknown::from_raw(result) };
+                                        let resolved = instance
+                                            .cast::<IInspectable>()
+                                            .ok()
+                                            .and_then(|insp| insp.GetRuntimeClassName().ok())
+                                            .map(|cn| cn.to_string())
+                                            .and_then(|n| MetadataReader::find_by_name(&n).map(|d| (n, d)))
+                                            .filter(|(_, d)| !matches!(d.read().kind(), DeclarationKind::Struct));
+                                        match resolved {
+                                            Some((cname, decl)) => {
+                                                let ret: Local<v8::Value> = create_ns_ctor_instance_object(cname.as_str(), None, None, decl, Some(instance), scope).into();
+                                                retval.set(ret.into());
+                                            }
+                                            None => {
+                                                let _ = std::mem::ManuallyDrop::new(instance);
+                                                unsafe { set_ret_val(result, scope, retval, NativeType::Pointer); }
+                                            }
+                                        }
+                                        return;
+                                    }
+
                                     match NativeType::try_from(method.return_type()) {
                                         Ok(return_type) => {
                                             unsafe { set_ret_val(result, scope, retval, return_type); }
@@ -5681,6 +5841,35 @@ fn create_ns_ctor_instance_object<'a>(
 
                                     if method.is_void() {
                                         retval.set_undefined();
+                                        return;
+                                    }
+
+                                    let return_sig = method.return_type().to_string();
+                                    if return_sig == "Object" && !result.is_null() {
+                                        // Methods declared to return `Object`/IInspectable (e.g.
+                                        // XamlReader.Load) hand back an opaque pointer whose concrete
+                                        // type is only known at runtime. Resolve via GetRuntimeClassName
+                                        // and wrap as a full typed proxy so property/event interceptors
+                                        // work — otherwise the caller gets a non-extensible object that
+                                        // can't subscribe to events.
+                                        let instance = unsafe { IUnknown::from_raw(result) };
+                                        let resolved = instance
+                                            .cast::<IInspectable>()
+                                            .ok()
+                                            .and_then(|insp| insp.GetRuntimeClassName().ok())
+                                            .map(|cn| cn.to_string())
+                                            .and_then(|n| MetadataReader::find_by_name(&n).map(|d| (n, d)))
+                                            .filter(|(_, d)| !matches!(d.read().kind(), DeclarationKind::Struct));
+                                        match resolved {
+                                            Some((cname, decl)) => {
+                                                let ret: Local<v8::Value> = create_ns_ctor_instance_object(cname.as_str(), None, None, decl, Some(instance), scope).into();
+                                                retval.set(ret.into());
+                                            }
+                                            None => {
+                                                let _ = std::mem::ManuallyDrop::new(instance);
+                                                unsafe { set_ret_val(result, scope, retval, NativeType::Pointer); }
+                                            }
+                                        }
                                         return;
                                     }
 
@@ -5968,8 +6157,8 @@ fn create_ns_ctor_instance_object<'a>(
                                             retval.set(ret);
                                             return;
                                         }
-                                    } else if let Ok(return_type) = NativeType::try_from(return_sig.as_str()) {
-                                        unsafe { set_ret_val(result, scope, retval, return_type); }
+                                    } else {
+                                        crate::ns_proxy::set_ret_val_resolving_object(result, return_sig.as_str(), scope, retval);
                                     }
                                 })
                                     .data(ext.into())
@@ -6132,12 +6321,8 @@ fn create_ns_ctor_instance_object<'a>(
                                     .into();
                                     retval.set(ret_val);
                                 }
-                            } else if let Ok(return_type) =
-                                NativeType::try_from(return_sig.as_str())
-                            {
-                                unsafe {
-                                    set_ret_val(result, scope, retval, return_type);
-                                }
+                            } else {
+                                crate::ns_proxy::set_ret_val_resolving_object(result, return_sig.as_str(), scope, retval);
                             }
                         },
                     )
@@ -8704,7 +8889,19 @@ fn handle_named_property_setter(
                     if let Some(instance) = instance {
                         let mut mc =
                             MethodCall::new(&add_method, add_method.is_sealed(), instance, false);
-                        let (_, token) = mc.call_with_raw_ptr(delegate_ptr);
+                        let (ret, token) = mc.call_with_raw_ptr(delegate_ptr);
+                        if ret.is_err() {
+                            let detail = format!(
+                                "Event add '{}' failed: {} (0x{:08X})",
+                                name,
+                                ret.message(),
+                                ret.0 as u32
+                            );
+                            let message = v8::String::new(scope, &detail).unwrap();
+                            let error = v8::Exception::error(scope, message);
+                            scope.throw_exception(error);
+                            return v8::Intercepted::kYes;
+                        }
                         if let Some(tok_key_str) = v8::String::new(scope, &token_key) {
                             let tok_ptr = token as *mut c_void;
                             store.set(
@@ -9040,8 +9237,6 @@ fn handle_ns_func(
     // scope.throw_exception(v8::Exception::error(scope, v8::String::new("")))
 }
 
-// ── WinRT JS Delegate COM bridge ─────────────────────────────────────────────
-//
 // A JsDelegate wraps a `v8::Global<v8::Function>` inside a minimal COM object
 // so it can be passed directly to WinRT event-add methods.  Every delegate
 // type shares a single vtable; the per-instance GUID stored in the struct
@@ -9838,9 +10033,9 @@ impl Runtime {
         value.to_string(tc).map(|s| s.to_rust_string_lossy(tc))
     }
 
-    /// Invokes the JS global `__nsOnAppEvent(payloadJson)` if defined. Called by the host
+    /// Invokes the JS global `__nsOnAppEvent(kind, message)` if defined. Called by the host
     /// (via `runtime_notify_app_event`) to forward lifecycle events; runs on the V8/UI thread.
-    pub fn notify_app_event(&mut self, payload: &str) {
+    pub fn notify_app_event(&mut self, kind: i32, message: Option<&str>) {
         v8::scope!(scope, &mut self.isolate);
         let context = v8::Local::new(scope, &self.global_context);
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -9856,12 +10051,17 @@ impl Runtime {
         let Ok(func) = v8::Local::<v8::Function>::try_from(value) else {
             return; // handler not registered (yet) — nothing to do
         };
-        let Some(arg) = v8::String::new(tc, payload) else {
-            return;
-        };
-        let recv: v8::Local<v8::Value> = global.into();
-        func.call(tc, recv, &[arg.into()]);
 
+        let recv: v8::Local<v8::Value> = global.into();
+        
+        // kind is an i32 → wrap as a V8 Integer; message (Option<&str>) becomes the 2nd arg if present.
+        let kind_val: v8::Local<v8::Value> = v8::Integer::new(tc, kind).into();
+        if let Some(arg) = message.and_then(|m| v8::String::new(tc, m)) {
+            func.call(tc, recv, &[kind_val, arg.into()]);
+        } else {
+            func.call(tc, recv, &[kind_val]);
+        };
+        
         // Swallow handler errors: no outer TryCatch here (see run_script).
         if tc.has_caught() {
             let _ = tc.exception();
@@ -9881,8 +10081,6 @@ impl Drop for Runtime {
         }
     }
 }
-
-// ── Structured-clone helpers ─────────────────────────────────────────────────
 
 struct WorkerValueSerializer;
 

@@ -38,6 +38,7 @@ $ErrorActionPreference = "Stop"
 $ScriptDir  = $PSScriptRoot
 $RepoRoot   = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 $FrameworkLibs = Join-Path $ScriptDir "framework\libs"
+$ToolsDir = Join-Path $ScriptDir "framework\tools"
 
 Write-Host "Repo root  : $RepoRoot"
 Write-Host "Output dir : $FrameworkLibs"
@@ -100,6 +101,22 @@ if (-not $SkipDotnet) {
         }
 }
 
+# ManifestMerger MSBuild task
+Write-Host "`n=== ManifestMerger MSBuild task ===" -ForegroundColor Cyan
+if (-not (Test-Path $ToolsDir)) { New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null }
+$ManifestMergerProj = Join-Path $RepoRoot "tools\ManifestMerger\ManifestMerger.csproj"
+$ManifestMergerOut = Join-Path $ToolsDir "ManifestMerger"
+if (Test-Path $ManifestMergerProj) {
+    & dotnet publish $ManifestMergerProj -c Release -o $ManifestMergerOut --nologo
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "dotnet publish for ManifestMerger failed (exit $LASTEXITCODE)." -ForegroundColor Yellow
+    } else {
+        Write-Host "  published ManifestMerger -> $(Resolve-Path $ManifestMergerOut -Relative)"
+    }
+} else {
+    Write-Host "ManifestMerger project not found: $ManifestMergerProj" -ForegroundColor Yellow
+}
+
 # Targets
 $Targets = @(
     @{ Arch = "x64";   RustTarget = "x86_64-pc-windows-msvc"  }
@@ -134,7 +151,6 @@ foreach ($t in $Targets) {
 Write-Host "`n=== Build dotnet-tool prebuilt binaries ===" -ForegroundColor Cyan
 # Place prebuilt tools into the framework folder so they are included in the
 # packaged framework (npm publish copies framework/* into the package root).
-$ToolsDir = Join-Path $ScriptDir "framework\tools"
 if (-not (Test-Path $ToolsDir)) { New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null }
 
 

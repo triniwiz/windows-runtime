@@ -28,7 +28,6 @@ pub struct KnownFn {
 }
 
 pub static KNOWN_FNS: &[KnownFn] = &[
-    // ── kernel32.dll ─────────────────────────────────────────────────────────
     KnownFn { dll: "kernel32.dll", name: "GetTickCount64",           ret: "u64",     params: &[] },
     KnownFn { dll: "kernel32.dll", name: "GetTickCount",             ret: "u32",     params: &[] },
     KnownFn { dll: "kernel32.dll", name: "Sleep",                    ret: "void",    params: &["u32"] },
@@ -55,7 +54,6 @@ pub static KNOWN_FNS: &[KnownFn] = &[
     KnownFn { dll: "kernel32.dll", name: "FreeConsole",              ret: "bool",    params: &[] },
     KnownFn { dll: "kernel32.dll", name: "OutputDebugStringW",       ret: "void",    params: &["wstr"] },
 
-    // ── user32.dll ────────────────────────────────────────────────────────────
     KnownFn { dll: "user32.dll", name: "GetSystemMetrics",           ret: "i32",     params: &["i32"] },
     KnownFn { dll: "user32.dll", name: "MessageBoxW",                ret: "i32",     params: &["pointer", "wstr", "wstr", "u32"] },
     KnownFn { dll: "user32.dll", name: "MessageBeep",                ret: "bool",    params: &["u32"] },
@@ -82,33 +80,27 @@ pub static KNOWN_FNS: &[KnownFn] = &[
     KnownFn { dll: "user32.dll", name: "UpdateWindow",               ret: "bool",    params: &["pointer"] },
     KnownFn { dll: "user32.dll", name: "DestroyWindow",              ret: "bool",    params: &["pointer"] },
 
-    // ── ntdll.dll ─────────────────────────────────────────────────────────────
     KnownFn { dll: "ntdll.dll", name: "NtQuerySystemTime",           ret: "i32",     params: &["pointer"] },
     KnownFn { dll: "ntdll.dll", name: "RtlGetVersion",               ret: "i32",     params: &["pointer"] },
     KnownFn { dll: "ntdll.dll", name: "RtlMoveMemory",               ret: "void",    params: &["pointer", "pointer", "u64"] },
 
-    // ── winmm.dll ─────────────────────────────────────────────────────────────
     KnownFn { dll: "winmm.dll", name: "timeGetTime",                 ret: "u32",     params: &[] },
     KnownFn { dll: "winmm.dll", name: "timeBeginPeriod",             ret: "u32",     params: &["u32"] },
     KnownFn { dll: "winmm.dll", name: "timeEndPeriod",               ret: "u32",     params: &["u32"] },
     KnownFn { dll: "winmm.dll", name: "mciSendStringW",              ret: "u32",     params: &["wstr", "pointer", "u32", "pointer"] },
 
-    // ── gdi32.dll ─────────────────────────────────────────────────────────────
     KnownFn { dll: "gdi32.dll", name: "GetDeviceCaps",               ret: "i32",     params: &["pointer", "i32"] },
     KnownFn { dll: "gdi32.dll", name: "CreateSolidBrush",            ret: "pointer", params: &["u32"] },
     KnownFn { dll: "gdi32.dll", name: "DeleteObject",                ret: "bool",    params: &["pointer"] },
 
-    // ── shell32.dll ───────────────────────────────────────────────────────────
     KnownFn { dll: "shell32.dll", name: "ShellExecuteW",             ret: "pointer", params: &["pointer", "wstr", "wstr", "wstr", "wstr", "i32"] },
     KnownFn { dll: "shell32.dll", name: "SHGetFolderPathW",          ret: "i32",     params: &["pointer", "i32", "pointer", "u32", "pointer"] },
 
-    // ── advapi32.dll ──────────────────────────────────────────────────────────
     KnownFn { dll: "advapi32.dll", name: "RegOpenKeyExW",            ret: "i32",     params: &["pointer", "wstr", "u32", "u32", "pointer"] },
     KnownFn { dll: "advapi32.dll", name: "RegQueryValueExW",         ret: "i32",     params: &["pointer", "wstr", "pointer", "pointer", "pointer", "pointer"] },
     KnownFn { dll: "advapi32.dll", name: "RegCloseKey",              ret: "i32",     params: &["pointer"] },
     KnownFn { dll: "advapi32.dll", name: "GetUserNameW",             ret: "bool",    params: &["pointer", "pointer"] },
 
-    // ── psapi.dll / kernel32 (Vista+) ─────────────────────────────────────────
     KnownFn { dll: "psapi.dll",    name: "GetProcessMemoryInfo",     ret: "bool",    params: &["pointer", "pointer", "u32"] },
     KnownFn { dll: "kernel32.dll", name: "K32GetProcessMemoryInfo",  ret: "bool",    params: &["pointer", "pointer", "u32"] },
 ];

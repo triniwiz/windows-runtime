@@ -68,13 +68,10 @@ impl NativeType {
                 NativeType::I64 => {
                     types::sint64.size
                 }
-                NativeType::USize => {
-                    let usize_type = *(libffi::middle::Type::usize().as_raw_ptr());
-                    usize_type.size
-                }
-                NativeType::ISize => {
-                    let isize_type = *(libffi::middle::Type::isize().as_raw_ptr());
-                    isize_type.size
+                NativeType::USize | NativeType::ISize => {
+                    // Both are pointer-sized integers; use compile-time constant instead of
+                    // constructing a libffi Type object on every size() call.
+                    std::mem::size_of::<usize>()
                 }
                 NativeType::F32 => {
                     types::float.size
@@ -1349,7 +1346,13 @@ pub unsafe fn set_ret_val(value:*mut c_void, scope: &mut v8::PinScope<'_, '_>, m
             rv.set_double(ret);
         }
         NativeType::Pointer => {
-            rv.set(external_or_null(scope, value));
+            // A WinRT reference-type return is a COM pointer; resolve its concrete type so the JS side
+            // gets a full typed proxy (with property/event interceptors) rather than a bare, non-extensible
+            // External. Falls back to the plain wrapper when the type can't be resolved.
+            match crate::ns_proxy::try_wrap_inspectable_pointer(value, scope) {
+                Some(v) => rv.set(v),
+                None => rv.set(external_or_null(scope, value)),
+            }
         }
         NativeType::Buffer => {
             rv.set(external_or_null(scope, value));

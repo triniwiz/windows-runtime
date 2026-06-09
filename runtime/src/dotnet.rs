@@ -42,8 +42,6 @@ fn get_dotnet_mode() -> DotnetMode {
     }
 }
 
-// ── hostfxr ABI ───────────────────────────────────────────────────────────────
-
 type FnInitForRuntimeConfig = unsafe extern "C" fn(
     runtime_config_path: *const u16,
     parameters: *const c_void,
@@ -67,8 +65,6 @@ type FnLoadAsmAndGetFnPtr = unsafe extern "C" fn(
     delegate: *mut *mut c_void,
 ) -> i32;
 
-// ── bridge entry-point signatures (UTF-8 ABI) ─────────────────────────────────
-//
 // Switching from char* (UTF-16) to byte* (UTF-8) eliminates:
 //   • encode_utf16().collect() → Vec<u16> on every call
 //   • String::from_utf16_lossy on every response
@@ -99,8 +95,6 @@ pub(crate) type FnJsCallback =
     unsafe extern "C" fn(i32, *const u8, i32, *mut *mut u8, *mut i32);
 type FnRegisterJsCallback = unsafe extern "C" fn(callback: FnJsCallback) -> i32;
 
-// ── host state ────────────────────────────────────────────────────────────────
-
 struct DotNetHost {
     _hostfxr: HMODULE,
     invoke: FnBridgeInvoke,
@@ -119,8 +113,6 @@ static DOTNET_APP_ROOT: OnceLock<String> = OnceLock::new();
 pub(crate) fn set_app_root(app_root: &str) {
     let _ = DOTNET_APP_ROOT.get_or_init(|| app_root.to_string());
 }
-
-// ── helpers ───────────────────────────────────────────────────────────────────
 
 fn to_wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -177,8 +169,6 @@ fn scan_fxr_dir(dir: &PathBuf) -> Option<PathBuf> {
         candidate.exists().then_some(candidate)
     })
 }
-
-// ── initialisation ────────────────────────────────────────────────────────────
 
 fn build_host(bridge_dll: &str, runtime_config: &str) -> Result<DotNetHost, String> {
     // Prefer the hostfxr.dll that is already loaded into this process (e.g. when the
@@ -320,8 +310,6 @@ fn find_bridge_and_config(app_root: &str) -> Option<(PathBuf, PathBuf)> {
     }
     None
 }
-
-// ── public API ────────────────────────────────────────────────────────────────
 
 pub(crate) fn try_init_dotnet(app_root: &str) {
     // Respect NS_DOTNET_MODE so embedders can disable or choose out-of-proc.

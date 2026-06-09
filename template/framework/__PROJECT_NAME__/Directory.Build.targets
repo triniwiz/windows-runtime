@@ -5,96 +5,42 @@
   <!-- Default properties are provided in Directory.Build.props so they can be
        easily overridden per-app or via MSBuild /p: properties. -->
 
-  <!-- Inline merge task: will merge App_Resources/Windows/Package.appxmanifest or Package.appxmanifest.partial.xml into the generated Package.appxmanifest -->
-  <UsingTask TaskName="MergeAppxManifest" TaskFactory="CodeTaskFactory" AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll" Condition="'$(MSBuildRuntimeType)' != 'Core'">
-    <ParameterGroup>
-      <SourceManifest ParameterType="System.String" Required="true" />
-      <TargetManifest ParameterType="System.String" Required="true" />
-    </ParameterGroup>
-    <Task>
-      <Reference Include="System.Core" />
-      <Reference Include="System.Xml" />
-      <Reference Include="System.Xml.Linq" />
-      <Using Namespace="System" />
-      <Using Namespace="System.IO" />
-      <Using Namespace="System.Linq" />
-      <Using Namespace="System.Xml.Linq" />
-      <Code Type="Fragment" Language="cs"><![CDATA[
-        try {
-            if (!File.Exists(SourceManifest)) { Log.LogMessage(MessageImportance.Low, "No source manifest found: " + SourceManifest); return true; }
-            if (!File.Exists(TargetManifest)) { Log.LogMessage(MessageImportance.Low, "No target manifest found: " + TargetManifest); return true; }
-            XDocument src = XDocument.Load(SourceManifest);
-            XDocument dest = XDocument.Load(TargetManifest);
+  <PropertyGroup>
+    <ManifestMergerAssembly Condition="'$(ManifestMergerAssembly)' == ''">$(MSBuildThisFileDirectory)..\tools\ManifestMerger\ManifestMerger.dll</ManifestMergerAssembly>
+    <ValidateMergedManifest Condition="'$(ValidateMergedManifest)' == ''">false</ValidateMergedManifest>
+    <TreatManifestValidationErrorsAsWarnings Condition="'$(TreatManifestValidationErrorsAsWarnings)' == ''">false</TreatManifestValidationErrorsAsWarnings>
+    <LogManifestMergeDiagnosticsAsWarnings Condition="'$(LogManifestMergeDiagnosticsAsWarnings)' == ''">false</LogManifestMergeDiagnosticsAsWarnings>
+  </PropertyGroup>
 
-            Func<XElement, XElement, bool> mergeElement = null;
-            mergeElement = (srcElem, destParent) => {
-                XElement match = destParent.Elements().FirstOrDefault(c => c.Name.LocalName == srcElem.Name.LocalName);
-                if (match == null) {
-                    destParent.Add(new XElement(srcElem));
-                    return true;
-                }
-                // copy/overwrite attributes
-                foreach (var a in srcElem.Attributes()) { match.SetAttributeValue(a.Name, a.Value); }
-                // merge children
-                foreach (var child in srcElem.Elements()) {
-                    // skip if identical child exists
-                    bool exists = match.Elements().Any(mc => mc.Name.LocalName == child.Name.LocalName && mc.ToString() == child.ToString());
-                    if (exists) { continue; }
-                    // try to find same-named child to merge into
-                    XElement matchChild = match.Elements().FirstOrDefault(mc => mc.Name.LocalName == child.Name.LocalName);
-                    if (matchChild != null) { mergeElement(child, matchChild); } else { match.Add(new XElement(child)); }
-                }
-                return true;
-            };
+  <UsingTask TaskName="MergeAppxManifest" AssemblyFile="$(ManifestMergerAssembly)" Condition="Exists('$(ManifestMergerAssembly)')" />
 
-            // Merge VisualElements (common case) into the Application node
-            var srcVisuals = src.Descendants().Where(e => e.Name.LocalName == "VisualElements");
-            foreach (var ve in srcVisuals) {
-                var destApp = dest.Descendants().FirstOrDefault(e => e.Name.LocalName == "Application");
-                if (destApp == null) { dest.Root.Add(new XElement(ve)); }
-                else { mergeElement(ve, destApp); }
-            }
-
-            // Merge Capabilities (if present)
-            var srcCaps = src.Descendants().Where(e => e.Name.LocalName == "Capabilities");
-            foreach (var cap in srcCaps) {
-                var destCaps = dest.Descendants().FirstOrDefault(e => e.Name.LocalName == "Capabilities");
-                if (destCaps == null) { dest.Root.Add(new XElement(cap)); }
-                else { mergeElement(cap, destCaps); }
-            }
-
-            // Merge other top-level sections present in src (e.g., Extensions) by local-name
-            foreach (var top in src.Root.Elements()) {
-                if (top.Name.LocalName == "Dependencies" || top.Name.LocalName == "Applications") { continue; }
-                var existing = dest.Root.Elements().FirstOrDefault(e => e.Name.LocalName == top.Name.LocalName);
-                if (existing == null) { dest.Root.Add(new XElement(top)); }
-                else {
-                    // merge children of this section
-                    foreach (var child in top.Elements()) {
-                        bool exists = existing.Elements().Any(ec => ec.Name.LocalName == child.Name.LocalName && ec.ToString() == child.ToString());
-                        if (!exists) { existing.Add(new XElement(child)); }
-                    }
-                }
-            }
-
-            dest.Save(TargetManifest);
-            Log.LogMessage(MessageImportance.High, $"Merged manifest from {SourceManifest} into {TargetManifest}");
-            return true;
-        } catch (Exception ex) { Log.LogErrorFromException(ex); return false; }
-      ]]></Code>
-    </Task>
-  </UsingTask>
-
-  <Target Name="MergeAppResourcesManifest" AfterTargets="ApplyManifestOverrides" Condition="Exists('$(MSBuildProjectDirectory)\Package.appxmanifest') and '$(MSBuildRuntimeType)' != 'Core'">
+  <Target Name="MergeAppResourcesManifest" AfterTargets="ApplyManifestOverrides" Condition="Exists('$(MSBuildProjectDirectory)\Package.appxmanifest')">
     <PropertyGroup>
       <_AppResourcesManifest>$(MSBuildProjectDirectory)\App_Resources\Windows\Package.appxmanifest</_AppResourcesManifest>
       <!-- Allow CLI or callers to override the source manifest via MSBuild property 'AppResourcesManifestPath' -->
       <_AppResourcesManifest Condition="'$(AppResourcesManifestPath)' != ''">$(AppResourcesManifestPath)</_AppResourcesManifest>
       <!-- Fallback template manifest name (no '.partial' suffix) -->
       <_PartialManifest>$(MSBuildProjectDirectory)\Package.appxmanifest</_PartialManifest>
+      <_ManifestToMerge>$(_PartialManifest)</_ManifestToMerge>
+      <_ManifestToMerge Condition="Exists('$(_AppResourcesManifest)')">$(_AppResourcesManifest)</_ManifestToMerge>
     </PropertyGroup>
+    <ItemGroup>
+      <_ManifestMergerSchemaFiles Include="$(ManifestMergerSchemaFiles)" Condition="'$(ManifestMergerSchemaFiles)' != ''" />
+    </ItemGroup>
     <Message Text="Merging app manifest (if present) into generated Package.appxmanifest (app wins)" Importance="Low" />
-    <MergeAppxManifest SourceManifest="$([System.IO.File]::Exists('$(_AppResourcesManifest)') ? '$(_AppResourcesManifest)' : '$(_PartialManifest)')" TargetManifest="$(MSBuildProjectDirectory)\Package.appxmanifest" Condition=" $([System.IO.File]::Exists('$(_AppResourcesManifest)')) Or $([System.IO.File]::Exists('$(_PartialManifest)')) " />
+    <MergeAppxManifest SourceManifest="$(_ManifestToMerge)"
+                       TargetManifest="$(MSBuildProjectDirectory)\Package.appxmanifest"
+                       ValidateMergedManifest="$(ValidateMergedManifest)"
+                       TreatValidationErrorsAsWarnings="$(TreatManifestValidationErrorsAsWarnings)"
+                       LogMergeDiagnosticsAsWarnings="$(LogManifestMergeDiagnosticsAsWarnings)"
+                       SchemaFiles="@(_ManifestMergerSchemaFiles)"
+                       Condition="Exists('$(ManifestMergerAssembly)') and Exists('$(_ManifestToMerge)')" />
+  </Target>
+
+  <Target Name="WarnMissingManifestMerger"
+          BeforeTargets="MergeAppResourcesManifest"
+          Condition="Exists('$(MSBuildProjectDirectory)\Package.appxmanifest') and !Exists('$(ManifestMergerAssembly)')">
+    <Warning Text="ManifestMerger task assembly was not found at '$(ManifestMergerAssembly)'; app manifest resources will not be merged." />
   </Target>
 
   <Target Name="ApplyManifestOverrides" BeforeTargets="BeforeBuild" Condition="Exists('$(MSBuildProjectDirectory)\Package.appxmanifest')">

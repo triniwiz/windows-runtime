@@ -20,6 +20,3 @@ strip = true
 # Release build with development tools and SBG (Static Binding Generator)
 [profile.release-with-devtools]
 inherits = "release"
-debug = true
-strip = false
-opt-level = 2

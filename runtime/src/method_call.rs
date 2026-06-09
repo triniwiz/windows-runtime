@@ -1,5 +1,7 @@
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
+use std::rc::Rc;
+use std::cell::RefCell;
 use std::sync::Arc;
 use libffi::middle::*;
 use parking_lot::RwLock;
@@ -23,11 +25,33 @@ use crate::error::AnyError;
 use crate::helpers::{ffi_native_type_from_signature, strip_generic_suffix};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use crate::value::{append_struct_field_bytes, ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_query_interface_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue, read_value_from_ptr, set_out_param_value, try_unwrap_out_param, write_v8_value_to_ptr};
-use crate::DeclarationFFI;
+use crate::{DeclarationFFI, ReturnKind};
+
+struct MethodStaticInfo {
+    cif: Rc<Cif>,
+    func: *mut c_void,       // vtable slot — constant per WinRT COM interface type
+    iid: GUID,
+    pre_index: usize,
+    index: usize,
+    parameter_types: Vec<NativeType>,
+    parse_parameter_types: Vec<NativeType>,
+    parameters: Vec<ParameterDeclaration>,
+    return_type: String,
+    is_void: bool,
+    declaration: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>>,
+    number_of_parameters: usize,
+    return_kind: ReturnKind,
+    param_sigs: Vec<String>,
+}
+
+thread_local! {
+    static METHOD_STATIC_INFO_CACHE: RefCell<ahash::AHashMap<u64, Rc<MethodStaticInfo>>>
+        = RefCell::new(ahash::AHashMap::new());
+}
 
 pub struct MethodCall {
     index: usize,
-        method_name: String,
+    method_name: String,
     pre_index: usize,
     number_of_parameters: usize,
     number_of_abi_parameters: usize,
@@ -36,7 +60,7 @@ pub struct MethodCall {
     is_void: bool,
     iid: GUID,
     interface: IUnknown,
-    cif: Cif,
+    cif: Rc<Cif>,
     func: *mut c_void,
     parameter_types: Vec<NativeType>,
     parse_parameter_types: Vec<NativeType>,
@@ -53,6 +77,8 @@ pub struct MethodCall {
     /// Set when construction failed (e.g. QueryInterface returned E_NOINTERFACE for the IID).
     /// call() returns E_FAIL immediately instead of panicking.
     init_error: Option<String>,
+    pub(crate) return_kind: ReturnKind,
+    param_sigs: Vec<String>,
 }
 
 #[inline]
@@ -63,7 +89,7 @@ fn call_failure() -> HRESULT {
 impl MethodCall {
     fn new_init_error(interface: IUnknown, is_initializer: bool, is_sealed: bool, iid: GUID, error_msg: String) -> Self {
         Self {
-            cif: Cif::new(vec![], Type::i32()),
+            cif: Rc::new(Cif::new(vec![], Type::i32())),
             func: std::ptr::null_mut(),
             index: 0,
             method_name: String::new(),
@@ -84,6 +110,8 @@ impl MethodCall {
             argument_buf: Vec::new(),
             argument_parse_types: Vec::new(),
             init_error: Some(error_msg),
+            return_kind: ReturnKind::Void,
+            param_sigs: Vec::new(),
         }
     }
 
@@ -117,10 +145,57 @@ impl MethodCall {
             );
         };
 
+        // Fast path: if we've seen this method+sealed combination, reuse cached info.
+        // Skips find_declaring_interface_for_method + Cif::new + param processing (only 1 QI needed).
+        let cache_key = ((method.token().0 as u64) << 1) | (is_sealed as u64);
+        if let Some(si) = METHOD_STATIC_INFO_CACHE.with(|c| c.borrow().get(&cache_key).cloned()) {
+            let vtable = interface.vtable();
+            let mut interface_ptr: *mut c_void = std::ptr::null_mut();
+            let result = unsafe {
+                ((*vtable).QueryInterface)(
+                    interface.as_raw(),
+                    &si.iid,
+                    &mut interface_ptr as *mut _ as *mut *mut c_void,
+                )
+            };
+            if result.is_err() || interface_ptr.is_null() {
+                let hr = if result.is_err() { result.0 } else { 0x8000_4002u32 as i32 };
+                return Self::new_init_error(interface, is_initializer, is_sealed, si.iid,
+                    format!("QueryInterface failed (cached) for IID {:?}: {}",
+                        si.iid, crate::error::format_hresult_message(HRESULT(hr))));
+            }
+            let queried_interface = unsafe { IUnknown::from_raw(interface_ptr) };
+            let number_of_abi_parameters = si.parameter_types.len();
+            return Self {
+                cif: Rc::clone(&si.cif),
+                func: si.func,
+                index: si.index,
+                pre_index: si.pre_index,
+                method_name: method.name().to_string(),
+                number_of_parameters: si.number_of_parameters,
+                number_of_abi_parameters,
+                is_initializer,
+                is_sealed,
+                is_void: si.is_void,
+                iid: si.iid,
+                interface: queried_interface,
+                parameter_types: si.parameter_types.clone(),
+                parse_parameter_types: si.parse_parameter_types.clone(),
+                parameters: si.parameters.clone(),
+                declaration: si.declaration.clone(),
+                return_type: si.return_type.clone(),
+                return_value_buf: [0u8; 128],
+                argument_buf: Vec::with_capacity(number_of_abi_parameters),
+                argument_parse_types: Vec::with_capacity(number_of_abi_parameters),
+                init_error: None,
+                return_kind: si.return_kind.clone(),
+                param_sigs: si.param_sigs.clone(),
+            };
+        }
+
         let signature = method.return_type();
 
         let return_type = Signature::to_string(method_metadata, &signature);
-
 
         let number_of_parameters = method.number_of_parameters();
 
@@ -229,6 +304,7 @@ impl MethodCall {
 
         let mut parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters + other_params + 4);
         let mut parse_parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters);
+        let mut param_sigs: Vec<String> = Vec::with_capacity(number_of_parameters);
         parameter_types.push(NativeType::Pointer);
 
         for parameter in method.parameters().iter() {
@@ -258,6 +334,7 @@ impl MethodCall {
                 }
             };
             parse_parameter_types.push(parse_native_type.clone());
+            param_sigs.push(signature.clone());
             // If this parameter is an out (ByRef) parameter, represent its
             // ABI as a pointer to the underlying storage so callers allocate
             // space and pass the address for the callee to write into.
@@ -318,10 +395,10 @@ impl MethodCall {
             }
         };
 
-        let cif = Cif::new(
+        let cif = Rc::new(Cif::new(
             params,
             Type::i32(),
-        );
+        ));
 
         // Take ownership of the specific interface pointer returned by QueryInterface
         // so we can inspect its vtable directly to compute the correct function slot.
@@ -352,6 +429,28 @@ impl MethodCall {
         let func = unsafe { *vtable_ptr.offset(index as isize) };
 
 
+        let parameters = method.parameters().to_vec();
+        let return_kind = crate::classify_return(&return_type, is_void);
+
+        // Store static info in cache so future calls on the same method type skip the slow path.
+        let static_info = Rc::new(MethodStaticInfo {
+            cif: Rc::clone(&cif),
+            func,
+            iid,
+            pre_index,
+            index,
+            parameter_types: parameter_types.clone(),
+            parse_parameter_types: parse_parameter_types.clone(),
+            parameters: parameters.clone(),
+            return_type: return_type.clone(),
+            is_void,
+            declaration: declaration.clone(),
+            number_of_parameters,
+            return_kind: return_kind.clone(),
+            param_sigs: param_sigs.clone(),
+        });
+        METHOD_STATIC_INFO_CACHE.with(|c| c.borrow_mut().insert(cache_key, static_info));
+
         Self {
             cif,
             func,
@@ -367,32 +466,20 @@ impl MethodCall {
             interface: queried_interface,
             parameter_types,
             parse_parameter_types,
-            parameters: method.parameters().to_vec(),
+            parameters,
             declaration,
             return_type,
             return_value_buf: [0u8; 128],
             argument_buf: Vec::with_capacity(number_of_abi_parameters),
             argument_parse_types: Vec::with_capacity(number_of_abi_parameters),
             init_error: None,
+            return_kind,
+            param_sigs,
         }
     }
 
-    /// Returns true when the return type is a WinRT value-struct (GUID, Point, Rect, …)
-    /// that is NOT a COM reference type.  These must be written into a caller-allocated
-    /// buffer rather than into a pointer-sized slot.
-    fn is_value_type_return(&self) -> bool {
-        if self.return_type == "Guid" {
-            return true;
-        }
-        if self.return_type.contains('.') {
-            let lookup = strip_generic_suffix(self.return_type.as_str());
-            return MetadataReader::find_by_name(lookup)
-                .map_or(false, |dec| matches!(dec.read().kind(), DeclarationKind::Struct));
-        }
-        false
-    }
 
-    
+
 
     pub fn call<'s>(
         &mut self,
@@ -409,7 +496,7 @@ impl MethodCall {
         let is_initializer = self.is_initializer;
         let is_sealed = self.is_sealed;
         let is_void = self.is_void;
-        let is_value_type = self.is_value_type_return();
+        let is_value_type = matches!(self.return_kind, ReturnKind::Struct(_) | ReturnKind::Guid);
 
         let is_scalar_return = matches!(self.return_type.as_str(),
             "UInt8" | "Int8" | "UInt16" | "Int16" |
@@ -426,17 +513,19 @@ impl MethodCall {
         self.argument_parse_types.clear();
         let mut queried_interfaces: Vec<IUnknown> = Vec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
-        // Track out-parameter slots: (argument_buf index, parse_native_type, optional signature)
-        let mut out_slots: Vec<(usize, NativeType, Option<String>, Option<v8::Local<'s, v8::Object>>)> = Vec::new();
+        // Track out-parameter slots: (argument_buf index, parse_native_type, param_index, wrapper)
+        // param_index references self.param_sigs to avoid a String allocation per out-param per call.
+        let mut out_slots: Vec<(usize, NativeType, usize, Option<v8::Local<'s, v8::Object>>)> = Vec::new();
 
         self.argument_buf.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
         self.argument_parse_types.push(None);
 
         for (i, native_type) in self.parse_parameter_types.iter().enumerate() {
             let parameter = &self.parameters[i];
-            // Determine whether the parameter's signature is a ByRef type
-            let param_sig_opt = parameter.metadata().map(|m| Signature::to_string(m, &parameter.type_()));
-            let is_sig_byref = param_sig_opt.as_ref().map_or(false, |s| s.starts_with("ByRef "));
+            // Use the pre-computed signature string (cached at construction time) to avoid
+            // calling Signature::to_string() + metadata table reads on every invocation.
+            let param_sig = &self.param_sigs[i];
+            let is_sig_byref = param_sig.starts_with("ByRef ");
 
             // Handle out (ByRef) parameters by allocating stable storage that
             // the callee can write into. Also treat a missing caller argument
@@ -473,10 +562,9 @@ impl MethodCall {
                     }
                 }
 
-                // Capture the parameter signature so we can create proper WinRT
-                // wrapper objects for out-pointer returns (e.g. IJsonValue).
-                let sig = param_sig_opt;
-                out_slots.push((slot_index, native_type.clone(), sig, wrapper_obj));
+                // Store the parameter index so the marshaling loop can read self.param_sigs[i]
+                // directly instead of carrying an owned String through the out_slots vector.
+                out_slots.push((slot_index, native_type.clone(), i, wrapper_obj));
                 continue;
             }
 
@@ -526,11 +614,7 @@ impl MethodCall {
                     ffi_parse_f64_arg(value)
                 }
                 NativeType::Pointer => {
-                    let parameter = &self.parameters[i];
-                    let parameter_signature = Signature::to_string(
-                        parameter.metadata().unwrap(),
-                        &parameter.type_(),
-                    );
+                    let parameter_signature: &str = &self.param_sigs[i];
 
                     // IReference<T> parameters: box JS primitives with the correct Create* call
                     // so XAML receives the right typed IPropertyValue (e.g. IReference<Double>).
@@ -541,7 +625,7 @@ impl MethodCall {
                             ffi_parse_pointer_arg(scope, value)
                         }
                     } else if parameter_signature.contains('.') {
-                        let lookup_name = crate::helpers::strip_generic_suffix(parameter_signature.as_str());
+                        let lookup_name = crate::helpers::strip_generic_suffix(parameter_signature);
 
                         if let Some(declaration) = MetadataReader::find_by_name(lookup_name) {
                             // Struct parameters (TypeName, Point, Rect, …) are passed as a
@@ -596,28 +680,17 @@ impl MethodCall {
                                         if has_internal {
                                             ffi_parse_pointer_arg(scope, value)
                                         } else {
-                                            // Plain JS object {A:255, R:0, …} — build bytes from named fields
-                                            let fields_info: Vec<(String, NativeType)> = {
-                                                let lock = declaration.read();
-                                                lock.as_any().downcast_ref::<StructDeclaration>()
-                                                    .map(|sd| {
-                                                        sd.fields().iter().filter_map(|f| {
-                                                            let m = f.base().metadata()?;
-                                                            let ts = Signature::to_string(m, &f.type_());
-                                                            let nt = NativeType::try_from(ts.as_str()).ok()?;
-                                                            Some((f.name().to_string(), nt))
-                                                        }).collect()
-                                                    })
-                                                    .unwrap_or_default()
-                                            };
+                                            // Plain JS object {A:255, R:0, …} — build bytes honoring field
+                                            // alignment, nested structs, and enum fields (see
+                                            // property_call::append_struct_object_bytes).
                                             let mut sbuf: Vec<u8> = Vec::new();
-                                            for (fname, fnt) in &fields_info {
-                                                if let Some(key) = v8::String::new(scope, fname.as_str()) {
-                                                    let fv = obj_v.get(scope, key.into())
-                                                        .unwrap_or_else(|| v8::undefined(scope).into());
-                                                    append_struct_field_bytes(&mut sbuf, scope, fv, &fnt);
+                                            {
+                                                let lock = declaration.read();
+                                                if let Some(sd) = lock.as_any().downcast_ref::<StructDeclaration>() {
+                                                    crate::property_call::append_struct_object_bytes(&mut sbuf, scope, obj_v, sd);
                                                 }
                                             }
+                                            if sbuf.is_empty() { sbuf.push(0); }
                                             let ptr = sbuf.as_mut_ptr() as *mut c_void;
                                             struct_scratch.push(sbuf);
                                             Ok(NativeValue { pointer: ptr })
@@ -854,7 +927,7 @@ impl MethodCall {
 
         // Marshal out-parameters back into V8 values using the recorded slots.
         let mut out_values: Vec<v8::Local<'s, v8::Value>> = Vec::new();
-        for (slot_index, parse_native_type, sig_opt, wrapper_obj) in out_slots.into_iter() {
+        for (slot_index, parse_native_type, param_idx, wrapper_obj) in out_slots.into_iter() {
             let storage_ptr = unsafe { self.argument_buf.get(slot_index).map(|v| v.pointer).unwrap_or(std::ptr::null_mut()) };
             if storage_ptr.is_null() {
                 let v: v8::Local<v8::Value> = v8::null(scope).into();
@@ -865,6 +938,8 @@ impl MethodCall {
                 }
                 continue;
             }
+            // Borrow the pre-cached signature string (no String clone needed).
+            let sig = &self.param_sigs[param_idx];
             unsafe {
                 let v = match parse_native_type {
                     NativeType::Pointer | NativeType::Buffer | NativeType::Function => {
@@ -872,29 +947,25 @@ impl MethodCall {
                         let inner = std::ptr::read_unaligned(storage_ptr as *const usize) as *mut c_void;
                         if inner.is_null() {
                             v8::null(scope).into()
-                        } else if let Some(sig) = sig_opt.as_ref() {
+                        } else if !sig.is_empty() && sig.contains('.') {
                             // If the original parameter signature names a WinRT type,
                             // construct the proper JS WinRT wrapper (structs or ns objects).
-                            if sig.contains('.') {
-                                let mut lookup = sig.as_str();
-                                if let Some(stripped) = lookup.strip_prefix("ByRef ") {
-                                    lookup = stripped;
-                                }
-                                let lookup = crate::helpers::strip_generic_suffix(lookup);
-                                if let Some(declaration) = MetadataReader::find_by_name(lookup) {
-                                    if matches!(declaration.read().kind(), DeclarationKind::Struct) {
-                                        crate::create_struct_object_from_raw(declaration, inner, scope).into()
-                                    } else {
-                                        // Attempt to inspect runtime identity via IInspectable
-                                        let instance = unsafe { IUnknown::from_raw(inner) };
-                                        match instance.clone().cast::<IInspectable>() {
-                                            Ok(ins) => { let _ = ins.GetRuntimeClassName(); }
-                                            Err(e) => { let _ = e; }
-                                        }
-                                        crate::ns_proxy::create_ns_ctor_instance_object(sig.as_str(), None, None, declaration, Some(instance), scope).into()
-                                    }
+                            let mut lookup = sig.as_str();
+                            if let Some(stripped) = lookup.strip_prefix("ByRef ") {
+                                lookup = stripped;
+                            }
+                            let lookup = crate::helpers::strip_generic_suffix(lookup);
+                            if let Some(declaration) = MetadataReader::find_by_name(lookup) {
+                                if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                    crate::create_struct_object_from_raw(declaration, inner, scope).into()
                                 } else {
-                                    read_value_from_ptr(inner as *const c_void, scope, NativeType::Pointer)
+                                    // Attempt to inspect runtime identity via IInspectable
+                                    let instance = unsafe { IUnknown::from_raw(inner) };
+                                    match instance.clone().cast::<IInspectable>() {
+                                        Ok(ins) => { let _ = ins.GetRuntimeClassName(); }
+                                        Err(e) => { let _ = e; }
+                                    }
+                                    crate::ns_proxy::create_ns_ctor_instance_object(sig.as_str(), None, None, declaration, Some(instance), scope).into()
                                 }
                             } else {
                                 read_value_from_ptr(inner as *const c_void, scope, NativeType::Pointer)
@@ -919,13 +990,22 @@ impl MethodCall {
     /// Call an event add-method with a raw COM delegate pointer.
     /// Returns `(HRESULT, token)` where token is the EventRegistrationToken i64 value.
     pub fn call_with_raw_ptr(&mut self, ptr: *mut c_void) -> (HRESULT, i64) {
+        if let Some(error) = self.init_error.as_deref() {
+            crate::store_last_js_error(error.to_string());
+            return (call_failure(), 0);
+        }
+        if self.func.is_null() {
+            crate::store_last_js_error("WinRT event add call has no ABI function pointer".to_string());
+            return (call_failure(), 0);
+        }
+
         let is_void = self.is_void;
         self.argument_buf.clear();
         self.argument_buf.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
         self.argument_buf.push(NativeValue { pointer: ptr });
-        let mut result: *mut c_void = std::ptr::null_mut();
+        let mut token: i64 = 0;
         if !is_void {
-            self.argument_buf.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
+            self.argument_buf.push(NativeValue { pointer: &mut token as *mut _ as *mut c_void });
         }
         let mut call_args: Vec<Arg> = Vec::with_capacity(self.argument_buf.len());
         for (i, v) in self.argument_buf.iter().enumerate() {
@@ -942,14 +1022,30 @@ impl MethodCall {
                 return (call_failure(), 0);
             }
         };
-        // result's bytes were overwritten by WinRT with the EventRegistrationToken (i64).
-        let token = result as i64;
-        (HRESULT(ret), token)
+        let hr = HRESULT(ret);
+        if hr.is_err() {
+            crate::store_last_js_error(format!(
+                "WinRT event add failed for '{}': {}",
+                self.method_name,
+                crate::error::format_hresult_message(hr)
+            ));
+            return (hr, 0);
+        }
+        (hr, token)
     }
 
     /// Call an event remove-method with an EventRegistrationToken value.
     /// The token is passed by value (i64) per the WinRT ABI for remove_* methods.
     pub fn call_with_event_token(&mut self, token: i64) -> HRESULT {
+        if let Some(error) = self.init_error.as_deref() {
+            crate::store_last_js_error(error.to_string());
+            return call_failure();
+        }
+        if self.func.is_null() {
+            crate::store_last_js_error("WinRT event remove call has no ABI function pointer".to_string());
+            return call_failure();
+        }
+
         self.argument_buf.clear();
         self.argument_buf.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
         self.argument_buf.push(NativeValue { i64_value: token });

@@ -45,13 +45,12 @@ namespace __PROJECT_NAME__
         private static extern void runtime_pump_timers();
 
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_notify_app_event))]
-        private static extern void runtime_notify_app_event(long runtime, [MarshalAs(UnmanagedType.LPUTF8Str)] string payload);
+        private static extern void runtime_notify_app_event(long runtime, int kind, [MarshalAs(UnmanagedType.LPUTF8Str)] string message);
 
-        // Forwards a lifecycle event to JS (globalThis.__nsOnAppEvent). UI-thread only.
-        public void NotifyAppEvent(string payloadJson)
+        public void NotifyAppEvent(int kind, string message = null)
         {
-            if (!_initialized || string.IsNullOrEmpty(payloadJson)) return;
-            try { runtime_notify_app_event(_runtime, payloadJson); }
+            if (!_initialized) return;
+            try { runtime_notify_app_event(_runtime, kind, message); }
             catch { }
         }
 

@@ -25,8 +25,6 @@ use serde_json::Value;
 use windows::core::PCWSTR;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
-// ── DLL handle cache (global, shared across all threads) ─────────────────────
-
 static DLL_CACHE: std::sync::OnceLock<Mutex<HashMap<String, usize>>> =
     std::sync::OnceLock::new();
 
@@ -34,8 +32,6 @@ fn dll_cache() -> &'static Mutex<HashMap<String, usize>> {
     DLL_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-// ── Per-call-site Cif + fn-pointer cache (thread-local) ──────────────────────
-//
 // `Cif` contains a `*mut ffi_cif` — not `Send`.  Since all Win32 FFI calls
 // happen on the single V8 thread a thread-local is both safe and optimal:
 // no mutex needed, no atomic operations, no contention.
@@ -123,8 +119,6 @@ fn resolve_proc(dll_handle: usize, func_name: &str) -> Result<*mut c_void, Strin
     Ok(ptr as *mut c_void)
 }
 
-// ── Type mapping ──────────────────────────────────────────────────────────────
-
 fn ffi_type_for(ty: &str) -> Result<Type, String> {
     Ok(match ty {
         "void"    => Type::void(),
@@ -146,8 +140,6 @@ fn ffi_type_for(ty: &str) -> Result<Type, String> {
     })
 }
 
-// ── Stored argument ───────────────────────────────────────────────────────────
-//
 // Each variant keeps its data alive for the duration of the call.  Pointer-like
 // variants store the pointer VALUE in a field so that `Arg::new(&self.field)`
 // gives libffi a stable reference to the pointer, which it will dereference once
@@ -231,8 +223,6 @@ fn marshal(ty: &str, val: &Value) -> Result<StoredArg, String> {
         other => return Err(format!("Unsupported arg type: {other}")),
     })
 }
-
-// ── Typed raw-value dispatch (used by __nsWin32CallRaw, no JSON) ─────────────
 
 /// An argument value extracted directly from V8, before type-tagging.
 /// The caller (global_fns.rs) converts V8 locals to these plain Rust values;
@@ -327,8 +317,6 @@ pub(crate) fn call_win32_direct(
     })
 }
 
-// ── PE export table enumeration ───────────────────────────────────────────────
-
 /// Returns every named export from `dll` by parsing its PE export directory.
 /// Used by `NSWinRT.win32.import(dll)` to inject all DLL functions as globals.
 pub(crate) fn list_exports(dll: &str) -> Result<Vec<String>, String> {
@@ -403,8 +391,6 @@ pub(crate) fn list_exports(dll: &str) -> Result<Vec<String>, String> {
 
     Ok(names)
 }
-
-// ── Public API ────────────────────────────────────────────────────────────────
 
 /// Parse and execute a Win32 FFI call described by a JSON request string.
 /// Returns `{"value":<result>}` or `{"error":"…"}`.

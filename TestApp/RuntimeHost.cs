@@ -47,11 +47,10 @@ namespace TestApp
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_notify_app_event))]
         private static extern void runtime_notify_app_event(long runtime, [MarshalAs(UnmanagedType.LPUTF8Str)] string payload);
 
-        // Forwards a lifecycle event to JS (globalThis.__nsOnAppEvent). UI-thread only.
-        public void NotifyAppEvent(string payloadJson)
+        public void NotifyAppEvent(int kind, string message)
         {
-            if (!_initialized || string.IsNullOrEmpty(payloadJson)) return;
-            try { runtime_notify_app_event(_runtime, payloadJson); }
+            if (!_initialized) return;
+            try { runtime_notify_app_event(_runtime, kind, message); }
             catch { }
         }
 

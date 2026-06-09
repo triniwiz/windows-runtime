@@ -1,28 +1,12 @@
-//! A native WinRT vector (`IVector<IInspectable>`) that JS can build and hand to XAML
-//! `ItemsSource`, so WinUI virtualizes over it (firing `ContainerContentChanging`).
-//!
-//! JS arrays cannot be marshalled to `Object`-typed WinRT params, which is why assigning
-//! a JS array to `ItemsSource` silently failed. This builds a real COM collection instead.
-//!
-//! Items are boxed `Int32` indices `[0..count)`; the ListView maps a realized container
-//! back to a JS row via `args.ItemIndex` from `ContainerContentChanging`.
-//!
-//! The collection implements the full `IVector<IInspectable>` (with an `IVectorView`
-//! snapshot and an `IIterator`) plus `IObservableVector`: `VectorChanged` fires on every
-//! mutation so a bound `ListView` updates incrementally rather than resetting. Each
-//! mutation applies to the backing store and releases the `RefCell` borrow *before*
-//! raising the event, so a handler may reenter the collection synchronously — which XAML
-//! does, re-reading `Size`/`GetAt` from inside the notification.
-
 use std::cell::{Cell, RefCell};
 use windows::Foundation::Collections::{
-    IObservableVector, IObservableVector_Impl, VectorChangedEventHandler,
-    IVectorChangedEventArgs, IVectorChangedEventArgs_Impl, CollectionChange,
+    CollectionChange, IObservableVector, IObservableVector_Impl, IVectorChangedEventArgs,
+    IVectorChangedEventArgs_Impl, VectorChangedEventHandler,
 };
 use windows::Foundation::PropertyValue;
 use windows_collections::{
-    IIterable, IIterable_Impl, IIterator, IIterator_Impl, IVector, IVector_Impl, IVectorView,
-    IVectorView_Impl,
+    IIterable, IIterable_Impl, IIterator, IIterator_Impl, IVector, IVectorView, IVectorView_Impl,
+    IVector_Impl,
 };
 use windows_core::{implement, IInspectable, Interface, Ref, Result, HRESULT};
 
@@ -32,7 +16,7 @@ fn err_bounds() -> windows_core::Error {
     windows_core::Error::from_hresult(E_BOUNDS)
 }
 
-// Iterator over a snapshot of the items.
+
 #[implement(IIterator<IInspectable>)]
 struct JsVectorIterator {
     items: Vec<IInspectable>,
@@ -66,7 +50,7 @@ impl IIterator_Impl<IInspectable> for JsVectorIterator_Impl {
     }
 }
 
-// VectorView: an immutable snapshot returned by GetView.
+
 #[implement(IVectorView<IInspectable>)]
 struct JsVectorView {
     items: Vec<IInspectable>,
@@ -84,7 +68,10 @@ impl IIterable_Impl<IInspectable> for JsVectorView_Impl {
 
 impl IVectorView_Impl<IInspectable> for JsVectorView_Impl {
     fn GetAt(&self, index: u32) -> Result<IInspectable> {
-        self.items.get(index as usize).cloned().ok_or_else(err_bounds)
+        self.items
+            .get(index as usize)
+            .cloned()
+            .ok_or_else(err_bounds)
     }
     fn Size(&self) -> Result<u32> {
         Ok(self.items.len() as u32)
@@ -114,7 +101,7 @@ impl IVectorView_Impl<IInspectable> for JsVectorView_Impl {
     }
 }
 
-// Simple concrete event-args we can construct to pass to handlers.
+
 #[implement(IVectorChangedEventArgs)]
 struct JsVectorChangedEventArgs {
     index: u32,
@@ -130,7 +117,7 @@ impl IVectorChangedEventArgs_Impl for JsVectorChangedEventArgs_Impl {
     }
 }
 
-// Vector: the mutable, observable collection handed to ItemsSource.
+
 #[implement(IObservableVector<IInspectable>, IVector<IInspectable>, IIterable<IInspectable>)]
 struct JsVector {
     items: RefCell<Vec<IInspectable>>,
@@ -156,15 +143,9 @@ impl IObservableVector_Impl<IInspectable> for JsVector_Impl {
 impl JsVector_Impl {
     fn fire_vector_changed(&self, index: u32, change: CollectionChange) -> Result<()> {
         let args: IVectorChangedEventArgs = JsVectorChangedEventArgs { index, change }.into();
-        // Snapshot the handlers before dispatch and release the borrow: a handler may
-        // (un)subscribe via VectorChanged/RemoveVectorChanged during the notification,
-        // which would otherwise borrow_mut while this borrow is held and panic.
-        let handlers: Vec<VectorChangedEventHandler<IInspectable>> =
-            self.handlers.borrow().iter().map(|(_, h)| h.clone()).collect();
-        // Pass no sender (None) — handlers inspect args (Index/CollectionChange) and
-        // re-read the collection they already hold a reference to.
         let sender: Option<IObservableVector<IInspectable>> = None;
-        for h in &handlers {
+        let guard = self.handlers.borrow();
+        for (_, h) in guard.iter() {
             h.Invoke(sender.as_ref(), Some(&args))?;
         }
         Ok(())
@@ -213,9 +194,7 @@ impl IVector_Impl<IInspectable> for JsVector_Impl {
         Ok(false)
     }
     fn SetAt(&self, index: u32, value: Ref<IInspectable>) -> Result<()> {
-        // Apply the change and release the borrow before raising VectorChanged, so a
-        // handler that re-reads the collection (XAML's ListView does) cannot panic on a
-        // re-entrant RefCell borrow.
+        
         {
             let mut items = self.items.borrow_mut();
             if (index as usize) >= items.len() {
@@ -307,8 +286,7 @@ impl IVector_Impl<IInspectable> for JsVector_Impl {
     }
 }
 
-/// Build an `IVector<IInspectable>` of `count` boxed `Int32` values `[0..count)`,
-/// returning it as an `IInspectable` ready to be wrapped in a JS `{ handle }`.
+
 pub(crate) fn make_index_vector(count: u32) -> Result<IInspectable> {
     let mut items: Vec<IInspectable> = Vec::with_capacity(count as usize);
     for i in 0..count {
@@ -326,13 +304,13 @@ pub(crate) fn make_index_vector(count: u32) -> Result<IInspectable> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Foundation::{PropertyValue, IPropertyValue};
-    use windows::Foundation::Collections::{
-        IObservableVector, VectorChangedEventHandler, IVectorChangedEventArgs, CollectionChange,
-    };
-    use windows_collections::{IVector, IIterable, IIterator, IVectorView};
-    use windows_core::IInspectable as WInspectable;
     use std::sync::{Arc, Mutex};
+    use windows::Foundation::Collections::{
+        CollectionChange, IObservableVector, IVectorChangedEventArgs, VectorChangedEventHandler,
+    };
+    use windows::Foundation::{IPropertyValue, PropertyValue};
+    use windows_collections::{IIterable, IIterator, IVector, IVectorView};
+    use windows_core::IInspectable as WInspectable;
 
     #[test]
     fn make_index_vector_values() -> Result<()> {
@@ -374,7 +352,8 @@ mod tests {
         // mutate the original vector — replace all values with a different value
         let new_val = PropertyValue::CreateInt32(999)?;
         let new_ins = new_val.cast::<WInspectable>()?;
-        let replacements: Vec<Option<WInspectable>> = vec![Some(new_ins.clone()), Some(new_ins.clone()), Some(new_ins)];
+        let replacements: Vec<Option<WInspectable>> =
+            vec![Some(new_ins.clone()), Some(new_ins.clone()), Some(new_ins)];
         vec.ReplaceAll(&replacements)?;
 
         // the snapshot view should still reflect the original value (0)
@@ -393,13 +372,17 @@ mod tests {
         let calls_clone = calls.clone();
 
         let handler = VectorChangedEventHandler::new(
-            move |_sender: Ref<IObservableVector<WInspectable>>, args: Ref<IVectorChangedEventArgs>| {
+            move |_sender: Ref<IObservableVector<WInspectable>>,
+                  args: Ref<IVectorChangedEventArgs>| {
                 if let Some(a) = args.as_ref() {
                     let idx = a.Index()?;
                     let ch = a.CollectionChange()?;
                     calls_clone.lock().unwrap().push((idx, ch));
                 } else {
-                    calls_clone.lock().unwrap().push((0, CollectionChange::Reset));
+                    calls_clone
+                        .lock()
+                        .unwrap()
+                        .push((0, CollectionChange::Reset));
                 }
                 Ok(())
             },
@@ -431,18 +414,19 @@ mod tests {
         let vec: IObservableVector<WInspectable> = inspectable.cast()?;
         // A second interface pointer to the SAME object, captured by the handler so it
         // reenters the live collection during dispatch.
-        let vec_in_handler: IVector<WInspectable> = inspectable.cast()?;
+        // let vec_in_handler: IVector<WInspectable> = inspectable.cast()?;
 
         // Each entry: (index reported by args, Size() observed during the callback).
         let seen = Arc::new(Mutex::new(Vec::<(u32, u32)>::new()));
         let seen_clone = seen.clone();
 
         let handler = VectorChangedEventHandler::new(
-            move |_sender: Ref<IObservableVector<WInspectable>>, args: Ref<IVectorChangedEventArgs>| {
-                let size = vec_in_handler.Size()?;
+            move |sender: Ref<IObservableVector<WInspectable>>, args: Ref<IVectorChangedEventArgs>| {
+                let vec: IVector<WInspectable> = sender.ok()?.cast()?;
+                let size = vec.Size()?;
                 if size > 0 {
                     // Reads the front element while the mutation that triggered us is done.
-                    let _ = vec_in_handler.GetAt(0)?;
+                    let _ = vec.GetAt(0)?;
                 }
                 let idx = match args.as_ref() {
                     Some(a) => a.Index()?,

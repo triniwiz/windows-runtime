@@ -6,8 +6,6 @@ thread_local! {
     static URL_CTOR: RefCell<Option<v8::Global<v8::Function>>> = const { RefCell::new(None) };
 }
 
-// ── Internal data structs ─────────────────────────────────────────────────────
-
 struct UrlData {
     url: Url,
 }
@@ -96,8 +94,6 @@ impl RetainAtPosition for Vec<(String, String)> {
     }
 }
 
-// ── Internal field helpers ────────────────────────────────────────────────────
-
 unsafe fn url_data_ptr(scope: &mut v8::PinScope<'_, '_>, obj: v8::Local<v8::Object>) -> *mut UrlData {
     let field = obj.get_internal_field(scope, 0).unwrap();
     unsafe { field.cast::<v8::External>() }.value() as *mut UrlData
@@ -110,8 +106,6 @@ unsafe fn sp_data_ptr(
     let field = obj.get_internal_field(scope, 0).unwrap();
     unsafe { field.cast::<v8::External>() }.value() as *mut SearchParamsData
 }
-
-// ── Utilities ─────────────────────────────────────────────────────────────────
 
 fn to_v8_str<'s>(scope: &mut v8::PinScope<'s, '_>, s: &str) -> v8::Local<'s, v8::Value> {
     v8::String::new(scope, s)
@@ -144,8 +138,6 @@ fn parse_url(input: &str, base: Option<&str>) -> Result<Url, url::ParseError> {
     }
 }
 
-// ── WHATWG-compatible property helpers ───────────────────────────────────────
-
 fn whatwg_host(url: &Url) -> String {
     match url.port() {
         Some(p) => format!("{}:{}", url.host_str().unwrap_or(""), p),
@@ -168,8 +160,6 @@ fn whatwg_hash(url: &Url) -> String {
 fn whatwg_port(url: &Url) -> String {
     url.port().map_or_else(String::new, |p| p.to_string())
 }
-
-// ── URL constructor ───────────────────────────────────────────────────────────
 
 fn url_constructor(
     scope: &mut v8::PinScope<'_, '_>,
@@ -195,8 +185,6 @@ fn url_constructor(
         }
     }
 }
-
-// ── URL getters ───────────────────────────────────────────────────────────────
 
 fn url_href_get(scope: &mut v8::PinScope<'_, '_>, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
     let d = unsafe { url_data_ptr(scope, args.this()) };
@@ -253,8 +241,6 @@ fn url_origin_get(scope: &mut v8::PinScope<'_, '_>, args: v8::FunctionCallbackAr
     let s = unsafe { (*d).url.origin().ascii_serialization() };
     rv.set(to_v8_str(scope, &s));
 }
-
-// ── URL setters ───────────────────────────────────────────────────────────────
 
 fn url_href_set(scope: &mut v8::PinScope<'_, '_>, args: v8::FunctionCallbackArguments, _rv: v8::ReturnValue) {
     let val = arg_str(scope, &args, 0).unwrap_or_default();
@@ -327,8 +313,6 @@ fn url_hash_set(scope: &mut v8::PinScope<'_, '_>, args: v8::FunctionCallbackArgu
     unsafe { (*d).url.set_fragment(if f.is_empty() { None } else { Some(f) }) };
 }
 
-// ── URL methods + statics ─────────────────────────────────────────────────────
-
 fn url_to_string(scope: &mut v8::PinScope<'_, '_>, args: v8::FunctionCallbackArguments, mut rv: v8::ReturnValue) {
     let d = unsafe { url_data_ptr(scope, args.this()) };
     let s = unsafe { (*d).url.as_str().to_owned() };
@@ -374,8 +358,6 @@ fn url_parse_static(scope: &mut v8::PinScope<'_, '_>, args: v8::FunctionCallback
 
     rv.set(new_obj.map(Into::into).unwrap_or_else(|| v8::null(scope).into()));
 }
-
-// ── URLSearchParams constructor ───────────────────────────────────────────────
 
 fn sp_constructor(
     scope: &mut v8::PinScope<'_, '_>,
@@ -434,8 +416,6 @@ fn sp_constructor(
     let data = Box::into_raw(Box::new(params));
     args.this().set_internal_field(0, v8::External::new(scope, data as _).into());
 }
-
-// ── URLSearchParams methods ───────────────────────────────────────────────────
 
 fn sp_append(scope: &mut v8::PinScope<'_, '_>, args: v8::FunctionCallbackArguments, _rv: v8::ReturnValue) {
     let k = arg_str(scope, &args, 0).unwrap_or_default();
@@ -566,8 +546,6 @@ fn sp_entries(scope: &mut v8::PinScope<'_, '_>, args: v8::FunctionCallbackArgume
     rv.set(arr.into());
 }
 
-// ── install_url_globals ───────────────────────────────────────────────────────
-
 pub(crate) fn install_url_globals(
     scope: &mut v8::ContextScope<v8::HandleScope<v8::Context>>,
 ) {
@@ -599,7 +577,6 @@ pub(crate) fn install_url_globals(
         }};
     }
 
-    // ── URLSearchParams ───────────────────────────────────────────────────────
     let sp_tmpl = FunctionTemplate::new(scope, sp_constructor);
     sp_tmpl.set_class_name(v8::String::new(scope, "URLSearchParams").unwrap());
     sp_tmpl.instance_template(scope).set_internal_field_count(1);
@@ -622,7 +599,6 @@ pub(crate) fn install_url_globals(
     let sp_fn = sp_tmpl.get_function(scope).unwrap();
     global.set(scope, v8::String::new(scope, "URLSearchParams").unwrap().into(), sp_fn.into());
 
-    // ── URL ───────────────────────────────────────────────────────────────────
     let url_tmpl = FunctionTemplate::new(scope, url_constructor);
     url_tmpl.set_class_name(v8::String::new(scope, "URL").unwrap());
     url_tmpl.instance_template(scope).set_internal_field_count(1);

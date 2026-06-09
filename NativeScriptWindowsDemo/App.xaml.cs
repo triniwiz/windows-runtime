@@ -18,6 +18,16 @@ namespace NativeScriptWindowsDemo
         public Window MainWindow => CurrentWindow;
         public Window Window => CurrentWindow;
 
+        enum AppEventKind
+        {
+            Activated = 1,
+            Deactivated = 2,
+            Shown = 3,
+            Hidden = 4,
+            UncaughtError = 5,
+            Exit = 6
+        }
+
         public App()
         {
 			this.InitializeComponent();
@@ -77,12 +87,8 @@ namespace NativeScriptWindowsDemo
 
             void ShowMainWindow()
             {
-                CompositionTarget.Rendering -= OnRenderFrame;
-                CompositionTarget.Rendering += OnRenderFrame;
+                StartPump();
 
-                // NativeScript (JS) creates, populates and activates the application Window.
-                // Only activate this host-owned window if JS put content on it; otherwise leave it
-                // hidden so we don't pop an empty second window.
                 try
                 {
                     if (CurrentWindow?.Content != null)
@@ -93,8 +99,6 @@ namespace NativeScriptWindowsDemo
                 catch { /* JS owns its own Window */ }
             }
 
-            // After any await, the continuation may run on a thread pool thread.
-            // Schedule all UI-thread-required operations through the dispatcher queue.
             if (dispatcherQueue?.HasThreadAccess == true)
             {
                 ShowMainWindow();
@@ -107,9 +111,8 @@ namespace NativeScriptWindowsDemo
 
         private void OnWindowClosed(object sender, WindowEventArgs e)
         {
-            CompositionTarget.Rendering -= OnRenderFrame;
-            // Fire the JS `exit` event while the V8 isolate is still alive (before Dispose).
-            _runtimeHost.NotifyAppEvent("{\"kind\":\"exit\"}");
+            StopPump();
+            _runtimeHost.NotifyAppEvent((int)AppEventKind.Exit, null);
             ApplicationData.Current.LocalSettings.Values[LastLaunchArgsKey] = string.Empty;
             _runtimeHost.Dispose();
         }
@@ -117,13 +120,14 @@ namespace NativeScriptWindowsDemo
         // WindowActivationState.Deactivated → lost focus (background); otherwise foreground/resume.
         private void OnWindowActivated(object sender, WindowActivatedEventArgs e)
         {
-            var kind = e.WindowActivationState == WindowActivationState.Deactivated ? "deactivated" : "activated";
-            _runtimeHost.NotifyAppEvent("{\"kind\":\"" + kind + "\"}");
+            var kind = e.WindowActivationState == WindowActivationState.Deactivated ? AppEventKind.Deactivated : AppEventKind.Activated;
+            _runtimeHost.NotifyAppEvent((int)kind, null);
         }
 
         private void OnWindowVisibilityChanged(object sender, WindowVisibilityChangedEventArgs e)
         {
-            _runtimeHost.NotifyAppEvent(e.Visible ? "{\"kind\":\"shown\"}" : "{\"kind\":\"hidden\"}");
+            var kind = e.Visible ? AppEventKind.Shown : AppEventKind.Hidden;
+            _runtimeHost.NotifyAppEvent((int)kind, null);
         }
 
         private void OnUnhandledException(object sender, Microsoft.UI.Xaml.UnhandledExceptionEventArgs e)
@@ -134,8 +138,8 @@ namespace NativeScriptWindowsDemo
             // Surface to the JS `uncaughtError` application event before reporting.
             try
             {
-                var payload = JsonSerializer.Serialize(new { kind = "uncaughtError", message = e.Message ?? jsError ?? "Unhandled exception" });
-                _runtimeHost.NotifyAppEvent(payload);
+                var message = e.Message ?? jsError ?? "Unhandled exception";
+                _runtimeHost.NotifyAppEvent((int)AppEventKind.UncaughtError, message);
             }
             catch { }
 
@@ -150,12 +154,67 @@ namespace NativeScriptWindowsDemo
                 e.Message ?? "Unhandled exception", report);
         }
 
-        private void OnRenderFrame(object sender, object e)
+        // Pump cadence from two sources, both via the guarded SchedulePump(): CompositionTarget.Rendering
+        // (display refresh rate; smooth JS-driven animations) + a low-frequency DispatcherQueueTimer
+        // heartbeat (keeps timers/promises running when Rendering stops, e.g. minimised/occluded). The pump
+        // runs OUTSIDE the render walk (TryEnqueue) so the JS it pumps can mutate the XAML tree without
+        // tripping XAML's re-entrancy guard (which RoFailFasts with E_UNEXPECTED / 0xC000027B). _pumpQueued
+        // keeps at most one pump in flight.
+        private DispatcherQueue _dispatcherQueue;
+        private DispatcherQueueTimer _pumpHeartbeat;
+        private bool _pumpQueued;
+
+        private void StartPump()
         {
-            _runtimeHost.PumpTimers();
+            _dispatcherQueue = DispatcherQueue.GetForCurrentThread();
+            CompositionTarget.Rendering -= OnRenderFrame;
+            CompositionTarget.Rendering += OnRenderFrame;
+            if (_pumpHeartbeat == null && _dispatcherQueue != null)
+            {
+                _pumpHeartbeat = _dispatcherQueue.CreateTimer();
+                _pumpHeartbeat.Interval = TimeSpan.FromMilliseconds(100);
+                _pumpHeartbeat.IsRepeating = true;
+                _pumpHeartbeat.Tick += OnPumpHeartbeat;
+                _pumpHeartbeat.Start();
+            }
+        }
+
+        private void StopPump()
+        {
+            CompositionTarget.Rendering -= OnRenderFrame;
+            if (_pumpHeartbeat != null)
+            {
+                _pumpHeartbeat.Stop();
+                _pumpHeartbeat.Tick -= OnPumpHeartbeat;
+                _pumpHeartbeat = null;
+            }
+        }
+
+        // Inside XAML's render walk — only schedule; never pump or touch the tree here.
+        private void OnRenderFrame(object sender, object e) => SchedulePump();
+
+        private void OnPumpHeartbeat(DispatcherQueueTimer sender, object args) => SchedulePump();
+
+        private void SchedulePump()
+        {
+            if (_pumpQueued)
+            {
+                return;
+            }
+            var dispatcherQueue = _dispatcherQueue;
+            if (dispatcherQueue == null)
+            {
+                return;
+            }
+            _pumpQueued = true;
+            dispatcherQueue.TryEnqueue(() =>
+            {
+                _pumpQueued = false;
+                _runtimeHost.PumpTimers();
 #if DEBUG
-            _runtimeHost.PumpDevtools();
+                _runtimeHost.PumpDevtools();
 #endif
+            });
         }
     }
 }

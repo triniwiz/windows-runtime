@@ -31,8 +31,6 @@ thread_local!(static INSPECTOR_DOMAIN_DISPATCHERS: RefCell<HashMap<String, v8::G
 
 const INSPECTOR_DISPATCHERS_GLOBAL: &str = "__nsInspectorDomainDispatchers";
 
-// ── Private helpers ───────────────────────────────────────────────────────────
-
 pub(crate) fn value_to_string(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> Option<String> {
     let value = value.to_string(scope)?;
     Some(value.to_rust_string_lossy(scope))
@@ -205,8 +203,6 @@ fn polled_event_to_v8<'s>(
         }
     }
 }
-
-// ── Global function handlers ──────────────────────────────────────────────────
 
 pub(crate) fn handle_host_wait_for_async(
     scope: &mut v8::PinScope<'_, '_>,
@@ -815,8 +811,6 @@ pub(crate) fn handle_worker_poll_messages_blocking(
     }
     retval.set(array.into());
 }
-
-// ── Runtime bootstrap JavaScript ──────────────────────────────────────────────
 
 /// Installed into every context. Provides NSWinRT, module loader, async helpers,
 /// proxy extension infrastructure, and the `Function.prototype.extend` NativeScript API.
@@ -2274,10 +2268,8 @@ const HELPER_SOURCE: &str = r#"
             globalThis.NSWinRT.dynamicImport = __nsDynamicImport;
         })();
 
-        // ── runtime metadata ──────────────────────────────────────────────────
         globalThis.__runtimeVersion = "1.0.0";
 
-        // ── Timers bootstrap (runtime-registered defaults, embedders may override) ─
         // The runtime registers host-facing timer entrypoints into the JS global:
         //   global.__ns__setTimeout
         //   global.__ns__setInterval
@@ -2306,7 +2298,6 @@ const HELPER_SOURCE: &str = r#"
             }
         })();
 
-        // ── requestAnimationFrame / cancelAnimationFrame ──────────────────────
         // Uses __nsDwmFlush() — the Windows equivalent of Choreographer /
         // CADisplayLink.  DwmFlush() blocks the calling thread until the next
         // monitor VSync, giving frame-perfect timing at any refresh rate
@@ -2350,7 +2341,6 @@ const HELPER_SOURCE: &str = r#"
             };
         })();
 
-        // ── URL / URLSearchParams / URLPattern post-install wiring ────────────
         // The native classes are installed by install_url_globals() before this
         // script runs.  This block adds the JS-layer searchParams accessor
         // (mutation propagation + caching), Symbol.iterator, and the blob-URL API.
@@ -2380,7 +2370,6 @@ const HELPER_SOURCE: &str = r#"
             // Make URLSearchParams iterable (entries by default)
             URLSearchParams.prototype[Symbol.iterator] = URLSearchParams.prototype.entries;
 
-            // ── URL.createObjectURL / revokeObjectURL ─────────────────────────
             var BLOB_STORE = new Map();
             var _blobSeq = 0;
             URL.createObjectURL = function (object, options) {
@@ -2401,7 +2390,6 @@ const HELPER_SOURCE: &str = r#"
             };
         })();
 
-        // ── URLPattern polyfill ───────────────────────────────────────────────
         // ada-url (C++) doesn't expose URLPattern; this JS polyfill covers the
         // common cases: :name capture groups, * / ** wildcards, literal segments.
         (function () {
@@ -2525,7 +2513,6 @@ const HELPER_SOURCE: &str = r#"
             globalThis.URLPattern = URLPattern;
         })();
 
-        // ── NSWinRT.dotnet — BCL / arbitrary .NET dispatch ───────────────────
         // Requires the dotnet-bridge project to be published into
         //   <app-root>/dotnet-bridge/publish/DotNetBridge.dll
         (function () {
@@ -2546,7 +2533,6 @@ const HELPER_SOURCE: &str = r#"
                 );
             }
 
-            // ── Type-metadata cache ──────────────────────────────────────────
             // Populated lazily on first access; avoids repeated bridge round-trips.
             var _typeInfoCache = {};
             var _emptyInfo = { methods: [], properties: [], staticMethods: [], staticProperties: [], readonlyProperties: [], readonlyStaticProperties: [], writeonlyProperties: [], writeonlyStaticProperties: [] };
@@ -2568,7 +2554,6 @@ const HELPER_SOURCE: &str = r#"
                 return '';
             }
 
-            // ── Auto-release via FinalizationRegistry ────────────────────────
             // When the JS GC collects a DotNet proxy the registry fires the
             // callback with the managed handle id, releasing the CLR reference.
             // Explicit sw.release() still works for deterministic teardown.
@@ -2617,7 +2602,6 @@ const HELPER_SOURCE: &str = r#"
                 return v;
             }
 
-            // ── Instance Proxy ───────────────────────────────────────────────
             // Makes sw.Stop() and sw.Elapsed both work naturally.
             // The proxy is registered with _dotNetFinalizers so the CLR reference
             // is released automatically when JS GC collects the proxy.
@@ -2723,7 +2707,6 @@ const HELPER_SOURCE: &str = r#"
                 },
             };
 
-            // ── Natural namespace proxies ────────────────────────────────────
             // System.Diagnostics.Stopwatch.StartNew()    →  static method call
             // System.Environment.MachineName             →  static property get
             // new System.Text.StringBuilder(64)          →  constructor
@@ -2792,7 +2775,6 @@ const HELPER_SOURCE: &str = r#"
             globalThis.Microsoft      = _makeNamespaceProxy('Microsoft');
             globalThis.NativeScript   = _makeNamespaceProxy('NativeScript');
 
-            // ── NSWinRT.dotnet.asDelegate ────────────────────────────────────
             // Creates a typed .NET BCL delegate (not a WinRT COM delegate).
             // Use this when the API expects a managed System.Action,
             // System.EventHandler, etc. rather than a WinRT delegate interface.
@@ -2836,7 +2818,6 @@ const HELPER_SOURCE: &str = r#"
             }
         })();
 
-        // ── NSWinRT.win32 — dynamic Win32 FFI via libffi ────────────────────
         (function () {
             if (typeof globalThis.__nsWin32Call !== 'function') return;
 
@@ -2941,7 +2922,6 @@ const HELPER_SOURCE: &str = r#"
             };
         })();
 
-        // ── NSWinRT.asDelegate ───────────────────────────────────────────────
         // Wraps a JS function as a typed WinRT delegate via the native JsDelegate
         // COM bridge using WinRT metadata for GUID and parameter-type resolution.
         //
@@ -2982,7 +2962,6 @@ const HELPER_SOURCE: &str = r#"
             };
         })();
 
-        // ── CommonJS require() ────────────────────────────────────────────────
         (function () {
             var cjsCache = new Map();
 
@@ -3077,8 +3056,6 @@ const HELPER_SOURCE: &str = r#"
         })();
         "#;
 
-// ── __nsDotNetInvoke ──────────────────────────────────────────────────────────
-
 /// Calls the .NET bridge with a JSON request string and returns the JSON
 /// response string.  Throws a JS error if the host is not initialised or the
 /// call fails at the hosting layer (application-level errors are returned as
@@ -3106,8 +3083,6 @@ pub(crate) fn handle_dotnet_invoke(
         Err(e) => throw_js_error(scope, &e),
     }
 }
-
-// ── __nsDotNetInvokeBin ───────────────────────────────────────────────────────
 
 /// Binary-protocol bridge: builds a compact request packet from structured V8
 /// arguments, calls the C# InvokeBinary entry point, and converts the binary
@@ -3203,8 +3178,6 @@ pub(crate) fn handle_dotnet_invoke_binary(
         Err(e) => throw_js_error(scope, &e),
     }
 }
-
-// ── __nsDotNetCreateDelegate ──────────────────────────────────────────────────
 
 /// Called by the Rust runtime (via stored function pointer) when a managed .NET
 /// delegate fires.  Runs on the V8/JS isolate thread — same pattern as the
@@ -3781,8 +3754,6 @@ fn bin_read_value<'s>(
     }
 }
 
-// ── __nsWin32Exports ──────────────────────────────────────────────────────────
-
 /// Returns a JSON array of exported function names for the given DLL, e.g.
 /// `["MessageBoxW","CreateWindowExW",…]`.  Used by `NSWinRT.win32.import()`.
 pub(crate) fn handle_win32_exports(
@@ -3801,8 +3772,6 @@ pub(crate) fn handle_win32_exports(
         retval.set(s.into());
     }
 }
-
-// ── __nsDwmFlush ──────────────────────────────────────────────────────────────
 
 /// Blocks the calling thread until the next DWM VSync (monitor refresh), then
 /// returns the elapsed milliseconds since process start as a `f64`.
@@ -3828,7 +3797,6 @@ pub(crate) fn handle_dwm_flush(
     retval.set_double(ts);
 }
 
-// ── __tns_uptime
 pub(crate) fn handle_tns_uptime(
     _scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments,
@@ -3840,8 +3808,6 @@ pub(crate) fn handle_tns_uptime(
         .as_nanos() as f64 / 1_000_000.0;
     retval.set_double(ts);
 }
-
-// ── __nsUUID ──────────────────────────────────────────────────────────────────
 
 pub(crate) fn handle_ns_uuid(
     scope: &mut v8::PinScope<'_, '_>,
@@ -3864,8 +3830,6 @@ pub(crate) fn handle_ns_uuid(
     }
 }
 
-// ── __nsIsUiThread ───────────────────────────────────────────────────────────
-
 pub(crate) fn handle_is_ui_thread(
     _scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments,
@@ -3875,7 +3839,6 @@ pub(crate) fn handle_is_ui_thread(
     retval.set_bool(is_ui);
 }
 
-// ── __nsThreadInfo ──────────────────────────────────────────────────────────
 pub(crate) fn handle_thread_info(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments,
@@ -3912,7 +3875,6 @@ pub(crate) fn handle_thread_info(
     retval.set(obj.into());
 }
 
-// ── __nsGetLastJsError ──────────────────────────────────────────────────────
 pub(crate) fn handle_get_last_js_error(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments,
@@ -3928,8 +3890,6 @@ pub(crate) fn handle_get_last_js_error(
 }
 
 
-// ── __nsTypedValue / __nsCreateReference ─────────────────────────────────────
-//
 // __nsTypedValue(typeName, value) — box a JS value as a concrete WinRT IPropertyValue.
 //   Useful for passing typed primitives to Object/IInspectable parameters and for
 //   method overload disambiguation.
@@ -3998,8 +3958,6 @@ pub(crate) fn handle_create_reference(
     box_and_return(scope, type_name.trim(), args.get(1), retval);
 }
 
-// ── __nsWin32CallRaw ──────────────────────────────────────────────────────────
-
 /// Fast typed Win32 dispatch — no JSON round-trip.
 /// Args: (dll, fn_name, retType, argType₀, argVal₀, argType₁, argVal₁, …)
 /// Returns the result as a typed V8 value (number, bool, or null for void).
@@ -4065,8 +4023,6 @@ pub(crate) fn handle_win32_call_raw(
     }
 }
 
-// ── __nsWin32Call ─────────────────────────────────────────────────────────────
-
 /// Calls an arbitrary Win32 function via libffi dynamic dispatch.
 /// Accepts a JSON string `{dll, fn, returnType, args:[{type,value}…]}` and
 /// returns `{"value": <result>}` or `{"error": "…"}`.
@@ -4092,8 +4048,6 @@ pub(crate) fn handle_win32_call(
         retval.set(s.into());
     }
 }
-
-// ── Context initialisation ────────────────────────────────────────────────────
 
 /// Installs all host-side global functions and the runtime bootstrap JS into `scope`.
 pub(crate) fn init_async_helpers(
