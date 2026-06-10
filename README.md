@@ -34,11 +34,6 @@ Install these before building the full workspace:
 Open a Visual Studio Developer PowerShell when building native libraries so `cl.exe`
 and the Windows SDK tools are on `PATH`.
 
-The Rust `metadata` crate no longer builds the old `bindings.cpp` shim, so it does
-not require the hardcoded `.NET Framework NETFXSDK` C++ include path just to compile.
-The full repo still needs .NET and Visual Studio tooling for the bridge, app hosts,
-native `nativescript.dll`, and tests.
-
 ## Build
 
 Build the main workspace crates:
