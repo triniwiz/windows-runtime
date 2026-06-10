@@ -72,6 +72,36 @@ pub fn post_to_ui_thread(f: impl FnOnce() + Send + 'static) {
     let _ = dq.TryEnqueue(&handler);
 }
 
+/// Enqueue `f` as an ordinary work item on the XAML host's `DispatcherQueue`,
+/// even when already on the UI thread (`post_to_ui_thread` would run it inline
+/// there). Used to move work out of re-entrancy-sensitive XAML callouts such as
+/// the render walk: the work item runs only after the current callout returns
+/// to the dispatcher.
+///
+/// Returns `false` without running `f` when deferral is unavailable — no XAML
+/// host queue on this thread (console hosts, workers, unit tests; a
+/// runtime-owned `DispatcherQueueController` has no render walk to stay out of)
+/// or the enqueue failed. The caller should then run the work inline.
+pub fn defer_on_ui_thread(f: impl FnOnce() + Send + 'static) -> bool {
+    if needs_win32_pump() {
+        return false;
+    }
+    let Some(dq) = UI_QUEUE.get() else {
+        return false;
+    };
+    if UI_THREAD_ID.get().copied() != Some(std::thread::current().id()) {
+        return false;
+    }
+    let cell = std::sync::Mutex::new(Some(f));
+    let handler = DispatcherQueueHandler::new(move || {
+        if let Some(f) = cell.lock().unwrap().take() {
+            f();
+        }
+        Ok(())
+    });
+    dq.TryEnqueue(&handler).unwrap_or(false)
+}
+
 pub fn is_initialized() -> bool {
     UI_QUEUE.get().is_some()
 }

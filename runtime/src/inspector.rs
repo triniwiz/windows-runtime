@@ -210,6 +210,11 @@ pub fn try_dispatch_inspector_message_to_js(msg: &str) -> bool {
             }
             tc.reset();
         }
+        // Explicit microtasks policy: drain continuations queued by the
+        // dispatcher method so devtools responses don't wait for the next pump.
+        if !crate::defer_microtask_drain() {
+            tc.perform_microtask_checkpoint();
+        }
         return true;
     }
 

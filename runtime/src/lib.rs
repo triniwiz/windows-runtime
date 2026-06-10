@@ -98,6 +98,10 @@ thread_local!(pub(crate) static DELEGATE_ISOLATE_PTR: Cell<*mut v8::Isolate> = C
 // already inside a V8 scope (e.g. XAML re-entering ContainerContentChanging), so we must
 // adopt the active scope instead of pushing a new root HandleScope from the raw isolate.
 thread_local!(pub(crate) static DELEGATE_DEPTH: Cell<u32> = Cell::new(0));
+// Set while a coalesced microtask drain is queued on the XAML DispatcherQueue,
+// so the native→JS callbacks firing within one dispatcher pass schedule at most
+// one drain work item between them. See `defer_microtask_drain`.
+thread_local!(pub(crate) static MICROTASK_DRAIN_QUEUED: Cell<bool> = Cell::new(false));
 
 // JS functions registered via NSWinRT.asDelegate so managed .NET delegates can
 // call back into V8. Keyed by the integer id sent to C# as the callback id.
@@ -144,9 +148,12 @@ pub fn store_last_js_error(error: String) {
 /// XAML dispatches `Completed` notifications for async operations (e.g.
 /// `BitmapImage.SetSourceAsync`) via `CoreDispatcher`/`CoreWindow` between
 /// render frames. When those fire, `JsDelegate::Invoke` calls into V8 and
-/// queues a microtask (Promise resolution), but V8 may not run it immediately
-/// if microtask policy is explicit. This function drains the microtask queue
-/// so Promise continuations run at the next frame boundary rather than stalling.
+/// queues a microtask (Promise resolution). The isolate runs with explicit
+/// microtasks policy (see `Runtime::new`), so nothing drains automatically:
+/// this function and the per-callback checkpoints in the native→JS entry
+/// points are the only drain sites. It is the target of the coalesced drain
+/// scheduled by `defer_microtask_drain`, and is also called once per frame /
+/// heartbeat via `runtime_pump_timers` so continuations never stall.
 ///
 /// NOTE: Do NOT call `PeekMessageW + DispatchMessageW` here. This function is
 /// called from `CompositionTarget.Rendering` via `runtime_pump_timers`, and
@@ -167,6 +174,46 @@ pub fn pump_dispatcher() {
     let scope = &mut v8::ContextScope::new(scope, ctx);
     v8::tc_scope!(tc, scope);
     tc.perform_microtask_checkpoint();
+}
+
+/// Move the post-callback microtask checkpoint out of the current native frame
+/// when that frame may be a re-entrancy-sensitive XAML callout.
+///
+/// JS delegates frequently fire from inside XAML's render walk — a JS handler on
+/// `CompositionTarget.Rendering`, or a re-entrant raise like
+/// `ContainerContentChanging`. Draining Promise continuations there lets
+/// arbitrary JS mutate the live XAML tree mid-walk, which trips XAML's
+/// re-entrancy guard and fail-fasts the process with a stowed exception
+/// (0xC000027B) — the host-side half of this contract is documented at
+/// App.xaml.cs `SchedulePump`. On the XAML UI thread the checkpoint is therefore
+/// queued as an ordinary `DispatcherQueue` work item (coalesced: at most one in
+/// flight), which the dispatcher runs only after the render walk completes.
+///
+/// Returns `true` when a drain is queued (or already pending) and the caller
+/// must skip its inline checkpoint. Returns `false` when this thread has no
+/// XAML dispatcher — console hosts, workers and tests keep the inline
+/// checkpoint, where no render walk exists and prompt draining is preferable.
+pub(crate) fn defer_microtask_drain() -> bool {
+    MICROTASK_DRAIN_QUEUED.with(|queued| {
+        if queued.get() {
+            return true;
+        }
+        let scheduled = ui_dispatcher::defer_on_ui_thread(|| {
+            // Drain before clearing the flag: microtasks queued while the
+            // checkpoint runs are processed by the same checkpoint loop, so
+            // clearing afterwards cannot strand work. catch_unwind keeps a JS
+            // panic from unwinding into the COM dispatcher frames above us.
+            let result = std::panic::catch_unwind(pump_dispatcher);
+            MICROTASK_DRAIN_QUEUED.with(|q| q.set(false));
+            if result.is_err() {
+                store_last_js_error("panic while draining deferred microtasks".to_string());
+            }
+        });
+        if scheduled {
+            queued.set(true);
+        }
+        scheduled
+    })
 }
 
 /// Pump Win32 messages and flush V8 microtasks.
@@ -7174,7 +7221,11 @@ fn js_delegate_run(
         }
         tc.reset();
     }
-    tc.perform_microtask_checkpoint();
+    // Delegates can fire from inside XAML's render walk; never drain Promise
+    // continuations there (fail-fast 0xC000027B) — defer when possible.
+    if !defer_microtask_drain() {
+        tc.perform_microtask_checkpoint();
+    }
     HRESULT(0)
 }
 
@@ -7402,6 +7453,16 @@ impl Runtime {
         let params = v8::CreateParams::default();
         let mut isolate = v8::Isolate::new(params);
         isolate.set_capture_stack_trace_for_uncaught_exceptions(true, 100);
+
+        // Microtasks must drain only at the runtime's explicit checkpoint sites
+        // (pump_dispatcher and the native→JS callback exits). V8's default kAuto
+        // policy also drains whenever a Function::call returns at embedder call
+        // depth zero — which includes delegate invokes fired from inside XAML's
+        // render walk (e.g. a JS handler on CompositionTarget.Rendering), where
+        // running Promise continuations re-enters the XAML core and fail-fasts
+        // with 0xC000027B. Explicit policy lets `defer_microtask_drain` move
+        // that drain to a DispatcherQueue work item outside the walk.
+        isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
 
         // Provide a host callback for dynamic `import()` so embedders and
         // tests that use `import(modulePath)` work. The callback compiles
@@ -7776,7 +7837,7 @@ impl Runtime {
         // Swallow handler errors: no outer TryCatch here (see run_script).
         if tc.has_caught() {
             let _ = tc.exception();
-        } else {
+        } else if !defer_microtask_drain() {
             tc.perform_microtask_checkpoint();
         }
     }
@@ -7801,6 +7862,9 @@ impl Drop for Runtime {
         crate::global_fns::clear_thread_dispatchers();
         ISOLATE.with(|cell| *cell.borrow_mut() = None);
         DELEGATE_ISOLATE_PTR.with(|cell| cell.set(std::ptr::null_mut()));
+        // A queued drain work item may never run once the host's dispatcher
+        // stops; reset so a future Runtime on this thread can schedule drains.
+        MICROTASK_DRAIN_QUEUED.with(|cell| cell.set(false));
         if self.winrt_initialized {
             unsafe { RoUninitialize() };
         }

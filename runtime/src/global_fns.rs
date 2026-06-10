@@ -106,6 +106,11 @@ pub(crate) fn handle_run_on_ui_thread(
             tc.reset();
         }
 
+        // Explicit microtasks policy: each native→JS task ends with a checkpoint.
+        if !crate::defer_microtask_drain() {
+            tc.perform_microtask_checkpoint();
+        }
+
         crate::DOTNET_JS_CALLBACKS.with(|m| {
             m.borrow_mut().remove(&cb_id);
         });
@@ -3561,6 +3566,12 @@ pub(crate) unsafe extern "C" fn invoke_dotnet_js_callback(
             set.remove(&callback_id);
         }
     });
+
+    // Managed delegates can fire from anywhere, including XAML's render walk —
+    // same re-entrancy contract as js_delegate_run: defer the drain when possible.
+    if !crate::defer_microtask_drain() {
+        tc.perform_microtask_checkpoint();
+    }
 }
 
 fn parse_dotnet_callback_args<'s>(

@@ -241,6 +241,13 @@ fn invoke_callback_by_id(id: i32) {
         tc.reset();
     }
 
+    // The isolate runs with explicit microtasks policy, so each timer task must
+    // end with a checkpoint (browser semantics). Deferred when a blocking-wait
+    // pump fires this inside a XAML callout; inline otherwise.
+    if !crate::defer_microtask_drain() {
+        tc.perform_microtask_checkpoint();
+    }
+
     if !repeats {
         TASKS.with(|tasks| {
             tasks.borrow_mut().remove(&id);
