@@ -55,6 +55,7 @@ public static partial class Bridge
         s_ctorCache.Clear();
         s_handles.Clear();
         s_nativePtrs.Clear();
+        s_nativePtrsReverse.Clear();
         s_nextHandle = 0;
     }
 
@@ -62,6 +63,24 @@ public static partial class Bridge
     // Populated when a managed object can yield a native COM pointer via
     // Marshal.GetIUnknownForObject. Cleared and released on __release.
     internal static readonly ConcurrentDictionary<int, IntPtr> s_nativePtrs = new();
+
+    // Reverse index kept in lockstep with s_nativePtrs so CoerceBin can
+    // resolve identity round-trips without scanning every entry.
+    internal static readonly ConcurrentDictionary<IntPtr, int> s_nativePtrsReverse = new();
+
+    internal static void StoreNativePtr(int handleId, IntPtr ptr)
+    {
+        s_nativePtrs[handleId] = ptr;
+        s_nativePtrsReverse[ptr] = handleId;
+    }
+
+    internal static void RemoveNativePtr(int handleId, IntPtr ptr)
+    {
+        // Only drop the reverse entry if it still points at this handle —
+        // another handle may have re-registered the same pointer.
+        if (s_nativePtrsReverse.TryGetValue(ptr, out var owner) && owner == handleId)
+            s_nativePtrsReverse.TryRemove(ptr, out _);
+    }
 
     // Runtime-configurable logging toggle. Default to true in DEBUG builds so
     // developers get verbose diagnostics without setting environment vars.
@@ -559,7 +578,7 @@ public static partial class Bridge
             var ip = ObtainNativePtr(obj);
             if (ip != IntPtr.Zero)
             {
-                s_nativePtrs[handleId] = ip;
+                StoreNativePtr(handleId, ip);
                 return ip;
             }
         }
