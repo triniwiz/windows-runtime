@@ -1,7 +1,9 @@
-use std::any::Any;
-use crate::prelude::*;
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, ELEMENT_TYPE_BYREF, IMetaDataImport2, mdtParamDef};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
+use crate::prelude::*;
+use std::any::Any;
+use windows::Win32::System::WinRT::Metadata::{
+    mdtParamDef, CorTokenType, IMetaDataImport2, ELEMENT_TYPE_BYREF,
+};
 
 #[derive(Clone, Debug)]
 pub struct ParameterDeclaration {
@@ -48,7 +50,7 @@ impl ParameterDeclaration {
         };
 
         Self {
-            kind:DeclarationKind::Parameter,
+            kind: DeclarationKind::Parameter,
             metadata: metadata.map(|f| f.clone()),
             token,
             parameter_type: sig_type,
@@ -58,8 +60,7 @@ impl ParameterDeclaration {
 
     pub fn is_out(&self) -> bool {
         let mut parameter_type = self.parameter_type.clone();
-        cor_sig_uncompress_token(&mut parameter_type)
-            == ELEMENT_TYPE_BYREF.0 as u32
+        cor_sig_uncompress_token(&mut parameter_type) == ELEMENT_TYPE_BYREF.0 as u32
     }
 
     pub fn token(&self) -> CorTokenType {

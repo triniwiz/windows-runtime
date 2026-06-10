@@ -1,11 +1,11 @@
-use std::any::Any;
-use std::ffi::{c_void};
-use std::ptr::addr_of_mut;
-use windows::Win32::System::WinRT::Metadata::COR_ENUM_FIELD_NAME_W;
-use windows::Win32::System::WinRT::Metadata::CorTokenType;
-use windows::Win32::System::WinRT::Metadata::IMAGE_CEE_CS_CALLCONV_FIELD;
-use windows::Win32::System::WinRT::Metadata::IMetaDataImport2;
 use crate::declarations::declaration::{Declaration, DeclarationKind};
+use std::any::Any;
+use std::ffi::c_void;
+use std::ptr::addr_of_mut;
+use windows::Win32::System::WinRT::Metadata::CorTokenType;
+use windows::Win32::System::WinRT::Metadata::IMetaDataImport2;
+use windows::Win32::System::WinRT::Metadata::COR_ENUM_FIELD_NAME_W;
+use windows::Win32::System::WinRT::Metadata::IMAGE_CEE_CS_CALLCONV_FIELD;
 
 use crate::declarations::enum_member_declaration::EnumMemberDeclaration;
 use crate::declarations::type_declaration::TypeDeclaration;
@@ -45,7 +45,7 @@ impl Declaration for EnumDeclaration {
 impl EnumDeclaration {
     pub fn new(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> Self {
         Self {
-            base: TypeDeclaration::new(DeclarationKind::Enum, metadata, token)
+            base: TypeDeclaration::new(DeclarationKind::Enum, metadata, token),
         }
     }
 
@@ -59,14 +59,19 @@ impl EnumDeclaration {
         if let Some(metadata) = self.base.metadata() {
             let mut enumerator = std::ptr::null_mut() as *mut c_void;
 
-            let result = unsafe { metadata.EnumFields(addr_of_mut!(enumerator), self.base.token().0 as u32, 0 as _, 0, 0 as _) };
-            ;
+            let result = unsafe {
+                metadata.EnumFields(
+                    addr_of_mut!(enumerator),
+                    self.base.token().0 as u32,
+                    0 as _,
+                    0,
+                    0 as _,
+                )
+            };
 
             assert!(result.is_ok());
 
-            let result = unsafe {
-                metadata.CountEnum(enumerator, &mut size)
-            };
+            let result = unsafe { metadata.CountEnum(enumerator, &mut size) };
 
             assert!(result.is_ok());
 
@@ -86,7 +91,10 @@ impl EnumDeclaration {
                 let result = unsafe {
                     metadata.FindField(
                         self.base.token().0 as u32,
-                        COR_ENUM_FIELD_NAME_W, 0 as _, 0 as _, &mut type_field,
+                        COR_ENUM_FIELD_NAME_W,
+                        0 as _,
+                        0 as _,
+                        &mut type_field,
                     )
                 };
                 assert!(result.is_ok());
@@ -96,7 +104,10 @@ impl EnumDeclaration {
                 let result = unsafe {
                     metadata.GetFieldProps(
                         type_field,
-                        0 as _, None, 0 as _, 0 as _,
+                        0 as _,
+                        None,
+                        0 as _,
+                        0 as _,
                         addr_of_mut!(signature.0),
                         &mut signature_size,
                         0 as _,
@@ -104,9 +115,7 @@ impl EnumDeclaration {
                         0 as _,
                     )
                 };
-                assert!(
-                    result.is_ok()
-                );
+                assert!(result.is_ok());
 
                 let header = cor_sig_uncompress_data(&mut signature);
 
@@ -135,7 +144,15 @@ impl EnumDeclaration {
         if let Some(metadata) = self.base.metadata() {
             let mut enumerator = std::ptr::null_mut();
             let mut size = 0_u32;
-            let result = unsafe { metadata.EnumFields(addr_of_mut!(enumerator), self.base.token().0 as u32, 0 as _, 0, 0 as _) };
+            let result = unsafe {
+                metadata.EnumFields(
+                    addr_of_mut!(enumerator),
+                    self.base.token().0 as u32,
+                    0 as _,
+                    0,
+                    0 as _,
+                )
+            };
             assert!(result.is_ok());
             // offset by 1 to remove the __value enum
             let result = unsafe { metadata.ResetEnum(enumerator, 1) };
@@ -147,9 +164,20 @@ impl EnumDeclaration {
             assert!(result.is_ok());
             for _ in 0..size {
                 let mut field = 0_u32;
-                let result = unsafe { metadata.EnumFields(&mut enumerator, self.base.token().0 as u32, &mut field, 1, 0 as _) };
+                let result = unsafe {
+                    metadata.EnumFields(
+                        &mut enumerator,
+                        self.base.token().0 as u32,
+                        &mut field,
+                        1,
+                        0 as _,
+                    )
+                };
                 assert!(result.is_ok());
-                enums.push(EnumMemberDeclaration::new(self.base.metadata(), CorTokenType(field as i32)))
+                enums.push(EnumMemberDeclaration::new(
+                    self.base.metadata(),
+                    CorTokenType(field as i32),
+                ))
             }
             unsafe { metadata.CloseEnum(enumerator) };
         }

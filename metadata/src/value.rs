@@ -1,8 +1,11 @@
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
-use windows::core::{BSTR, Interface};
+use windows::core::{Interface, BSTR};
 use windows::Win32::System::Com::IDispatch;
-use windows::Win32::System::Variant::{VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_BOOL, VT_BSTR, VT_I1, VT_I2, VT_I4, VT_I8, VT_NULL, VT_PTR, VT_R4, VT_R8, VT_UI2, VT_UI4, VT_UI8};
+use windows::Win32::System::Variant::{
+    VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_BOOL, VT_BSTR, VT_I1, VT_I2, VT_I4,
+    VT_I8, VT_NULL, VT_PTR, VT_R4, VT_R8, VT_UI2, VT_UI4, VT_UI8,
+};
 
 #[derive(Debug)]
 pub enum Value {
@@ -37,9 +40,9 @@ impl Variant {
                         wReserved2: 0,
                         wReserved3: 0,
                         Anonymous: contents,
-                    })
-                }
-            }
+                    }),
+                },
+            },
         }
     }
 
@@ -55,7 +58,10 @@ impl Variant {
 impl From<bool> for Variant {
     fn from(value: bool) -> Self {
         Variant::new(
-            VT_BOOL, VARIANT_0_0_0 { boolVal: value.into() },
+            VT_BOOL,
+            VARIANT_0_0_0 {
+                boolVal: value.into(),
+            },
         )
     }
 }
@@ -63,7 +69,10 @@ impl From<bool> for Variant {
 impl From<String> for Variant {
     fn from(value: String) -> Self {
         Variant::new(
-            VT_BSTR, VARIANT_0_0_0 { bstrVal: ManuallyDrop::new(BSTR::from(value)) },
+            VT_BSTR,
+            VARIANT_0_0_0 {
+                bstrVal: ManuallyDrop::new(BSTR::from(value)),
+            },
         )
     }
 }
@@ -77,88 +86,71 @@ impl From<&str> for Variant {
 impl From<char> for Variant {
     fn from(value: char) -> Self {
         Variant::new(
-            VT_UI2, VARIANT_0_0_0 { uiVal: value as u16 },
+            VT_UI2,
+            VARIANT_0_0_0 {
+                uiVal: value as u16,
+            },
         )
     }
 }
 
 impl From<i8> for Variant {
     fn from(value: i8) -> Self {
-        Variant::new(
-            VT_I1, VARIANT_0_0_0 { cVal: value },
-        )
+        Variant::new(VT_I1, VARIANT_0_0_0 { cVal: value })
     }
 }
 
 impl From<u8> for Variant {
     fn from(value: u8) -> Self {
-        Variant::new(
-            VT_UI4, VARIANT_0_0_0 { bVal: value },
-        )
+        Variant::new(VT_UI4, VARIANT_0_0_0 { bVal: value })
     }
 }
 
 impl From<i16> for Variant {
     fn from(value: i16) -> Self {
-        Variant::new(
-            VT_I2, VARIANT_0_0_0 { iVal: value },
-        )
+        Variant::new(VT_I2, VARIANT_0_0_0 { iVal: value })
     }
 }
 
 impl From<u16> for Variant {
     fn from(value: u16) -> Self {
-        Variant::new(
-            VT_UI2, VARIANT_0_0_0 { uiVal: value },
-        )
+        Variant::new(VT_UI2, VARIANT_0_0_0 { uiVal: value })
     }
 }
 
 impl From<i32> for Variant {
     fn from(value: i32) -> Self {
-        Variant::new(
-            VT_I4, VARIANT_0_0_0 { lVal: value },
-        )
+        Variant::new(VT_I4, VARIANT_0_0_0 { lVal: value })
     }
 }
 
 impl From<u32> for Variant {
     fn from(value: u32) -> Self {
-        Variant::new(
-            VT_UI4, VARIANT_0_0_0 { ulVal: value },
-        )
+        Variant::new(VT_UI4, VARIANT_0_0_0 { ulVal: value })
     }
 }
 
 impl From<i64> for Variant {
     fn from(value: i64) -> Self {
-        Variant::new(
-            VT_I8, VARIANT_0_0_0 { llVal: value },
-        )
+        Variant::new(VT_I8, VARIANT_0_0_0 { llVal: value })
     }
 }
 
 impl From<u64> for Variant {
     fn from(value: u64) -> Self {
-        Variant::new(
-            VT_UI8, VARIANT_0_0_0 { ullVal: value },
-        )
+        Variant::new(VT_UI8, VARIANT_0_0_0 { ullVal: value })
     }
 }
 
 impl From<f32> for Variant {
     fn from(value: f32) -> Self {
-        Variant::new(
-            VT_R4, VARIANT_0_0_0 { fltVal: value },
-        )
+        Variant::new(VT_R4, VARIANT_0_0_0 { fltVal: value })
     }
 }
 
 impl From<f64> for Variant {
     fn from(value: f64) -> Self {
-        Variant::new(
-            VT_R8, VARIANT_0_0_0 { dblVal: value },
-        )
+        Variant::new(VT_R8, VARIANT_0_0_0 { dblVal: value })
     }
 }
 
@@ -171,10 +163,9 @@ impl From<*mut c_void> for Variant {
         };
 
         Variant::new(
-            VT_PTR, VARIANT_0_0_0 {
-                pdispVal: ManuallyDrop::new(
-                    ret
-                )
+            VT_PTR,
+            VARIANT_0_0_0 {
+                pdispVal: ManuallyDrop::new(ret),
             },
         )
     }
@@ -184,9 +175,7 @@ impl Drop for Variant {
     fn drop(&mut self) {
         unsafe {
             match VARENUM(self.0.Anonymous.Anonymous.vt.0) {
-                VT_BSTR => {
-                    drop(&mut &self.0.Anonymous.Anonymous.Anonymous.bstrVal)
-                }
+                VT_BSTR => drop(&mut &self.0.Anonymous.Anonymous.Anonymous.bstrVal),
                 _ => {}
             }
             drop(&mut self.0.Anonymous.Anonymous)
@@ -197,51 +186,21 @@ impl Drop for Variant {
 impl Into<Variant> for Value {
     fn into(self) -> Variant {
         match self {
-            Value::Void(value) => {
-                Variant::from(value)
-            }
-            Value::Boolean(value) => {
-                Variant::from(value)
-            }
-            Value::Char16(value) => {
-                Variant::from(value)
-            }
-            Value::Int8(value) => {
-                Variant::from(value)
-            }
-            Value::Uint8(value) => {
-                Variant::from(value)
-            }
-            Value::Int16(value) => {
-                Variant::from(value)
-            }
-            Value::Uint16(value) => {
-                Variant::from(value)
-            }
-            Value::Int32(value) => {
-                Variant::from(value)
-            }
-            Value::Uint32(value) => {
-                Variant::from(value)
-            }
-            Value::Int64(value) => {
-                Variant::from(value)
-            }
-            Value::Uint64(value) => {
-                Variant::from(value)
-            }
-            Value::Single(value) => {
-                Variant::from(value)
-            }
-            Value::Double(value) => {
-                Variant::from(value)
-            }
-            Value::String(value) => {
-                Variant::from(value.as_str())
-            }
-            Value::Object(value) => {
-                Variant::from(value)
-            }
+            Value::Void(value) => Variant::from(value),
+            Value::Boolean(value) => Variant::from(value),
+            Value::Char16(value) => Variant::from(value),
+            Value::Int8(value) => Variant::from(value),
+            Value::Uint8(value) => Variant::from(value),
+            Value::Int16(value) => Variant::from(value),
+            Value::Uint16(value) => Variant::from(value),
+            Value::Int32(value) => Variant::from(value),
+            Value::Uint32(value) => Variant::from(value),
+            Value::Int64(value) => Variant::from(value),
+            Value::Uint64(value) => Variant::from(value),
+            Value::Single(value) => Variant::from(value),
+            Value::Double(value) => Variant::from(value),
+            Value::String(value) => Variant::from(value.as_str()),
+            Value::Object(value) => Variant::from(value),
             Value::SZArray(_) => {
                 // todo
                 Variant::null()

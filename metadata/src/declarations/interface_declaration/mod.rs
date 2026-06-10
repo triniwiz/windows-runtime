@@ -1,6 +1,3 @@
-use std::any::Any;
-use windows::core::GUID;
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 use crate::declarations::base_class_declaration::{BaseClassDeclaration, BaseClassDeclarationImpl};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::event_declaration::EventDeclaration;
@@ -8,6 +5,9 @@ use crate::declarations::method_declaration::MethodDeclaration;
 use crate::declarations::property_declaration::PropertyDeclaration;
 use crate::declarations::type_declaration::TypeDeclaration;
 use crate::prelude::*;
+use std::any::Any;
+use windows::core::GUID;
+use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 
 pub mod generic_interface_declaration;
 pub mod generic_interface_instance_declaration;
@@ -36,9 +36,7 @@ impl InterfaceDeclaration {
         let base = self.base.base();
         match base.metadata.as_ref() {
             None => GUID::zeroed(),
-            Some(metadata) => {
-                get_guid_attribute_value(Some(metadata), base.token())
-            }
+            Some(metadata) => get_guid_attribute_value(Some(metadata), base.token()),
         }
     }
 }

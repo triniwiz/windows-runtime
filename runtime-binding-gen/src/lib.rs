@@ -33,19 +33,19 @@ pub struct RuntimeExtensionMetadata {
     /// Namespace containing the class
     #[serde(default)]
     pub namespace: Option<String>,
-    
+
     /// Base class name
     #[serde(default)]
     pub base_class: Option<String>,
-    
+
     /// Methods defined on the extension
     #[serde(default)]
     pub methods: Vec<RuntimeMethodMetadata>,
-    
+
     /// Properties defined on the extension
     #[serde(default)]
     pub properties: Vec<RuntimePropertyMetadata>,
-    
+
     /// Interfaces implemented
     #[serde(default)]
     pub interfaces: Vec<String>,
@@ -53,7 +53,7 @@ pub struct RuntimeExtensionMetadata {
     /// Whether the JS-visible type name was synthesized automatically
     #[serde(default)]
     pub is_auto_generated_name: bool,
-    
+
     /// When this extension was registered
     #[serde(default)]
     pub registered_at: Option<String>,
@@ -65,10 +65,10 @@ pub struct RuntimeExtensionMetadata {
 pub struct RuntimeMethodMetadata {
     /// Method name
     pub name: String,
-    
+
     /// Return type (string representation)
     pub return_type: String,
-    
+
     /// Parameter names and types
     #[serde(default)]
     pub parameters: Vec<RuntimeParameterMetadata>,
@@ -80,13 +80,13 @@ pub struct RuntimeMethodMetadata {
 pub struct RuntimePropertyMetadata {
     /// Property name
     pub name: String,
-    
+
     /// Property type (string representation)
     pub prop_type: String,
-    
+
     /// Whether property is readable
     pub readable: bool,
-    
+
     /// Whether property is writable
     pub writable: bool,
 }
@@ -107,7 +107,8 @@ impl RuntimeExtensionRegistry {
 
     /// Register an extension at runtime
     pub fn register(&mut self, metadata: RuntimeExtensionMetadata) {
-        self.extensions.insert(metadata.class_name.clone(), metadata);
+        self.extensions
+            .insert(metadata.class_name.clone(), metadata);
     }
 
     /// Get metadata for an extension
@@ -142,13 +143,13 @@ impl Default for RuntimeExtensionRegistry {
 pub struct MethodDispatchInfo {
     /// Method name
     pub name: String,
-    
+
     /// Unique dispatch ID
     pub dispatch_id: u32,
-    
+
     /// Return type info
     pub return_type: String,
-    
+
     /// Parameter count
     pub param_count: usize,
 }
@@ -169,14 +170,14 @@ impl DispatchMetadataBuilder {
     }
 
     /// Add a method to dispatch table; returns the assigned dispatch ID.
-    pub fn add_method(
-        &mut self,
-        name: String,
-        return_type: String,
-        param_count: usize,
-    ) -> u32 {
+    pub fn add_method(&mut self, name: String, return_type: String, param_count: usize) -> u32 {
         let id = self.next_id;
-        self.methods.push(MethodDispatchInfo { name, dispatch_id: id, return_type, param_count });
+        self.methods.push(MethodDispatchInfo {
+            name,
+            dispatch_id: id,
+            return_type,
+            param_count,
+        });
         self.next_id += 1;
         id
     }

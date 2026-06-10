@@ -1,7 +1,7 @@
-use std::ffi::{c_char, CStr, CString, c_void};
-use std::sync::{Once, OnceLock};
-use std::sync::Arc;
 use runtime::Runtime;
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::sync::Arc;
+use std::sync::{Once, OnceLock};
 
 static PANIC_HOOK_INIT: Once = Once::new();
 static APP_ROOT: OnceLock<String> = OnceLock::new();
@@ -18,20 +18,26 @@ fn install_panic_hook() {
             } else {
                 "unknown panic".to_string()
             };
-            let location = info.location()
+            let location = info
+                .location()
                 .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
                 .unwrap_or_else(|| "<unknown location>".to_string());
             let full = format!("[NativeScript] PANIC at {}: {}\n", location, msg);
             eprint!("{}", full);
-            let log_dir = LOCAL_FOLDER.get()
+            let log_dir = LOCAL_FOLDER
+                .get()
                 .map(|s| s.as_str())
                 .or_else(|| APP_ROOT.get().map(|s| s.as_str()));
             let log_written = if let Some(dir) = log_dir {
                 let path = std::path::Path::new(dir).join("nativescript-panic.log");
                 std::fs::OpenOptions::new()
-                    .create(true).append(true)
+                    .create(true)
+                    .append(true)
                     .open(&path)
-                    .and_then(|mut f| { use std::io::Write; f.write_all(full.as_bytes()) })
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        f.write_all(full.as_bytes())
+                    })
                     .is_ok()
             } else {
                 false
@@ -39,12 +45,111 @@ fn install_panic_hook() {
             if !log_written {
                 let temp = std::env::temp_dir().join("nativescript-panic.log");
                 let _ = std::fs::OpenOptions::new()
-                    .create(true).append(true)
+                    .create(true)
+                    .append(true)
                     .open(&temp)
-                    .and_then(|mut f| { use std::io::Write; f.write_all(full.as_bytes()) });
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        f.write_all(full.as_bytes())
+                    });
             }
             prev(info);
         }));
+    });
+}
+
+// ── DIAGNOSTIC: vectored exception handler ──────────────────────────────────
+// Captures the runtime's "last WinRT calls" ring buffer + native fault info to a
+// file the moment a fatal native exception (severity-error, e.g. a XAML RoFailFast
+// stowed exception 0xC000027B) is raised — before the process is torn down.
+use std::sync::atomic::{AtomicBool, Ordering};
+static VEH_INIT: Once = Once::new();
+static VEH_DUMPED: AtomicBool = AtomicBool::new(false);
+
+#[repr(C)]
+struct VehExceptionRecord {
+    code: u32,
+    flags: u32,
+    next: *mut VehExceptionRecord,
+    address: *mut c_void,
+    number_parameters: u32,
+    information: [usize; 15],
+}
+#[repr(C)]
+struct VehExceptionPointers {
+    exception_record: *mut VehExceptionRecord,
+    context_record: *mut c_void,
+}
+
+extern "system" {
+    fn AddVectoredExceptionHandler(
+        first: u32,
+        handler: unsafe extern "system" fn(*mut VehExceptionPointers) -> i32,
+    ) -> *mut c_void;
+    fn RtlCaptureStackBackTrace(
+        skip: u32,
+        capture: u32,
+        back_trace: *mut *mut c_void,
+        back_trace_hash: *mut u32,
+    ) -> u16;
+}
+
+unsafe extern "system" fn ns_veh(info: *mut VehExceptionPointers) -> i32 {
+    const CONTINUE_SEARCH: i32 = 0;
+    if info.is_null() {
+        return CONTINUE_SEARCH;
+    }
+    let rec = (*info).exception_record;
+    if rec.is_null() {
+        return CONTINUE_SEARCH;
+    }
+    let code = (*rec).code;
+    // Only fatal native faults (top nibble 0xC = STATUS_SEVERITY_ERROR). This skips
+    // benign C++ (0xE06D7363) and .NET (0xE0434352) language exceptions raised first-chance.
+    if (code & 0xF000_0000) != 0xC000_0000 {
+        return CONTINUE_SEARCH;
+    }
+    if VEH_DUMPED.swap(true, Ordering::SeqCst) {
+        return CONTINUE_SEARCH;
+    }
+
+    let mut report = format!(
+        "============================================================\n\
+         [NativeScript VEH] fatal native exception\n\
+         code=0x{:08X}  address=0x{:016X}  thread={:?}\n\
+         --- native return addresses ---\n",
+        code,
+        (*rec).address as usize,
+        std::thread::current().id(),
+    );
+    let mut frames: [*mut c_void; 48] = [std::ptr::null_mut(); 48];
+    let n = RtlCaptureStackBackTrace(0, 48, frames.as_mut_ptr(), std::ptr::null_mut());
+    for f in frames.iter().take(n as usize) {
+        report.push_str(&format!("0x{:016X}\n", *f as usize));
+    }
+    report.push('\n');
+
+    let dir = LOCAL_FOLDER
+        .get()
+        .map(|s| s.as_str())
+        .or_else(|| APP_ROOT.get().map(|s| s.as_str()));
+    if let Some(dir) = dir {
+        let path = std::path::Path::new(dir).join("nativescript-veh.log");
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(report.as_bytes())
+            });
+    }
+    CONTINUE_SEARCH
+}
+
+fn install_veh() {
+    VEH_INIT.call_once(|| unsafe {
+        AddVectoredExceptionHandler(1, ns_veh);
     });
 }
 
@@ -72,13 +177,22 @@ pub extern "C" fn runtime_install_ctrlc_handler(exit_code: i32) {
 
 #[no_mangle]
 pub extern "C" fn runtime_set_local_folder(path: *const c_char) {
-    if path.is_null() { return; }
-    let s = unsafe { CStr::from_ptr(path) }.to_string_lossy().to_string();
+    if path.is_null() {
+        return;
+    }
+    let s = unsafe { CStr::from_ptr(path) }
+        .to_string_lossy()
+        .to_string();
+    // Point the runtime's trace log (console.log) at the same folder as the crash/panic
+    // logs, instead of the process temp dir (which, for a runFullTrust packaged app, is the system
+    // temp — not where the CLI tails). Keep both in sync.
+    runtime::set_log_dir(s.clone());
     let _ = LOCAL_FOLDER.set(s);
 }
 
 #[no_mangle]
 pub extern "C" fn runtime_init(app_root: *const c_char) -> i64 {
+    install_veh();
     let result = std::panic::catch_unwind(|| {
         let mut boxed = if app_root.is_null() {
             Box::new(Runtime::new(""))
@@ -93,9 +207,13 @@ pub extern "C" fn runtime_init(app_root: *const c_char) -> i64 {
     match result {
         Ok(ptr) => ptr,
         Err(e) => {
-            let msg = if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
-                      else if let Some(s) = e.downcast_ref::<String>() { s.clone() }
-                      else { "unknown panic".to_string() };
+            let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = e.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
             eprintln!("[NativeScript] runtime_init panic: {}", msg);
             0
         }
@@ -122,9 +240,28 @@ pub extern "C" fn runtime_runscript(runtime: i64, script: *const c_char, filenam
             let filename = if filename.is_null() {
                 "main.js".to_string()
             } else {
-                unsafe { CStr::from_ptr(filename) }.to_string_lossy().into_owned()
+                unsafe { CStr::from_ptr(filename) }
+                    .to_string_lossy()
+                    .into_owned()
             };
             runtime.run_script(script.as_ref(), &filename);
+        });
+    }
+}
+
+/// Forward a host lifecycle event into JS via `globalThis.__nsOnAppEvent(kind, message)`.
+#[no_mangle]
+pub extern "C" fn runtime_notify_app_event(runtime: i64, kind: c_int, message: *const c_char) {
+    if runtime != 0 {
+        let _ = std::panic::catch_unwind(|| {
+            let runtime: *mut Runtime = runtime as _;
+            let runtime = unsafe { &mut *runtime };
+            if !message.is_null() {
+                let message = unsafe { CStr::from_ptr(message) }.to_string_lossy();
+                runtime.notify_app_event(kind, Some(&message));
+            } else {
+                runtime.notify_app_event(kind, None);
+            }
         });
     }
 }
@@ -133,7 +270,9 @@ pub extern "C" fn runtime_runscript(runtime: i64, script: *const c_char, filenam
 #[no_mangle]
 pub extern "C" fn runtime_get_last_js_error() -> *mut c_char {
     match runtime::get_last_js_error() {
-        Some(s) => CString::new(s).map(|c| c.into_raw()).unwrap_or(std::ptr::null_mut()),
+        Some(s) => CString::new(s)
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
         None => std::ptr::null_mut(),
     }
 }
@@ -157,21 +296,33 @@ pub extern "C" fn runtime_has_devtools() -> bool {
 #[cfg(feature = "devtools")]
 #[no_mangle]
 pub extern "C" fn runtime_devtools_start(runtime: i64, port: u16) -> *mut c_char {
-    if runtime == 0 { return std::ptr::null_mut(); }
+    if runtime == 0 {
+        return std::ptr::null_mut();
+    }
     let rt = unsafe { &mut *(runtime as *mut Runtime) };
 
-    let config = DevtoolsServerConfig { host: "127.0.0.1".to_string(), port };
+    let config = DevtoolsServerConfig {
+        host: "127.0.0.1".to_string(),
+        port,
+    };
     // Split borrows: copy the Global handle first, then take the mutable isolate borrow.
     let global_ctx = rt.global_context().clone();
     let forwarder: Option<Arc<dyn Fn(&str) + Send + Sync>> = Some(Arc::new(|s: &str| {
         runtime::debug_output(s);
     }));
 
-    let dispatcher: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>> = Some(Arc::new(|msg: &str| {
-        runtime::inspector::try_dispatch_inspector_message_to_js(msg)
-    }));
+    let dispatcher: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>> =
+        Some(Arc::new(|msg: &str| {
+            runtime::inspector::try_dispatch_inspector_message_to_js(msg)
+        }));
 
-    match DevtoolsServer::attach(&config, rt.isolate_mut(), &global_ctx, forwarder, dispatcher) {
+    match DevtoolsServer::attach(
+        &config,
+        rt.isolate_mut(),
+        &global_ctx,
+        forwarder,
+        dispatcher,
+    ) {
         Err(_) => std::ptr::null_mut(),
         Ok(server) => {
             let ws_url = server.endpoint().websocket_url.clone();
@@ -180,15 +331,21 @@ pub extern "C" fn runtime_devtools_start(runtime: i64, port: u16) -> *mut c_char
                 *hook.borrow_mut() = Some(Box::new(|| {
                     DEVTOOLS.with(|d| {
                         if let Ok(mut guard) = d.try_borrow_mut() {
-                            if let Some(s) = guard.as_mut() { s.pump_messages(); }
+                            if let Some(s) = guard.as_mut() {
+                                s.pump_messages();
+                            }
                         }
                     });
                 }));
             });
 
-            DEVTOOLS.with(|d| { *d.borrow_mut() = Some(server); });
+            DEVTOOLS.with(|d| {
+                *d.borrow_mut() = Some(server);
+            });
 
-            CString::new(ws_url).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+            CString::new(ws_url)
+                .map(|s| s.into_raw())
+                .unwrap_or(std::ptr::null_mut())
         }
     }
 }
@@ -199,7 +356,9 @@ pub extern "C" fn runtime_devtools_pump(_runtime: i64) {
     let _ = std::panic::catch_unwind(|| {
         DEVTOOLS.with(|d| {
             if let Ok(mut guard) = d.try_borrow_mut() {
-                if let Some(s) = guard.as_mut() { s.pump_messages(); }
+                if let Some(s) = guard.as_mut() {
+                    s.pump_messages();
+                }
             }
         });
     });
@@ -239,9 +398,7 @@ pub extern "C" fn runtime_pump_timers() {
 /// Returns `true` if at least one Win32 message was dispatched.
 #[no_mangle]
 pub extern "C" fn runtime_pump_messages() -> bool {
-    std::panic::catch_unwind(|| {
-        runtime::pump_messages()
-    }).unwrap_or(false)
+    std::panic::catch_unwind(|| runtime::pump_messages()).unwrap_or(false)
 }
 
 /// Free a string previously returned by `runtime_devtools_start`.

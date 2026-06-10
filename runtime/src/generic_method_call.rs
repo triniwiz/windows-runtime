@@ -1,6 +1,16 @@
-use std::ffi::c_void;
+use crate::create_struct_object_from_raw;
+use crate::error::AnyError;
+use crate::helpers::ffi_native_type_from_signature;
+use crate::ns_proxy;
+use crate::value::{
+    ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg,
+    ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg,
+    ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_query_interface_arg,
+    ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg,
+    ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, read_value_from_ptr,
+    set_out_param_value, try_unwrap_out_param, write_v8_value_to_ptr, NativeType, NativeValue,
+};
 use libffi::middle::*;
-use windows::core::{GUID, HRESULT, Interface, IUnknown};
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration::DeclarationKind;
@@ -10,14 +20,11 @@ use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::declarations::method_declaration::MethodDeclaration;
 use metadata::declarations::parameter_declaration::ParameterDeclaration;
 use metadata::declaring_interface_for_method::Metadata;
-use metadata::signature::Signature;
-use crate::error::AnyError;
-use crate::helpers::ffi_native_type_from_signature;
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use crate::value::{ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_query_interface_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue, read_value_from_ptr, set_out_param_value, try_unwrap_out_param, write_v8_value_to_ptr};
 use metadata::meta_data_reader::MetadataReader;
-use crate::ns_proxy;
-use crate::create_struct_object_from_raw;
+use metadata::signature::Signature;
+use std::ffi::c_void;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use windows::core::{IUnknown, Interface, GUID, HRESULT};
 
 pub struct GenericMethodCall {
     index: usize,
@@ -66,7 +73,11 @@ impl GenericMethodCall {
     ) -> Self {
         let number_of_parameters = method.number_of_parameters();
 
-        let mut index = Metadata::find_method_index(method.metadata().unwrap(), class.base().token(),method.token());
+        let mut index = Metadata::find_method_index(
+            method.metadata().unwrap(),
+            class.base().token(),
+            method.token(),
+        );
 
         let iid = class.id();
 
@@ -104,7 +115,8 @@ impl GenericMethodCall {
             }
         };
 
-        let mut parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters + other_params + 4);
+        let mut parameter_types: Vec<NativeType> =
+            Vec::with_capacity(number_of_parameters + other_params + 4);
         let mut parse_parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters);
         let mut parameter_arg_iids: Vec<Option<GUID>> = Vec::with_capacity(number_of_parameters);
         parameter_types.push(NativeType::Pointer);
@@ -138,14 +150,22 @@ impl GenericMethodCall {
                         let lock = decl.read();
                         match lock.kind() {
                             DeclarationKind::Interface => lock
-                                .as_any().downcast_ref::<InterfaceDeclaration>().map(|i| i.id()),
+                                .as_any()
+                                .downcast_ref::<InterfaceDeclaration>()
+                                .map(|i| i.id()),
                             DeclarationKind::GenericInterface => lock
-                                .as_any().downcast_ref::<GenericInterfaceDeclaration>().map(|i| i.id()),
+                                .as_any()
+                                .downcast_ref::<GenericInterfaceDeclaration>()
+                                .map(|i| i.id()),
                             DeclarationKind::GenericInterfaceInstance => lock
-                                .as_any().downcast_ref::<GenericInterfaceInstanceDeclaration>().map(|i| i.id()),
+                                .as_any()
+                                .downcast_ref::<GenericInterfaceInstanceDeclaration>()
+                                .map(|i| i.id()),
                             DeclarationKind::Class => lock
-                                .as_any().downcast_ref::<ClassDeclaration>()
-                                .and_then(|c| c.default_interface()).map(|i| i.id()),
+                                .as_any()
+                                .downcast_ref::<ClassDeclaration>()
+                                .and_then(|c| c.default_interface())
+                                .map(|i| i.id()),
                             _ => None,
                         }
                     })
@@ -183,19 +203,15 @@ impl GenericMethodCall {
 
         let number_of_abi_parameters = parameter_types.len();
 
-        let params =
-            parameter_types
-                .iter()
-                .cloned()
-                .map(libffi::middle::Type::try_from)
-                .collect::<std::result::Result<Vec<Type>, AnyError>>();
+        let params = parameter_types
+            .iter()
+            .cloned()
+            .map(libffi::middle::Type::try_from)
+            .collect::<std::result::Result<Vec<Type>, AnyError>>();
 
         assert!(params.is_ok());
 
-        let cif = Cif::new(
-            params.unwrap(),
-            Type::i32(),
-        );
+        let cif = Cif::new(params.unwrap(), Type::i32());
 
         let effective_interface = if qi_ok {
             unsafe { IUnknown::from_raw(interface_ptr) }
@@ -233,20 +249,32 @@ impl GenericMethodCall {
         let number_of_abi_parameters = self.number_of_abi_parameters;
         let mut arguments: Vec<NativeValue> = Vec::with_capacity(number_of_abi_parameters);
         // Track parse-level types for each ABI argument slot.
-        let mut argument_parse_types: Vec<Option<NativeType>> = Vec::with_capacity(number_of_abi_parameters);
+        let mut argument_parse_types: Vec<Option<NativeType>> =
+            Vec::with_capacity(number_of_abi_parameters);
         // Keep QI'd interfaces alive for the duration of the FFI call.
         let mut queried_interfaces: Vec<IUnknown> = Vec::new();
         // Stable per-call buffers for out (ByRef) parameters.
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
-        let mut out_slots: Vec<(usize, NativeType, Option<String>, Option<v8::Local<'s, v8::Object>>)> = Vec::new();
+        let mut out_slots: Vec<(
+            usize,
+            NativeType,
+            Option<String>,
+            Option<v8::Local<'s, v8::Object>>,
+        )> = Vec::new();
 
-        arguments.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
+        arguments.push(NativeValue {
+            pointer: self.interface.as_raw() as *mut c_void,
+        });
         argument_parse_types.push(None);
 
         for (i, native_type) in self.parse_parameter_types.iter().enumerate() {
             let parameter = &self.parameters[i];
-            let param_sig_opt = parameter.metadata().map(|m| Signature::to_string(m, &parameter.type_()));
-            let is_sig_byref = param_sig_opt.as_ref().map_or(false, |s| s.starts_with("ByRef "));
+            let param_sig_opt = parameter
+                .metadata()
+                .map(|m| Signature::to_string(m, &parameter.type_()));
+            let is_sig_byref = param_sig_opt
+                .as_ref()
+                .map_or(false, |s| s.starts_with("ByRef "));
 
             // Handle out (ByRef) parameters by allocating stable storage.
             // Also treat a missing caller argument for a `ByRef` signature as an implicit out-slot.
@@ -254,7 +282,10 @@ impl GenericMethodCall {
                 let slot_index = arguments.len();
                 let slot_size = match native_type {
                     NativeType::Struct(_) => native_type.size(),
-                    NativeType::Pointer | NativeType::Buffer | NativeType::Function | NativeType::String => std::mem::size_of::<usize>(),
+                    NativeType::Pointer
+                    | NativeType::Buffer
+                    | NativeType::Function
+                    | NativeType::String => std::mem::size_of::<usize>(),
                     _ => native_type.size(),
                 };
                 let mut buf: Vec<u8> = vec![0u8; slot_size];
@@ -287,7 +318,7 @@ impl GenericMethodCall {
             let value = args.get(i as i32);
 
             let value = match *native_type {
-                NativeType::Void => { return (call_failure(), std::ptr::null_mut(), Vec::new()) }
+                NativeType::Void => return (call_failure(), std::ptr::null_mut(), Vec::new()),
                 NativeType::Bool => ffi_parse_bool_arg(value),
                 NativeType::U8 => ffi_parse_u8_arg(value),
                 NativeType::I8 => ffi_parse_i8_arg(value),
@@ -322,7 +353,9 @@ impl GenericMethodCall {
                         Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
                     };
 
-                    arguments.push(NativeValue { u32_value: byte_length });
+                    arguments.push(NativeValue {
+                        u32_value: byte_length,
+                    });
                     argument_parse_types.push(Some(native_type.clone()));
                     arguments.push(buffer_value);
                     argument_parse_types.push(Some(native_type.clone()));
@@ -344,19 +377,43 @@ impl GenericMethodCall {
 
         let mut result: *mut c_void = std::ptr::null_mut();
 
-        let is_value_type = if self.return_type == "Guid" { true } else if self.return_type.contains('.') { let lookup = crate::helpers::strip_generic_suffix(self.return_type.as_str()); MetadataReader::find_by_name(lookup).map_or(false, |dec| matches!(dec.read().kind(), DeclarationKind::Struct)) } else { false };
+        let is_value_type = if self.return_type == "Guid" {
+            true
+        } else if self.return_type.contains('.') {
+            let lookup = crate::helpers::strip_generic_suffix(self.return_type.as_str());
+            MetadataReader::find_by_name(lookup).map_or(false, |dec| {
+                matches!(dec.read().kind(), DeclarationKind::Struct)
+            })
+        } else {
+            false
+        };
 
-        let is_scalar_return = matches!(self.return_type.as_str(),
-            "UInt8" | "Int8" | "UInt16" | "Int16" |
-            "UInt32" | "Int32" | "UInt64" | "Int64" |
-            "USize" | "ISize" | "Single" | "Double" |
-            "Boolean" | "Char16"
+        let is_scalar_return = matches!(
+            self.return_type.as_str(),
+            "UInt8"
+                | "Int8"
+                | "UInt16"
+                | "Int16"
+                | "UInt32"
+                | "Int32"
+                | "UInt64"
+                | "Int64"
+                | "USize"
+                | "ISize"
+                | "Single"
+                | "Double"
+                | "Boolean"
+                | "Char16"
         );
 
         let is_string_return = self.return_type.as_str() == "String";
 
         if self.is_initializer {
-            unsafe { arguments.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void }) };
+            unsafe {
+                arguments.push(NativeValue {
+                    pointer: &mut result as *mut _ as *mut c_void,
+                })
+            };
             argument_parse_types.push(None);
         } else {
             if !self.is_void {
@@ -365,18 +422,24 @@ impl GenericMethodCall {
                     arguments.push(NativeValue { pointer: buf_ptr });
                     argument_parse_types.push(None);
                 } else {
-                    arguments.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
+                    arguments.push(NativeValue {
+                        pointer: &mut result as *mut _ as *mut c_void,
+                    });
                     argument_parse_types.push(None);
                 }
             }
         }
 
-        let prep = match crate::ffi::prepare_string_storage(&arguments, &self.parameter_types, &argument_parse_types) {
+        let prep = match crate::ffi::prepare_string_storage(
+            &arguments,
+            &self.parameter_types,
+            &argument_parse_types,
+        ) {
             Ok(value) => value,
             Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
         };
 
-        let call_args = crate::ffi::build_call_args(&prep, &arguments, &argument_parse_types);
+        let call_args = crate::ffi::build_call_args(&prep, &arguments, &self.parameter_types);
 
         let ret_i32_res = catch_unwind(AssertUnwindSafe(|| unsafe {
             self.cif.call(CodePtr::from_ptr(self.func), &call_args)
@@ -387,7 +450,11 @@ impl GenericMethodCall {
             Err(_) => {
                 let msg = format!("WinRT call panicked during invocation: returning E_FAIL");
                 crate::store_last_js_error(msg);
-                return (HRESULT(0x8000_4005u32 as i32), std::ptr::null_mut(), Vec::new()); // E_FAIL
+                return (
+                    HRESULT(0x8000_4005u32 as i32),
+                    std::ptr::null_mut(),
+                    Vec::new(),
+                ); // E_FAIL
             }
         };
 
@@ -402,14 +469,22 @@ impl GenericMethodCall {
             }
         }
 
-        if !self.is_initializer && !self.is_void && (is_value_type || is_scalar_return || is_string_return) {
+        if !self.is_initializer
+            && !self.is_void
+            && (is_value_type || is_scalar_return || is_string_return)
+        {
             result = self.return_value_buf.as_mut_ptr() as *mut c_void;
         }
 
         // Marshal out-parameters back into V8 values using the recorded slots.
         let mut out_values: Vec<v8::Local<'s, v8::Value>> = Vec::new();
         for (slot_index, parse_native_type, sig_opt, wrapper_obj) in out_slots.into_iter() {
-            let storage_ptr = unsafe { arguments.get(slot_index).map(|v| v.pointer).unwrap_or(std::ptr::null_mut()) };
+            let storage_ptr = unsafe {
+                arguments
+                    .get(slot_index)
+                    .map(|v| v.pointer)
+                    .unwrap_or(std::ptr::null_mut())
+            };
             if storage_ptr.is_null() {
                 let v: v8::Local<v8::Value> = v8::null(scope).into();
                 if let Some(wrapper) = wrapper_obj {
@@ -422,7 +497,8 @@ impl GenericMethodCall {
             unsafe {
                 let v = match parse_native_type {
                     NativeType::Pointer | NativeType::Buffer | NativeType::Function => {
-                        let inner = std::ptr::read_unaligned(storage_ptr as *const usize) as *mut c_void;
+                        let inner =
+                            std::ptr::read_unaligned(storage_ptr as *const usize) as *mut c_void;
                         if inner.is_null() {
                             v8::null(scope).into()
                         } else if let Some(sig) = sig_opt.as_ref() {
@@ -433,23 +509,45 @@ impl GenericMethodCall {
                                 }
                                 let lookup = crate::helpers::strip_generic_suffix(lookup);
                                 if let Some(declaration) = MetadataReader::find_by_name(lookup) {
-                                    if matches!(declaration.read().kind(), DeclarationKind::Struct) {
-                                        create_struct_object_from_raw(declaration, inner, scope).into()
+                                    if matches!(declaration.read().kind(), DeclarationKind::Struct)
+                                    {
+                                        create_struct_object_from_raw(declaration, inner, scope)
+                                            .into()
                                     } else {
                                         let instance = unsafe { IUnknown::from_raw(inner) };
-                                        ns_proxy::create_ns_ctor_instance_object(sig.as_str(), None, None, declaration, Some(instance), scope).into()
+                                        ns_proxy::create_ns_ctor_instance_object(
+                                            sig.as_str(),
+                                            None,
+                                            None,
+                                            declaration,
+                                            Some(instance),
+                                            scope,
+                                        )
+                                        .into()
                                     }
                                 } else {
-                                    read_value_from_ptr(inner as *const c_void, scope, NativeType::Pointer)
+                                    read_value_from_ptr(
+                                        inner as *const c_void,
+                                        scope,
+                                        NativeType::Pointer,
+                                    )
                                 }
                             } else {
-                                read_value_from_ptr(inner as *const c_void, scope, NativeType::Pointer)
+                                read_value_from_ptr(
+                                    inner as *const c_void,
+                                    scope,
+                                    NativeType::Pointer,
+                                )
                             }
                         } else {
                             read_value_from_ptr(inner as *const c_void, scope, NativeType::Pointer)
                         }
                     }
-                    _ => read_value_from_ptr(storage_ptr as *const c_void, scope, parse_native_type.clone()),
+                    _ => read_value_from_ptr(
+                        storage_ptr as *const c_void,
+                        scope,
+                        parse_native_type.clone(),
+                    ),
                 };
                 if let Some(wrapper) = wrapper_obj {
                     let _ = set_out_param_value(scope, wrapper, v);

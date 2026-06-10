@@ -1,1 +1,1 @@
-pub fn set_value(){}
+pub fn set_value() {}

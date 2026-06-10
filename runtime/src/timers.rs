@@ -1,15 +1,15 @@
+use parking_lot::{Condvar, Mutex};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, OnceLock};
-use parking_lot::{Condvar, Mutex};
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::{Duration, Instant};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use v8;
 
-use crate::{DELEGATE_ISOLATE_PTR, ASYNC_PUMP_HOOK};
+use crate::{ASYNC_PUMP_HOOK, DELEGATE_ISOLATE_PTR};
 
 struct CallbackInfo {
     cb: v8::Global<v8::Function>,
@@ -21,7 +21,16 @@ thread_local! {
     static TASKS: RefCell<HashMap<i32, CallbackInfo>> = RefCell::new(HashMap::new());
 }
 
-struct TimerRef { due: Instant, id: i32 }
+/// Called from `Runtime::drop` while the isolate is alive — the stored
+/// `v8::Global`s must not outlive it.
+pub(crate) fn clear_thread_tasks() {
+    TASKS.with(|tasks| tasks.borrow_mut().clear());
+}
+
+struct TimerRef {
+    due: Instant,
+    id: i32,
+}
 thread_local! {
     // Per-thread channel used to receive fired timer ids targeted at this
     // thread's runtime. This prevents one thread's pump from draining ids
@@ -30,7 +39,11 @@ thread_local! {
 }
 
 #[derive(Clone)]
-struct TimerMeta { interval_ms: u64, repeats: bool, dest: Sender<i32> }
+struct TimerMeta {
+    interval_ms: u64,
+    repeats: bool,
+    dest: Sender<i32>,
+}
 
 struct SchedulerInner {
     timers: Vec<TimerRef>, // always sorted by due ascending
@@ -49,22 +62,30 @@ static SCHEDULER: OnceLock<Arc<Scheduler>> = OnceLock::new();
 
 impl Scheduler {
     fn instance() -> Arc<Scheduler> {
-        SCHEDULER.get_or_init(|| {
-            let sched = Arc::new(Scheduler {
-                next_id: AtomicI32::new(1),
-                inner: Mutex::new(SchedulerInner { timers: Vec::new(), metas: HashMap::new(), deleted: HashSet::new() }),
-                cond: Condvar::new(),
-            });
+        SCHEDULER
+            .get_or_init(|| {
+                let sched = Arc::new(Scheduler {
+                    next_id: AtomicI32::new(1),
+                    inner: Mutex::new(SchedulerInner {
+                        timers: Vec::new(),
+                        metas: HashMap::new(),
+                        deleted: HashSet::new(),
+                    }),
+                    cond: Condvar::new(),
+                });
 
-            // Spawn scheduler thread
-            let runner = sched.clone();
-            thread::Builder::new()
-                .name("ns-timer-scheduler".to_string())
-                .spawn(move || { runner.run(); })
-                .ok();
+                // Spawn scheduler thread
+                let runner = sched.clone();
+                thread::Builder::new()
+                    .name("ns-timer-scheduler".to_string())
+                    .spawn(move || {
+                        runner.run();
+                    })
+                    .ok();
 
-            sched
-        }).clone()
+                sched
+            })
+            .clone()
     }
 
     fn run(self: Arc<Self>) {
@@ -76,7 +97,9 @@ impl Scheduler {
 
             // Re-check in a loop to handle multiple timers becoming due
             loop {
-                if guard.timers.is_empty() { break; }
+                if guard.timers.is_empty() {
+                    break;
+                }
                 let now = Instant::now();
                 if guard.timers[0].due > now {
                     let wait_dur = guard.timers[0].due - now;
@@ -93,7 +116,9 @@ impl Scheduler {
                 }
 
                 // Grab its meta (clone) then release lock before sending
-                let Some(meta) = guard.metas.get(&id).cloned() else { continue; };
+                let Some(meta) = guard.metas.get(&id).cloned() else {
+                    continue;
+                };
                 drop(guard);
 
                 // Send the fired id to the originating thread via the stored
@@ -123,7 +148,14 @@ impl Scheduler {
 
     fn add_timer(&self, id: i32, due: Instant, interval_ms: u64, repeats: bool, dest: Sender<i32>) {
         let mut guard = self.inner.lock();
-        guard.metas.insert(id, TimerMeta { interval_ms, repeats, dest });
+        guard.metas.insert(
+            id,
+            TimerMeta {
+                interval_ms,
+                repeats,
+                dest,
+            },
+        );
         let idx = match guard.timers.binary_search_by(|r| r.due.cmp(&due)) {
             Ok(i) => i,
             Err(i) => i,
@@ -142,16 +174,28 @@ impl Scheduler {
 
 fn to_millis_from_arg(arg: &v8::Local<v8::Value>, scope: &mut v8::PinScope<'_, '_>) -> u64 {
     if let Some(n) = arg.integer_value(scope) {
-        if n < 0 { 0 } else { n as u64 }
+        if n < 0 {
+            0
+        } else {
+            n as u64
+        }
     } else if let Some(n) = arg.number_value(scope) {
-        if n.is_finite() && n >= 0.0 { n as u64 } else { 0 }
-    } else { 0 }
+        if n.is_finite() && n >= 0.0 {
+            n as u64
+        } else {
+            0
+        }
+    } else {
+        0
+    }
 }
 
 fn invoke_callback_by_id(id: i32) {
     // Create a V8 scope and call the stored callback for `id` from TASKS.
     let isolate_ptr = DELEGATE_ISOLATE_PTR.with(|c| c.get());
-    if isolate_ptr.is_null() { return; }
+    if isolate_ptr.is_null() {
+        return;
+    }
     let isolate: &mut v8::Isolate = unsafe { &mut *isolate_ptr };
     v8::scope!(scope, isolate);
     let ctx_global = match scope.get_slot::<v8::Global<v8::Context>>() {
@@ -168,9 +212,12 @@ fn invoke_callback_by_id(id: i32) {
     // the callback itself calls clearTimeout/clearInterval.
     let item_opt = TASKS.with(|tasks| {
         let map = tasks.borrow();
-        map.get(&id).map(|info| (info.cb.clone(), info.args.clone(), info.repeats))
+        map.get(&id)
+            .map(|info| (info.cb.clone(), info.args.clone(), info.repeats))
     });
-    let Some((cb_global, args_globals, repeats)) = item_opt else { return; };
+    let Some((cb_global, args_globals, repeats)) = item_opt else {
+        return;
+    };
 
     let func = v8::Local::new(tc, &cb_global);
     let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
@@ -184,19 +231,28 @@ fn invoke_callback_by_id(id: i32) {
     if tc.has_caught() {
         if let Some(ex) = tc.exception() {
             let s = ex.to_string(tc).and_then(|v| v.to_string(tc));
-            if let Some(ss) = s { eprintln!("[NativeScript] timer callback error: {}", ss.to_rust_string_lossy(tc)); }
+            if let Some(ss) = s {
+                eprintln!(
+                    "[NativeScript] timer callback error: {}",
+                    ss.to_rust_string_lossy(tc)
+                );
+            }
         }
         tc.reset();
     }
 
     if !repeats {
-        TASKS.with(|tasks| { tasks.borrow_mut().remove(&id); });
+        TASKS.with(|tasks| {
+            tasks.borrow_mut().remove(&id);
+        });
     }
 }
 
 pub fn pump() {
     // If the scheduler hasn't been initialized yet, nothing to do.
-    if SCHEDULER.get().is_none() { return; }
+    if SCHEDULER.get().is_none() {
+        return;
+    }
 
     // Pump only this thread's receiver so we handle fired timers that
     // belong to this runtime. The receiver is stored in THREAD_TX_RX.
@@ -227,7 +283,9 @@ pub(crate) fn init() {
     // Register pump into ASYNC_PUMP_HOOK so blocking waits will pump timers.
     ASYNC_PUMP_HOOK.with(|hook| {
         if let Ok(mut guard) = hook.try_borrow_mut() {
-            *guard = Some(Box::new(|| { crate::timers::pump(); }));
+            *guard = Some(Box::new(|| {
+                crate::timers::pump();
+            }));
         }
     });
 }
@@ -261,10 +319,17 @@ fn handle_set_timer_common(
 
     let func = match v8::Local::<v8::Function>::try_from(args.get(0)) {
         Ok(f) => f,
-        Err(_) => { retval.set_int32(0); return; }
+        Err(_) => {
+            retval.set_int32(0);
+            return;
+        }
     };
 
-    let delay = if args.length() >= 2 { to_millis_from_arg(&args.get(1), scope) } else { 0 };
+    let delay = if args.length() >= 2 {
+        to_millis_from_arg(&args.get(1), scope)
+    } else {
+        0
+    };
 
     // Capture additional args
     let mut extra: Vec<v8::Global<v8::Value>> = Vec::new();
@@ -284,7 +349,14 @@ fn handle_set_timer_common(
 
     TASKS.with(|tasks| {
         let mut map = tasks.borrow_mut();
-        map.insert(id, CallbackInfo { cb: gfunc, args: extra, repeats: repeatable });
+        map.insert(
+            id,
+            CallbackInfo {
+                cb: gfunc,
+                args: extra,
+                repeats: repeatable,
+            },
+        );
     });
 
     let due = Instant::now() + Duration::from_millis(delay);
@@ -311,12 +383,16 @@ pub(crate) fn handle_ns_clear_timeout(
 ) {
     let mut id = -1;
     if args.length() > 0 {
-        if let Some(n) = args.get(0).integer_value(_scope) { id = n as i32; }
+        if let Some(n) = args.get(0).integer_value(_scope) {
+            id = n as i32;
+        }
     }
     if id > 0 {
         let sched = Scheduler::instance();
         sched.clear_timer(id);
-        TASKS.with(|tasks| { tasks.borrow_mut().remove(&id); });
+        TASKS.with(|tasks| {
+            tasks.borrow_mut().remove(&id);
+        });
     }
     retval.set_undefined();
 }
@@ -324,20 +400,19 @@ pub(crate) fn handle_ns_clear_timeout(
 pub(crate) fn handle_ns_clear_interval(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
-    mut retval: v8::ReturnValue,
+    retval: v8::ReturnValue,
 ) {
     handle_ns_clear_timeout(scope, args, retval);
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use std::sync::mpsc;
+    use std::thread;
     use std::time::Duration;
     use std::time::Instant;
-    use std::sync::atomic::Ordering;
-    use std::thread;
 
     // Validate scheduler delivers fired IDs to the specified Sender and that
     // separate receivers on different threads only receive their own IDs.
@@ -349,10 +424,12 @@ mod tests {
         let (tx2, rx2) = mpsc::channel::<i32>();
 
         let h1 = thread::spawn(move || {
-            rx1.recv_timeout(Duration::from_secs(1)).expect("thread 1 did not receive id")
+            rx1.recv_timeout(Duration::from_secs(1))
+                .expect("thread 1 did not receive id")
         });
         let h2 = thread::spawn(move || {
-            rx2.recv_timeout(Duration::from_secs(1)).expect("thread 2 did not receive id")
+            rx2.recv_timeout(Duration::from_secs(1))
+                .expect("thread 2 did not receive id")
         });
 
         // Allocate two ids from the scheduler's counter

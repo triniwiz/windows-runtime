@@ -1,11 +1,11 @@
 use anyhow::Result;
 use parking_lot::Mutex;
+use serde_json::Value as JsonValue;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
-use serde_json::Value as JsonValue;
 use std::thread;
 use tungstenite::Message;
 use v8::inspector::{
@@ -24,7 +24,10 @@ pub struct DevtoolsServerConfig {
 
 impl Default for DevtoolsServerConfig {
     fn default() -> Self {
-        Self { host: "127.0.0.1".to_string(), port: 42000 }
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 42000,
+        }
     }
 }
 
@@ -67,8 +70,11 @@ fn format_remote_object(arg: &JsonValue, depth: usize) -> String {
         } else if v.is_array() {
             let mut items = Vec::new();
             for it in v.as_array().unwrap().iter() {
-                if it.is_string() { items.push(it.as_str().unwrap().to_string()) }
-                else { items.push(it.to_string()) }
+                if it.is_string() {
+                    items.push(it.as_str().unwrap().to_string())
+                } else {
+                    items.push(it.to_string())
+                }
             }
             return format!("[{}]", items.join(", "));
         } else {
@@ -101,8 +107,11 @@ fn format_remote_object(arg: &JsonValue, depth: usize) -> String {
                 let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("?");
                 let val = if let Some(vv) = p.get("value") {
                     format_remote_object(vv, depth + 1)
-                } else if let Some(dv) = p.get("description").and_then(|d| d.as_str()) { dv.to_string() }
-                else { p.to_string() };
+                } else if let Some(dv) = p.get("description").and_then(|d| d.as_str()) {
+                    dv.to_string()
+                } else {
+                    p.to_string()
+                };
                 pairs.push(format!("{}: {}", name, val));
             }
             return format!("{{{}}}", pairs.join(", "));
@@ -119,7 +128,10 @@ fn format_stack_trace(stack: &JsonValue) -> String {
     if let Some(frames) = stack.get("callFrames").and_then(|f| f.as_array()) {
         let mut out = String::new();
         for f in frames.iter() {
-            let fn_name = f.get("functionName").and_then(|s| s.as_str()).unwrap_or("(anonymous)");
+            let fn_name = f
+                .get("functionName")
+                .and_then(|s| s.as_str())
+                .unwrap_or("(anonymous)");
             let url = f.get("url").and_then(|s| s.as_str()).unwrap_or("");
             let line = f.get("lineNumber").and_then(|n| n.as_i64()).unwrap_or(0);
             let col = f.get("columnNumber").and_then(|n| n.as_i64()).unwrap_or(0);
@@ -143,10 +155,16 @@ fn try_format_inspector_message(s: &str) -> Option<String> {
                         let typ = params.get("type").and_then(|t| t.as_str()).unwrap_or("log");
                         let mut parts: Vec<String> = Vec::new();
                         if let Some(args) = params.get("args").and_then(|a| a.as_array()) {
-                            for arg in args.iter() { parts.push(format_remote_object(arg, 0)); }
+                            for arg in args.iter() {
+                                parts.push(format_remote_object(arg, 0));
+                            }
                         }
-                        let mut out = format!("[DEVTOOLS] [{}] {}", typ.to_uppercase(), parts.join(" "));
-                        if let Some(stack) = params.get("stackTrace") { out.push_str("\n"); out.push_str(&format_stack_trace(stack)); }
+                        let mut out =
+                            format!("[DEVTOOLS] [{}] {}", typ.to_uppercase(), parts.join(" "));
+                        if let Some(stack) = params.get("stackTrace") {
+                            out.push_str("\n");
+                            out.push_str(&format_stack_trace(stack));
+                        }
                         out.push('\n');
                         return Some(out);
                     }
@@ -162,9 +180,14 @@ fn try_format_inspector_message(s: &str) -> Option<String> {
                 "Runtime.exceptionThrown" => {
                     if let Some(params) = json.get("params") {
                         if let Some(details) = params.get("exceptionDetails") {
-                            let text = details.get("text").and_then(|t| t.as_str()).unwrap_or("(exception)");
+                            let text = details
+                                .get("text")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("(exception)");
                             let mut out = format!("[DEVTOOLS] [EXCEPTION] {}\n", text);
-                            if let Some(stack) = details.get("stackTrace") { out.push_str(&format_stack_trace(stack)); }
+                            if let Some(stack) = details.get("stackTrace") {
+                                out.push_str(&format_stack_trace(stack));
+                            }
                             out.push('\n');
                             return Some(out);
                         }
@@ -302,7 +325,10 @@ impl DevtoolsServer {
 
         let session = Box::new(inspector.connect(
             1,
-            Channel::new(Box::new(DevtoolsChannel { tx: outbound_tx.clone(), forwarder: console_forwarder.clone() })),
+            Channel::new(Box::new(DevtoolsChannel {
+                tx: outbound_tx.clone(),
+                forwarder: console_forwarder.clone(),
+            })),
             StringView::empty(),
             V8InspectorClientTrustLevel::FullyTrusted,
         ));
@@ -321,7 +347,10 @@ impl DevtoolsServer {
             .spawn(move || run_server(listener, inbound_tx, outbound_rx, ws_url))?;
 
         Ok(Self {
-            endpoint: DevtoolsEndpoint { websocket_url, frontend_url },
+            endpoint: DevtoolsEndpoint {
+                websocket_url,
+                frontend_url,
+            },
             inbound_rx,
             session_ptr,
             outbound_tx,
@@ -434,7 +463,11 @@ fn handle_connection(
         Err(_) => return,
     };
     let peek_str = String::from_utf8_lossy(&peek_buf[..n]);
-    let path = peek_str.split_whitespace().nth(1).unwrap_or("/").to_string();
+    let path = peek_str
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/")
+        .to_string();
 
     if path.starts_with("/json") {
         serve_json(stream, &path, ws_url);
@@ -476,8 +509,7 @@ fn handle_ws(
             }
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
-            Err(tungstenite::Error::Io(ref e))
-                if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(tungstenite::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => break,
         }
 
@@ -540,7 +572,10 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&build_version_json(ws)).unwrap();
         assert!(v.get("Browser").is_some());
         assert!(v.get("Protocol-Version").is_some());
-        assert_eq!(v.get("webSocketDebuggerUrl").and_then(|u| u.as_str()), Some(ws));
+        assert_eq!(
+            v.get("webSocketDebuggerUrl").and_then(|u| u.as_str()),
+            Some(ws)
+        );
     }
 
     #[test]

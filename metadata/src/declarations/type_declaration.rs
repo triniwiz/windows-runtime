@@ -1,7 +1,9 @@
-use std::any::Any;
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2, mdtTypeDef, mdtTypeRef};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::prelude::*;
+use std::any::Any;
+use windows::Win32::System::WinRT::Metadata::{
+    mdtTypeDef, mdtTypeRef, CorTokenType, IMetaDataImport2,
+};
 
 #[derive(Clone, Debug)]
 pub struct TypeDeclaration {
@@ -9,7 +11,7 @@ pub struct TypeDeclaration {
     pub(crate) metadata: Option<IMetaDataImport2>,
     token: CorTokenType,
     full_name: String,
-    name: String
+    name: String,
 }
 
 impl Declaration for TypeDeclaration {
@@ -26,7 +28,9 @@ impl Declaration for TypeDeclaration {
         match self.metadata() {
             None => false,
             Some(metadata) => {
-                let result = unsafe { metadata.GetTypeDefProps(self.token.0 as u32, None, 0 as _, &mut flags, 0 as _)};
+                let result = unsafe {
+                    metadata.GetTypeDefProps(self.token.0 as u32, None, 0 as _, &mut flags, 0 as _)
+                };
 
                 debug_assert!(result.is_ok());
 
@@ -72,20 +76,32 @@ impl TypeDeclaration {
         // );
         // debug_assert!(token != mdTypeDefNil);
 
-
         let mut full_name_data = [0_u16; MAX_IDENTIFIER_LENGTH];
 
-        let fullname= match metadata {
+        let fullname = match metadata {
             None => String::new(),
             Some(metadata) => {
-                let mut length  = 0;
-                match CorTokenType(type_from_token(token)){
+                let mut length = 0;
+                match CorTokenType(type_from_token(token)) {
                     mdtTypeDef => {
-                        let _ = unsafe { metadata.GetTypeDefProps(token.0 as u32, Some(&mut full_name_data), &mut length, 0 as _, 0 as _) };
+                        let _ = unsafe {
+                            metadata.GetTypeDefProps(
+                                token.0 as u32,
+                                Some(&mut full_name_data),
+                                &mut length,
+                                0 as _,
+                                0 as _,
+                            )
+                        };
                     }
                     mdtTypeRef => {
                         let _ = unsafe {
-                            metadata.GetTypeRefProps(token.0 as u32, 0 as _, Some(&mut full_name_data), &mut length)
+                            metadata.GetTypeRefProps(
+                                token.0 as u32,
+                                0 as _,
+                                Some(&mut full_name_data),
+                                &mut length,
+                            )
                         };
                     }
                     _ => {
@@ -117,11 +133,11 @@ impl TypeDeclaration {
             metadata: metadata.map(|f| f.clone()),
             token,
             full_name: fullname,
-            name
+            name,
         }
     }
 
     pub fn metadata(&self) -> Option<&IMetaDataImport2> {
-       self.metadata.as_ref()
+        self.metadata.as_ref()
     }
 }

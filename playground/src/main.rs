@@ -1,18 +1,24 @@
 mod interop;
 
-use std::env;
-use std::fs;
-use std::ffi::CString;
-use windows::Win32::System::WinRT::{RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize};
-use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, MSG, TranslateMessage};
 use crate::interop::create_dispatcher_queue_controller_for_current_thread;
+use std::env;
+use std::ffi::CString;
+use std::fs;
+use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_SINGLETHREADED};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, GetMessageW, TranslateMessage, MSG,
+};
 
 fn script_to_run() -> (String, String) {
     let app_root = env::var("PLAYGROUND_APP_ROOT").unwrap_or_else(|_| String::new());
 
     if let Ok(script_path) = env::var("PLAYGROUND_SCRIPT_PATH") {
-        let script = fs::read_to_string(&script_path)
-            .unwrap_or_else(|e| panic!("Failed to read PLAYGROUND_SCRIPT_PATH '{}': {}", script_path, e));
+        let script = fs::read_to_string(&script_path).unwrap_or_else(|e| {
+            panic!(
+                "Failed to read PLAYGROUND_SCRIPT_PATH '{}': {}",
+                script_path, e
+            )
+        });
         let resolved_root = if app_root.is_empty() {
             std::path::Path::new(&script_path)
                 .parent()

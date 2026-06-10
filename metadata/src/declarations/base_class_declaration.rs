@@ -1,10 +1,3 @@
-use std::any::Any;
-use std::ffi::c_void;
-use std::fmt::{Debug, Formatter};
-use std::ptr::addr_of_mut;
-use std::sync::OnceLock;
-use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 use crate::declaration_factory::DeclarationFactory;
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::event_declaration::EventDeclaration;
@@ -12,6 +5,13 @@ use crate::declarations::interface_declaration::InterfaceDeclaration;
 use crate::declarations::method_declaration::MethodDeclaration;
 use crate::declarations::property_declaration::PropertyDeclaration;
 use crate::declarations::type_declaration::TypeDeclaration;
+use std::any::Any;
+use std::ffi::c_void;
+use std::fmt::{Debug, Formatter};
+use std::ptr::addr_of_mut;
+use std::sync::OnceLock;
+use windows::core::{HSTRING, PCWSTR};
+use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 
 #[derive(Clone)]
 pub struct BaseClassDeclaration {
@@ -45,31 +45,29 @@ impl BaseClassDeclaration {
         match metadata {
             None => {}
             Some(metadata) => {
-                let tokens = BaseClassDeclaration::collect_enum_tokens(metadata, |enumerator, buffer, buffer_len, count| unsafe {
-                    metadata.EnumInterfaceImpls(
-                        enumerator,
-                        token.0 as u32,
-                        buffer,
-                        buffer_len,
-                        count,
-                    )
-                });
+                let tokens = BaseClassDeclaration::collect_enum_tokens(
+                    metadata,
+                    |enumerator, buffer, buffer_len, count| unsafe {
+                        metadata.EnumInterfaceImpls(
+                            enumerator,
+                            token.0 as u32,
+                            buffer,
+                            buffer_len,
+                            count,
+                        )
+                    },
+                );
 
                 for token in tokens {
                     let mut interface_token = 0_u32;
                     let result_inner = unsafe {
-                        metadata.GetInterfaceImplProps(
-                            token,
-                            0 as _,
-                            &mut interface_token,
-                        )
+                        metadata.GetInterfaceImplProps(token, 0 as _, &mut interface_token)
                     };
                     debug_assert!(result_inner.is_ok());
                     if let Some(dec) = DeclarationFactory::make_interface_declaration(
                         Some(metadata),
                         CorTokenType(interface_token as i32),
-                    )
-                    {
+                    ) {
                         result.push(dec);
                     }
                 }
@@ -118,19 +116,17 @@ impl BaseClassDeclaration {
         match metadata {
             None => {}
             Some(metadata) => {
-                let tokens = BaseClassDeclaration::collect_enum_tokens(metadata, |enumerator, buffer, buffer_len, count| unsafe {
-                    metadata.EnumMethods(
-                        enumerator,
-                        token.0 as u32,
-                        buffer,
-                        buffer_len,
-                        count,
-                    )
-                });
+                let tokens = BaseClassDeclaration::collect_enum_tokens(
+                    metadata,
+                    |enumerator, buffer, buffer_len, count| unsafe {
+                        metadata.EnumMethods(enumerator, token.0 as u32, buffer, buffer_len, count)
+                    },
+                );
 
                 result.reserve(tokens.len());
                 for token in tokens {
-                    let method = MethodDeclaration::new(Some(&metadata), CorTokenType(token as i32));
+                    let method =
+                        MethodDeclaration::new(Some(&metadata), CorTokenType(token as i32));
                     if !method.is_exported() {
                         continue;
                     }
@@ -150,21 +146,25 @@ impl BaseClassDeclaration {
         match metadata {
             None => {}
             Some(metadata) => {
-
-                let tokens = BaseClassDeclaration::collect_enum_tokens(metadata, |enumerator, buffer, buffer_len, count| unsafe {
-                    metadata.EnumProperties(
-                        enumerator,
-                        token.0 as u32,
-                        buffer,
-                        buffer_len,
-                        count,
-                    )
-                });
+                let tokens = BaseClassDeclaration::collect_enum_tokens(
+                    metadata,
+                    |enumerator, buffer, buffer_len, count| unsafe {
+                        metadata.EnumProperties(
+                            enumerator,
+                            token.0 as u32,
+                            buffer,
+                            buffer_len,
+                            count,
+                        )
+                    },
+                );
                 result.reserve(tokens.len());
 
                 for property_token in tokens {
-                    let property =
-                        PropertyDeclaration::new(Some(metadata), CorTokenType(property_token as i32));
+                    let property = PropertyDeclaration::new(
+                        Some(metadata),
+                        CorTokenType(property_token as i32),
+                    );
                     if !property.is_exported() {
                         continue;
                     }
@@ -182,16 +182,12 @@ impl BaseClassDeclaration {
     ) -> Vec<EventDeclaration> {
         let mut result = Vec::new();
         if let Some(metadata) = metadata {
-
-            let tokens = BaseClassDeclaration::collect_enum_tokens(metadata, |enumerator, buffer, buffer_len, count| unsafe {
-                metadata.EnumEvents(
-                    enumerator,
-                    token.0 as u32,
-                    buffer,
-                    buffer_len,
-                    count,
-                )
-            });
+            let tokens = BaseClassDeclaration::collect_enum_tokens(
+                metadata,
+                |enumerator, buffer, buffer_len, count| unsafe {
+                    metadata.EnumEvents(enumerator, token.0 as u32, buffer, buffer_len, count)
+                },
+            );
 
             result.reserve(tokens.len());
 
@@ -212,12 +208,8 @@ impl BaseClassDeclaration {
         metadata: Option<&IMetaDataImport2>,
         token: CorTokenType,
     ) -> Self {
-          Self {
-            base: TypeDeclaration::new(
-                kind,
-                metadata.clone(),
-                token,
-            ),
+        Self {
+            base: TypeDeclaration::new(kind, metadata.clone(), token),
             implemented_interfaces: OnceLock::new(),
             properties: OnceLock::new(),
             events: OnceLock::new(),
@@ -236,7 +228,6 @@ impl BaseClassDeclaration {
 }
 
 pub trait BaseClassDeclarationImpl: dyn_clone::DynClone {
-
     fn as_declaration(&self) -> &dyn Declaration;
 
     fn as_declaration_mut(&mut self) -> &mut dyn Declaration;
@@ -291,21 +282,27 @@ pub trait BaseClassDeclarationImpl: dyn_clone::DynClone {
             let name = HSTRING::from(name);
             let name = PCWSTR(name.as_ptr());
             let base = self.base();
-            let method_tokens = BaseClassDeclaration::collect_enum_tokens(metadata, |enumerator, buffer, buffer_len, count| unsafe {
-                metadata.EnumMethodsWithName(
-                    enumerator,
-                    base.token().0 as u32,
-                    name,
-                    buffer,
-                    buffer_len,
-                    count,
-                )
-            });
+            let method_tokens = BaseClassDeclaration::collect_enum_tokens(
+                metadata,
+                |enumerator, buffer, buffer_len, count| unsafe {
+                    metadata.EnumMethodsWithName(
+                        enumerator,
+                        base.token().0 as u32,
+                        name,
+                        buffer,
+                        buffer_len,
+                        count,
+                    )
+                },
+            );
 
             return method_tokens
                 .iter()
                 .map(|method_token| {
-                    MethodDeclaration::new(self.base().metadata(), CorTokenType(*method_token as i32))
+                    MethodDeclaration::new(
+                        self.base().metadata(),
+                        CorTokenType(*method_token as i32),
+                    )
                 })
                 .collect();
         }
@@ -327,20 +324,20 @@ impl BaseClassDeclarationImpl for BaseClassDeclaration {
         &self.base
     }
 
-    fn implemented_interfaces(&self) -> Vec<&InterfaceDeclaration>{
+    fn implemented_interfaces(&self) -> Vec<&InterfaceDeclaration> {
         self.implemented_interfaces_storage()
             .iter()
-            .filter_map(|f| f.as_declaration().as_any().downcast_ref::<InterfaceDeclaration>())
+            .filter_map(|f| {
+                f.as_declaration()
+                    .as_any()
+                    .downcast_ref::<InterfaceDeclaration>()
+            })
             .collect::<Vec<_>>()
-
     }
 
     fn methods(&self) -> &[MethodDeclaration] {
         self.methods.get_or_init(|| {
-            BaseClassDeclaration::make_method_declarations(
-                self.base.metadata(),
-                self.base.token(),
-            )
+            BaseClassDeclaration::make_method_declarations(self.base.metadata(), self.base.token())
         })
     }
 
@@ -355,10 +352,7 @@ impl BaseClassDeclarationImpl for BaseClassDeclaration {
 
     fn events(&self) -> &[EventDeclaration] {
         self.events.get_or_init(|| {
-            BaseClassDeclaration::make_event_declarations(
-                self.base.metadata(),
-                self.base.token(),
-            )
+            BaseClassDeclaration::make_event_declarations(self.base.metadata(), self.base.token())
         })
     }
 }

@@ -3,8 +3,8 @@
 
 #[test]
 fn direct_typed_calls() {
-    use windows::Data::Json::JsonValue;
     use windows::core::HSTRING;
+    use windows::Data::Json::JsonValue;
 
     // Boolean
     let b = JsonValue::CreateBooleanValue(true).expect("CreateBooleanValue failed");
@@ -15,6 +15,7 @@ fn direct_typed_calls() {
     println!("CreateNumberValue succeeded: {:?}", n);
 
     // String
-    let s = JsonValue::CreateStringValue(&HSTRING::from("hello")).expect("CreateStringValue failed");
+    let s =
+        JsonValue::CreateStringValue(&HSTRING::from("hello")).expect("CreateStringValue failed");
     println!("CreateStringValue succeeded: {:?}", s);
 }

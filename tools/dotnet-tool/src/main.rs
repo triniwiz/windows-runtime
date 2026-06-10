@@ -89,14 +89,20 @@ fn winrt_method_signature(
                 return Some((
                     "protected override",
                     "Windows.Foundation.Size",
-                    vec![["availableSize".to_string(), "Windows.Foundation.Size".to_string()]],
+                    vec![[
+                        "availableSize".to_string(),
+                        "Windows.Foundation.Size".to_string(),
+                    ]],
                 ))
             }
             "ArrangeOverride" => {
                 return Some((
                     "protected override",
                     "Windows.Foundation.Size",
-                    vec![["finalSize".to_string(), "Windows.Foundation.Size".to_string()]],
+                    vec![[
+                        "finalSize".to_string(),
+                        "Windows.Foundation.Size".to_string(),
+                    ]],
                 ))
             }
             _ => {}
@@ -676,6 +682,13 @@ fn publish_and_copy_bridge(app_root: PathBuf) -> Result<()> {
         anyhow::anyhow!("dotnet-bridge not found (searched up to 6 levels from app_root)")
     })?;
 
+    // The generated Windows project already consumes dotnet-bridge from the
+    // located bridge directory itself (for example platforms/windows/dotnet-bridge).
+    // Writing the publish output marker under the app project directory
+    // (for example platforms/windows/toolbox/dotnet-bridge) creates a second,
+    // stale location that the build does not use.
+    let publish_dir = bridge_dir.join("publish");
+
     let status = std::process::Command::new("dotnet")
         .args([
             "publish",
@@ -693,19 +706,14 @@ fn publish_and_copy_bridge(app_root: PathBuf) -> Result<()> {
         anyhow::bail!("dotnet publish failed with exit code: {:?}", status.code());
     }
 
-    let src = bridge_dir.join("publish");
-    if !src.exists() {
+    if !publish_dir.exists() {
         anyhow::bail!(
             "dotnet publish did not produce a publish/ folder at {}",
-            src.display()
+            publish_dir.display()
         );
     }
 
-    let dest = app_root.join("dotnet-bridge").join("publish");
-    fs::create_dir_all(&dest)?;
-    copy_dir_recursive(&src, &dest)?;
-
-    let marker = dest.join(".dotnet_tool_done");
+    let marker = publish_dir.join(".dotnet_tool_done");
     fs::write(&marker, "dotnet-tool-published")
         .with_context(|| format!("failed to write marker at {}", marker.display()))?;
     Ok(())
@@ -723,22 +731,4 @@ fn find_bridge_dir(start: &PathBuf) -> Option<PathBuf> {
         }
     }
     None
-}
-
-fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> Result<()> {
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let path = entry.path();
-        let dest_path = dst.join(path.strip_prefix(src).unwrap());
-        if path.is_dir() {
-            fs::create_dir_all(&dest_path)?;
-            copy_dir_recursive(&path, &dest_path)?;
-        } else {
-            if let Some(p) = dest_path.parent() {
-                fs::create_dir_all(p)?;
-            }
-            fs::copy(&path, &dest_path)?;
-        }
-    }
-    Ok(())
 }

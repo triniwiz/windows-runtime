@@ -1,10 +1,10 @@
-use std::any::Any;
-use std::ptr::addr_of_mut;
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::delegate_declaration::{DelegateDeclaration, DelegateDeclarationImpl};
 use crate::declarations::method_declaration::MethodDeclaration;
 use crate::declarations::type_declaration::TypeDeclaration;
+use std::any::Any;
+use std::ptr::addr_of_mut;
+use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 
 #[derive(Clone, Debug)]
 pub struct GenericDelegateDeclaration {
@@ -27,18 +27,20 @@ impl GenericDelegateDeclaration {
 
         if let Some(metadata) = self.base.base.metadata() {
             let mut enumerator = std::ptr::null_mut();
-            let result = unsafe { metadata.EnumGenericParams(
-                addr_of_mut!(enumerator),
-                self.base.base.token().0 as u32,
-                0 as _,
-                0,
-                0 as _,
-            )};
+            let result = unsafe {
+                metadata.EnumGenericParams(
+                    addr_of_mut!(enumerator),
+                    self.base.base.token().0 as u32,
+                    0 as _,
+                    0,
+                    0 as _,
+                )
+            };
             assert!(result.is_ok());
 
-            let result = unsafe { metadata.CountEnum(enumerator, &mut count)};
+            let result = unsafe { metadata.CountEnum(enumerator, &mut count) };
             assert!(result.is_ok());
-            unsafe { metadata.CloseEnum(enumerator)};
+            unsafe { metadata.CloseEnum(enumerator) };
         }
         count as usize
     }

@@ -9,7 +9,8 @@ fn assert_js(rt: &mut Runtime, expr: &str, msg: &str) {
 }
 
 fn eval(rt: &mut Runtime, expr: &str) -> String {
-    rt.eval_script_to_string(expr).unwrap_or_else(|| "<eval failed>".to_string())
+    rt.eval_script_to_string(expr)
+        .unwrap_or_else(|| "<eval failed>".to_string())
 }
 
 // ── class instanceof ─────────────────────────────────────────────────────────

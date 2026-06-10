@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 
@@ -38,6 +40,39 @@ namespace NativeScriptWindowsDemo
 
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_has_devtools))]
         private static extern bool runtime_has_devtools();
+
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_pump_timers))]
+        private static extern void runtime_pump_timers();
+
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_notify_app_event))]
+        private static extern void runtime_notify_app_event(long runtime, int kind, [MarshalAs(UnmanagedType.LPUTF8Str)] string message);
+
+        public void NotifyAppEvent(int kind, string message = null)
+        {
+            if (!_initialized) return;
+            try { runtime_notify_app_event(_runtime, kind, message); }
+            catch { }
+        }
+
+    #if DEBUG
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(ns_set_log_to_console))]
+        private static extern int ns_set_log_to_console(int enabled);
+
+        public static bool TrySetLogToConsole(bool enabled)
+        {
+            try { return ns_set_log_to_console(enabled ? 1 : 0) == 1; }
+            catch { return false; }
+        }
+    #else
+        public static bool TrySetLogToConsole(bool enabled) => false;
+    #endif
+
+        public void PumpTimers()
+        {
+            if (!_initialized) return;
+            try { runtime_pump_timers(); }
+            catch { }
+        }
 
 #if DEBUG
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_devtools_start))]
@@ -91,7 +126,55 @@ namespace NativeScriptWindowsDemo
                 if (urlPtr != IntPtr.Zero) runtime_free_string(urlPtr);
             }
         }
+#endif
 
+        private long _runtime;
+        private bool _initialized;
+
+        public void Initialize()
+        {
+            if (_initialized) return;
+            bool attached = false;
+            try { attached = AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
+            runtime_install_ctrlc_handler(0);
+            runtime_set_local_folder(Windows.Storage.ApplicationData.Current.LocalFolder.Path);
+            _runtime = runtime_init(AppContext.BaseDirectory);
+#if DEBUG
+            var trySet = TrySetLogToConsole(true);
+            System.Diagnostics.Debug.WriteLine($"[NativeScript] TrySetLogToConsole returned={trySet}");
+
+            // Also notify the managed bridge (if present) so managed-side
+            // diagnostics follow the runtime toggle. Use reflection to avoid a
+            // hard compile-time dependency on the bridge assembly.
+            try
+            {
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    try
+                    {
+                        var t = asm.GetType("NativeScriptBridge.Bridge");
+                        if (t is null) continue;
+                        var m = t.GetMethod("SetLogToConsole", BindingFlags.Public | BindingFlags.Static);
+                        if (m is null) continue;
+                        m.Invoke(null, new object[] { true });
+                        System.Diagnostics.Debug.WriteLine($"[NativeScript] Invoked Bridge.SetLogToConsole on {asm.GetName().Name}");
+                        break;
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            if (ConsumeDebugBreakMarker())
+                StartDevtoolsSafely();
+#endif
+            _initialized = true;
+        }
+
+#if DEBUG
+        /// <summary>
+        /// Returns true and deletes the marker if the CLI wrote ns-debugbreak to LocalFolder,
+        /// matching the Android sentinel-file pattern used by the NativeScript CLI.
+        /// </summary>
         private static bool ConsumeDebugBreakMarker()
         {
             try
@@ -108,39 +191,44 @@ namespace NativeScriptWindowsDemo
         }
 #endif
 
-        private long _runtime;
-        private bool _initialized;
-
-        public void Initialize()
-        {
-            if (_initialized) return;
-            AttachConsole(ATTACH_PARENT_PROCESS);
-            runtime_install_ctrlc_handler(0);
-            runtime_set_local_folder(Windows.Storage.ApplicationData.Current.LocalFolder.Path);
-            _runtime = runtime_init(AppContext.BaseDirectory);
-#if DEBUG
-            if (ConsumeDebugBreakMarker())
-                StartDevtoolsSafely();
-#endif
-            _initialized = true;
-        }
-
         public void RunMainScript()
         {
             if (!_initialized)
                 throw new InvalidOperationException("Runtime must be initialized before running scripts.");
 
             var entryPath = ResolveEntryScriptPath();
-            var script = File.ReadAllText(Path.GetFullPath(entryPath));
-            try
+            if (entryPath == null)
             {
-                runtime_runscript(_runtime, script, Path.GetFileName(entryPath));
+                System.Diagnostics.Debug.WriteLine("[NativeScript Runtime] No entry script found — bundle missing from app directory.");
+                return;
             }
-            catch (Exception ex)
+
+            var dir = Path.GetDirectoryName(Path.GetFullPath(entryPath));
+            var chunks = new List<string>();
+            foreach (var chunkName in new[] { "runtime.js", "vendor.js" })
             {
-                CrashDiagnostics.WriteExceptionReport("RuntimeHost.RunMainScript", ex, "EntryScript=" + entryPath);
-                System.Diagnostics.Debug.WriteLine($"[NativeScript Runtime] Script execution failed ({entryPath}): {ex}");
-                throw;
+                var chunkPath = Path.Combine(dir, chunkName);
+                if (File.Exists(chunkPath) &&
+                    !string.Equals(chunkPath, Path.GetFullPath(entryPath), StringComparison.OrdinalIgnoreCase))
+                {
+                    chunks.Add(chunkPath);
+                }
+            }
+            chunks.Add(entryPath);
+
+            foreach (var scriptPath in chunks)
+            {
+                var script = File.ReadAllText(Path.GetFullPath(scriptPath));
+                try
+                {
+                    runtime_runscript(_runtime, script, Path.GetFileName(scriptPath));
+                }
+                catch (Exception ex)
+                {
+                    CrashDiagnostics.WriteExceptionReport("RuntimeHost.RunMainScript", ex, "Script=" + scriptPath);
+                    System.Diagnostics.Debug.WriteLine($"[NativeScript Runtime] Script execution failed ({scriptPath}): {ex}");
+                    throw;
+                }
             }
         }
 
@@ -153,10 +241,12 @@ namespace NativeScriptWindowsDemo
         private static string ResolveEntryScriptPath()
         {
             var baseDir = AppContext.BaseDirectory;
+            // EXE lives in <project>/bin/; webpack bundle lives in <project>/app/.
             var parentDir = Path.GetDirectoryName(
                 baseDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
                 ?? baseDir;
 
+            // Candidate app directories: sibling of bin/ first, then directly under baseDir.
             var appDirCandidates = new[]
             {
                 Path.Combine(parentDir, "app"),
@@ -178,6 +268,7 @@ namespace NativeScriptWindowsDemo
                 }
             }
 
+            // Also accept package.json at the project root (parent of bin/).
             if (packageJsonPath == null && File.Exists(Path.Combine(parentDir, "package.json")))
             {
                 packageJsonPath = Path.Combine(parentDir, "package.json");
@@ -185,7 +276,9 @@ namespace NativeScriptWindowsDemo
             }
 
             string Fallback() =>
-                appDirCandidates.Select(d => Path.Combine(d, "bundle.js")).FirstOrDefault(File.Exists);
+                appDirCandidates
+                    .SelectMany(d => new[] { Path.Combine(d, "bundle.js"), Path.Combine(d, "bundle.mjs") })
+                    .FirstOrDefault(File.Exists);
 
             if (packageJsonPath == null)
                 return Fallback();
@@ -225,7 +318,7 @@ namespace NativeScriptWindowsDemo
         {
             if (string.IsNullOrWhiteSpace(scriptPath)) return null;
             var normalized = scriptPath.Replace('/', Path.DirectorySeparatorChar);
-            foreach (var candidate in new[] { normalized, normalized + ".js" })
+            foreach (var candidate in new[] { normalized, normalized + ".js", normalized + ".mjs" })
             {
                 var direct = Path.IsPathRooted(candidate) ? candidate : Path.Combine(baseDir, candidate);
                 if (File.Exists(direct)) return direct;
@@ -237,6 +330,8 @@ namespace NativeScriptWindowsDemo
             return null;
         }
 
+        /// Returns the last JavaScript error (message + stack trace) captured during
+        /// script execution, or null if no error was recorded since the last call.
         public string GetLastJsError()
         {
             if (!_initialized) return null;

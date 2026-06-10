@@ -9,6 +9,11 @@ namespace NativeScriptBridge;
 
 public static partial class Bridge
 {
+    // Safe to reuse per thread: the response is copied to unmanaged memory
+    // before InvokeBinary returns.
+    [ThreadStatic]
+    private static ArrayBufferWriter<byte>? t_responseWriter;
+
     [UnmanagedCallersOnly(EntryPoint = "InvokeBinary",
         CallConvs = [typeof(System.Runtime.CompilerServices.CallConvCdecl)])]
     public static unsafe int InvokeBinary(
@@ -19,7 +24,8 @@ public static partial class Bridge
         {
             var r   = new BinReader(new ReadOnlySpan<byte>(requestPtr, requestLen));
             var res = DispatchBin(ref r);
-            var buf = new ArrayBufferWriter<byte>(128);
+            var buf = t_responseWriter ??= new ArrayBufferWriter<byte>(256);
+            buf.ResetWrittenCount();
             res.WriteAsBin(buf);
             WriteUnmanaged(buf.WrittenSpan, responsePtr, responseLenPtr);
         }
@@ -40,6 +46,7 @@ public static partial class Bridge
                 s_handles.TryRemove(handleToRemove, out _);
                 if (s_nativePtrs.TryRemove(handleToRemove, out var nativePtr))
                 {
+                    RemoveNativePtr(handleToRemove, nativePtr);
                     try
                     {
                         Marshal.Release(nativePtr);
@@ -250,18 +257,11 @@ public static partial class Bridge
             // to preserve identity and avoid creating a new RCW which can
             // fail for CCW pointers. This addresses cases where the runtime
             // round-trips a managed object's canonical IUnknown pointer.
-            try
+            if (s_nativePtrsReverse.TryGetValue(nativePtr, out var ownerHandle)
+                && s_handles.TryGetValue(ownerHandle, out var original))
             {
-                var kvp = s_nativePtrs.FirstOrDefault(k => k.Value == nativePtr);
-                if (!kvp.Equals(default(KeyValuePair<int, IntPtr>)))
-                {
-                    if (s_handles.TryGetValue(kvp.Key, out var original))
-                    {
-                        return original;
-                    }
-                }
+                return original;
             }
-            catch { }
             // 1. Typed QI first: works for COM/CsWinRT interface types that carry a
             //    [Guid] attribute.  More precise than a generic RCW for strongly-typed
             //    parameters such as Windows.UI.Xaml.UIElement.

@@ -5,14 +5,14 @@
     <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
     <RootNamespace>TestApp</RootNamespace>
     <AssemblyName>TestApp</AssemblyName>
-    <UseUwp>true</UseUwp>
+    <UseWinUI>true</UseWinUI>
     <Platforms>x86;x64;arm64</Platforms>
     <RuntimeIdentifiers>win-x86;win-x64;win-arm64</RuntimeIdentifiers>
     <DefaultLanguage>en-US</DefaultLanguage>
     <EnableMsixTooling>true</EnableMsixTooling>
     <GenerateAppInstallerFile>false</GenerateAppInstallerFile>
     <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>
-    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <Nullable>disable</Nullable>
     <NSGenDir>$(BaseIntermediateOutputPath)_ns_\gen</NSGenDir>
@@ -55,7 +55,7 @@
           Condition="Exists('$(SBGEntryScript)')" />
     <Exec WorkingDirectory="$(WindowsRuntimeRepoRoot)"
           Command="cargo run --quiet --manifest-path &quot;$(WindowsRuntimeRepoRoot)\Cargo.toml&quot; -p sbg"
-          EnvironmentVariables="NSWINRT_AUTO_METADATA_PATH=$(SBGMetadataSource);SBG_OUTPUT_DIR=$(SBG_OUTPUT_DIR);SBG_METADATA_SOURCE=$(SBGMetadataSource);SBG_TARGET_FRAMEWORK=$(TargetFramework);SBG_TARGET_PLATFORM_MIN_VERSION=$(TargetPlatformMinVersion);SBG_USE_UWP=$(UseUwp);SBG_APP_CS_SOURCES_DIR=$(MSBuildProjectDirectory)"
+          EnvironmentVariables="NSWINRT_AUTO_METADATA_PATH=$(SBGMetadataSource);SBG_OUTPUT_DIR=$(SBG_OUTPUT_DIR);SBG_METADATA_SOURCE=$(SBGMetadataSource);SBG_TARGET_FRAMEWORK=$(TargetFramework);SBG_TARGET_PLATFORM_MIN_VERSION=$(TargetPlatformMinVersion);SBG_USE_UWP=false;SBG_APP_CS_SOURCES_DIR=$(MSBuildProjectDirectory)"
           Condition="Exists('$(SBGMetadataSource)')" />
   </Target>
 
@@ -74,6 +74,11 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Release|arm64'">
     <PublishProfile>win-arm64.pubxml</PublishProfile>
   </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.6.250205002" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.1742" />
+  </ItemGroup>
 
   <ItemGroup>
     <AppxManifest Include="Package.appxmanifest" />

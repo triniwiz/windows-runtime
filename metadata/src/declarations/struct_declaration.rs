@@ -1,9 +1,9 @@
-use std::any::Any;
-use std::ptr::addr_of_mut;
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::struct_field_declaration::StructFieldDeclaration;
 use crate::declarations::type_declaration::TypeDeclaration;
+use std::any::Any;
+use std::ptr::addr_of_mut;
+use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 
 #[derive(Clone, Debug)]
 pub struct StructDeclaration {
@@ -36,15 +36,8 @@ impl Declaration for StructDeclaration {
 impl StructDeclaration {
     pub fn new(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> Self {
         Self {
-            base: TypeDeclaration::new(
-                DeclarationKind::Struct,
-                metadata,
-                token,
-            ),
-            fields: StructDeclaration::make_field_declarations(
-                metadata,
-                token,
-            ),
+            base: TypeDeclaration::new(DeclarationKind::Struct, metadata, token),
+            fields: StructDeclaration::make_field_declarations(metadata, token),
         }
     }
 
@@ -70,19 +63,20 @@ impl StructDeclaration {
             let mut enumerator = std::ptr::null_mut();
             let mut count = 0;
             let mut tokens = [0_u32; 1024];
-            let result_inner = unsafe { metadata.EnumFields(
-                addr_of_mut!(enumerator),
-                token.0 as u32,
-                tokens.as_mut_ptr(),
-                tokens.len() as u32,
-                &mut count,
-            )};
+            let result_inner = unsafe {
+                metadata.EnumFields(
+                    addr_of_mut!(enumerator),
+                    token.0 as u32,
+                    tokens.as_mut_ptr(),
+                    tokens.len() as u32,
+                    &mut count,
+                )
+            };
             assert!(result_inner.is_ok());
-
 
             assert!(count < tokens.len().saturating_sub(1) as u32);
 
-           unsafe { metadata.CloseEnum(enumerator) };
+            unsafe { metadata.CloseEnum(enumerator) };
 
             result.reserve(count as usize);
 

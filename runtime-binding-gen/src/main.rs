@@ -37,27 +37,31 @@ fn main() {
 
 fn print_usage(prog_name: &str) {
     eprintln!("Usage:");
-    eprintln!("  {} list <manifest.json>    - List extensions from manifest", prog_name);
-    eprintln!("  {} generate                 - Generate dispatch metadata", prog_name);
+    eprintln!(
+        "  {} list <manifest.json>    - List extensions from manifest",
+        prog_name
+    );
+    eprintln!(
+        "  {} generate                 - Generate dispatch metadata",
+        prog_name
+    );
 }
 
 fn list_extensions(manifest_path: &str) {
     match std::fs::read_to_string(manifest_path) {
-        Ok(content) => {
-            match serde_json::from_str::<serde_json::Value>(&content) {
-                Ok(manifest) => {
-                    println!("[Runtime Binding Generator] Extensions in manifest:");
-                    if let Some(classes) = manifest.get("proxy_classes").and_then(|c| c.as_array()) {
-                        for class in classes {
-                            if let Some(name) = class.get("name").and_then(|n| n.as_str()) {
-                                println!("  - {}", name);
-                            }
+        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(manifest) => {
+                println!("[Runtime Binding Generator] Extensions in manifest:");
+                if let Some(classes) = manifest.get("proxy_classes").and_then(|c| c.as_array()) {
+                    for class in classes {
+                        if let Some(name) = class.get("name").and_then(|n| n.as_str()) {
+                            println!("  - {}", name);
                         }
                     }
                 }
-                Err(e) => eprintln!("Failed to parse manifest: {}", e),
             }
-        }
+            Err(e) => eprintln!("Failed to parse manifest: {}", e),
+        },
         Err(e) => eprintln!("Failed to read manifest: {}", e),
     }
 }

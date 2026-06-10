@@ -1,14 +1,27 @@
-using Windows.UI.Xaml;
+using System;
+using System.Threading;
+using Microsoft.UI.Dispatching;
+using Microsoft.UI.Xaml;
+using WinRT;
 
 namespace NativeScriptWindowsDemo
 {
     public static class Program
     {
+        [System.STAThread]
         public static void Main(string[] args)
         {
-            Application.Start(p =>
+            ComWrappersSupport.InitializeComWrappers();
+
+            Application.Start((_callbackParams) =>
             {
-                var app = new App();
+                var dispatcherQueue = DispatcherQueue.GetForCurrentThread();
+                if (dispatcherQueue != null)
+                {
+                    SynchronizationContext.SetSynchronizationContext(new DispatcherQueueSynchronizationContext(dispatcherQueue));
+                }
+
+				new App();
             });
         }
     }

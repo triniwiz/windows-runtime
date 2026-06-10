@@ -1,7 +1,9 @@
 use std::any::Any;
 use std::ptr::addr_of_mut;
 
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMAGE_CEE_CS_CALLCONV_FIELD, IMetaDataImport2};
+use windows::Win32::System::WinRT::Metadata::{
+    CorTokenType, IMetaDataImport2, IMAGE_CEE_CS_CALLCONV_FIELD,
+};
 
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::field_declaration::FieldDeclaration;

@@ -1,10 +1,8 @@
-use std::ffi::c_void;
-use std::mem::ManuallyDrop;
-use windows::core::HSTRING;
+use crate::error::generic_error;
 use crate::value::NativeType;
 use crate::value::NativeValue;
-use crate::error::generic_error;
 use libffi::middle::Arg;
+use windows::core::HSTRING;
 
 /// Stable storage for HSTRING arguments across a libffi call.
 ///
@@ -56,6 +54,12 @@ pub fn prepare_string_storage(
         .filter(|opt| matches!(opt, Some(NativeType::String)))
         .count();
 
+    // No HSTRING arguments: `build_call_args` falls back to the ABI types
+    // directly, so no per-slot bookkeeping is needed.
+    if string_count == 0 {
+        return Ok(FfiStringPrep::new(0, 0));
+    }
+
     let mut prep = FfiStringPrep::new(slot_count, string_count);
 
     for (i, v) in argument_buf.iter().enumerate() {
@@ -100,22 +104,36 @@ pub fn prepare_string_storage(
 ///
 /// For String slots the argument is the raw HSTRING handle (usize) stored
 /// in `prep.string_handle_values`; for all other slots it is a typed
-/// reference into `argument_buf`.
+/// reference into `argument_buf`. When `prep` is empty (no string args) the
+/// ABI types in `parameter_types` are used directly, borrow-only.
 pub fn build_call_args<'a>(
     prep: &'a FfiStringPrep,
     argument_buf: &'a [NativeValue],
-    _argument_parse_types: &'a [Option<NativeType>],
+    parameter_types: &'a [NativeType],
 ) -> Vec<Arg<'a>> {
     let mut call_args: Vec<Arg> = Vec::with_capacity(argument_buf.len());
 
+    if prep.effective_natives.is_empty() {
+        for (i, v) in argument_buf.iter().enumerate() {
+            let abi = parameter_types.get(i).unwrap_or(&POINTER_FALLBACK_REF);
+            call_args.push(unsafe { v.as_arg(abi) });
+        }
+        return call_args;
+    }
+
     for (i, v) in argument_buf.iter().enumerate() {
-        let effective_native = prep.effective_natives.get(i).cloned().unwrap_or(NativeType::Pointer);
         if let Some(idx) = prep.string_index_for_slot.get(i).and_then(|o| *o) {
             call_args.push(Arg::new(&prep.string_handle_values[idx]));
         } else {
-            call_args.push(unsafe { v.as_arg(&effective_native) });
+            let effective = prep
+                .effective_natives
+                .get(i)
+                .unwrap_or(&POINTER_FALLBACK_REF);
+            call_args.push(unsafe { v.as_arg(effective) });
         }
     }
 
     call_args
 }
+
+static POINTER_FALLBACK_REF: NativeType = NativeType::Pointer;

@@ -16,12 +16,21 @@ fn enum_values_are_accessible_as_integers() {
     let mut rt = Runtime::new(".");
 
     // Windows.UI.Popups.Placement (no XAML dependency)
-    assert_js(&mut rt, "typeof Windows.UI.Popups.Placement === 'object'",
-        "Placement should be an object");
-    assert_js(&mut rt, "Windows.UI.Popups.Placement.Default === 0",
-        "Placement.Default should be 0");
-    assert_js(&mut rt, "Windows.UI.Popups.Placement.Right === 4",
-        "Placement.Right should be 4");
+    assert_js(
+        &mut rt,
+        "typeof Windows.UI.Popups.Placement === 'object'",
+        "Placement should be an object",
+    );
+    assert_js(
+        &mut rt,
+        "Windows.UI.Popups.Placement.Default === 0",
+        "Placement.Default should be 0",
+    );
+    assert_js(
+        &mut rt,
+        "Windows.UI.Popups.Placement.Right === 4",
+        "Placement.Right should be 4",
+    );
 }
 
 #[test]
@@ -29,13 +38,21 @@ fn enum_values_compare_correctly_to_literals() {
     let mut rt = Runtime::new(".");
 
     // Verify the values round-trip through JS equality correctly.
-    assert_js(&mut rt, "Windows.UI.Popups.Placement.Default == 0",
-        "Default == 0");
-    assert_js(&mut rt, "Windows.UI.Popups.Placement.Right != 0",
-        "Right != 0");
-    assert_js(&mut rt,
+    assert_js(
+        &mut rt,
+        "Windows.UI.Popups.Placement.Default == 0",
+        "Default == 0",
+    );
+    assert_js(
+        &mut rt,
+        "Windows.UI.Popups.Placement.Right != 0",
+        "Right != 0",
+    );
+    assert_js(
+        &mut rt,
         "Windows.UI.Popups.Placement.Default !== Windows.UI.Popups.Placement.Right",
-        "Default !== Right");
+        "Default !== Right",
+    );
 }
 
 // ── Enum-typed property setter ───────────────────────────────────────────────
@@ -53,21 +70,31 @@ fn enum_values_compare_correctly_to_literals() {
 fn scrollbarvisibility_enum_values_are_integers() {
     let mut rt = Runtime::new(".");
 
-    assert_js(&mut rt,
+    assert_js(
+        &mut rt,
         "typeof Windows.UI.Xaml.Controls.ScrollBarVisibility === 'object'",
-        "ScrollBarVisibility should be accessible");
-    assert_js(&mut rt,
+        "ScrollBarVisibility should be accessible",
+    );
+    assert_js(
+        &mut rt,
         "Windows.UI.Xaml.Controls.ScrollBarVisibility.Disabled === 0",
-        "ScrollBarVisibility.Disabled should be 0");
-    assert_js(&mut rt,
+        "ScrollBarVisibility.Disabled should be 0",
+    );
+    assert_js(
+        &mut rt,
         "Windows.UI.Xaml.Controls.ScrollBarVisibility.Auto === 1",
-        "ScrollBarVisibility.Auto should be 1");
-    assert_js(&mut rt,
+        "ScrollBarVisibility.Auto should be 1",
+    );
+    assert_js(
+        &mut rt,
         "Windows.UI.Xaml.Controls.ScrollBarVisibility.Hidden === 2",
-        "ScrollBarVisibility.Hidden should be 2");
-    assert_js(&mut rt,
+        "ScrollBarVisibility.Hidden should be 2",
+    );
+    assert_js(
+        &mut rt,
         "Windows.UI.Xaml.Controls.ScrollBarVisibility.Visible === 3",
-        "ScrollBarVisibility.Visible should be 3");
+        "ScrollBarVisibility.Visible should be 3",
+    );
 }
 
 #[test]
@@ -76,7 +103,9 @@ fn enum_value_is_a_number_not_an_object() {
 
     // Enum values must be plain numbers so they pass as Int32 to WinRT setters.
     // If this returns 'object' the setter receives a pointer instead of int.
-    assert_js(&mut rt,
+    assert_js(
+        &mut rt,
         "typeof Windows.UI.Xaml.Controls.ScrollBarVisibility.Auto === 'number'",
-        "ScrollBarVisibility.Auto must be typeof 'number'");
+        "ScrollBarVisibility.Auto must be typeof 'number'",
+    );
 }

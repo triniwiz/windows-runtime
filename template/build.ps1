@@ -34,17 +34,16 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-
+# Paths
 $ScriptDir  = $PSScriptRoot
 $RepoRoot   = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 $FrameworkLibs = Join-Path $ScriptDir "framework\libs"
+$ToolsDir = Join-Path $ScriptDir "framework\tools"
 
 Write-Host "Repo root  : $RepoRoot"
 Write-Host "Output dir : $FrameworkLibs"
 
-# ── Helper ────────────────────────────────────────────────────────────────────
-
+# Helper
 function Copy-Dll {
     param([string]$Src, [string]$Dest)
     $null = New-Item -ItemType Directory -Force -Path (Split-Path $Dest)
@@ -70,7 +69,7 @@ function Build-Crate {
     }
 }
 
-# ── DotNet Bridge ─────────────────────────────────────────────────────────────
+# DotNet Bridge
 # Copies the dotnet-bridge source (csproj + .cs files) into
 # template/framework/dotnet-bridge/ so it ships inside the npm package.
 # The actual `dotnet publish` is deferred to the app's MSBuild process —
@@ -102,8 +101,23 @@ if (-not $SkipDotnet) {
         }
 }
 
-# ── Targets ───────────────────────────────────────────────────────────────────
+# ManifestMerger MSBuild task
+Write-Host "`n=== ManifestMerger MSBuild task ===" -ForegroundColor Cyan
+if (-not (Test-Path $ToolsDir)) { New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null }
+$ManifestMergerProj = Join-Path $RepoRoot "tools\ManifestMerger\ManifestMerger.csproj"
+$ManifestMergerOut = Join-Path $ToolsDir "ManifestMerger"
+if (Test-Path $ManifestMergerProj) {
+    & dotnet publish $ManifestMergerProj -c Release -o $ManifestMergerOut --nologo
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "dotnet publish for ManifestMerger failed (exit $LASTEXITCODE)." -ForegroundColor Yellow
+    } else {
+        Write-Host "  published ManifestMerger -> $(Resolve-Path $ManifestMergerOut -Relative)"
+    }
+} else {
+    Write-Host "ManifestMerger project not found: $ManifestMergerProj" -ForegroundColor Yellow
+}
 
+# Targets
 $Targets = @(
     @{ Arch = "x64";   RustTarget = "x86_64-pc-windows-msvc"  }
 )
@@ -111,8 +125,7 @@ if (-not $SkipArm64) {
     $Targets += @{ Arch = "arm64"; RustTarget = "aarch64-pc-windows-msvc" }
 }
 
-# ── Build ─────────────────────────────────────────────────────────────────────
-
+# Build
 foreach ($t in $Targets) {
     $arch        = $t.Arch
     $rustTarget  = $t.RustTarget
@@ -134,11 +147,10 @@ foreach ($t in $Targets) {
     }
 }
 
-# ── dotnet-tool prebuilt binaries ────────────────────────────────────────────
+# dotnet-tool prebuilt binaries
 Write-Host "`n=== Build dotnet-tool prebuilt binaries ===" -ForegroundColor Cyan
 # Place prebuilt tools into the framework folder so they are included in the
 # packaged framework (npm publish copies framework/* into the package root).
-$ToolsDir = Join-Path $ScriptDir "framework\tools"
 if (-not (Test-Path $ToolsDir)) { New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null }
 
 
@@ -174,7 +186,7 @@ if (Test-Path $x64Path) {
     Write-Host "  copied dotnet-tool-x64.exe -> dotnet-tool.exe"
 }
 
-# ── sbg prebuilt binaries ─────────────────────────────────────────────────────
+# sbg prebuilt binaries
 Write-Host "`n=== Build sbg prebuilt binaries ===" -ForegroundColor Cyan
 
 foreach ($t in $Targets) {
@@ -206,6 +218,53 @@ $x64Path = Join-Path $ToolsDir "sbg-x64.exe"
 if (Test-Path $x64Path) {
     Copy-Item -Force $x64Path (Join-Path $ToolsDir "sbg.exe")
     Write-Host "  copied sbg-x64.exe -> sbg.exe"
+}
+
+# typings-generator: shipped so `ns typings windows` can generate WinRT/.NET typings.
+Write-Host "`n=== Build typings-generator prebuilt binaries ===" -ForegroundColor Cyan
+
+foreach ($t in $Targets) {
+    $arch = $t.Arch
+    $rustTarget = $t.RustTarget
+    Write-Host "Building typings-generator for $arch ($rustTarget)..."
+    Push-Location $RepoRoot
+    try {
+        & cargo build -p typings-generator --release --target $rustTarget
+        $buildExit = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    if ($buildExit -ne 0) {
+        Write-Host "cargo build for typings-generator failed for target $rustTarget (exit $buildExit). Skipping copy for $arch." -ForegroundColor Yellow
+        continue
+    }
+    $candidate = Join-Path $RepoRoot "target\$rustTarget\release\typings-generator.exe"
+    if (Test-Path $candidate) {
+        $dest = Join-Path $ToolsDir "typings-generator-$arch.exe"
+        Copy-Item -Force $candidate $dest
+        Write-Host "  copied typings-generator -> $(Resolve-Path $dest -Relative)"
+    } else {
+        Write-Host "Expected build output not found: $candidate" -ForegroundColor Yellow
+    }
+}
+
+$x64Path = Join-Path $ToolsDir "typings-generator-x64.exe"
+if (Test-Path $x64Path) {
+    Copy-Item -Force $x64Path (Join-Path $ToolsDir "typings-generator.exe")
+    Write-Host "  copied typings-generator-x64.exe -> typings-generator.exe"
+}
+
+# dotnet-typings-gen: .NET sub-tool typings-generator shells to for managed/non-Windows assemblies.
+$DotnetTypingsProj = Join-Path $RepoRoot "typings-generator\dotnet-src\dotnet-typings-gen.csproj"
+if (Test-Path $DotnetTypingsProj) {
+    Write-Host "`n=== Publish dotnet-typings-gen (.NET typings sub-tool) ===" -ForegroundColor Cyan
+    $DotnetTypingsOut = Join-Path $ToolsDir "dotnet-typings-gen"
+    & dotnet publish $DotnetTypingsProj -c Release -o $DotnetTypingsOut --nologo
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "dotnet publish for dotnet-typings-gen failed (exit $LASTEXITCODE)." -ForegroundColor Yellow
+    } else {
+        Write-Host "  published dotnet-typings-gen -> $(Resolve-Path $DotnetTypingsOut -Relative)"
+    }
 }
 
 Write-Host ""

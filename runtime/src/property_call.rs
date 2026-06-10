@@ -1,27 +1,155 @@
-use std::ffi::c_void;
-use std::sync::Arc;
+use crate::error::AnyError;
+use crate::helpers::{ffi_native_type_from_signature, strip_generic_suffix};
+use crate::value::{
+    append_struct_field_bytes, ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length,
+    ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg,
+    ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg,
+    ffi_parse_pointer_arg, ffi_parse_query_interface_arg, ffi_parse_string_arg,
+    ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg,
+    ffi_parse_u8_arg, ffi_parse_usize_arg, read_value_from_ptr, set_out_param_value,
+    try_unwrap_out_param, write_v8_value_to_ptr, NativeType, NativeValue,
+};
+use crate::ReturnKind;
 use libffi::middle::*;
-use parking_lot::RwLock;
-use windows::core::{GUID, HRESULT, Interface, IUnknown, IInspectable};
-use windows::Win32::System::WinRT::IActivationFactory;
-use windows::Win32::System::WinRT::Metadata::CorTokenType;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
-use metadata::declarations::declaration::DeclarationKind;
-use metadata::declarations::struct_declaration::StructDeclaration;
-use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
+use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration::Declaration;
+use metadata::declarations::declaration::DeclarationKind;
+use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
+use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
 use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::declarations::parameter_declaration::ParameterDeclaration;
 use metadata::declarations::property_declaration::PropertyDeclaration;
-use metadata::declarations::class_declaration::ClassDeclaration;
+use metadata::declarations::struct_declaration::StructDeclaration;
 use metadata::declaring_interface_for_method::Metadata;
-use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
 use metadata::meta_data_reader::MetadataReader;
 use metadata::signature::Signature;
-use crate::error::AnyError;
-use crate::helpers::{ffi_native_type_from_signature, strip_generic_suffix};
+use parking_lot::RwLock;
+use std::cell::RefCell;
+use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use crate::value::{append_struct_field_bytes, ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_query_interface_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue, read_value_from_ptr, set_out_param_value, try_unwrap_out_param, write_v8_value_to_ptr};
+use std::rc::Rc;
+use std::sync::Arc;
+use windows::core::{IInspectable, IUnknown, Interface, GUID, HRESULT};
+use windows::Win32::System::WinRT::IActivationFactory;
+use windows::Win32::System::WinRT::Metadata::CorTokenType;
+
+#[inline]
+fn align_up(n: usize, a: usize) -> usize {
+    if a <= 1 {
+        n
+    } else {
+        (n + a - 1) / a * a
+    }
+}
+
+/// (size, alignment) in bytes for a struct field signature. Recurses into nested structs; WinRT enums
+/// are 4-byte Int32; primitives use their native size.
+fn sig_size_align(sig: &str) -> (usize, usize) {
+    if sig.contains('.') {
+        let lookup = strip_generic_suffix(sig);
+        if let Some(decl) = MetadataReader::find_by_name(lookup) {
+            let lock = decl.read();
+            match lock.kind() {
+                DeclarationKind::Struct => {
+                    if let Some(sd) = lock.as_any().downcast_ref::<StructDeclaration>() {
+                        return struct_size_align(sd);
+                    }
+                }
+                DeclarationKind::Enum => return (4, 4),
+                _ => {}
+            }
+        }
+        return (4, 4); // unknown dotted ref in a value struct — treat as Int32-sized enum
+    }
+    if let Ok(nt) = NativeType::try_from(sig) {
+        let s = nt.size().max(1);
+        return (s, s);
+    }
+    (4, 4)
+}
+
+/// (size, alignment) for a whole struct: standard C layout — fields placed at aligned offsets, total
+/// rounded up to the struct's alignment (the max field alignment).
+fn struct_size_align(sd: &StructDeclaration) -> (usize, usize) {
+    let mut size = 0usize;
+    let mut align = 1usize;
+    for f in sd.fields().iter() {
+        if let Some(m) = f.base().metadata() {
+            let ts = Signature::to_string(m, &f.type_());
+            let (fs, fa) = sig_size_align(&ts);
+            size = align_up(size, fa) + fs;
+            if fa > align {
+                align = fa;
+            }
+        }
+    }
+    (align_up(size, align), align)
+}
+
+/// Serializes a JS object into a WinRT value-struct's byte layout, honoring field alignment, trailing
+/// padding, nested structs (recursed), and enum fields (Int32). The naive field-concatenation path zeroed
+/// nested-struct/enum fields and dropped padding — which silently broke e.g. `Duration { TimeSpan; Type }`
+/// (a 0-tick / instant animation) and `GridLength { Value; GridUnitType }`.
+pub(crate) fn append_struct_object_bytes(
+    buf: &mut Vec<u8>,
+    scope: &mut v8::PinScope<'_, '_>,
+    obj: v8::Local<v8::Object>,
+    sd: &StructDeclaration,
+) {
+    let start = buf.len();
+    let mut max_align = 1usize;
+    for f in sd.fields().iter() {
+        let m = match f.base().metadata() {
+            Some(m) => m,
+            None => continue,
+        };
+        let ts = Signature::to_string(m, &f.type_());
+        let fname = f.name().to_string();
+        let fv = v8::String::new(scope, fname.as_str())
+            .and_then(|k| obj.get(scope, k.into()))
+            .unwrap_or_else(|| v8::undefined(scope).into());
+
+        let (fsize, falign) = sig_size_align(&ts);
+        if falign > max_align {
+            max_align = falign;
+        }
+        let pad = align_up(buf.len(), falign) - buf.len();
+        buf.extend(std::iter::repeat(0u8).take(pad));
+
+        let is_struct = ts.contains('.')
+            && MetadataReader::find_by_name(strip_generic_suffix(&ts))
+                .map(|d| d.read().kind() == DeclarationKind::Struct)
+                .unwrap_or(false);
+        if is_struct {
+            let lookup = strip_generic_suffix(&ts);
+            if !fv.is_null_or_undefined() && fv.is_object() {
+                if let (Some(decl), Some(fobj)) =
+                    (MetadataReader::find_by_name(lookup), fv.to_object(scope))
+                {
+                    let lock = decl.read();
+                    if let Some(nsd) = lock.as_any().downcast_ref::<StructDeclaration>() {
+                        append_struct_object_bytes(buf, scope, fobj, nsd);
+                        continue;
+                    }
+                }
+            }
+            buf.extend(std::iter::repeat(0u8).take(fsize));
+            continue;
+        }
+
+        // Enum fields are dotted but Int32-valued; primitives use their resolved native type.
+        let nt = if ts.contains('.') {
+            NativeType::I32
+        } else {
+            NativeType::try_from(ts.as_str()).unwrap_or(NativeType::I32)
+        };
+        append_struct_field_bytes(buf, scope, fv, &nt);
+    }
+    let total = buf.len() - start;
+    let tail = align_up(total, max_align) - total;
+    buf.extend(std::iter::repeat(0u8).take(tail));
+}
 
 fn substitute_type_vars(s: &str, type_args: &[String]) -> String {
     if type_args.is_empty() {
@@ -34,25 +162,49 @@ fn substitute_type_vars(s: &str, type_args: &[String]) -> String {
     result
 }
 
-pub struct PropertyCall {
-    index: usize,
-    number_of_parameters: usize,
-    number_of_abi_parameters: usize,
-    is_initializer: bool,
-    is_sealed: bool,
-    is_void: bool,
-    is_setter: bool,
+/// Immutable per-property-method-type data cached after first construction.
+/// Class path key: (method_token as u64) << 1 | (is_initializer as u64).
+/// Interface path key: (token, declaring IID, is_setter) — the IID disambiguates
+/// generic interface instantiations that share metadata tokens.
+struct PropertyStaticInfo {
+    cif: Rc<Cif>,
     iid: GUID,
-    cif: Cif,
-    func: *mut c_void,
-    parent_interface: IUnknown,
-    interface: IUnknown,
+    /// Vtable slot index. The function pointer is re-read from the QI'd
+    /// interface's vtable per construction — implementations differ per class
+    /// even when the metadata token is shared (interface-declared members).
+    index: usize,
     parameter_types: Vec<NativeType>,
     parse_parameter_types: Vec<NativeType>,
     parameters: Vec<ParameterDeclaration>,
     return_type: String,
-    pub(crate) declaration: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>>,
+    is_void: bool,
+    is_sealed: bool,
+    declaration: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>>,
+    number_of_parameters: usize,
+    number_of_abi_parameters: usize,
+    return_kind: ReturnKind,
+    param_sigs: Vec<String>,
     type_args: Vec<String>,
+}
+
+thread_local! {
+    static PROPERTY_STATIC_INFO_CACHE: RefCell<ahash::AHashMap<u64, Rc<PropertyStaticInfo>>>
+        = RefCell::new(ahash::AHashMap::new());
+    /// Cache for the interface-routed constructors (generic vectors, maps, …).
+    /// Keyed by (method token | is_setter bit, declaring interface IID).
+    static INTERFACE_STATIC_INFO_CACHE: RefCell<ahash::AHashMap<(u64, u128), Rc<PropertyStaticInfo>>>
+        = RefCell::new(ahash::AHashMap::new());
+}
+
+pub struct PropertyCall {
+    si: Rc<PropertyStaticInfo>,
+    is_initializer: bool,
+    is_setter: bool,
+    /// Original (pre-QI) interface, kept alive for the duration of the call object.
+    #[allow(dead_code)]
+    parent_interface: IUnknown,
+    interface: IUnknown,
+    func: *mut c_void,
     /// Pre-allocated argument buffer reused on every call to avoid per-call heap allocation.
     argument_buf: Vec<NativeValue>,
     /// Per-call parse-type tracker reused to avoid per-call heap allocation.
@@ -70,19 +222,59 @@ fn call_failure() -> HRESULT {
 
 impl PropertyCall {
     pub fn is_void(&self) -> bool {
-        self.is_void
+        self.si.is_void
     }
 
     pub fn return_type(&self) -> &str {
-        self.return_type.as_str()
+        self.si.return_type.as_str()
+    }
+
+    pub(crate) fn return_kind(&self) -> &ReturnKind {
+        &self.si.return_kind
     }
 
     pub fn parse_types_debug(&self) -> &[NativeType] {
-        &self.parse_parameter_types
+        &self.si.parse_parameter_types
     }
 
     pub fn abi_types_debug(&self) -> &[NativeType] {
-        &self.parameter_types
+        &self.si.parameter_types
+    }
+
+    fn from_static_info(
+        si: Rc<PropertyStaticInfo>,
+        interface: IUnknown,
+        is_setter: bool,
+        is_initializer: bool,
+    ) -> Option<Self> {
+        let vtable = interface.vtable();
+        let mut interface_ptr: *mut c_void = std::ptr::null_mut();
+        let result = unsafe {
+            ((*vtable).QueryInterface)(
+                interface.as_raw(),
+                &si.iid,
+                &mut interface_ptr as *mut _ as *mut *mut c_void,
+            )
+        };
+        if result.is_err() || interface_ptr.is_null() {
+            return None;
+        }
+        let queried_interface = unsafe { IUnknown::from_raw(interface_ptr) };
+        let vtable_ptr: *mut *mut c_void =
+            unsafe { std::mem::transmute(queried_interface.vtable()) };
+        let func = unsafe { *vtable_ptr.add(si.index) };
+        let cap = si.number_of_abi_parameters + 3;
+        Some(Self {
+            si,
+            is_initializer,
+            is_setter,
+            parent_interface: interface,
+            interface: queried_interface,
+            func,
+            return_value_buf: [0u8; 128],
+            argument_buf: Vec::with_capacity(cap),
+            argument_parse_types: Vec::with_capacity(cap),
+        })
     }
 
     pub fn new(
@@ -97,6 +289,12 @@ impl PropertyCall {
             property.getter()
         };
 
+        // Fast path: reuse cached static info; only the QI is per-instance work.
+        let cache_key = ((method.token().0 as u64) << 1) | (is_initializer as u64);
+        if let Some(si) = PROPERTY_STATIC_INFO_CACHE.with(|c| c.borrow().get(&cache_key).cloned()) {
+            return Self::from_static_info(si, interface, is_setter, is_initializer);
+        }
+
         let number_of_parameters = method.number_of_parameters();
 
         let mut index = 0 as usize;
@@ -107,15 +305,16 @@ impl PropertyCall {
             None => {
                 if let Some(metadata) = method.metadata() {
                     let containing_type = CorTokenType(
-                        Metadata::get_method_containing_class_token(metadata, method.token()) as i32,
+                        Metadata::get_method_containing_class_token(metadata, method.token())
+                            as i32,
                     );
 
                     if containing_type.0 != 0 {
-                        let interface_declaration = Arc::new(RwLock::new(InterfaceDeclaration::new(
-                            Some(metadata),
-                            containing_type,
-                        )));
-                        index = Metadata::find_method_index(metadata, containing_type, method.token());
+                        let interface_declaration = Arc::new(RwLock::new(
+                            InterfaceDeclaration::new(Some(metadata), containing_type),
+                        ));
+                        index =
+                            Metadata::find_method_index(metadata, containing_type, method.token());
                         let iid = interface_declaration.read().id();
                         declaration = Some(interface_declaration);
                         iid
@@ -157,7 +356,7 @@ impl PropertyCall {
             }
         };
 
-        let pre_index = index;
+        let _pre_index = index;
 
         let vtable = interface.vtable();
 
@@ -185,7 +384,6 @@ impl PropertyCall {
 
         let return_type = Signature::to_string(method.metadata()?, &signature);
 
-
         let other_params: usize = if is_initializer {
             if is_sealed {
                 2
@@ -200,8 +398,10 @@ impl PropertyCall {
             }
         };
 
-        let mut parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters + other_params + 4);
+        let mut parameter_types: Vec<NativeType> =
+            Vec::with_capacity(number_of_parameters + other_params + 4);
         let mut parse_parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters);
+        let mut param_sigs: Vec<String> = Vec::with_capacity(number_of_parameters);
         parameter_types.push(NativeType::Pointer);
 
         for parameter in method.parameters().iter() {
@@ -212,6 +412,7 @@ impl PropertyCall {
 
             let parse_native_type = NativeType::try_from(signature.as_str()).ok()?;
             parse_parameter_types.push(parse_native_type);
+            param_sigs.push(signature.clone());
             if parameter.is_out() || signature.trim().starts_with("ByRef ") {
                 parameter_types.push(NativeType::Pointer);
             } else {
@@ -239,22 +440,17 @@ impl PropertyCall {
             }
         }
 
-
         let number_of_abi_parameters = parameter_types.len();
 
-        let params =
-            parameter_types
-                .iter()
-                .cloned()
-                .map(libffi::middle::Type::try_from)
-                .collect::<std::result::Result<Vec<Type>, AnyError>>();
+        let params = parameter_types
+            .iter()
+            .cloned()
+            .map(libffi::middle::Type::try_from)
+            .collect::<std::result::Result<Vec<Type>, AnyError>>();
 
         let params = params.ok()?;
 
-        let cif = Cif::new(
-            params,
-            Type::i32(),
-        );
+        let cif = Rc::new(Cif::new(params, Type::i32()));
 
         let parent_interface = interface.clone();
 
@@ -272,7 +468,9 @@ impl PropertyCall {
         };
 
         let base_offset = if supports_iinspectable.is_ok() && !inspectable_ptr.is_null() {
-            unsafe { IUnknown::from_raw(inspectable_ptr as *mut c_void); }
+            unsafe {
+                IUnknown::from_raw(inspectable_ptr as *mut c_void);
+            }
             6
         } else {
             3
@@ -282,30 +480,40 @@ impl PropertyCall {
 
         let func = unsafe { *vtable_ptr.offset(index as isize) };
 
+        let parameters = method.parameters().to_vec();
+        let return_kind = crate::classify_return(&return_type, is_void);
 
-
-        Some(Self {
-            index,
-            number_of_parameters,
-            number_of_abi_parameters,
-            is_initializer,
-            is_sealed,
-            is_void: method.is_void(),
-            iid,
+        let static_info = Rc::new(PropertyStaticInfo {
             cif,
-            func,
-            parent_interface,
-            interface,
+            iid,
+            index,
             parameter_types,
             parse_parameter_types,
-            parameters: method.parameters().to_vec(),
-            declaration,
+            parameters,
             return_type,
-            is_setter,
+            is_void: method.is_void(),
+            is_sealed,
+            declaration,
+            number_of_parameters,
+            number_of_abi_parameters,
+            return_kind,
+            param_sigs,
             type_args: Vec::new(),
+        });
+        PROPERTY_STATIC_INFO_CACHE
+            .with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
+
+        let cap = number_of_abi_parameters + 3;
+        Some(Self {
+            si: static_info,
+            is_initializer,
+            is_setter,
+            parent_interface,
+            interface,
+            func,
             return_value_buf: [0u8; 128],
-            argument_buf: Vec::with_capacity(number_of_abi_parameters),
-            argument_parse_types: Vec::with_capacity(number_of_abi_parameters),
+            argument_buf: Vec::with_capacity(cap),
+            argument_parse_types: Vec::with_capacity(cap),
         })
     }
 
@@ -326,14 +534,26 @@ impl PropertyCall {
             property.getter()
         };
 
+        // Fast path: static info cached per (token, declaring IID) — generic
+        // instantiations share tokens, so the IID is part of the key.
+        let cache_key = (
+            ((method.token().0 as u64) << 1) | (is_setter as u64),
+            declaring_iid.to_u128(),
+        );
+        if let Some(si) = INTERFACE_STATIC_INFO_CACHE.with(|c| c.borrow().get(&cache_key).cloned())
+        {
+            return Self::from_static_info(si, interface, is_setter, is_initializer);
+        }
+
         let number_of_parameters = method.number_of_parameters();
         let mut index = 0_usize;
 
         // Derive vtable index from the method's position in its containing interface.
         if let Some(metadata) = method.metadata() {
-            let containing_type = CorTokenType(
-                Metadata::get_method_containing_class_token(metadata, method.token()) as i32,
-            );
+            let containing_type = CorTokenType(Metadata::get_method_containing_class_token(
+                metadata,
+                method.token(),
+            ) as i32);
             if containing_type.0 != 0 {
                 index = Metadata::find_method_index(metadata, containing_type, method.token());
             }
@@ -360,11 +580,14 @@ impl PropertyCall {
         let signature = method.return_type();
         let raw_return_type = Signature::to_string(method.metadata()?, &signature);
         let return_type = substitute_type_vars(&raw_return_type, &type_args);
+        let return_kind = crate::classify_return(&return_type, is_void);
 
         let other_params: usize = if is_void { 1 } else { 2 };
 
-        let mut parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters + other_params + 2);
+        let mut parameter_types: Vec<NativeType> =
+            Vec::with_capacity(number_of_parameters + other_params + 2);
         let mut parse_parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters);
+        let mut param_sigs: Vec<String> = Vec::with_capacity(number_of_parameters);
         parameter_types.push(NativeType::Pointer);
 
         for parameter in method.parameters().iter() {
@@ -375,11 +598,14 @@ impl PropertyCall {
 
             let parse_native_type = NativeType::try_from(signature.as_str()).ok()?;
             parse_parameter_types.push(parse_native_type);
+            param_sigs.push(signature.clone());
             if parameter.is_out() || signature.trim().starts_with("ByRef ") {
                 parameter_types.push(NativeType::Pointer);
             } else {
                 let abi_native = crate::helpers::struct_native_type_for_sig(signature.as_str())
-                    .unwrap_or_else(|| crate::helpers::ffi_native_type_from_signature(signature.as_str()));
+                    .unwrap_or_else(|| {
+                        crate::helpers::ffi_native_type_from_signature(signature.as_str())
+                    });
                 if matches!(abi_native, NativeType::Buffer) {
                     parameter_types.push(NativeType::U32);
                     parameter_types.push(NativeType::Buffer);
@@ -391,8 +617,6 @@ impl PropertyCall {
 
         if !is_void {
             parameter_types.push(NativeType::Pointer);
-        } else {
-            // void setter — no return-value pointer slot
         }
 
         let number_of_abi_parameters = parameter_types.len();
@@ -404,7 +628,7 @@ impl PropertyCall {
             .collect::<std::result::Result<Vec<Type>, _>>();
         let params = params.ok()?;
 
-        let cif = Cif::new(params, Type::i32());
+        let cif = Rc::new(Cif::new(params, Type::i32()));
 
         let parent_interface = interface.clone();
         let interface = unsafe { IUnknown::from_raw(interface_ptr as *mut c_void) };
@@ -421,7 +645,9 @@ impl PropertyCall {
         };
 
         let base_offset = if supports_iinspectable.is_ok() && !inspectable_ptr.is_null() {
-            unsafe { IUnknown::from_raw(inspectable_ptr as *mut c_void); }
+            unsafe {
+                IUnknown::from_raw(inspectable_ptr as *mut c_void);
+            }
             6
         } else {
             3
@@ -430,28 +656,37 @@ impl PropertyCall {
         index = index.saturating_add(base_offset);
         let func = unsafe { *vtable_ptr.offset(index as isize) };
 
-        Some(Self {
-            index,
-            number_of_parameters,
-            number_of_abi_parameters,
-            is_initializer,
-            is_sealed,
-            is_void,
-            iid: declaring_iid,
+        let static_info = Rc::new(PropertyStaticInfo {
             cif,
-            func,
-            parent_interface,
-            interface,
+            iid: declaring_iid,
+            index,
             parameter_types,
             parse_parameter_types,
             parameters: method.parameters().to_vec(),
-            declaration: None,
             return_type,
-            is_setter,
+            is_void,
+            is_sealed,
+            declaration: None,
+            number_of_parameters,
+            number_of_abi_parameters,
+            return_kind,
+            param_sigs,
             type_args,
+        });
+        INTERFACE_STATIC_INFO_CACHE
+            .with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
+
+        let cap = number_of_abi_parameters + 3;
+        Some(Self {
+            si: static_info,
+            is_initializer,
+            is_setter,
+            parent_interface,
+            interface,
+            func,
             return_value_buf: [0u8; 128],
-            argument_buf: Vec::with_capacity(number_of_abi_parameters),
-            argument_parse_types: Vec::with_capacity(number_of_abi_parameters),
+            argument_buf: Vec::with_capacity(cap),
+            argument_parse_types: Vec::with_capacity(cap),
         })
     }
 
@@ -463,6 +698,13 @@ impl PropertyCall {
         declaring_iid: GUID,
         type_args: Vec<String>,
     ) -> Option<Self> {
+        // Fast path: static info cached per (token, declaring IID).
+        let cache_key = ((method.token().0 as u64) << 1, declaring_iid.to_u128());
+        if let Some(si) = INTERFACE_STATIC_INFO_CACHE.with(|c| c.borrow().get(&cache_key).cloned())
+        {
+            return Self::from_static_info(si, interface, false, false);
+        }
+
         let number_of_parameters = method.number_of_parameters();
         let mut index = 0_usize;
 
@@ -471,7 +713,11 @@ impl PropertyCall {
                 metadata::declaring_interface_for_method::Metadata::get_method_containing_class_token(metadata, method.token()) as i32,
             );
             if containing_type.0 != 0 {
-                index = metadata::declaring_interface_for_method::Metadata::find_method_index(metadata, containing_type, method.token());
+                index = metadata::declaring_interface_for_method::Metadata::find_method_index(
+                    metadata,
+                    containing_type,
+                    method.token(),
+                );
             }
         }
 
@@ -495,11 +741,14 @@ impl PropertyCall {
         let signature = method.return_type();
         let raw_return_type = Signature::to_string(method.metadata()?, &signature);
         let return_type = substitute_type_vars(&raw_return_type, &type_args);
+        let return_kind = crate::classify_return(&return_type, is_void);
 
         let other_params: usize = if is_void { 1 } else { 2 };
 
-        let mut parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters + other_params + 2);
+        let mut parameter_types: Vec<NativeType> =
+            Vec::with_capacity(number_of_parameters + other_params + 2);
         let mut parse_parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters);
+        let mut param_sigs: Vec<String> = Vec::with_capacity(number_of_parameters);
         parameter_types.push(NativeType::Pointer);
 
         for parameter in method.parameters().iter() {
@@ -509,11 +758,14 @@ impl PropertyCall {
             let sig = substitute_type_vars(&raw_sig, &type_args);
             let parse_native_type = NativeType::try_from(sig.as_str()).ok()?;
             parse_parameter_types.push(parse_native_type);
+            param_sigs.push(sig.clone());
             if parameter.is_out() || sig.trim().starts_with("ByRef ") {
                 parameter_types.push(NativeType::Pointer);
             } else {
                 let abi_native = crate::helpers::struct_native_type_for_sig(sig.as_str())
-                    .unwrap_or_else(|| crate::helpers::ffi_native_type_from_signature(sig.as_str()));
+                    .unwrap_or_else(|| {
+                        crate::helpers::ffi_native_type_from_signature(sig.as_str())
+                    });
                 if matches!(abi_native, NativeType::Buffer) {
                     parameter_types.push(NativeType::U32);
                     parameter_types.push(NativeType::Buffer);
@@ -536,7 +788,7 @@ impl PropertyCall {
             .collect::<std::result::Result<Vec<Type>, _>>();
         let params = params.ok()?;
 
-        let cif = Cif::new(params, Type::i32());
+        let cif = Rc::new(Cif::new(params, Type::i32()));
 
         let parent_interface = interface.clone();
         let interface = unsafe { IUnknown::from_raw(interface_ptr as *mut c_void) };
@@ -553,7 +805,9 @@ impl PropertyCall {
         };
 
         let base_offset = if supports_iinspectable.is_ok() && !inspectable_ptr.is_null() {
-            unsafe { IUnknown::from_raw(inspectable_ptr as *mut c_void); }
+            unsafe {
+                IUnknown::from_raw(inspectable_ptr as *mut c_void);
+            }
             6
         } else {
             3
@@ -562,28 +816,37 @@ impl PropertyCall {
         index = index.saturating_add(base_offset);
         let func = unsafe { *vtable_ptr.offset(index as isize) };
 
-        Some(Self {
-            index,
-            number_of_parameters,
-            number_of_abi_parameters,
-            is_initializer: false,
-            is_sealed,
-            is_void,
-            iid: declaring_iid,
+        let static_info = Rc::new(PropertyStaticInfo {
             cif,
-            func,
-            parent_interface,
-            interface,
+            iid: declaring_iid,
+            index,
             parameter_types,
             parse_parameter_types,
             parameters: method.parameters().to_vec(),
-            declaration: None,
             return_type,
-            is_setter: false,
+            is_void,
+            is_sealed,
+            declaration: None,
+            number_of_parameters,
+            number_of_abi_parameters,
+            return_kind,
+            param_sigs,
             type_args,
+        });
+        INTERFACE_STATIC_INFO_CACHE
+            .with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
+
+        let cap = number_of_abi_parameters + 3;
+        Some(Self {
+            si: static_info,
+            is_initializer: false,
+            is_setter: false,
+            parent_interface,
+            interface,
+            func,
             return_value_buf: [0u8; 128],
-            argument_buf: Vec::with_capacity(number_of_abi_parameters),
-            argument_parse_types: Vec::with_capacity(number_of_abi_parameters),
+            argument_buf: Vec::with_capacity(cap),
+            argument_parse_types: Vec::with_capacity(cap),
         })
     }
 
@@ -592,12 +855,20 @@ impl PropertyCall {
         scope: &mut v8::PinScope<'s, '_>,
         args: &v8::FunctionCallbackArguments,
     ) -> (HRESULT, *mut c_void, Vec<v8::Local<'s, v8::Value>>) {
-        let mut values = Vec::with_capacity(self.parse_parameter_types.len());
-        for index in 0..self.parse_parameter_types.len() {
-            values.push(args.get(index as i32));
+        // Avoid heap allocation for the common 0-2 parameter case by using stack arrays.
+        // Properties are almost always 0 params (getter) or 1 param (setter).
+        match self.si.parse_parameter_types.len() {
+            0 => self.call_with_values(scope, &[]),
+            1 => self.call_with_values(scope, &[args.get(0)]),
+            2 => self.call_with_values(scope, &[args.get(0), args.get(1)]),
+            n => {
+                let mut values = Vec::with_capacity(n);
+                for index in 0..n {
+                    values.push(args.get(index as i32));
+                }
+                self.call_with_values(scope, &values)
+            }
         }
-
-        self.call_with_values(scope, &values)
     }
 
     pub fn call_with_values<'s>(
@@ -605,49 +876,66 @@ impl PropertyCall {
         scope: &mut v8::PinScope<'s, '_>,
         values: &[v8::Local<v8::Value>],
     ) -> (HRESULT, *mut c_void, Vec<v8::Local<'s, v8::Value>>) {
-        let is_void = self.is_void;
+        let is_void = self.si.is_void;
 
-        let is_value_type = if self.return_type == "Guid" {
-            true
-        } else if self.return_type.contains('.') {
-            let lookup = strip_generic_suffix(self.return_type.as_str());
-            MetadataReader::find_by_name(lookup)
-                .map_or(false, |dec| matches!(dec.read().kind(), DeclarationKind::Struct))
-        } else {
-            false
-        };
+        let is_value_type = matches!(
+            self.si.return_kind,
+            ReturnKind::Struct(_) | ReturnKind::Guid
+        );
 
-        let is_scalar_return = matches!(self.return_type.as_str(),
-            "UInt8" | "Int8" | "UInt16" | "Int16" |
-            "UInt32" | "Int32" | "UInt64" | "Int64" |
-            "USize" | "ISize" | "Single" | "Double" |
-            "Boolean" | "Char16"
+        let is_scalar_return = matches!(
+            self.si.return_type.as_str(),
+            "UInt8"
+                | "Int8"
+                | "UInt16"
+                | "Int16"
+                | "UInt32"
+                | "Int32"
+                | "UInt64"
+                | "Int64"
+                | "USize"
+                | "ISize"
+                | "Single"
+                | "Double"
+                | "Boolean"
+                | "Char16"
         );
 
         // HSTRING out-params must also land in a stable buffer; the local
         // `result` variable goes out of scope before the caller can read it.
-        let is_string_return = self.return_type.as_str() == "String";
+        let is_string_return = self.si.return_type.as_str() == "String";
 
         self.argument_buf.clear();
         self.argument_parse_types.clear();
         let mut queried_interfaces: Vec<IUnknown> = Vec::new();
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
-        let mut out_slots: Vec<(usize, NativeType, Option<String>, Option<v8::Local<'s, v8::Object>>)> = Vec::new();
+        // param_index (usize) replaces Option<String> — references self.param_sigs[i] directly,
+        // saving one String clone per out-param per call.
+        let mut out_slots: Vec<(usize, NativeType, usize, Option<v8::Local<'s, v8::Object>>)> =
+            Vec::new();
 
-        self.argument_buf.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
+        self.argument_buf.push(NativeValue {
+            pointer: self.interface.as_raw() as *mut c_void,
+        });
         self.argument_parse_types.push(None);
 
-        for (i, native_type) in self.parse_parameter_types.iter().enumerate() {
-            let value = values.get(i).copied().unwrap_or_else(|| v8::undefined(scope).into());
+        for (i, native_type) in self.si.parse_parameter_types.iter().enumerate() {
+            let value = values
+                .get(i)
+                .copied()
+                .unwrap_or_else(|| v8::undefined(scope).into());
 
-            let parameter = &self.parameters[i];
-            let param_sig_opt = parameter.metadata().map(|m| Signature::to_string(m, &parameter.type_()));
-            let is_sig_byref = param_sig_opt.as_ref().map_or(false, |s| s.starts_with("ByRef "));
+            let parameter = &self.si.parameters[i];
+            let param_sig = &self.si.param_sigs[i];
+            let is_sig_byref = param_sig.starts_with("ByRef ");
             if parameter.is_out() || is_sig_byref {
                 let slot_index = self.argument_buf.len();
                 let slot_size = match native_type {
                     NativeType::Struct(_) => native_type.size(),
-                    NativeType::Pointer | NativeType::Buffer | NativeType::Function | NativeType::String => std::mem::size_of::<usize>(),
+                    NativeType::Pointer
+                    | NativeType::Buffer
+                    | NativeType::Function
+                    | NativeType::String => std::mem::size_of::<usize>(),
                     _ => native_type.size(),
                 };
                 let mut buf: Vec<u8> = vec![0u8; slot_size];
@@ -672,13 +960,12 @@ impl PropertyCall {
                     }
                 }
 
-                let sig = param_sig_opt;
-                out_slots.push((slot_index, native_type.clone(), sig, wrapper_obj));
+                out_slots.push((slot_index, native_type.clone(), i, wrapper_obj));
                 continue;
             }
 
             let value = match *native_type {
-                NativeType::Void => { return (call_failure(), std::ptr::null_mut(), Vec::new()) }
+                NativeType::Void => return (call_failure(), std::ptr::null_mut(), Vec::new()),
                 NativeType::Bool => ffi_parse_bool_arg(value),
                 NativeType::U8 => ffi_parse_u8_arg(value),
                 NativeType::I8 => ffi_parse_i8_arg(value),
@@ -693,22 +980,19 @@ impl PropertyCall {
                 NativeType::F32 => ffi_parse_f32_arg(value),
                 NativeType::F64 => ffi_parse_f64_arg(value),
                 NativeType::Pointer => {
-                    let parameter = &self.parameters[i];
-                    let parameter_signature = substitute_type_vars(
-                        &Signature::to_string(parameter.metadata().unwrap(), &parameter.type_()),
-                        &self.type_args,
-                    );
+                    let parameter_signature: &str = &self.si.param_sigs[i];
 
                     // IReference<T> parameters: box JS primitives with the correct Create* call
                     // so XAML receives the right typed IPropertyValue (e.g. IReference<Double>).
-                    if let Some(inner) = crate::helpers::ireference_inner_type(&parameter_signature) {
+                    if let Some(inner) = crate::helpers::ireference_inner_type(&parameter_signature)
+                    {
                         if let Some(nv) = crate::value::box_as_ireference(scope, value, inner) {
                             Ok(nv)
                         } else {
                             ffi_parse_pointer_arg(scope, value)
                         }
                     } else if parameter_signature.contains('.') {
-                        let lookup_name = crate::helpers::strip_generic_suffix(parameter_signature.as_str());
+                        let lookup_name = crate::helpers::strip_generic_suffix(parameter_signature);
 
                         if let Some(declaration) = MetadataReader::find_by_name(lookup_name) {
                             if declaration.read().kind() == DeclarationKind::Struct {
@@ -717,40 +1001,21 @@ impl PropertyCall {
                                     ffi_parse_struct_arg(scope, value)
                                 } else if value.is_object() {
                                     let obj = value.to_object(scope).unwrap();
-                                    // Struct instance created by `new T(...)` has an internal field
-                                    let has_internal = obj.get_internal_field(scope, 0)
-                                        .map(|f| !unsafe { f.cast::<v8::External>() }.value().is_null())
-                                        .unwrap_or(false);
-                                    if has_internal {
-                                        // Already a struct instance — extract the bytes pointer
-                                        ffi_parse_pointer_arg(scope, value)
-                                    } else {
-                                        // Plain JS object {A:255, R:0, G:0, B:0} — build bytes from named fields
-                                        let fields_info: Vec<(String, NativeType)> = {
-                                            let lock = declaration.read();
+                                    let mut sbuf: Vec<u8> = Vec::new();
+                                    {
+                                        let lock = declaration.read();
+                                        if let Some(sd) =
                                             lock.as_any().downcast_ref::<StructDeclaration>()
-                                                .map(|sd| {
-                                                    sd.fields().iter().filter_map(|f| {
-                                                        let m = f.base().metadata()?;
-                                                        let ts = Signature::to_string(m, &f.type_());
-                                                        let nt = NativeType::try_from(ts.as_str()).ok()?;
-                                                        Some((f.name().to_string(), nt))
-                                                    }).collect()
-                                                })
-                                                .unwrap_or_default()
-                                        };
-                                        let mut sbuf: Vec<u8> = Vec::new();
-                                        for (fname, fnt) in &fields_info {
-                                            if let Some(key) = v8::String::new(scope, fname.as_str()) {
-                                                let fv = obj.get(scope, key.into())
-                                                    .unwrap_or_else(|| v8::undefined(scope).into());
-                                                append_struct_field_bytes(&mut sbuf, scope, fv, &fnt);
-                                            }
+                                        {
+                                            append_struct_object_bytes(&mut sbuf, scope, obj, sd);
                                         }
-                                        let ptr = sbuf.as_mut_ptr() as *mut c_void;
-                                        struct_scratch.push(sbuf);
-                                        Ok(NativeValue { pointer: ptr })
                                     }
+                                    if sbuf.is_empty() {
+                                        sbuf.push(0);
+                                    }
+                                    let ptr = sbuf.as_mut_ptr() as *mut c_void;
+                                    struct_scratch.push(sbuf);
+                                    Ok(NativeValue { pointer: ptr })
                                 } else {
                                     ffi_parse_pointer_arg(scope, value)
                                 }
@@ -759,26 +1024,33 @@ impl PropertyCall {
 
                                 // Delegate types: auto-wrap a JS function as a JsDelegate COM object,
                                 // or extract the raw pointer from { handle: External } (NSWinRT.asDelegate result).
-                                let is_delegate = matches!(kind,
-                                    DeclarationKind::Delegate |
-                                    DeclarationKind::GenericDelegate |
-                                    DeclarationKind::GenericDelegateInstance
+                                let is_delegate = matches!(
+                                    kind,
+                                    DeclarationKind::Delegate
+                                        | DeclarationKind::GenericDelegate
+                                        | DeclarationKind::GenericDelegateInstance
                                 );
 
                                 if is_delegate {
                                     let handle_ptr = value.to_object(scope).and_then(|obj| {
                                         let key = v8::String::new(scope, "handle")?;
                                         let hv = obj.get(scope, key.into())?;
-                                        v8::Local::<v8::External>::try_from(hv).ok().map(|e| e.value())
+                                        v8::Local::<v8::External>::try_from(hv)
+                                            .ok()
+                                            .map(|e| e.value())
                                     });
 
                                     if let Some(ptr) = handle_ptr {
                                         Ok(NativeValue { pointer: ptr })
-                                    } else if let Ok(func) = v8::Local::<v8::Function>::try_from(value) {
-                                        let parameter = &self.parameters[i];
+                                    } else if let Ok(func) =
+                                        v8::Local::<v8::Function>::try_from(value)
+                                    {
+                                        let parameter = &self.si.parameters[i];
                                         let delegate_info = parameter.metadata().and_then(|meta| {
-                                            let raw_iid = Signature::to_iid_string(meta, &parameter.type_());
-                                            let iid_name = substitute_type_vars(&raw_iid, &self.type_args);
+                                            let raw_iid =
+                                                Signature::to_iid_string(meta, &parameter.type_());
+                                            let iid_name =
+                                                substitute_type_vars(&raw_iid, &self.si.type_args);
                                             crate::delegate_info_from_type_sig(&iid_name)
                                         });
                                         if let Some((guid, param_types)) = delegate_info {
@@ -788,12 +1060,14 @@ impl PropertyCall {
                                                 param_types,
                                             });
                                             let delegate = Box::new(crate::JsDelegate {
-                                                vtable:    &crate::JS_DELEGATE_VTBL as *const _,
+                                                vtable: &crate::JS_DELEGATE_VTBL as *const _,
                                                 ref_count: AtomicU32::new(1),
                                                 guid,
-                                                data:      Box::into_raw(data),
+                                                data: Box::into_raw(data),
                                             });
-                                            Ok(NativeValue { pointer: Box::into_raw(delegate) as *mut c_void })
+                                            Ok(NativeValue {
+                                                pointer: Box::into_raw(delegate) as *mut c_void,
+                                            })
                                         } else {
                                             ffi_parse_pointer_arg(scope, value)
                                         }
@@ -853,7 +1127,9 @@ impl PropertyCall {
                         Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
                     };
 
-                    self.argument_buf.push(NativeValue { u32_value: byte_length });
+                    self.argument_buf.push(NativeValue {
+                        u32_value: byte_length,
+                    });
                     self.argument_parse_types.push(Some(native_type.clone()));
                     self.argument_buf.push(buffer_value);
                     self.argument_parse_types.push(Some(native_type.clone()));
@@ -881,7 +1157,9 @@ impl PropertyCall {
                 self.argument_buf.push(NativeValue { pointer: buf_ptr });
                 self.argument_parse_types.push(None);
             } else {
-                self.argument_buf.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
+                self.argument_buf.push(NativeValue {
+                    pointer: &mut result as *mut _ as *mut c_void,
+                });
                 self.argument_parse_types.push(None);
             }
         }
@@ -889,7 +1167,7 @@ impl PropertyCall {
         let mut call_args: Vec<Arg> = Vec::with_capacity(self.argument_buf.len());
 
         for (i, v) in self.argument_buf.iter().enumerate() {
-            let Some(abi_native) = self.parameter_types.get(i) else {
+            let Some(abi_native) = self.si.parameter_types.get(i) else {
                 return (call_failure(), std::ptr::null_mut(), Vec::new());
             };
 
@@ -910,10 +1188,13 @@ impl PropertyCall {
             call_args.push(unsafe { v.as_arg(&effective_native) });
         }
 
-        let ret = match catch_unwind(AssertUnwindSafe(|| unsafe { self.cif.call(CodePtr::from_ptr(self.func), &call_args) })) {
+        let ret = match catch_unwind(AssertUnwindSafe(|| unsafe {
+            self.si.cif.call(CodePtr::from_ptr(self.func), &call_args)
+        })) {
             Ok(code) => code,
             Err(_) => {
-                let msg = format!("WinRT property call panicked during invocation: returning E_FAIL");
+                let msg =
+                    format!("WinRT property call panicked during invocation: returning E_FAIL");
                 crate::store_last_js_error(msg);
                 return (call_failure(), std::ptr::null_mut(), Vec::new());
             }
@@ -932,14 +1213,22 @@ impl PropertyCall {
             }
         }
 
-        if !self.is_initializer && !is_void && (is_value_type || is_scalar_return || is_string_return) {
+        if !self.is_initializer
+            && !is_void
+            && (is_value_type || is_scalar_return || is_string_return)
+        {
             result = self.return_value_buf.as_mut_ptr() as *mut c_void;
         }
 
         // Marshal out-parameters back into V8 values using the recorded slots.
         let mut out_values: Vec<v8::Local<'s, v8::Value>> = Vec::new();
-        for (slot_index, parse_native_type, sig_opt, wrapper_obj) in out_slots.into_iter() {
-            let storage_ptr = unsafe { self.argument_buf.get(slot_index).map(|v| v.pointer).unwrap_or(std::ptr::null_mut()) };
+        for (slot_index, parse_native_type, param_idx, wrapper_obj) in out_slots.into_iter() {
+            let storage_ptr = unsafe {
+                self.argument_buf
+                    .get(slot_index)
+                    .map(|v| v.pointer)
+                    .unwrap_or(std::ptr::null_mut())
+            };
             if storage_ptr.is_null() {
                 let v: v8::Local<v8::Value> = v8::null(scope).into();
                 if let Some(wrapper) = wrapper_obj {
@@ -949,37 +1238,53 @@ impl PropertyCall {
                 }
                 continue;
             }
+            // Borrow the pre-cached signature string — no String allocation needed.
+            let sig = &self.si.param_sigs[param_idx];
             unsafe {
                 let v = match parse_native_type {
                     NativeType::Pointer | NativeType::Buffer | NativeType::Function => {
-                        let inner = std::ptr::read_unaligned(storage_ptr as *const usize) as *mut c_void;
+                        let inner =
+                            std::ptr::read_unaligned(storage_ptr as *const usize) as *mut c_void;
                         if inner.is_null() {
                             v8::null(scope).into()
-                        } else if let Some(sig) = sig_opt.as_ref() {
-                            if sig.contains('.') {
-                                let mut lookup = sig.as_str();
-                                if let Some(stripped) = lookup.strip_prefix("ByRef ") {
-                                    lookup = stripped;
-                                }
-                                let lookup = strip_generic_suffix(lookup);
-                                if let Some(declaration) = MetadataReader::find_by_name(lookup) {
-                                    if matches!(declaration.read().kind(), DeclarationKind::Struct) {
-                                        crate::create_struct_object_from_raw(declaration, inner, scope).into()
-                                    } else {
-                                        let instance = unsafe { IUnknown::from_raw(inner) };
-                                        crate::ns_proxy::create_ns_ctor_instance_object(sig.as_str(), None, None, declaration, Some(instance), scope).into()
-                                    }
+                        } else if !sig.is_empty() && sig.contains('.') {
+                            let mut lookup = sig.as_str();
+                            if let Some(stripped) = lookup.strip_prefix("ByRef ") {
+                                lookup = stripped;
+                            }
+                            let lookup = strip_generic_suffix(lookup);
+                            if let Some(declaration) = MetadataReader::find_by_name(lookup) {
+                                if matches!(declaration.read().kind(), DeclarationKind::Struct) {
+                                    crate::create_struct_object_from_raw(declaration, inner, scope)
+                                        .into()
                                 } else {
-                                    read_value_from_ptr(inner as *const c_void, scope, NativeType::Pointer)
+                                    let instance = unsafe { IUnknown::from_raw(inner) };
+                                    crate::ns_proxy::create_ns_ctor_instance_object(
+                                        sig.as_str(),
+                                        None,
+                                        None,
+                                        declaration,
+                                        Some(instance),
+                                        scope,
+                                    )
+                                    .into()
                                 }
                             } else {
-                                read_value_from_ptr(inner as *const c_void, scope, NativeType::Pointer)
+                                read_value_from_ptr(
+                                    inner as *const c_void,
+                                    scope,
+                                    NativeType::Pointer,
+                                )
                             }
                         } else {
                             read_value_from_ptr(inner as *const c_void, scope, NativeType::Pointer)
                         }
                     }
-                    _ => read_value_from_ptr(storage_ptr as *const c_void, scope, parse_native_type.clone()),
+                    _ => read_value_from_ptr(
+                        storage_ptr as *const c_void,
+                        scope,
+                        parse_native_type.clone(),
+                    ),
                 };
                 if let Some(wrapper) = wrapper_obj {
                     let _ = set_out_param_value(scope, wrapper, v);

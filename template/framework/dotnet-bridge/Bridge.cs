@@ -21,6 +21,11 @@ public static partial class Bridge
     internal static readonly ConcurrentDictionary<int, object?> s_handles = new();
     internal static int s_nextHandle;
 
+    // Cached WinUI3 UI-thread DispatcherQueue. Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread()
+    // returns null off the UI thread, so we capture the queue the first time we run on a thread that owns
+    // one (the UI thread during init/dispatch) and reuse it to marshal back from background threads.
+    private static object? s_uiDispatcherQueue;
+
     // Function pointer registered by the Rust runtime so managed delegates can
     // call back into V8 without a JSON round-trip.
     internal static unsafe delegate* unmanaged[Cdecl]<int, byte*, int, byte**, int*, void>
@@ -50,6 +55,7 @@ public static partial class Bridge
         s_ctorCache.Clear();
         s_handles.Clear();
         s_nativePtrs.Clear();
+        s_nativePtrsReverse.Clear();
         s_nextHandle = 0;
     }
 
@@ -57,6 +63,24 @@ public static partial class Bridge
     // Populated when a managed object can yield a native COM pointer via
     // Marshal.GetIUnknownForObject. Cleared and released on __release.
     internal static readonly ConcurrentDictionary<int, IntPtr> s_nativePtrs = new();
+
+    // Reverse index kept in lockstep with s_nativePtrs so CoerceBin can
+    // resolve identity round-trips without scanning every entry.
+    internal static readonly ConcurrentDictionary<IntPtr, int> s_nativePtrsReverse = new();
+
+    internal static void StoreNativePtr(int handleId, IntPtr ptr)
+    {
+        s_nativePtrs[handleId] = ptr;
+        s_nativePtrsReverse[ptr] = handleId;
+    }
+
+    internal static void RemoveNativePtr(int handleId, IntPtr ptr)
+    {
+        // Only drop the reverse entry if it still points at this handle —
+        // another handle may have re-registered the same pointer.
+        if (s_nativePtrsReverse.TryGetValue(ptr, out var owner) && owner == handleId)
+            s_nativePtrsReverse.TryRemove(ptr, out _);
+    }
 
     // Runtime-configurable logging toggle. Default to true in DEBUG builds so
     // developers get verbose diagnostics without setting environment vars.
@@ -70,9 +94,11 @@ public static partial class Bridge
 
     internal static bool IsLogToConsole() => s_logToConsole;
 
-    // Returns a JSON object mapping top-level namespace roots (e.g. "NativeScript")
-    // to the assembly simple-name that most likely contains that namespace's types.
-    // Reuses s_assemblySearchDirs so plugin and NuGet assemblies are included.
+    // Returns a JSON object mapping namespaces to the assembly simple-name that
+    // most likely contains those types. Exact namespaces are included so the
+    // runtime can prefer the longest matching prefix (for example
+    // Microsoft.UI.Xaml.Controls -> Microsoft.UI.Xaml) instead of relying only
+    // on a coarse top-level root such as Microsoft.
     public static string GetNamespaceAssemblyMapJson()
     {
         var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -101,11 +127,15 @@ public static partial class Bridge
                             try { types = asm.GetExportedTypes(); }
                             catch { types = Array.Empty<Type>(); }
 
+                            var assemblyName = asm.GetName().Name;
+                            if (string.IsNullOrEmpty(assemblyName)) continue;
+
                             foreach (var t in types)
                             {
                                 if (string.IsNullOrEmpty(t.Namespace)) continue;
+                                map[t.Namespace] = assemblyName;
                                 var root = t.Namespace.Split('.')[0];
-                                if (!map.ContainsKey(root)) map[root] = asm.GetName().Name;
+                                if (!map.ContainsKey(root)) map[root] = assemblyName;
                             }
                         }
                         catch { }
@@ -180,6 +210,53 @@ public static partial class Bridge
         }
     }
 
+    // Runs `action` via the WinUI3 (Windows App SDK) DispatcherQueue when this is a WinUI3 app.
+    // Returns true if it handled the call — either by running inline (already on the UI thread) or by
+    // enqueuing to the UI thread's queue from a background thread and waiting. Returns false when no
+    // DispatcherQueue type exists (classic UWP/WPF app) so the caller can try its other dispatchers.
+    // A single probed path keeps one bridge binary working for both classic UWP and WinUI3 — there is
+    // no separate method or "is this WinUI3?" flag; whichever dispatcher is actually present wins.
+    private static bool TryDispatcherQueueInvoke(Action action)
+    {
+        try
+        {
+            Type? dqType = null;
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                dqType = asm.GetType("Microsoft.UI.Dispatching.DispatcherQueue");
+                if (dqType != null) break;
+            }
+            if (dqType == null) return false; // not a WinUI3 app
+
+            // Capture the UI queue whenever we're on a thread that owns one (the UI thread).
+            var current = dqType.GetMethod("GetForCurrentThread", BindingFlags.Public | BindingFlags.Static)?.Invoke(null, null);
+            if (current != null) s_uiDispatcherQueue = current;
+
+            var queue = current ?? s_uiDispatcherQueue;
+            if (queue == null) return false; // WinUI3 present, but the UI queue hasn't been seen yet
+
+            // On the UI thread → run inline.
+            if (queue.GetType().GetProperty("HasThreadAccess")?.GetValue(queue) is true)
+            {
+                action();
+                return true;
+            }
+
+            // Background thread → enqueue onto the UI queue and block until it runs.
+            var tryEnqueue = queue.GetType().GetMethods()
+                .FirstOrDefault(m => m.Name == "TryEnqueue" && m.GetParameters().Length == 1);
+            if (tryEnqueue == null) return false;
+            var handlerType = tryEnqueue.GetParameters()[0].ParameterType; // DispatcherQueueHandler
+            using var mre = new ManualResetEventSlim(false);
+            var wrapped = new Action(() => { try { action(); } finally { mre.Set(); } });
+            var del = Delegate.CreateDelegate(handlerType, wrapped.Target, wrapped.Method);
+            if (tryEnqueue.Invoke(queue, new object[] { del }) is false) return false;
+            mre.Wait();
+            return true;
+        }
+        catch { return false; }
+    }
+
     public static object? RunOnUIThread(int callbackId)
     {
         var action = new Action(() =>
@@ -237,25 +314,7 @@ public static partial class Bridge
         }
         catch { }
 
-        try
-        {
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                var dqType = asm.GetType("Microsoft.UI.Dispatching.DispatcherQueue");
-                if (dqType == null) continue;
-                var getForCurrent = dqType.GetMethod("GetForCurrentThread", BindingFlags.Public | BindingFlags.Static);
-                var dq = getForCurrent?.Invoke(null, null);
-                if (dq == null) continue;
-
-                if (dq.GetType().GetProperty("HasThreadAccess")?.GetValue(dq) is true)
-                {
-                    action();
-                    return null;
-                }
-                break;
-            }
-        }
-        catch { }
+        try { if (TryDispatcherQueueInvoke(action)) return null; } catch { }
 
         try
         {
@@ -339,25 +398,7 @@ public static partial class Bridge
         }
         catch { }
 
-        try
-        {
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                var dqType = asm.GetType("Microsoft.UI.Dispatching.DispatcherQueue");
-                if (dqType == null) continue;
-                var getForCurrent = dqType.GetMethod("GetForCurrentThread", BindingFlags.Public | BindingFlags.Static);
-                var dq = getForCurrent?.Invoke(null, null);
-                if (dq == null) continue;
-
-                if (dq.GetType().GetProperty("HasThreadAccess")?.GetValue(dq) is true)
-                {
-                    wrapped();
-                    return result;
-                }
-                break;
-            }
-        }
-        catch { }
+        try { if (TryDispatcherQueueInvoke(wrapped)) return result; } catch { }
 
         try
         {
@@ -537,7 +578,7 @@ public static partial class Bridge
             var ip = ObtainNativePtr(obj);
             if (ip != IntPtr.Zero)
             {
-                s_nativePtrs[handleId] = ip;
+                StoreNativePtr(handleId, ip);
                 return ip;
             }
         }

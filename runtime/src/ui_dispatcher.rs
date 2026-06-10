@@ -1,11 +1,9 @@
 use std::sync::OnceLock;
 use std::thread::ThreadId;
-use windows::System::{DispatcherQueue, DispatcherQueueHandler, DispatcherQueueController};
+use windows::System::{DispatcherQueue, DispatcherQueueController, DispatcherQueueHandler};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::System::WinRT::{
-    CreateDispatcherQueueController, DispatcherQueueOptions,
-    DISPATCHERQUEUE_THREAD_APARTMENTTYPE, DISPATCHERQUEUE_THREAD_TYPE,
-    DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT,
+    CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT,
 };
 
 static UI_QUEUE: OnceLock<DispatcherQueue> = OnceLock::new();
@@ -66,7 +64,9 @@ pub fn post_to_ui_thread(f: impl FnOnce() + Send + 'static) {
 
     let cell = std::sync::Mutex::new(Some(f));
     let handler = DispatcherQueueHandler::new(move || {
-        if let Some(f) = cell.lock().unwrap().take() { f(); }
+        if let Some(f) = cell.lock().unwrap().take() {
+            f();
+        }
         Ok(())
     });
     let _ = dq.TryEnqueue(&handler);
@@ -101,7 +101,10 @@ pub fn needs_win32_pump() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
 
     #[test]
     fn not_initialized_on_mta_test_thread() {
@@ -115,7 +118,10 @@ mod tests {
         let fired = Arc::new(AtomicBool::new(false));
         let fired2 = fired.clone();
         post_to_ui_thread(move || fired2.store(true, Ordering::SeqCst));
-        assert!(fired.load(Ordering::SeqCst), "fallback must call f() synchronously");
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "fallback must call f() synchronously"
+        );
     }
 
     #[test]
@@ -123,7 +129,9 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         for _ in 0..5 {
             let c = count.clone();
-            post_to_ui_thread(move || { c.fetch_add(1, Ordering::SeqCst); });
+            post_to_ui_thread(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            });
         }
         assert_eq!(count.load(Ordering::SeqCst), 5);
     }
@@ -132,7 +140,9 @@ mod tests {
     fn post_fallback_closure_sees_captured_value() {
         let result = Arc::new(std::sync::Mutex::new(0u32));
         let r2 = result.clone();
-        post_to_ui_thread(move || { *r2.lock().unwrap() = 42; });
+        post_to_ui_thread(move || {
+            *r2.lock().unwrap() = 42;
+        });
         assert_eq!(*result.lock().unwrap(), 42);
     }
 }

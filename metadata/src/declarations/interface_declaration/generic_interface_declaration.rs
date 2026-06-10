@@ -1,7 +1,3 @@
-use std::any::Any;
-use std::ptr::addr_of_mut;
-use windows::core::GUID;
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 use crate::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::event_declaration::EventDeclaration;
@@ -9,6 +5,10 @@ use crate::declarations::interface_declaration::InterfaceDeclaration;
 use crate::declarations::method_declaration::MethodDeclaration;
 use crate::declarations::property_declaration::PropertyDeclaration;
 use crate::declarations::type_declaration::TypeDeclaration;
+use std::any::Any;
+use std::ptr::addr_of_mut;
+use windows::core::GUID;
+use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 
 #[derive(Clone, Debug)]
 pub struct GenericInterfaceDeclaration {
@@ -33,8 +33,15 @@ impl GenericInterfaceDeclaration {
         match base.metadata() {
             None => {}
             Some(metadata) => {
-                let result =
-                    unsafe { metadata.EnumGenericParams(addr_of_mut!(enumerator), base.token().0 as u32, 0 as _, 0 as _, 0 as _) };
+                let result = unsafe {
+                    metadata.EnumGenericParams(
+                        addr_of_mut!(enumerator),
+                        base.token().0 as u32,
+                        0 as _,
+                        0 as _,
+                        0 as _,
+                    )
+                };
                 debug_assert!(result.is_ok());
                 let result = unsafe { metadata.CountEnum(enumerator, &mut count) };
                 debug_assert!(result.is_ok());

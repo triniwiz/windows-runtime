@@ -22,18 +22,23 @@ fn bench_script_eval(c: &mut Criterion) {
 
     group.bench_function("method_wrapper_lookup_hot", |b| {
         let mut runtime = Runtime::new(".");
-        runtime.run_script(r#"
+        runtime.run_script(
+            r#"
             const uri = new Windows.Foundation.Uri('http://example.com/');
             void uri.AbsoluteUri;
-        "#, "<warmup>");
+        "#,
+            "<warmup>",
+        );
 
         b.iter_batched(
-            || r#"
+            || {
+                r#"
                 (function() {
                     const uri = new Windows.Foundation.Uri('http://example.com/');
                     for (let i = 0; i < 2000; i++) { void uri.AbsoluteUri; }
                 })();
-            "#,
+            "#
+            },
             |script| runtime.run_script(script, "<bench>"),
             BatchSize::SmallInput,
         );
@@ -104,14 +109,19 @@ fn bench_win32_ffi(c: &mut Criterion) {
     // GetTickCount64 — no args, u64 return.  Measures raw libffi + DLL dispatch.
     group.bench_function("get_tick_count64_100K", |b| {
         let mut runtime = Runtime::new(".");
-        runtime.run_script("NSWinRT.win32.call('kernel32.dll','GetTickCount64','u64');", "<warmup>");
+        runtime.run_script(
+            "NSWinRT.win32.call('kernel32.dll','GetTickCount64','u64');",
+            "<warmup>",
+        );
         b.iter_batched(
-            || r#"
+            || {
+                r#"
                 (function(){
                     for (var i = 0; i < 100000; i++)
                         NSWinRT.win32.call('kernel32.dll','GetTickCount64','u64');
                 })();
-            "#,
+            "#
+            },
             |script| runtime.run_script(script, "<bench>"),
             BatchSize::SmallInput,
         );
@@ -120,13 +130,18 @@ fn bench_win32_ffi(c: &mut Criterion) {
     // bind() Proxy overhead vs direct call.
     group.bench_function("bind_proxy_100K", |b| {
         let mut runtime = Runtime::new(".");
-        runtime.run_script("var _k32 = NSWinRT.win32.bind('kernel32.dll','u64'); _k32.GetTickCount64();", "<warmup>");
+        runtime.run_script(
+            "var _k32 = NSWinRT.win32.bind('kernel32.dll','u64'); _k32.GetTickCount64();",
+            "<warmup>",
+        );
         b.iter_batched(
-            || r#"
+            || {
+                r#"
                 (function(){
                     for (var i = 0; i < 100000; i++) _k32.GetTickCount64();
                 })();
-            "#,
+            "#
+            },
             |script| runtime.run_script(script, "<bench>"),
             BatchSize::SmallInput,
         );
@@ -135,13 +150,18 @@ fn bench_win32_ffi(c: &mut Criterion) {
     // import() makes DLL exports plain globals: GetTickCount64() with no prefix.
     group.bench_function("import_global_100K", |b| {
         let mut runtime = Runtime::new(".");
-        runtime.run_script("NSWinRT.win32.import('kernel32.dll','u64'); GetTickCount64();", "<warmup>");
+        runtime.run_script(
+            "NSWinRT.win32.import('kernel32.dll','u64'); GetTickCount64();",
+            "<warmup>",
+        );
         b.iter_batched(
-            || r#"
+            || {
+                r#"
                 (function(){
                     for (var i = 0; i < 100000; i++) GetTickCount64();
                 })();
-            "#,
+            "#
+            },
             |script| runtime.run_script(script, "<bench>"),
             BatchSize::SmallInput,
         );
@@ -176,7 +196,9 @@ fn bench_url_parse(c: &mut Criterion) {
 /// .NET BCL invoke throughput (skipped if DotNetBridge is not published).
 fn bench_dotnet(c: &mut Criterion) {
     let bridge = std::path::PathBuf::from(".")
-        .join("dotnet-bridge").join("publish").join("DotNetBridge.dll");
+        .join("dotnet-bridge")
+        .join("publish")
+        .join("DotNetBridge.dll");
     if !bridge.exists() {
         eprintln!("[bench_dotnet] SKIP: dotnet-bridge not published");
         return;
@@ -190,12 +212,14 @@ fn bench_dotnet(c: &mut Criterion) {
         let mut runtime = Runtime::new(".");
         runtime.run_script("System.Diagnostics.Stopwatch.GetTimestamp();", "<warmup>");
         b.iter_batched(
-            || r#"
+            || {
+                r#"
                 (function(){
                     for (var i = 0; i < 1000; i++)
                         System.Diagnostics.Stopwatch.GetTimestamp();
                 })();
-            "#,
+            "#
+            },
             |script| runtime.run_script(script, "<bench>"),
             BatchSize::SmallInput,
         );
@@ -206,7 +230,8 @@ fn bench_dotnet(c: &mut Criterion) {
         let mut runtime = Runtime::new(".");
         runtime.run_script("System.Diagnostics.Stopwatch.StartNew();", "<warmup>");
         b.iter_batched(
-            || r#"
+            || {
+                r#"
                 (function(){
                     for (var i = 0; i < 100; i++) {
                         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -214,7 +239,8 @@ fn bench_dotnet(c: &mut Criterion) {
                         sw.release();
                     }
                 })();
-            "#,
+            "#
+            },
             |script| runtime.run_script(script, "<bench>"),
             BatchSize::SmallInput,
         );
@@ -233,14 +259,17 @@ fn bench_raf(c: &mut Criterion) {
     group.bench_function("pump_10_frames", |b| {
         let mut runtime = Runtime::new(".");
         b.iter(|| {
-            runtime.run_script(r#"
+            runtime.run_script(
+                r#"
                 var _frames = 0;
                 function _frame(ts) {
                     _frames++;
                     if (_frames < 10) requestAnimationFrame(_frame);
                 }
                 requestAnimationFrame(_frame);
-            "#, "<bench>");
+            "#,
+                "<bench>",
+            );
             // Drain microtasks (runs all 10 rAF iterations).
             runtime.run_script("", "<pump>");
         });
@@ -293,12 +322,14 @@ fn bench_class_member_cache(c: &mut Criterion) {
             "<warmup>",
         );
         b.iter_batched(
-            || r#"
+            || {
+                r#"
                 (function(){
                     for (var i = 0; i < 1000; i++)
                         Windows.Data.Json.JsonValue.CreateStringValue('x').GetString();
                 })();
-            "#,
+            "#
+            },
             |script| rt.run_script(script, "<bench>"),
             criterion::BatchSize::SmallInput,
         );
@@ -307,7 +338,8 @@ fn bench_class_member_cache(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches,
+criterion_group!(
+    benches,
     bench_script_eval,
     bench_marshalling,
     bench_win32_ffi,

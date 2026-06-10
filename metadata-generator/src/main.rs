@@ -7,25 +7,23 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr::addr_of_mut;
 
-use windows::core::{GUID, HSTRING, PCWSTR};
 use windows::Win32::System::WinRT::Metadata::{
-    CorElementType, CorTokenType, IMetaDataImport2, IMAGE_CEE_CS_CALLCONV_GENERIC,
-    ELEMENT_TYPE_I1, ELEMENT_TYPE_I2, ELEMENT_TYPE_I4, ELEMENT_TYPE_I8,
-    ELEMENT_TYPE_U1, ELEMENT_TYPE_U2, ELEMENT_TYPE_U4, ELEMENT_TYPE_U8,
-    mdtTypeDef, mdtTypeRef,
+    CorElementType, CorTokenType, ELEMENT_TYPE_I1, ELEMENT_TYPE_I2, ELEMENT_TYPE_I4,
+    ELEMENT_TYPE_I8, ELEMENT_TYPE_U1, ELEMENT_TYPE_U2, ELEMENT_TYPE_U4, ELEMENT_TYPE_U8,
+    IMAGE_CEE_CS_CALLCONV_GENERIC, IMetaDataImport2, mdtTypeDef, mdtTypeRef,
 };
+use windows::core::{GUID, HSTRING, PCWSTR};
 
 use metadata::prelude::{
-    cor_sig_uncompress_calling_conv, cor_sig_uncompress_data, get_guid_attribute_value,
-    get_type_name, type_from_token, MAX_IDENTIFIER_LENGTH, PCCOR_SIGNATURE,
-    SYSTEM_ENUM, SYSTEM_MULTICASTDELEGATE, SYSTEM_VALUETYPE,
+    MAX_IDENTIFIER_LENGTH, PCCOR_SIGNATURE, SYSTEM_ENUM, SYSTEM_MULTICASTDELEGATE,
+    SYSTEM_VALUETYPE, cor_sig_uncompress_calling_conv, cor_sig_uncompress_data,
+    get_guid_attribute_value, get_type_name, type_from_token,
 };
 use metadata::signature::Signature;
 
 use metadata_generator::{
-    ClassRecord, DelegateRecord, EnumMemberRecord, EnumRecord, FieldRecord,
-    InterfaceRecord, MetadataBundle, MethodRecord, ParamRecord, StructRecord,
-    TypeRecord, FORMAT_VERSION,
+    ClassRecord, DelegateRecord, EnumMemberRecord, EnumRecord, FORMAT_VERSION, FieldRecord,
+    InterfaceRecord, MetadataBundle, MethodRecord, ParamRecord, StructRecord, TypeRecord,
 };
 
 // ─── Type visibility / flags constants (from CorTypeAttr / ECMA-335) ─────────
@@ -220,10 +218,21 @@ fn extract_methods(metadata: &IMetaDataImport2, type_token: u32) -> Vec<MethodRe
                 format!("arg{}", i)
             };
             let is_out = type_name.starts_with("ByRef ");
-            params.push(ParamRecord { name: pname, type_name, is_out });
+            params.push(ParamRecord {
+                name: pname,
+                type_name,
+                is_out,
+            });
         }
 
-        records.push(MethodRecord { name, vtable_index, is_static, is_special, return_type, params });
+        records.push(MethodRecord {
+            name,
+            vtable_index,
+            is_static,
+            is_special,
+            return_type,
+            params,
+        });
     }
 
     records
@@ -296,15 +305,15 @@ fn field_constant_value(metadata: &IMetaDataImport2, field_token: u32) -> i64 {
     let ok = unsafe {
         metadata.GetFieldProps(
             field_token,
-            0 as _, // pClass
-            None,   // szField (not needed)
-            0 as _, // pchField
-            0 as _, // pdwAttr
-            0 as _, // ppvSigBlob
-            0 as _, // pcbSigBlob
+            0 as _,              // pClass
+            None,                // szField (not needed)
+            0 as _,              // pchField
+            0 as _,              // pdwAttr
+            0 as _,              // ppvSigBlob
+            0 as _,              // pcbSigBlob
             &mut value_type,     // pdwCPlusTypeFlag
             addr_of_mut!(value), // ppValue
-            0 as _, // pcchValue
+            0 as _,              // pcchValue
         )
     }
     .is_ok();
@@ -456,21 +465,12 @@ enum TypeKind {
     Unknown,
 }
 
-fn classify_typedef(
-    metadata: &IMetaDataImport2,
-    type_token: u32,
-) -> (TypeKind, String, u32) {
+fn classify_typedef(metadata: &IMetaDataImport2, type_token: u32) -> (TypeKind, String, u32) {
     let mut flags = 0u32;
     let mut extends_token = 0u32;
 
     let ok = unsafe {
-        metadata.GetTypeDefProps(
-            type_token,
-            None,
-            0 as _,
-            &mut flags,
-            &mut extends_token,
-        )
+        metadata.GetTypeDefProps(type_token, None, 0 as _, &mut flags, &mut extends_token)
     }
     .is_ok();
     if !ok {
@@ -558,7 +558,12 @@ fn extract_all_types(metadata: &IMetaDataImport2) -> Vec<TypeRecord> {
                         CorTokenType(token as i32),
                     ));
                     let methods = extract_methods(metadata, token);
-                    TypeRecord::Interface(InterfaceRecord { full_name, guid, is_winrt, methods })
+                    TypeRecord::Interface(InterfaceRecord {
+                        full_name,
+                        guid,
+                        is_winrt,
+                        methods,
+                    })
                 }
                 TypeKind::Class => {
                     let interface_names = implemented_interface_names(metadata, token);
@@ -577,11 +582,17 @@ fn extract_all_types(metadata: &IMetaDataImport2) -> Vec<TypeRecord> {
                     })
                 }
                 TypeKind::Enum => {
-                    let is_flags =
-                        has_attribute(metadata, token, "Windows.Foundation.Metadata.FlagsAttribute")
-                            || has_attribute(metadata, token, "System.FlagsAttribute");
+                    let is_flags = has_attribute(
+                        metadata,
+                        token,
+                        "Windows.Foundation.Metadata.FlagsAttribute",
+                    ) || has_attribute(metadata, token, "System.FlagsAttribute");
                     let members = extract_enum_members(metadata, token);
-                    TypeRecord::Enum(EnumRecord { full_name, is_flags, members })
+                    TypeRecord::Enum(EnumRecord {
+                        full_name,
+                        is_flags,
+                        members,
+                    })
                 }
                 TypeKind::Struct => {
                     let fields = extract_struct_fields(metadata, token);
@@ -766,7 +777,11 @@ fn parse_args() -> Config {
         }
     }
 
-    Config { inputs, output, verbose }
+    Config {
+        inputs,
+        output,
+        verbose,
+    }
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -792,7 +807,10 @@ fn main() {
         std::process::exit(1);
     }
 
-    let mut bundle = MetadataBundle { version: FORMAT_VERSION, types: Vec::new() };
+    let mut bundle = MetadataBundle {
+        version: FORMAT_VERSION,
+        types: Vec::new(),
+    };
 
     for path in &config.inputs {
         if config.verbose {
@@ -807,7 +825,10 @@ fn main() {
                 bundle.types.extend(types);
             }
             None => {
-                eprintln!("warning: could not open metadata scope for: {}", path.display());
+                eprintln!(
+                    "warning: could not open metadata scope for: {}",
+                    path.display()
+                );
             }
         }
     }
@@ -815,11 +836,12 @@ fn main() {
     // Deduplicate: keep the first occurrence of each fully-qualified name.
     {
         let mut seen: HashSet<String> = HashSet::new();
-        bundle.types.retain(|r| seen.insert(r.full_name().to_string()));
+        bundle
+            .types
+            .retain(|r| seen.insert(r.full_name().to_string()));
     }
 
-    let encoded =
-        bincode::serialize(&bundle).expect("failed to serialise metadata bundle");
+    let encoded = bincode::serialize(&bundle).expect("failed to serialise metadata bundle");
 
     if let Some(parent) = config.output.parent() {
         if !parent.as_os_str().is_empty() {

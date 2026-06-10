@@ -2,9 +2,11 @@ using System;
 using System.Buffers;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
+using System.Runtime.Loader;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading;
@@ -24,6 +26,7 @@ public static partial class Bridge
                 s_handles.TryRemove(id, out _);
                 if (s_nativePtrs.TryRemove(id, out var nativePtr))
                 {
+                    RemoveNativePtr(id, nativePtr);
                     try
                     {
                         Marshal.Release(nativePtr);
@@ -335,7 +338,7 @@ public static partial class Bridge
                 {
                     var p = ObtainNativePtr(value);
                     if (p != IntPtr.Zero)
-                        s_nativePtrs[id] = p;
+                        StoreNativePtr(id, p);
                 }
             }
             catch
@@ -387,6 +390,63 @@ public static partial class Bridge
         return s_typeCache.GetOrAdd(key, _ => ResolveTypeCore(assemblyName, typeName));
     }
 
+    private static Type? ResolveTypeInAssembly(Assembly asm, string typeName, int lastDot, string shortName)
+    {
+        var t = asm.GetType(typeName);
+        if (t is not null) return t;
+
+        foreach (var ty in asm.GetTypes())
+        {
+            if (string.Equals(ty.FullName, typeName, StringComparison.Ordinal))
+                return ty;
+            if (lastDot < 0 && string.Equals(ty.Name, shortName, StringComparison.Ordinal))
+                return ty;
+        }
+
+        return null;
+    }
+
+    private static Type? ResolveTypeFromKnownAssemblies(string typeName, int lastDot, string shortName, string? skipAssemblyName = null)
+    {
+        foreach (var dir in s_assemblySearchDirs.Where(Directory.Exists))
+        {
+            IEnumerable<string> candidates;
+            try
+            {
+                candidates = Directory.EnumerateFiles(dir, "*.dll", SearchOption.TopDirectoryOnly);
+            }
+            catch
+            {
+                continue;
+            }
+
+            foreach (var file in candidates)
+            {
+                try
+                {
+                    var simple = Path.GetFileNameWithoutExtension(file);
+                    if (string.IsNullOrEmpty(simple) || string.Equals(simple, skipAssemblyName, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var asm = AppDomain.CurrentDomain.GetAssemblies()
+                        .FirstOrDefault(a => string.Equals(a.GetName().Name, simple, StringComparison.OrdinalIgnoreCase));
+                    if (asm is null)
+                    {
+                        try { asm = AssemblyLoadContext.Default.LoadFromAssemblyPath(file); }
+                        catch { continue; }
+                    }
+
+                    var t = ResolveTypeInAssembly(asm, typeName, lastDot, shortName);
+                    if (t is not null) return t;
+                }
+                catch (ReflectionTypeLoadException) { }
+                catch { }
+            }
+        }
+
+        return null;
+    }
+
     private static Type? ResolveTypeCore(string? assemblyName, string? typeName)
     {
         if (string.IsNullOrEmpty(typeName)) return null;
@@ -408,23 +468,8 @@ public static partial class Bridge
         {
             try
             {
-                t = asm.GetType(typeName);
+                t = ResolveTypeInAssembly(asm, typeName, lastDot, shortName);
                 if (t is not null) return t;
-
-                // Fall back to scanning exported types only when necessary. Some
-                // assemblies throw on GetTypes() (ReflectionTypeLoadException) so
-                // we catch and continue.
-                foreach (var ty in asm.GetTypes())
-                {
-                    if (string.Equals(ty.FullName, typeName, StringComparison.Ordinal))
-                        return ty;
-                    // Short-name match only when input has no namespace prefix (e.g. "Stopwatch").
-                    // Guarding on lastDot < 0 prevents matching unrelated types in other namespaces
-                    // (e.g. "NativeScript.Widgets.FlexboxLayout" must not match a different
-                    //  FlexboxLayout that happens to live in another namespace).
-                    if (lastDot < 0 && string.Equals(ty.Name, shortName, StringComparison.Ordinal))
-                        return ty;
-                }
             }
             catch (ReflectionTypeLoadException) { }
             catch { }
@@ -439,25 +484,14 @@ public static partial class Bridge
                 var asm = Assembly.Load(assemblyName);
                 if (asm is not null)
                 {
-                    t = asm.GetType(typeName!);
+                    t = ResolveTypeInAssembly(asm, typeName!, lastDot, shortName);
                     if (t is not null) return t;
-                    try
-                    {
-                        foreach (var ty in asm.GetTypes())
-                        {
-                            if (string.Equals(ty.FullName, typeName, StringComparison.Ordinal))
-                                return ty;
-                            if (lastDot < 0 && string.Equals(ty.Name, shortName, StringComparison.Ordinal))
-                                return ty;
-                        }
-                    }
-                    catch (ReflectionTypeLoadException) { }
                 }
             }
             catch { }
         }
 
-        return null;
+        return ResolveTypeFromKnownAssemblies(typeName!, lastDot, shortName, assemblyName);
     }
 
     private static MethodInfo? FindMethodCore(Type type, string name, int argCount, BindingFlags flags)

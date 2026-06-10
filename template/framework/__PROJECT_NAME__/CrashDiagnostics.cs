@@ -3,6 +3,7 @@ using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
+using WinRT.Interop;
 using Windows.ApplicationModel.Core;
 using Windows.ApplicationModel.DataTransfer;
 using Windows.Storage;
@@ -178,6 +179,15 @@ namespace __PROJECT_NAME__
                     summary += "\n\nFull log: " + logPath;
 
                 var dialog = new MessageDialog(summary, "NativeScript Runtime Error");
+                try
+                {
+                    var window = App.CurrentWindow;
+                    if (window != null)
+                    {
+                        InitializeWithWindow.Initialize(dialog, WindowNative.GetWindowHandle(window));
+                    }
+                }
+                catch { }
 
                 // MessageDialog supports at most 3 commands. When a source location is
                 // available, swap "Copy Details" for "Open in VS Code" so the user can
@@ -235,15 +245,15 @@ namespace __PROJECT_NAME__
         /// <summary>
         /// Appends <paramref name="message"/> to the runtime trace file in the Win32 temp path.
         /// Prefer `console.log`; fall back to `ns_trace.log` for CLI/legacy compatibility.
-        /// Inside UWP, GetTempPath() virtualises to AC\Temp — the same folder Rust's
-        /// std::env::temp_dir() uses — so this write appears in the CLI's log stream.
+        /// In a packaged Windows app, GetTempPath() resolves inside the app container temp area,
+        /// matching Rust's std::env::temp_dir() so the CLI still sees the same log stream.
         /// </summary>
         public static void WriteToTraceLog(string message)
         {
             try
             {
-                // System.IO.Path.GetTempPath() calls Win32 GetTempPathW() which inside a
-                // UWP process returns the container's AC\Temp folder, matching Rust.
+            // System.IO.Path.GetTempPath() calls Win32 GetTempPathW() which for a packaged
+            // desktop app resolves into the container temp folder, matching Rust.
                 var temp = System.IO.Path.GetTempPath();
                 var consolePath = Path.Combine(temp, "console.log");
                 File.AppendAllText(consolePath, message, Encoding.UTF8);

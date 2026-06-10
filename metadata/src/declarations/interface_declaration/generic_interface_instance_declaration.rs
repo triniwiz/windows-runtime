@@ -1,7 +1,3 @@
-use std::any::Any;
-use std::ptr::addr_of_mut;
-use windows::core::GUID;
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2, mdtTypeSpec};
 use crate::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::event_declaration::EventDeclaration;
@@ -12,6 +8,10 @@ use crate::declarations::type_declaration::TypeDeclaration;
 use crate::generic_instance_id_builder::GenericInstanceIdBuilder;
 use crate::prelude::*;
 use crate::signature::Signature;
+use std::any::Any;
+use std::ptr::addr_of_mut;
+use windows::core::GUID;
+use windows::Win32::System::WinRT::Metadata::{mdtTypeSpec, CorTokenType, IMetaDataImport2};
 
 #[derive(Clone, Debug)]
 pub struct GenericInterfaceInstanceDeclaration {
@@ -31,9 +31,7 @@ impl GenericInterfaceInstanceDeclaration {
         closed_token: CorTokenType,
     ) -> Self {
         debug_assert!(closed_metadata.is_some());
-        debug_assert!(
-            type_from_token(closed_token) == mdtTypeSpec.0
-        );
+        debug_assert!(type_from_token(closed_token) == mdtTypeSpec.0);
         debug_assert!(closed_token.0 != 0);
 
         let mut full_name = String::new();

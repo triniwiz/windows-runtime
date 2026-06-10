@@ -10,9 +10,9 @@ use regex::Regex;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration::{Declaration, DeclarationKind};
-use metadata::declarations::delegate_declaration::{DelegateDeclaration, DelegateDeclarationImpl};
 use metadata::declarations::delegate_declaration::generic_delegate_declaration::GenericDelegateDeclaration;
 use metadata::declarations::delegate_declaration::generic_delegate_instance_declaration::GenericDelegateInstanceDeclaration;
+use metadata::declarations::delegate_declaration::{DelegateDeclaration, DelegateDeclarationImpl};
 use metadata::declarations::enum_declaration::EnumDeclaration;
 use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
 use metadata::declarations::interface_declaration::InterfaceDeclaration;
@@ -20,13 +20,15 @@ use metadata::declarations::namespace_declaration::NamespaceDeclaration;
 use metadata::declarations::struct_declaration::StructDeclaration;
 use metadata::meta_data_reader::MetadataReader;
 use metadata::prelude::{
-    get_type_name, is_td_class, is_td_interface, type_from_token,
-    SYSTEM_ENUM, SYSTEM_MULTICASTDELEGATE, SYSTEM_VALUETYPE, MAX_IDENTIFIER_LENGTH,
+    get_type_name, is_td_class, is_td_interface, type_from_token, MAX_IDENTIFIER_LENGTH,
+    SYSTEM_ENUM, SYSTEM_MULTICASTDELEGATE, SYSTEM_VALUETYPE,
 };
 use metadata::signature::Signature;
 use metadata::value::Value;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2, mdtTypeDef, mdtTypeRef};
+use windows::Win32::System::WinRT::Metadata::{
+    mdtTypeDef, mdtTypeRef, CorTokenType, IMetaDataImport2,
+};
 
 // ---------------------------------------------------------------------------
 // TypeScript type mapping
@@ -106,15 +108,57 @@ fn generic_parameter_names(full_name: &str, fallback_count: usize) -> Vec<String
 /// as a parameter name it is suffixed with `_` to form a valid identifier.
 /// Method and property names inside interface/class bodies are quoted instead.
 const JS_RESERVED: &[&str] = &[
-    "break", "case", "catch", "class", "const", "continue", "debugger",
-    "default", "delete", "do", "else", "enum", "export", "extends", "false",
-    "finally", "for", "function", "if", "implements", "import", "in",
-    "instanceof", "interface", "let", "new", "null", "package", "private",
-    "protected", "public", "return", "static", "super", "switch", "this",
-    "throw", "true", "try", "typeof", "undefined", "var", "void", "while",
-    "with", "yield",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "instanceof",
+    "interface",
+    "let",
+    "new",
+    "null",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "return",
+    "static",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "undefined",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
     // Additional identifiers that break generated code in practice.
-    "arguments", "eval", "constructor", "prototype",
+    "arguments",
+    "eval",
+    "constructor",
+    "prototype",
 ];
 
 /// Make an identifier safe for use as a parameter / variable name.
@@ -164,10 +208,21 @@ fn map_type_to_ts_with_generics(value: &str, generic_params: &[String]) -> Strin
         return format!("{}[]", map_type_to_ts_with_generics(inner, generic_params));
     }
 
-    let base = if let Some(idx) = value.find('<') { &value[..idx] } else { value };
-    let base_no_arity = if let Some(idx) = base.find('`') { &base[..idx] } else { base };
+    let base = if let Some(idx) = value.find('<') {
+        &value[..idx]
+    } else {
+        value
+    };
+    let base_no_arity = if let Some(idx) = base.find('`') {
+        &base[..idx]
+    } else {
+        base
+    };
 
-    if let Some(index) = value.strip_prefix("Var!").and_then(|rest| rest.parse::<usize>().ok()) {
+    if let Some(index) = value
+        .strip_prefix("Var!")
+        .and_then(|rest| rest.parse::<usize>().ok())
+    {
         if let Some(name) = generic_params.get(index) {
             return name.clone();
         }
@@ -196,18 +251,29 @@ fn map_type_to_ts_with_generics(value: &str, generic_params: &[String]) -> Strin
         _ => {}
     }
 
-    if base_no_arity == "IAsyncOperation" || base_no_arity.ends_with(".IAsyncOperation") ||
-       base_no_arity == "IAsyncAction" || base_no_arity.ends_with(".IAsyncAction") {
+    if base_no_arity == "IAsyncOperation"
+        || base_no_arity.ends_with(".IAsyncOperation")
+        || base_no_arity == "IAsyncAction"
+        || base_no_arity.ends_with(".IAsyncAction")
+    {
         if let Some(inner) = value.find('<').and_then(|s| {
             let inner = &value[s + 1..value.len().saturating_sub(1)];
-            if inner.is_empty() { None } else { Some(inner) }
+            if inner.is_empty() {
+                None
+            } else {
+                Some(inner)
+            }
         }) {
             let iface = if base_no_arity.contains('.') {
                 base_no_arity.to_string()
             } else {
                 format!("Windows.Foundation.{}", base_no_arity)
             };
-            return format!("{}<{}>", iface, map_type_to_ts_with_generics(inner, generic_params));
+            return format!(
+                "{}<{}>",
+                iface,
+                map_type_to_ts_with_generics(inner, generic_params)
+            );
         }
         return if base_no_arity.contains('.') {
             base_no_arity.to_string()
@@ -222,7 +288,11 @@ fn map_type_to_ts_with_generics(value: &str, generic_params: &[String]) -> Strin
     if base_no_arity == "IReference" || base_no_arity.ends_with(".IReference") {
         if let Some(inner) = value.find('<').and_then(|s| {
             let inner = &value[s + 1..value.len().saturating_sub(1)];
-            if inner.is_empty() { None } else { Some(inner) }
+            if inner.is_empty() {
+                None
+            } else {
+                Some(inner)
+            }
         }) {
             let inner_ts = map_type_to_ts_with_generics(inner, generic_params);
             return format!("{} | null", inner_ts);
@@ -230,13 +300,22 @@ fn map_type_to_ts_with_generics(value: &str, generic_params: &[String]) -> Strin
         return "unknown | null".to_string();
     }
 
-    if base_no_arity == "IVector" || base_no_arity.ends_with(".IVector") ||
-       base_no_arity == "IReadOnlyList" || base_no_arity.ends_with(".IReadOnlyList") ||
-       base_no_arity == "IIterable" || base_no_arity.ends_with(".IIterable") ||
-       base_no_arity == "IVectorView" || base_no_arity.ends_with(".IVectorView") {
+    if base_no_arity == "IVector"
+        || base_no_arity.ends_with(".IVector")
+        || base_no_arity == "IReadOnlyList"
+        || base_no_arity.ends_with(".IReadOnlyList")
+        || base_no_arity == "IIterable"
+        || base_no_arity.ends_with(".IIterable")
+        || base_no_arity == "IVectorView"
+        || base_no_arity.ends_with(".IVectorView")
+    {
         if let Some(inner) = value.find('<').and_then(|s| {
             let inner = &value[s + 1..value.len().saturating_sub(1)];
-            if inner.is_empty() { None } else { Some(inner) }
+            if inner.is_empty() {
+                None
+            } else {
+                Some(inner)
+            }
         }) {
             let inner_ts = map_type_to_ts_with_generics(inner, generic_params);
             let iface = if base_no_arity.contains('.') {
@@ -249,16 +328,25 @@ fn map_type_to_ts_with_generics(value: &str, generic_params: &[String]) -> Strin
         return "unknown[]".to_string();
     }
 
-    if base_no_arity == "IMap" || base_no_arity.ends_with(".IMap") ||
-       base_no_arity == "IReadOnlyDictionary" || base_no_arity.ends_with(".IReadOnlyDictionary") {
-        if let Some(inner) = value.find('<').map(|s| &value[s + 1..value.len().saturating_sub(1)]) {
+    if base_no_arity == "IMap"
+        || base_no_arity.ends_with(".IMap")
+        || base_no_arity == "IReadOnlyDictionary"
+        || base_no_arity.ends_with(".IReadOnlyDictionary")
+    {
+        if let Some(inner) = value
+            .find('<')
+            .map(|s| &value[s + 1..value.len().saturating_sub(1)])
+        {
             let mut depth = 0usize;
             let mut split = None;
             for (i, c) in inner.char_indices() {
                 match c {
                     '<' => depth += 1,
                     '>' => depth = depth.saturating_sub(1),
-                    ',' if depth == 0 => { split = Some(i); break; }
+                    ',' if depth == 0 => {
+                        split = Some(i);
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -283,10 +371,15 @@ fn map_type_to_ts_with_generics(value: &str, generic_params: &[String]) -> Strin
 
     // Common non-generic map-like types (PropertySet / ValueSet / StringMap)
     // should behave like a string-keyed dictionary in TypeScript.
-    if base_no_arity == "IPropertySet" || base_no_arity.ends_with(".IPropertySet") ||
-       base_no_arity == "PropertySet" || base_no_arity.ends_with(".PropertySet") ||
-       base_no_arity == "ValueSet" || base_no_arity.ends_with(".ValueSet") ||
-       base_no_arity == "StringMap" || base_no_arity.ends_with(".StringMap") {
+    if base_no_arity == "IPropertySet"
+        || base_no_arity.ends_with(".IPropertySet")
+        || base_no_arity == "PropertySet"
+        || base_no_arity.ends_with(".PropertySet")
+        || base_no_arity == "ValueSet"
+        || base_no_arity.ends_with(".ValueSet")
+        || base_no_arity == "StringMap"
+        || base_no_arity.ends_with(".StringMap")
+    {
         // Emit the real WinRT interface so consumers see the concrete API shape
         // instead of an anonymous TS index signature.
         let iface = if base_no_arity.contains('.') {
@@ -299,7 +392,11 @@ fn map_type_to_ts_with_generics(value: &str, generic_params: &[String]) -> Strin
     }
 
     if value.contains('<') {
-        let name = if let Some(idx) = base.find('`') { &base[..idx] } else { base };
+        let name = if let Some(idx) = base.find('`') {
+            &base[..idx]
+        } else {
+            base
+        };
         if let Some(args) = split_generic_arguments(value) {
             let rendered = args
                 .iter()
@@ -351,14 +448,12 @@ fn method_signature_with_generics(
                 .map(|m| Signature::to_string(m, &p.type_()))
                 .unwrap_or_else(|| "Object".to_string());
             let rendered = if !generic_params.is_empty()
-                && (
-                    (method_name == "GetMany"
-                        && ((total_params == 1 && index == 0)
-                            || (total_params >= 2 && index + 1 == total_params)))
-                        || (method_name == "ReplaceAll" && index == 0)
-                        || (raw_name == "items"
-                            && (method_name == "GetMany" || method_name == "ReplaceAll"))
-                )
+                && ((method_name == "GetMany"
+                    && ((total_params == 1 && index == 0)
+                        || (total_params >= 2 && index + 1 == total_params)))
+                    || (method_name == "ReplaceAll" && index == 0)
+                    || (raw_name == "items"
+                        && (method_name == "GetMany" || method_name == "ReplaceAll")))
             {
                 format!("{}[]", generic_params[0])
             } else if method_name == "GetMany" && total_params >= 2 && index == 0 {
@@ -463,7 +558,10 @@ fn collect_interface_hierarchy(
     }
 }
 
-fn interface_extends_clause_recursive(interface: &InterfaceDeclaration, generic_params: &[String]) -> String {
+fn interface_extends_clause_recursive(
+    interface: &InterfaceDeclaration,
+    generic_params: &[String],
+) -> String {
     let mut bases: Vec<String> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     collect_interface_hierarchy(interface, &mut bases, &mut seen);
@@ -474,7 +572,11 @@ fn interface_extends_clause_recursive(interface: &InterfaceDeclaration, generic_
         .collect::<Vec<_>>();
     mapped.sort();
     mapped.dedup();
-    if mapped.is_empty() { String::new() } else { format!(" extends {}", mapped.join(", ")) }
+    if mapped.is_empty() {
+        String::new()
+    } else {
+        format!(" extends {}", mapped.join(", "))
+    }
 }
 
 // Collect all interfaces implemented by a class, including transitive interfaces
@@ -504,17 +606,33 @@ fn event_type_name(
     // namespace-qualified aliases so references resolve from any module.
     if let Some(dimpl) = event.delegate_impl() {
         // Concrete non-generic delegate (named alias)
-        if let Some(delegate) = dimpl.as_declaration().as_any().downcast_ref::<DelegateDeclaration>() {
+        if let Some(delegate) = dimpl
+            .as_declaration()
+            .as_any()
+            .downcast_ref::<DelegateDeclaration>()
+        {
             let full = delegate.full_name();
             let ns = declaration_namespace(full);
             let name = declaration_display_name(full);
-            return if ns.is_empty() { name } else { format!("{}.{}", ns, name) };
+            return if ns.is_empty() {
+                name
+            } else {
+                format!("{}.{}", ns, name)
+            };
         }
 
         // Generic closed-instance delegate (e.g. TypedEventHandler<TSender, TArgs>)
-        if let Some(generic_instance) = dimpl.as_declaration().as_any().downcast_ref::<GenericDelegateInstanceDeclaration>() {
+        if let Some(generic_instance) = dimpl
+            .as_declaration()
+            .as_any()
+            .downcast_ref::<GenericDelegateInstanceDeclaration>()
+        {
             let full = generic_instance.full_name();
-            let base = if let Some(idx) = full.find('<') { &full[..idx] } else { full };
+            let base = if let Some(idx) = full.find('<') {
+                &full[..idx]
+            } else {
+                full
+            };
             let ns = declaration_namespace(base);
             let base_name = declaration_display_name(base);
             if let Some(args) = split_generic_arguments(full) {
@@ -529,7 +647,11 @@ fn event_type_name(
                     return format!("{}.{}<{}>", ns, base_name, mapped);
                 }
             }
-            return if ns.is_empty() { base_name } else { format!("{}.{}", ns, base_name) };
+            return if ns.is_empty() {
+                base_name
+            } else {
+                format!("{}.{}", ns, base_name)
+            };
         }
     }
 
@@ -537,18 +659,28 @@ fn event_type_name(
     // and produce an inline signature when we can't render the delegate alias.
     if let Some(md) = event.add_method().metadata() {
         let params = event.add_method().parameters();
-                if let Some(param) = params.iter().find(|p| !p.is_out()) {
+        if let Some(param) = params.iter().find(|p| !p.is_out()) {
             let param_ty = Signature::to_string(md, &param.type_());
-            let base = if let Some(idx) = param_ty.find('<') { &param_ty[..idx] } else { param_ty.as_str() };
-            let base_no_arity = if let Some(idx) = base.find('`') { &base[..idx] } else { base };
+            let base = if let Some(idx) = param_ty.find('<') {
+                &param_ty[..idx]
+            } else {
+                param_ty.as_str()
+            };
+            let base_no_arity = if let Some(idx) = base.find('`') {
+                &base[..idx]
+            } else {
+                base
+            };
             let simple = declaration_display_name(base_no_arity);
 
             match simple.as_str() {
                 "TypedEventHandler" => {
                     if let Some(args) = split_generic_arguments(&param_ty) {
                         if args.len() == 2 {
-                            let sender_ts = map_type_to_ts_with_generics(args[0].trim(), generic_params);
-                            let args_ts = map_type_to_ts_with_generics(args[1].trim(), generic_params);
+                            let sender_ts =
+                                map_type_to_ts_with_generics(args[0].trim(), generic_params);
+                            let args_ts =
+                                map_type_to_ts_with_generics(args[1].trim(), generic_params);
                             return format!("(sender: {}, args: {}) => void", sender_ts, args_ts);
                         }
                     }
@@ -557,7 +689,8 @@ fn event_type_name(
                 "EventHandler" => {
                     if let Some(args) = split_generic_arguments(&param_ty) {
                         if args.len() == 1 {
-                            let args_ts = map_type_to_ts_with_generics(args[0].trim(), generic_params);
+                            let args_ts =
+                                map_type_to_ts_with_generics(args[0].trim(), generic_params);
                             return format!("(sender: Object, args: {}) => void", args_ts);
                         }
                     }
@@ -567,7 +700,8 @@ fn event_type_name(
                 "RoutedEventHandler" => {
                     if let Some(args) = split_generic_arguments(&param_ty) {
                         if args.len() == 1 {
-                            let args_ts = map_type_to_ts_with_generics(args[0].trim(), generic_params);
+                            let args_ts =
+                                map_type_to_ts_with_generics(args[0].trim(), generic_params);
                             return format!("(sender: Object, args: {}) => void", args_ts);
                         }
                     }
@@ -596,8 +730,11 @@ fn render_interface(name: &str, interface: &InterfaceDeclaration) -> String {
     methods.sort_by(|a, b| a.name().cmp(b.name()));
 
     for method in methods {
-        out.push_str(&format!("  {}{};\n",
-            sanitize_member(method.name()), method_signature(&method, false)));
+        out.push_str(&format!(
+            "  {}{};\n",
+            sanitize_member(method.name()),
+            method_signature(&method, false)
+        ));
     }
 
     let mut properties = interface
@@ -608,9 +745,15 @@ fn render_interface(name: &str, interface: &InterfaceDeclaration) -> String {
     properties.sort_by(|a, b| a.name().cmp(b.name()));
 
     for prop in properties {
-        let Some(md) = prop.getter().metadata() else { continue };
+        let Some(md) = prop.getter().metadata() else {
+            continue;
+        };
         let return_ty = Signature::to_string(md, &prop.getter().return_type());
-        let readonly = if prop.setter().is_none() { "readonly " } else { "" };
+        let readonly = if prop.setter().is_none() {
+            "readonly "
+        } else {
+            ""
+        };
         out.push_str(&format!(
             "  {}{}: {};\n",
             readonly,
@@ -622,8 +765,11 @@ fn render_interface(name: &str, interface: &InterfaceDeclaration) -> String {
     for event in interface.events().iter().filter(|e| e.is_exported()) {
         let ety = event_type_name(event, &[]);
         let ety_nullable = format!("{} | null", ety);
-        out.push_str(&format!("  {}: {};\n",
-            sanitize_member(event.name()), ety_nullable));
+        out.push_str(&format!(
+            "  {}: {};\n",
+            sanitize_member(event.name()),
+            ety_nullable
+        ));
     }
 
     // Emit an indexer for well-known map-like interfaces so TS consumers can
@@ -696,7 +842,7 @@ fn render_class(name: &str, class_decl: &ClassDeclaration) -> String {
     methods.sort_by(|a, b| a.name().cmp(b.name()));
 
     for method in methods {
-        let sig  = method_signature(&method, false);
+        let sig = method_signature(&method, false);
         let mname = sanitize_member(method.name());
         if method.is_static() {
             out.push_str(&format!("  static {mname}{sig};\n"));
@@ -713,11 +859,17 @@ fn render_class(name: &str, class_decl: &ClassDeclaration) -> String {
     properties.sort_by(|a, b| a.name().cmp(b.name()));
 
     for prop in properties {
-        let Some(md) = prop.getter().metadata() else { continue };
+        let Some(md) = prop.getter().metadata() else {
+            continue;
+        };
         let return_ty = Signature::to_string(md, &prop.getter().return_type());
         let pname = sanitize_member(prop.name());
         let ts_ty = map_type_to_ts(return_ty.as_str());
-        let readonly = if prop.setter().is_none() { "readonly " } else { "" };
+        let readonly = if prop.setter().is_none() {
+            "readonly "
+        } else {
+            ""
+        };
         if prop.is_static() {
             out.push_str(&format!("  static {readonly}{pname}: {ts_ty};\n"));
         } else {
@@ -727,7 +879,7 @@ fn render_class(name: &str, class_decl: &ClassDeclaration) -> String {
 
     for event in class_decl.events().iter().filter(|e| e.is_exported()) {
         let ename = sanitize_member(event.name());
-        let ety   = event_type_name(event, &[]);
+        let ety = event_type_name(event, &[]);
         let ety_nullable = format!("{} | null", ety);
         if event.is_static() {
             out.push_str(&format!("  static {ename}: {ety_nullable};\n"));
@@ -760,7 +912,13 @@ fn enum_value_to_string(value: Value) -> String {
         Value::Uint64(v) => format!("{}", v),
         Value::Single(v) => v.to_string(),
         Value::Double(v) => v.to_string(),
-        Value::Boolean(v) => if v { "1".to_string() } else { "0".to_string() },
+        Value::Boolean(v) => {
+            if v {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }
+        }
         _ => "0".to_string(),
     }
 }
@@ -791,7 +949,9 @@ fn render_struct(name: &str, struct_decl: &StructDeclaration) -> String {
     // Collect fields once so we can use them for both the interface and the constructor var.
     let mut fields: Vec<(String, String)> = Vec::new();
     for field in struct_decl.fields() {
-        let Some(md) = field.base().metadata() else { continue };
+        let Some(md) = field.base().metadata() else {
+            continue;
+        };
         let field_ty = Signature::to_string(md, &field.type_());
         fields.push((field.name().to_string(), map_type_to_ts(field_ty.as_str())));
     }
@@ -808,11 +968,13 @@ fn render_struct(name: &str, struct_decl: &StructDeclaration) -> String {
     // Constructor var with two overloads:
     //   new(x: T, y: T, ...): Name   — positional
     //   new(fields: { X?: T; ... }): Name — object-literal
-    let positional: String = fields.iter()
+    let positional: String = fields
+        .iter()
         .map(|(fname, ftype)| format!("{}: {}", pascal_to_camel(fname), ftype))
         .collect::<Vec<_>>()
         .join(", ");
-    let obj_fields: String = fields.iter()
+    let obj_fields: String = fields
+        .iter()
         .map(|(fname, ftype)| format!("{}?: {}", fname, ftype))
         .collect::<Vec<_>>()
         .join("; ");
@@ -840,8 +1002,10 @@ fn render_delegate(name: &str, delegate: &DelegateDeclaration) -> String {
 
 fn render_generic_interface(interface: &GenericInterfaceDeclaration) -> String {
     let mut out = String::new();
-    let generic_params =
-        generic_parameter_names(interface.full_name(), interface.number_of_generic_parameters());
+    let generic_params = generic_parameter_names(
+        interface.full_name(),
+        interface.number_of_generic_parameters(),
+    );
     let name = declaration_display_name(interface.full_name());
     let generic_suffix = if generic_params.is_empty() {
         String::new()
@@ -849,7 +1013,10 @@ fn render_generic_interface(interface: &GenericInterfaceDeclaration) -> String {
         format!("<{}>", generic_params.join(", "))
     };
     let extends = interface_extends_clause(interface.implemented_interfaces(), &generic_params);
-    out.push_str(&format!("interface {}{}{} {{\n", name, generic_suffix, extends));
+    out.push_str(&format!(
+        "interface {}{}{} {{\n",
+        name, generic_suffix, extends
+    ));
 
     let mut methods = interface
         .methods()
@@ -874,9 +1041,15 @@ fn render_generic_interface(interface: &GenericInterfaceDeclaration) -> String {
     properties.sort_by(|a, b| a.name().cmp(b.name()));
 
     for prop in properties {
-        let Some(md) = prop.getter().metadata() else { continue };
+        let Some(md) = prop.getter().metadata() else {
+            continue;
+        };
         let return_ty = Signature::to_string(md, &prop.getter().return_type());
-        let readonly = if prop.setter().is_none() { "readonly " } else { "" };
+        let readonly = if prop.setter().is_none() {
+            "readonly "
+        } else {
+            ""
+        };
         out.push_str(&format!(
             "  {}{}: {};\n",
             readonly,
@@ -906,8 +1079,10 @@ fn render_generic_interface(interface: &GenericInterfaceDeclaration) -> String {
 
 fn render_generic_delegate(delegate: &GenericDelegateDeclaration) -> String {
     let mut out = String::new();
-    let generic_params =
-        generic_parameter_names(delegate.full_name(), delegate.number_of_generic_parameters());
+    let generic_params = generic_parameter_names(
+        delegate.full_name(),
+        delegate.number_of_generic_parameters(),
+    );
     let name = declaration_display_name(delegate.full_name());
     let generic_suffix = if generic_params.is_empty() {
         String::new()
@@ -1012,7 +1187,8 @@ fn walk_namespace(root: &str) -> BTreeMap<String, Vec<String>> {
                     // so they get declared and the `implements` references resolve.
                     for iface in item.implemented_interfaces() {
                         let iface_name = iface.full_name().to_string();
-                        if is_in_requested_root(&iface_name, root) && !visited.contains(&iface_name) {
+                        if is_in_requested_root(&iface_name, root) && !visited.contains(&iface_name)
+                        {
                             queue.push_back(iface_name);
                         }
                     }
@@ -1032,7 +1208,8 @@ fn walk_namespace(root: &str) -> BTreeMap<String, Vec<String>> {
                     // Also queue base interfaces (may include exclusive ones).
                     for iface in item.implemented_interfaces() {
                         let iface_name = iface.full_name().to_string();
-                        if is_in_requested_root(&iface_name, root) && !visited.contains(&iface_name) {
+                        if is_in_requested_root(&iface_name, root) && !visited.contains(&iface_name)
+                        {
                             queue.push_back(iface_name);
                         }
                     }
@@ -1256,16 +1433,24 @@ fn collect_candidates_with_tokens(
             let mut tokens = [0u32; 256];
             let mut fetched = 0u32;
             let result = unsafe {
-                metadata.EnumTypeDefs(&mut enumerator, tokens.as_mut_ptr(), tokens.len() as u32, &mut fetched)
+                metadata.EnumTypeDefs(
+                    &mut enumerator,
+                    tokens.as_mut_ptr(),
+                    tokens.len() as u32,
+                    &mut fetched,
+                )
             };
-            if result.is_err() || fetched == 0 { break; }
+            if result.is_err() || fetched == 0 {
+                break;
+            }
             for &raw in &tokens[..fetched as usize] {
                 let token = CorTokenType(raw as i32);
                 let name = get_type_name(&metadata, token);
                 if !name.is_empty() && is_in_requested_root(&name, root) {
                     candidates.insert(name.clone());
                     if let Some(ref mut tmap) = token_map.as_deref_mut() {
-                        tmap.entry(name).or_insert_with(|| (metadata.clone(), token));
+                        tmap.entry(name)
+                            .or_insert_with(|| (metadata.clone(), token));
                     }
                 }
             }
@@ -1314,10 +1499,7 @@ fn scan_winmd_candidates(path: &PathBuf, root: &str) -> BTreeSet<String> {
     };
 
     let text = String::from_utf8_lossy(&bytes);
-    let pattern = format!(
-        r"{}(?:\.[A-Za-z_][A-Za-z0-9_`]*)+",
-        regex::escape(root)
-    );
+    let pattern = format!(r"{}(?:\.[A-Za-z_][A-Za-z0-9_`]*)+", regex::escape(root));
 
     let Ok(re) = Regex::new(pattern.as_str()) else {
         return candidates;
@@ -1703,7 +1885,11 @@ fn extract_metadata_scope(lock: &dyn Declaration) -> Option<IMetaDataImport2> {
 // ---------------------------------------------------------------------------
 
 /// Collects additional scan paths based on roots and explicit lib paths.
-fn collect_scan_paths(roots: &[String], input: Option<&PathBuf>, lib_paths: &[PathBuf]) -> Vec<PathBuf> {
+fn collect_scan_paths(
+    roots: &[String],
+    input: Option<&PathBuf>,
+    lib_paths: &[PathBuf],
+) -> Vec<PathBuf> {
     let mut scan_paths = Vec::new();
 
     // Explicit --input file (winmd or dll treated as a source of types).
@@ -1746,8 +1932,16 @@ fn make_declaration_from_token(
     let mut parent_token = 0u32;
     let mut raw_flags = 0u32;
     if unsafe {
-        metadata.GetTypeDefProps(token.0 as u32, None, 0 as _, &mut raw_flags, &mut parent_token)
-    }.is_err() {
+        metadata.GetTypeDefProps(
+            token.0 as u32,
+            None,
+            0 as _,
+            &mut raw_flags,
+            &mut parent_token,
+        )
+    }
+    .is_err()
+    {
         return None;
     }
     let flags = raw_flags as i32;
@@ -1759,37 +1953,68 @@ fn make_declaration_from_token(
         let mut size = 0_u32;
         let parent_ok = match CorTokenType(tt) {
             mdtTypeDef => unsafe {
-                metadata.GetTypeDefProps(parent_token, Some(&mut parent_name), &mut size, 0 as _, 0 as _)
-            }.is_ok(),
+                metadata.GetTypeDefProps(
+                    parent_token,
+                    Some(&mut parent_name),
+                    &mut size,
+                    0 as _,
+                    0 as _,
+                )
+            }
+            .is_ok(),
             mdtTypeRef => unsafe {
                 metadata.GetTypeRefProps(parent_token, 0 as _, Some(&mut parent_name), &mut size)
-            }.is_ok(),
+            }
+            .is_ok(),
             _ => return None,
         };
-        if !parent_ok { return None; }
+        if !parent_ok {
+            return None;
+        }
         let parent_str = String::from_utf16_lossy(&parent_name[..size.saturating_sub(1) as usize]);
         return if parent_str == SYSTEM_ENUM {
-            Some(Arc::new(RwLock::new(EnumDeclaration::new(Some(metadata), token))))
+            Some(Arc::new(RwLock::new(EnumDeclaration::new(
+                Some(metadata),
+                token,
+            ))))
         } else if parent_str == SYSTEM_VALUETYPE {
-            Some(Arc::new(RwLock::new(StructDeclaration::new(Some(metadata), token))))
+            Some(Arc::new(RwLock::new(StructDeclaration::new(
+                Some(metadata),
+                token,
+            ))))
         } else if parent_str == SYSTEM_MULTICASTDELEGATE {
             let name = get_type_name(metadata, token);
             if name.contains('`') {
-                Some(Arc::new(RwLock::new(GenericDelegateDeclaration::new(Some(metadata), token))))
+                Some(Arc::new(RwLock::new(GenericDelegateDeclaration::new(
+                    Some(metadata),
+                    token,
+                ))))
             } else {
-                Some(Arc::new(RwLock::new(DelegateDeclaration::new(Some(metadata), token))))
+                Some(Arc::new(RwLock::new(DelegateDeclaration::new(
+                    Some(metadata),
+                    token,
+                ))))
             }
         } else {
-            Some(Arc::new(RwLock::new(ClassDeclaration::new(Some(metadata), token))))
+            Some(Arc::new(RwLock::new(ClassDeclaration::new(
+                Some(metadata),
+                token,
+            ))))
         };
     }
 
     if is_td_interface(flags) {
         let name = get_type_name(metadata, token);
         return if name.contains('`') {
-            Some(Arc::new(RwLock::new(GenericInterfaceDeclaration::new(Some(metadata), token))))
+            Some(Arc::new(RwLock::new(GenericInterfaceDeclaration::new(
+                Some(metadata),
+                token,
+            ))))
         } else {
-            Some(Arc::new(RwLock::new(InterfaceDeclaration::new(Some(metadata), token))))
+            Some(Arc::new(RwLock::new(InterfaceDeclaration::new(
+                Some(metadata),
+                token,
+            ))))
         };
     }
 
@@ -1830,9 +2055,9 @@ fn augment_modules_from_files(
                 continue;
             }
             let dec = MetadataReader::find_by_name(&candidate).or_else(|| {
-                file_type_map.get(&candidate).and_then(|(scope, token)| {
-                    make_declaration_from_token(scope, *token)
-                })
+                file_type_map
+                    .get(&candidate)
+                    .and_then(|(scope, token)| make_declaration_from_token(scope, *token))
             });
             let Some(dec) = dec else {
                 continue;
@@ -1986,7 +2211,13 @@ fn parse_args() -> GeneratorConfig {
     roots.sort();
     roots.dedup();
 
-    GeneratorConfig { roots, out, out_dir, input, lib_paths }
+    GeneratorConfig {
+        roots,
+        out,
+        out_dir,
+        input,
+        lib_paths,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2242,26 +2473,89 @@ fn write_split_output(
 /// is a .dll or .csproj.  In that case we delegate to the dotnet-typings-gen
 /// sub-tool which uses System.Reflection.Metadata for accurate .NET type mapping.
 fn is_dotnet_mode(config: &GeneratorConfig) -> bool {
-    let Some(input) = &config.input else { return false };
+    let Some(input) = &config.input else {
+        return false;
+    };
     let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("");
     if !matches!(ext, "dll" | "csproj") {
         return false;
     }
     // If any root is Windows or Windows.* this is a WinRT build.
-    !config.roots.iter().any(|r| r == "Windows" || r.starts_with("Windows."))
+    !config
+        .roots
+        .iter()
+        .any(|r| r == "Windows" || r.starts_with("Windows."))
+}
+
+/// Command that launches the C# `dotnet-typings-gen` sub-tool (callers append its args last).
+/// Prefers a published build next to this exe (`dotnet <dll>`, then apphost `.exe`); falls back
+/// to `dotnet run --project` from the source tree (CARGO_MANIFEST_DIR — dev only).
+fn dotnet_typings_gen_command() -> std::process::Command {
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            // Arch-agnostic via `dotnet <dll>`.
+            for dll in [
+                dir.join("dotnet-typings-gen")
+                    .join("dotnet-typings-gen.dll"),
+                dir.join("dotnet-typings-gen.dll"),
+            ] {
+                if dll.exists() {
+                    let mut cmd = std::process::Command::new("dotnet");
+                    cmd.arg(dll);
+                    return cmd;
+                }
+            }
+            // Self-contained / apphost executable fallback.
+            for tool_exe in [
+                dir.join("dotnet-typings-gen")
+                    .join("dotnet-typings-gen.exe"),
+                dir.join("dotnet-typings-gen.exe"),
+            ] {
+                if tool_exe.exists() {
+                    return std::process::Command::new(tool_exe);
+                }
+            }
+        }
+    }
+
+    // Dev fallback: compile & run the sub-tool from source.
+    let this_manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let sub_proj = this_manifest
+        .join("dotnet-src")
+        .join("dotnet-typings-gen.csproj");
+    let mut cmd = std::process::Command::new("dotnet");
+    cmd.arg("run").arg("--project").arg(&sub_proj).arg("--");
+    cmd
 }
 
 fn run_dotnet_typings_gen(config: &GeneratorConfig) {
-    // The C# sub-tool lives next to this source file's project directory.
-    let this_manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let sub_proj = this_manifest.join("dotnet-src").join("dotnet-typings-gen.csproj");
+    // Sub-tool emits a single `--out` file; when `--out-dir` was given, write into it.
+    let out_path = match &config.out_dir {
+        Some(dir) => {
+            let _ = fs::create_dir_all(dir);
+            let stem = config
+                .roots
+                .iter()
+                .find(|r| !r.starts_with("Windows"))
+                .cloned()
+                .or_else(|| {
+                    config
+                        .input
+                        .as_ref()
+                        .and_then(|p| p.file_stem())
+                        .map(|s| s.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| "dotnet".to_string());
+            dir.join(format!("{}.d.ts", stem))
+        }
+        None => config.out.clone(),
+    };
 
-    let mut cmd = std::process::Command::new("dotnet");
-    cmd.arg("run")
-        .arg("--project").arg(&sub_proj)
-        .arg("--")
-        .arg("--input").arg(config.input.as_ref().unwrap())
-        .arg("--out").arg(&config.out);
+    let mut cmd = dotnet_typings_gen_command();
+    cmd.arg("--input")
+        .arg(config.input.as_ref().unwrap())
+        .arg("--out")
+        .arg(&out_path);
 
     for root in &config.roots {
         cmd.arg("--root").arg(root);
@@ -2269,35 +2563,56 @@ fn run_dotnet_typings_gen(config: &GeneratorConfig) {
 
     let status = cmd.status().expect("failed to launch dotnet");
     if !status.success() {
-        eprintln!("[typings-generator] dotnet-typings-gen exited with {}", status);
+        eprintln!(
+            "[typings-generator] dotnet-typings-gen exited with {}",
+            status
+        );
         std::process::exit(status.code().unwrap_or(1));
     }
 }
 
 fn main() {
-    // Initialize COM MTA so that CoCreateInstance(CLSID_CorMetaDataDispenser) works
-    // in OpenMetadataScope (used by open_metadata_scope_from_file in Phase 2).
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() };
 
     let config = parse_args();
 
-    // Dotnet mode: delegate to the C# reflection-based sub-tool.
     if is_dotnet_mode(&config) {
         run_dotnet_typings_gen(&config);
         return;
     }
 
-    // Phase 1: BFS namespace walk — discovers types reachable via RoResolveNamespace.
+    if let Some(input) = &config.input {
+        let ext = input
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let only_windows_roots = config
+            .roots
+            .iter()
+            .all(|r| r == "Windows" || r.starts_with("Windows."));
+        if ext == "winmd" && !config.roots.is_empty() && !only_windows_roots {
+            eprintln!(
+                "[typings-generator] Refusing to render non-Windows namespaces ({}) from a raw .winmd — \
+the COM metadata path is unreliable for cross-assembly references. Pass the CsWinRT-projected .dll \
+instead (e.g. Microsoft.WinUI.dll / *.Projection.dll); it uses the safe reflection path.",
+                config.roots.join(", ")
+            );
+            std::process::exit(2);
+        }
+    }
+
     let mut modules: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for root in &config.roots {
         let generated = walk_namespace(root.as_str());
         for (namespace, mut declarations) in generated {
-            modules.entry(namespace).or_default().append(&mut declarations);
+            modules
+                .entry(namespace)
+                .or_default()
+                .append(&mut declarations);
         }
     }
 
-    // Phase 2: Metadata file scan — picks up types (like IClosable) that are not
-    // namespaces themselves and therefore never appear in the BFS queue.
     augment_modules_from_files(
         &config.roots,
         config.input.as_ref(),

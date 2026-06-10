@@ -1,118 +1,220 @@
 using System;
+using System.Text.Json;
 using Windows.ApplicationModel;
-using Windows.ApplicationModel.Activation;
+using Microsoft.UI.Dispatching;
+using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media;
 using Windows.Storage;
-using Windows.UI.Xaml;
-using Windows.UI.Xaml.Navigation;
-
 
 namespace NativeScriptWindowsDemo
 {
-    /// <summary>
-    /// Provides application-specific behavior to supplement the default Application class.
-    /// </summary>
-    /// 
-
     sealed partial class App : Application
     {
         private const string LastLaunchArgsKey = "LastLaunchArgs";
         private readonly RuntimeHost _runtimeHost = new RuntimeHost();
-        private string _lastLaunchArgs = string.Empty;
+
+        public static Window CurrentWindow { get; private set; }
+        public Window MainWindow => CurrentWindow;
+        public Window Window => CurrentWindow;
+
+        enum AppEventKind
+        {
+            Activated = 1,
+            Deactivated = 2,
+            Shown = 3,
+            Hidden = 4,
+            UncaughtError = 5,
+            Exit = 6
+        }
 
         public App()
         {
+			this.InitializeComponent();
+			CurrentWindow ??= new Window();
+
             CrashDiagnostics.InstallGlobalHandlers();
-            this.Suspending += OnSuspending;
+            CurrentWindow.Closed += OnWindowClosed;
+            CurrentWindow.Activated += OnWindowActivated;
+            CurrentWindow.VisibilityChanged += OnWindowVisibilityChanged;
             this.UnhandledException += OnUnhandledException;
         }
 
-        /// <summary>
-        /// Invoked when the application is launched normally by the end user.  Other entry points
-        /// will be used such as when the application is launched to open a specific file.
-        /// </summary>
-        /// <param name="e">Details about the launch request and process.</param>
-        protected override void OnLaunched(LaunchActivatedEventArgs e)
+        protected override async void OnLaunched(LaunchActivatedEventArgs e)
         {
-            _lastLaunchArgs = e.Arguments ?? string.Empty;
-
             _runtimeHost.Initialize();
+
+            // Capture before any await — continuations may resume on a thread pool thread.
+            var dispatcherQueue = DispatcherQueue.GetForCurrentThread();
+
+            // Show crash report from the previous run if one exists.
+            try
+            {
+                var panicLogPath = System.IO.Path.Combine(
+                    ApplicationData.Current.LocalFolder.Path, "nativescript-panic.log");
+                if (System.IO.File.Exists(panicLogPath))
+                {
+                    var content = System.IO.File.ReadAllText(panicLogPath);
+                    System.IO.File.Delete(panicLogPath);
+                    if (!string.IsNullOrWhiteSpace(content))
+                        await CrashDiagnostics.ShowCrashDialogAsync("Crash from previous run", content);
+                }
+            }
+            catch { }
+
+            string jsError = null;
             try
             {
                 _runtimeHost.RunMainScript();
+                jsError = _runtimeHost.GetLastJsError();
+                if (!string.IsNullOrEmpty(jsError))
+                {
+                    CrashDiagnostics.WriteMessage("JS Error", jsError);
+                    var report = CrashDiagnostics.BuildErrorReport(null, jsError);
+                    CrashDiagnostics.WriteToTraceLog(report);
+                    await CrashDiagnostics.ShowCrashDialogAsync("JavaScript Error", report);
+                }
             }
             catch (Exception scriptEx)
             {
+                jsError = _runtimeHost.GetLastJsError();
                 System.Diagnostics.Debug.WriteLine($"[NativeScript] Script exception: {scriptEx.Message}");
+                CrashDiagnostics.WriteExceptionReport("RunMainScript", scriptEx, null);
+                var report = CrashDiagnostics.BuildErrorReport(scriptEx, jsError);
+                CrashDiagnostics.WriteToTraceLog(report);
+                await CrashDiagnostics.ShowCrashDialogAsync("Script Execution Error", report);
             }
 
-#if DEBUG
-            Windows.UI.Xaml.Media.CompositionTarget.Rendering += OnRenderFrame;
-#endif
-
-            if (e.PreviousExecutionState == ApplicationExecutionState.Terminated
-                && ApplicationData.Current.LocalSettings.Values.TryGetValue(LastLaunchArgsKey, out object value))
+            void ShowMainWindow()
             {
-                _lastLaunchArgs = value as string ?? _lastLaunchArgs;
-            }
+                StartPump();
 
-            // If JS did not set a root view, show a fallback so the window is not blank.
-            // JS errors will appear in the VS Output window (stderr from the Rust runtime).
-            if (Window.Current.Content == null)
-            {
-                Window.Current.Content = new Windows.UI.Xaml.Controls.TextBlock
+                try
                 {
-                    Text = "NativeScript runtime initialized but no UI was rendered.\n" +
-                           "Check the VS Output window for JS errors.",
-                    Margin = new Windows.UI.Xaml.Thickness(20),
-                    TextWrapping = Windows.UI.Xaml.TextWrapping.Wrap,
-                    FontSize = 16,
-                };
+                    if (CurrentWindow?.Content != null)
+                    {
+                        CurrentWindow.Activate();
+                    }
+                }
+                catch { /* JS owns its own Window */ }
             }
 
-            if (!e.PrelaunchActivated)
+            if (dispatcherQueue?.HasThreadAccess == true)
             {
-                Window.Current.Activate();
+                ShowMainWindow();
+            }
+            else if (!(dispatcherQueue?.TryEnqueue(ShowMainWindow) ?? false))
+            {
+                ShowMainWindow();
             }
         }
 
-        /// <summary>
-        /// Invoked when Navigation to a certain page fails
-        /// </summary>
-        /// <param name="sender">The Frame which failed navigation</param>
-        /// <param name="e">Details about the navigation failure</param>
-        void OnNavigationFailed(object sender, NavigationFailedEventArgs e)
+        private void OnWindowClosed(object sender, WindowEventArgs e)
         {
-            throw new Exception("Failed to load Page " + e.SourcePageType.FullName);
-        }
-
-        /// <summary>
-        /// Invoked when application execution is being suspended.  Application state is saved
-        /// without knowing whether the application will be terminated or resumed with the contents
-        /// of memory still intact.
-        /// </summary>
-        /// <param name="sender">The source of the suspend request.</param>
-        /// <param name="e">Details about the suspend request.</param>
-        private void OnSuspending(object sender, SuspendingEventArgs e)
-        {
-            var deferral = e.SuspendingOperation.GetDeferral();
-#if DEBUG
-            Windows.UI.Xaml.Media.CompositionTarget.Rendering -= OnRenderFrame;
-#endif
-            ApplicationData.Current.LocalSettings.Values[LastLaunchArgsKey] = _lastLaunchArgs;
+            StopPump();
+            _runtimeHost.NotifyAppEvent((int)AppEventKind.Exit, null);
+            ApplicationData.Current.LocalSettings.Values[LastLaunchArgsKey] = string.Empty;
             _runtimeHost.Dispose();
-            deferral.Complete();
         }
 
-        private void OnUnhandledException(object sender, Windows.UI.Xaml.UnhandledExceptionEventArgs e)
+        // WindowActivationState.Deactivated → lost focus (background); otherwise foreground/resume.
+        private void OnWindowActivated(object sender, WindowActivatedEventArgs e)
         {
+            var kind = e.WindowActivationState == WindowActivationState.Deactivated ? AppEventKind.Deactivated : AppEventKind.Activated;
+            _runtimeHost.NotifyAppEvent((int)kind, null);
+        }
+
+        private void OnWindowVisibilityChanged(object sender, WindowVisibilityChangedEventArgs e)
+        {
+            var kind = e.Visible ? AppEventKind.Shown : AppEventKind.Hidden;
+            _runtimeHost.NotifyAppEvent((int)kind, null);
+        }
+
+        private void OnUnhandledException(object sender, Microsoft.UI.Xaml.UnhandledExceptionEventArgs e)
+        {
+            e.Handled = true;
+            var jsError = _runtimeHost.GetLastJsError();
+
+            // Surface to the JS `uncaughtError` application event before reporting.
+            try
+            {
+                var message = e.Message ?? jsError ?? "Unhandled exception";
+                _runtimeHost.NotifyAppEvent((int)AppEventKind.UncaughtError, message);
+            }
+            catch { }
+
             CrashDiagnostics.WriteExceptionReport(
                 "Xaml.UnhandledException",
                 e.Exception,
-                "Message=" + e.Message + "; Handled=" + e.Handled);
+                "JsError=" + (jsError ?? "<none>"));
+
+            var report = CrashDiagnostics.BuildErrorReport(e.Exception, jsError);
+            CrashDiagnostics.WriteToTraceLog(report);
+            var _ = CrashDiagnostics.ShowCrashDialogAsync(
+                e.Message ?? "Unhandled exception", report);
         }
 
+        // Pump cadence from two sources, both via the guarded SchedulePump(): CompositionTarget.Rendering
+        // (display refresh rate; smooth JS-driven animations) + a low-frequency DispatcherQueueTimer
+        // heartbeat (keeps timers/promises running when Rendering stops, e.g. minimised/occluded). The pump
+        // runs OUTSIDE the render walk (TryEnqueue) so the JS it pumps can mutate the XAML tree without
+        // tripping XAML's re-entrancy guard (which RoFailFasts with E_UNEXPECTED / 0xC000027B). _pumpQueued
+        // keeps at most one pump in flight.
+        private DispatcherQueue _dispatcherQueue;
+        private DispatcherQueueTimer _pumpHeartbeat;
+        private bool _pumpQueued;
+
+        private void StartPump()
+        {
+            _dispatcherQueue = DispatcherQueue.GetForCurrentThread();
+            CompositionTarget.Rendering -= OnRenderFrame;
+            CompositionTarget.Rendering += OnRenderFrame;
+            if (_pumpHeartbeat == null && _dispatcherQueue != null)
+            {
+                _pumpHeartbeat = _dispatcherQueue.CreateTimer();
+                _pumpHeartbeat.Interval = TimeSpan.FromMilliseconds(100);
+                _pumpHeartbeat.IsRepeating = true;
+                _pumpHeartbeat.Tick += OnPumpHeartbeat;
+                _pumpHeartbeat.Start();
+            }
+        }
+
+        private void StopPump()
+        {
+            CompositionTarget.Rendering -= OnRenderFrame;
+            if (_pumpHeartbeat != null)
+            {
+                _pumpHeartbeat.Stop();
+                _pumpHeartbeat.Tick -= OnPumpHeartbeat;
+                _pumpHeartbeat = null;
+            }
+        }
+
+        // Inside XAML's render walk — only schedule; never pump or touch the tree here.
+        private void OnRenderFrame(object sender, object e) => SchedulePump();
+
+        private void OnPumpHeartbeat(DispatcherQueueTimer sender, object args) => SchedulePump();
+
+        private void SchedulePump()
+        {
+            if (_pumpQueued)
+            {
+                return;
+            }
+            var dispatcherQueue = _dispatcherQueue;
+            if (dispatcherQueue == null)
+            {
+                return;
+            }
+            _pumpQueued = true;
+            dispatcherQueue.TryEnqueue(() =>
+            {
+                _pumpQueued = false;
+                _runtimeHost.PumpTimers();
 #if DEBUG
-        private void OnRenderFrame(object sender, object e) => _runtimeHost.PumpDevtools();
+                _runtimeHost.PumpDevtools();
 #endif
+            });
+        }
     }
 }

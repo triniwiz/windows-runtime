@@ -24,30 +24,29 @@ pub enum DeclarationKind {
 
 impl Display for DeclarationKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-       let value = match self {
-           DeclarationKind::Namespace => "Namespace",
-           DeclarationKind::Class => "Class",
-           DeclarationKind::Interface => "Interface",
-           DeclarationKind::GenericInterface => "GenericInterface",
-           DeclarationKind::GenericInterfaceInstance => "GenericInterfaceInstance",
-           DeclarationKind::Enum => "Enum",
-           DeclarationKind::EnumMember => "EnumMember",
-           DeclarationKind::Struct => "Struct",
-           DeclarationKind::StructField => "StructField",
-           DeclarationKind::Delegate => "Delegate",
-           DeclarationKind::GenericDelegate => "GenericDelegate",
-           DeclarationKind::GenericDelegateInstance => "GenericDelegateInstance",
-           DeclarationKind::Event => "Event",
-           DeclarationKind::Property => "Property",
-           DeclarationKind::Method => "Method",
-           DeclarationKind::Parameter => "Parameter"
-       };
-        write!(f,"{}", value)
+        let value = match self {
+            DeclarationKind::Namespace => "Namespace",
+            DeclarationKind::Class => "Class",
+            DeclarationKind::Interface => "Interface",
+            DeclarationKind::GenericInterface => "GenericInterface",
+            DeclarationKind::GenericInterfaceInstance => "GenericInterfaceInstance",
+            DeclarationKind::Enum => "Enum",
+            DeclarationKind::EnumMember => "EnumMember",
+            DeclarationKind::Struct => "Struct",
+            DeclarationKind::StructField => "StructField",
+            DeclarationKind::Delegate => "Delegate",
+            DeclarationKind::GenericDelegate => "GenericDelegate",
+            DeclarationKind::GenericDelegateInstance => "GenericDelegateInstance",
+            DeclarationKind::Event => "Event",
+            DeclarationKind::Property => "Property",
+            DeclarationKind::Method => "Method",
+            DeclarationKind::Parameter => "Parameter",
+        };
+        write!(f, "{}", value)
     }
 }
 
 pub trait Declaration {
-
     fn as_any(&self) -> &dyn Any;
 
     fn as_any_mut(&mut self) -> &mut dyn Any;

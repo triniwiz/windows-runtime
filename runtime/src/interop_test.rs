@@ -3,7 +3,9 @@ use serde_json::Value;
 use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
-use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PeekMessageW, PM_REMOVE, TranslateMessage};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+};
 
 fn unique_result_file(name: &str) -> String {
     let nanos = SystemTime::now()
@@ -185,8 +187,6 @@ fn application_data_values_string_keyed_map_behavior() {
     );
 }
 
-// ── DispatcherTimer delegate wiring tests ────────────────────────────────────
-//
 // These tests verify that assigning a plain JS function to DispatcherTimer.Tick
 // does not throw (i.e. the delegate IS registered). Actual firing requires a
 // running XAML STA dispatcher, which is not available in unit tests — so only
@@ -267,8 +267,6 @@ fn dispatcher_timer_tick_reassignment_removes_prior_handler() {
     );
 }
 
-// ── Timer integration tests ──────────────────────────────────────────────────
-
 #[test]
 fn timers_set_timeout_fires() {
     run_js_assert(
@@ -328,7 +326,8 @@ fn run_js_assert(name: &str, body: &str) {
     runtime.register_delegate_isolate_ptr();
     let result_file = unique_result_file(name);
     let result_file_json = serde_json::to_string(&result_file).unwrap();
-    let temp_dir_json = serde_json::to_string(&std::env::temp_dir().to_string_lossy().to_string()).unwrap();
+    let temp_dir_json =
+        serde_json::to_string(&std::env::temp_dir().to_string_lossy().to_string()).unwrap();
 
     let script = format!(
         r#"
@@ -436,7 +435,6 @@ fn typed_array_to_windows_buffer_roundtrip_readbyte() {
         "#,
     );
 }
-
 
 #[test]
 fn typed_array_to_windows_buffer_exposes_length() {
@@ -614,7 +612,6 @@ fn propertyset_marshalling_broad_validation() {
 
 #[test]
 fn arraybuffer_to_windows_buffer_roundtrip_readbyte() {
-
     run_js_assert(
         "arraybuffer_to_windows_buffer_roundtrip_readbyte",
         r#"
@@ -636,7 +633,6 @@ fn arraybuffer_to_windows_buffer_roundtrip_readbyte() {
         "#,
     );
 }
-
 
 #[test]
 fn typed_array_subarray_respects_byte_offset() {
@@ -757,6 +753,104 @@ fn interop_as_buffer_source_rejects_non_buffer_values() {
 
             if (!threw) {
                 throw new Error("Expected asBufferSource to reject non-buffer input");
+            }
+        "#,
+    );
+}
+
+#[test]
+fn interop_reference_and_typed_value_helpers_exist_and_box() {
+    run_js_assert(
+        "interop_reference_and_typed_value_helpers_exist_and_box",
+        r#"
+            const interop = NSWinRT.interop;
+
+            // Surface check: these regressed once when the helper script moved
+            // between source files, breaking NativeScript core (date/time pickers).
+            const expected = [
+                'reference', 'float', 'double', 'int', 'uint', 'long', 'ulong',
+                'short', 'ushort', 'byte', 'char', 'bool',
+                'timeSpan', 'dateTime', 'guid',
+            ];
+            for (const name of expected) {
+                if (typeof interop[name] !== 'function') {
+                    throw new Error(`NSWinRT.interop.${name} is not a function`);
+                }
+            }
+
+            // Behavior check: boxing produces a { handle } wrapper.
+            const boxed = [
+                interop.reference('Double', 1.5),
+                interop.reference('Windows.Foundation.TimeSpan', 1500),
+                interop.double(2.5),
+                interop.int(42),
+                interop.bool(true),
+                interop.timeSpan(250),
+                interop.dateTime(Date.now()),
+            ];
+            for (let i = 0; i < boxed.length; i++) {
+                if (boxed[i] == null || typeof boxed[i] !== 'object' || !('handle' in boxed[i])) {
+                    throw new Error(`Expected boxed value #${i} to be a { handle } wrapper, got ${JSON.stringify(boxed[i])}`);
+                }
+            }
+        "#,
+    );
+}
+
+#[test]
+fn diag_propertyset_mapchanged_event_resolution() {
+    use metadata::declarations::class_declaration::ClassDeclaration;
+    use metadata::meta_data_reader::MetadataReader;
+
+    let decl = MetadataReader::find_by_name("Windows.Foundation.Collections.PropertySet")
+        .expect("PropertySet metadata should resolve");
+    let lock = decl.read();
+    let clazz = lock
+        .as_any()
+        .downcast_ref::<ClassDeclaration>()
+        .expect("PropertySet should be a class declaration");
+
+    let found = crate::class_helpers::find_event_methods(clazz, "MapChanged");
+    assert!(
+        found.is_some(),
+        "find_event_methods could not resolve MapChanged on PropertySet"
+    );
+
+    let (add, _remove) = found.unwrap();
+    let info = crate::delegate_info_from_add_method(&add);
+    assert!(
+        info.is_some(),
+        "delegate_info_from_add_method failed for the MapChanged add method"
+    );
+}
+
+#[test]
+fn propertyset_mapchanged_event_fires_via_setter_assignment() {
+    run_js_assert(
+        "propertyset_mapchanged_event_fires_via_setter_assignment",
+        r#"
+            // End-to-end WinRT event path: `obj.Event = fn` must wire add_* with a
+            // JsDelegate that calls back into JS. PropertySet.MapChanged fires
+            // synchronously on Insert, so this works without a UI thread.
+            // Path A: explicit asDelegate handle (what NativeScript core does for Button.Click).
+            const psA = new Windows.Foundation.Collections.PropertySet();
+            let firedA = 0;
+            psA.MapChanged = NSWinRT.asDelegate(
+                'Windows.Foundation.Collections.MapChangedEventHandler`2<String, Object>',
+                function (sender, args) { firedA++; }
+            );
+            psA.Insert('k', 'v');
+            if (firedA !== 1) {
+                throw new Error(`Path A (asDelegate): expected MapChanged to fire once, fired ${firedA} times`);
+            }
+
+            // Path B: plain JS function auto-wrapped from the add method's delegate type.
+            const psB = new Windows.Foundation.Collections.PropertySet();
+            let firedB = 0;
+            psB.MapChanged = function (sender, args) { firedB++; };
+            psB.Insert('k', 'v');
+            if (firedB !== 1) {
+                throw new Error(`Path B (plain function): expected MapChanged to fire once, fired ${firedB} times`);
             }
         "#,
     );
@@ -895,8 +989,6 @@ fn message_channel_delivers_messages_across_ports() {
     );
 }
 
-// ─── MessagePort ────────────────────────────────────────────────────────────
-
 #[test]
 fn message_port_close_prevents_delivery() {
     run_js_assert(
@@ -1015,8 +1107,6 @@ fn message_port_remove_event_listener_stops_delivery() {
         "#,
     );
 }
-
-// ─── Worker ─────────────────────────────────────────────────────────────────
 
 #[test]
 fn worker_supports_eval_and_file_path_sources() {
@@ -1168,8 +1258,6 @@ fn worker_add_event_listener_receives_messages() {
         "#,
     );
 }
-
-// ─── Structured Clone ────────────────────────────────────────────────────────
 
 #[test]
 fn worker_structured_clone_date_roundtrip() {
@@ -1368,8 +1456,6 @@ fn worker_structured_clone_circular_ref_supported() {
         "#,
     );
 }
-
-// ─── Delegate ────────────────────────────────────────────────────────────────
 
 #[test]
 fn as_delegate_accepts_plain_function() {
@@ -1589,8 +1675,6 @@ fn event_emitter_emit_snapshot_prevents_late_add_being_called() {
     );
 }
 
-// ── WinRT delegate creation tests ────────────────────────────────────────────
-//
 // These tests exercise the JsDelegate COM bridge: when a plain JS function is
 // passed to a WinRT delegate constructor, the runtime should return a
 // `{ handle: External }` object whose handle is a valid COM pointer.
@@ -1713,8 +1797,6 @@ fn delegate_constructor_with_plain_object_falls_through() {
     );
 }
 
-// ── Composition border tests ──────────────────────────────────────────────────
-
 /// Verifies that `__nsCreateCompositionBorder` surfaces a catchable JS error
 /// rather than aborting the process. The test thread is MTA so XAML construction
 /// itself will throw an STA error — that's fine, we skip in that case.
@@ -1781,7 +1863,8 @@ fn run_js_assert_network(name: &str, body: &str) {
     runtime.register_delegate_isolate_ptr();
     let result_file = unique_result_file(name);
     let result_file_json = serde_json::to_string(&result_file).unwrap();
-    let temp_dir_json = serde_json::to_string(&std::env::temp_dir().to_string_lossy().to_string()).unwrap();
+    let temp_dir_json =
+        serde_json::to_string(&std::env::temp_dir().to_string_lossy().to_string()).unwrap();
 
     let script = format!(
         r#"
@@ -1981,8 +2064,6 @@ fn button_background_null_property_does_not_crash() {
     );
 }
 
-// ── __nsRunOnUIThread integration tests ──────────────────────────────────────
-//
 // In the test host (MTA thread) UI_QUEUE is never initialised, so
 // post_to_ui_thread falls back to synchronous inline execution.
 // These tests verify the JS-visible behaviour through that path.
@@ -2124,4 +2205,236 @@ fn run_on_ui_thread_callback_exception_does_not_crash_runtime() {
             // If we get here without a crash, the test passes.
         "#,
     );
+}
+
+/// Measures constructor and method/property call performance after the static-info cache
+/// is warm.  Run with `cargo test perf_ctor -- --nocapture` to see the numbers.
+///
+/// Expected (release build, after optimisations):
+///   warm constructor   < 5 µs per call
+///   property getter    < 3 µs per call
+#[test]
+fn perf_ctor_and_property_warm_cache() {
+    let mut runtime = Box::new(Runtime::new("."));
+    runtime.register_delegate_isolate_ptr();
+
+    // Warm up: first call populates MethodStaticInfo / PropertyStaticInfo caches.
+    runtime.run_script(
+        r#"
+        const _warmUri = new Windows.Foundation.Uri("https://example.com/");
+        const _warmLen = _warmUri.Path.length;
+    "#,
+        "perf_warmup.js",
+    );
+
+    const N: usize = 10_000;
+
+    let ctor_script = format!(
+        r#"
+        const __t0 = Date.now();
+        for (let i = 0; i < {n}; i++) {{
+            const u = new Windows.Foundation.Uri("https://example.com/" + i);
+        }}
+        const __ctorMs = Date.now() - __t0;
+        __nsProxyWriteTextFile(
+            __ctorResultFile,
+            JSON.stringify({{ ms: __ctorMs, n: {n} }})
+        );
+    "#,
+        n = N
+    );
+
+    let ctor_result = {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("perf_ctor_result.json");
+        tmp
+    };
+    let ctor_result_json =
+        serde_json::to_string(&ctor_result.to_string_lossy().to_string()).unwrap();
+
+    runtime.run_script(
+        &format!(
+            "const __ctorResultFile = {}; {}",
+            ctor_result_json, ctor_script
+        ),
+        "perf_ctor.js",
+    );
+
+    let prop_script = format!(
+        r#"
+        const __uri = new Windows.Foundation.Uri("https://example.com/path?q=1");
+        const __t1 = Date.now();
+        for (let i = 0; i < {n}; i++) {{
+            const p = __uri.Path;
+        }}
+        const __propMs = Date.now() - __t1;
+        __nsProxyWriteTextFile(
+            __propResultFile,
+            JSON.stringify({{ ms: __propMs, n: {n} }})
+        );
+    "#,
+        n = N
+    );
+
+    let prop_result = {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("perf_prop_result.json");
+        tmp
+    };
+    let prop_result_json =
+        serde_json::to_string(&prop_result.to_string_lossy().to_string()).unwrap();
+
+    runtime.run_script(
+        &format!(
+            "const __propResultFile = {}; {}",
+            prop_result_json, prop_script
+        ),
+        "perf_prop.js",
+    );
+
+    // Read results and print summary.
+    let ctor_json = std::fs::read_to_string(&ctor_result).unwrap_or_default();
+    let prop_json = std::fs::read_to_string(&prop_result).unwrap_or_default();
+
+    if let (Ok(cv), Ok(pv)) = (
+        serde_json::from_str::<serde_json::Value>(&ctor_json),
+        serde_json::from_str::<serde_json::Value>(&prop_json),
+    ) {
+        let ctor_ms = cv["ms"].as_f64().unwrap_or(0.0);
+        let prop_ms = pv["ms"].as_f64().unwrap_or(0.0);
+        let ctor_us = ctor_ms * 1000.0 / N as f64;
+        let prop_us = prop_ms * 1000.0 / N as f64;
+        println!("\n=== WinRT call performance ({N} iterations, warm cache) ===");
+        println!(
+            "  Uri constructor:  {:.2} µs/call  ({:.0} ms total)",
+            ctor_us, ctor_ms
+        );
+        println!(
+            "  Uri.Path getter:  {:.2} µs/call  ({:.0} ms total)",
+            prop_us, prop_ms
+        );
+        println!("===================================================\n");
+        // Sanity bounds — not strict, just to catch catastrophic regressions.
+        assert!(ctor_us < 500.0, "constructor too slow: {:.2} µs", ctor_us);
+        assert!(
+            prop_us < 500.0,
+            "property getter too slow: {:.2} µs",
+            prop_us
+        );
+    } else {
+        println!("(perf result files not written — skipping assertion)");
+    }
+}
+
+#[test]
+fn perf_return_kind_dispatch() {
+    let mut runtime = Box::new(Runtime::new("."));
+    runtime.register_delegate_isolate_ptr();
+
+    // Warm up caches.
+    runtime.run_script(
+        r#"
+        const _cal = new Windows.Globalization.Calendar();
+        const _dt = _cal.GetDateTime();
+        const _uri = new Windows.Foundation.Uri("https://example.com/");
+        const _qp = _uri.QueryParsed;
+    "#,
+        "perf_rk_warmup.js",
+    );
+
+    const N: usize = 10_000;
+
+    // Benchmark 1: method returning a WinRT struct (DateTime) — hits Struct path
+    let struct_script = format!(
+        r#"
+        const __cal = new Windows.Globalization.Calendar();
+        const __t0 = Date.now();
+        for (let i = 0; i < {n}; i++) {{
+            const dt = __cal.GetDateTime();
+        }}
+        const __structMs = Date.now() - __t0;
+        __nsProxyWriteTextFile(
+            __structResultFile,
+            JSON.stringify({{ ms: __structMs, n: {n} }})
+        );
+    "#,
+        n = N
+    );
+
+    let struct_result = {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("perf_rk_struct_result.json");
+        tmp
+    };
+    let struct_result_json =
+        serde_json::to_string(&struct_result.to_string_lossy().to_string()).unwrap();
+    runtime.run_script(
+        &format!(
+            "const __structResultFile = {}; {}",
+            struct_result_json, struct_script
+        ),
+        "perf_rk_struct.js",
+    );
+
+    // Benchmark 2: property returning a WinRT object (WwwFormUrlDecoder) — hits Object path
+    let obj_script = format!(
+        r#"
+        const __uri2 = new Windows.Foundation.Uri("https://example.com/path?q=1&r=2");
+        const __t1 = Date.now();
+        for (let i = 0; i < {n}; i++) {{
+            const qp = __uri2.QueryParsed;
+        }}
+        const __objMs = Date.now() - __t1;
+        __nsProxyWriteTextFile(
+            __objResultFile,
+            JSON.stringify({{ ms: __objMs, n: {n} }})
+        );
+    "#,
+        n = N
+    );
+
+    let obj_result = {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("perf_rk_obj_result.json");
+        tmp
+    };
+    let obj_result_json = serde_json::to_string(&obj_result.to_string_lossy().to_string()).unwrap();
+    runtime.run_script(
+        &format!(
+            "const __objResultFile = {}; {}",
+            obj_result_json, obj_script
+        ),
+        "perf_rk_obj.js",
+    );
+
+    let struct_json = std::fs::read_to_string(&struct_result).unwrap_or_default();
+    let obj_json = std::fs::read_to_string(&obj_result).unwrap_or_default();
+
+    if let (Ok(sv), Ok(ov)) = (
+        serde_json::from_str::<serde_json::Value>(&struct_json),
+        serde_json::from_str::<serde_json::Value>(&obj_json),
+    ) {
+        let struct_ms = sv["ms"].as_f64().unwrap_or(0.0);
+        let obj_ms = ov["ms"].as_f64().unwrap_or(0.0);
+        let struct_us = struct_ms * 1000.0 / N as f64;
+        let obj_us = obj_ms * 1000.0 / N as f64;
+        println!("\n=== ReturnKind dispatch perf ({N} iterations, warm cache) ===");
+        println!(
+            "  Calendar.GetDateTime() [struct]:  {:.2} µs/call  ({:.0} ms total)",
+            struct_us, struct_ms
+        );
+        println!(
+            "  Uri.QueryParsed [object]:         {:.2} µs/call  ({:.0} ms total)",
+            obj_us, obj_ms
+        );
+        println!("=========================================================\n");
+        assert!(
+            struct_us < 500.0,
+            "struct dispatch too slow: {:.2} µs",
+            struct_us
+        );
+        assert!(obj_us < 500.0, "object dispatch too slow: {:.2} µs", obj_us);
+    } else {
+        println!("(perf_return_kind result files not written — skipping assertion)");
+    }
 }

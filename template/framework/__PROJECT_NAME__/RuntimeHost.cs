@@ -44,6 +44,16 @@ namespace __PROJECT_NAME__
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_pump_timers))]
         private static extern void runtime_pump_timers();
 
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_notify_app_event))]
+        private static extern void runtime_notify_app_event(long runtime, int kind, [MarshalAs(UnmanagedType.LPUTF8Str)] string message);
+
+        public void NotifyAppEvent(int kind, string message = null)
+        {
+            if (!_initialized) return;
+            try { runtime_notify_app_event(_runtime, kind, message); }
+            catch { }
+        }
+
     #if DEBUG
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(ns_set_log_to_console))]
         private static extern int ns_set_log_to_console(int enabled);
