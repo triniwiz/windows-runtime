@@ -13,6 +13,12 @@ thread_local!(static DEVTOOLS_SERVER: RefCell<Option<DevtoolsServer>> = RefCell:
 
 thread_local!(static INSPECTOR_DOMAIN_DISPATCHERS: RefCell<HashMap<String, v8::Global<v8::Value>>> = RefCell::new(HashMap::new()));
 
+/// Drop cached inspector dispatcher handles (isolate-tied `v8::Global`s).
+/// Called from `Runtime::drop` while the isolate is still alive.
+pub(crate) fn clear_thread_dispatchers() {
+    INSPECTOR_DOMAIN_DISPATCHERS.with(|m| m.borrow_mut().clear());
+}
+
 const INSPECTOR_DISPATCHERS_GLOBAL: &str = "__nsInspectorDomainDispatchers";
 
 pub(crate) fn handle_register_domain_dispatcher(

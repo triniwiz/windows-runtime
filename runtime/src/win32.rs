@@ -53,7 +53,11 @@ thread_local! {
 
 fn cif_key(dll: &str, fn_name: &str) -> String {
     // Lower-case the DLL name so "Kernel32.dll" and "kernel32.dll" hit the same entry.
-    format!("{}|{}", dll.to_ascii_lowercase(), fn_name)
+    let mut key = String::with_capacity(dll.len() + 1 + fn_name.len());
+    key.extend(dll.chars().map(|c| c.to_ascii_lowercase()));
+    key.push('|');
+    key.push_str(fn_name);
+    key
 }
 
 /// Build (or retrieve) a cached `(fn_ptr, Cif)` for the given function.
@@ -119,7 +123,13 @@ fn resolve_proc(dll_handle: usize, func_name: &str) -> Result<*mut c_void, Strin
     Ok(ptr as *mut c_void)
 }
 
-fn ffi_type_for(ty: &str) -> Result<Type, String> {
+/// Load `dll` (cached) and resolve `func_name` to its raw address.
+pub(crate) fn resolve_fn(dll: &str, func_name: &str) -> Result<*mut c_void, String> {
+    let handle = load_dll(dll)?;
+    resolve_proc(handle, func_name)
+}
+
+pub(crate) fn ffi_type_for(ty: &str) -> Result<Type, String> {
     Ok(match ty {
         "void"    => Type::void(),
         "i8"      => Type::i8(),
@@ -281,17 +291,24 @@ pub(crate) fn call_win32_direct(
     ret_type: &str,
     arg_pairs: &[(&str, RawArgValue)],
 ) -> Result<Win32Result, String> {
-    let mut arg_types: Vec<Type>      = Vec::with_capacity(arg_pairs.len());
-    let mut stored:    Vec<StoredArg> = Vec::with_capacity(arg_pairs.len());
-
+    let mut stored: Vec<StoredArg> = Vec::with_capacity(arg_pairs.len());
     for (ty, val) in arg_pairs {
-        arg_types.push(ffi_type_for(ty)?);
         stored.push(marshal_raw(ty, val)?);
     }
 
-    get_or_build(dll, fn_name, ret_type, &arg_types)?;
-
     let key = cif_key(dll, fn_name);
+    let cached = CIF_CACHE.with(|cache| cache.borrow().contains_key(&key));
+    if !cached {
+        let mut arg_types: Vec<Type> = Vec::with_capacity(arg_pairs.len());
+        for (ty, _) in arg_pairs {
+            arg_types.push(ffi_type_for(ty)?);
+        }
+        let dll_handle = load_dll(dll)?;
+        let fn_ptr     = resolve_proc(dll_handle, fn_name)?;
+        let cif        = Cif::new(arg_types, ffi_type_for(ret_type)?);
+        CIF_CACHE.with(|cache| cache.borrow_mut().insert(key.clone(), CachedFn { fn_ptr, cif }));
+    }
+
     CIF_CACHE.with(|cache| {
         let borrow = cache.borrow();
         let entry  = borrow.get(&key).unwrap();

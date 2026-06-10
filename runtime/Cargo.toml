@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+mimalloc = "0.1"
 ahash = "0.8"
 byteorder = "1.5"
 regex = "1.10"

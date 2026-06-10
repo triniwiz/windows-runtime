@@ -29,6 +29,12 @@ thread_local!(static DEVTOOLS_SERVER: RefCell<Option<DevtoolsServer>> = RefCell:
 
 thread_local!(static INSPECTOR_DOMAIN_DISPATCHERS: RefCell<HashMap<String, v8::Global<v8::Value>>> = RefCell::new(HashMap::new()));
 
+/// Drop cached inspector dispatcher handles (isolate-tied `v8::Global`s).
+/// Called from `Runtime::drop` while the isolate is still alive.
+pub(crate) fn clear_thread_dispatchers() {
+    INSPECTOR_DOMAIN_DISPATCHERS.with(|m| m.borrow_mut().clear());
+}
+
 const INSPECTOR_DISPATCHERS_GLOBAL: &str = "__nsInspectorDomainDispatchers";
 
 pub(crate) fn value_to_string(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> Option<String> {
@@ -2862,14 +2868,63 @@ const HELPER_SOURCE: &str = r#"
                  */
                 bind: function (dll, returnType) {
                     var ret = returnType || 'i32';
+                    var raw = globalThis.__nsWin32CallRaw;
+                    var bindFast = globalThis.__nsWin32BindFast;
                     var win32 = globalThis.NSWinRT.win32;
+                    // One closure per name: a fresh closure per property access
+                    // defeats V8's inline caches at the call sites.
+                    var fns = Object.create(null);
                     return new Proxy({}, {
                         get: function (_, name) {
                             if (typeof name !== 'string') return undefined;
-                            return function () {
-                                var args = Array.prototype.slice.call(arguments).map(_autoType);
-                                return win32.call.apply(win32, [dll, name, ret].concat(args));
-                            };
+                            var hit = fns[name];
+                            if (hit !== undefined) return hit;
+                            var fn;
+                            if (typeof raw === 'function') {
+                                // Numeric signatures upgrade to a V8 Fast API Function
+                                // on first call; types derived from the call site lock
+                                // in, matching the native CIF cache. The wrapper keeps
+                                // delegating so captured references (import() globals,
+                                // destructuring) get the fast path too.
+                                var tryFast = typeof bindFast === 'function';
+                                var fastFn = null;
+                                fn = function () {
+                                    if (fastFn !== null) return fastFn.apply(null, arguments);
+                                    if (tryFast) {
+                                        tryFast = false;
+                                        var types = [];
+                                        var ok = arguments.length <= 4;
+                                        for (var i = 0; ok && i < arguments.length; i++) {
+                                            var v = arguments[i];
+                                            if (typeof v === 'number') types.push(Number.isInteger(v) ? 'i32' : 'f64');
+                                            else if (typeof v === 'boolean') types.push('bool');
+                                            else if (v === null || v === undefined) types.push('pointer');
+                                            else ok = false;
+                                        }
+                                        if (ok) {
+                                            var f = bindFast(dll, name, ret, types);
+                                            if (f) {
+                                                fastFn = f;
+                                                fns[name] = f;
+                                                return f.apply(null, arguments);
+                                            }
+                                        }
+                                    }
+                                    var rawArgs = [dll, name, ret];
+                                    for (var i = 0; i < arguments.length; i++) {
+                                        var t = _autoType(arguments[i]);
+                                        rawArgs.push(t.type, t.value);
+                                    }
+                                    return raw.apply(null, rawArgs);
+                                };
+                            } else {
+                                fn = function () {
+                                    var args = Array.prototype.slice.call(arguments).map(_autoType);
+                                    return win32.call.apply(win32, [dll, name, ret].concat(args));
+                                };
+                            }
+                            fns[name] = fn;
+                            return fn;
                         },
                     });
                 },
@@ -4023,6 +4078,39 @@ pub(crate) fn handle_win32_call_raw(
     }
 }
 
+/// `__nsWin32BindFast(dll, fn, retType, [argTypes])` — build a V8 Fast API
+/// capable bound Function for a purely numeric Win32 signature, or null when
+/// the signature is not fast-eligible (the JS caller keeps its fallback path).
+pub(crate) fn handle_win32_bind_fast(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    retval.set(v8::null(scope).into());
+    if args.length() < 3 {
+        return;
+    }
+    let Some(dll) = value_to_string(scope, args.get(0)) else { return };
+    let Some(fn_name) = value_to_string(scope, args.get(1)) else { return };
+    let Some(ret_type) = value_to_string(scope, args.get(2)) else { return };
+
+    let mut arg_types: Vec<String> = Vec::new();
+    if args.length() >= 4 {
+        let Ok(arr) = v8::Local::<v8::Array>::try_from(args.get(3)) else { return };
+        for i in 0..arr.length() {
+            let Some(v) = arr.get_index(scope, i) else { return };
+            let Some(s) = value_to_string(scope, v) else { return };
+            arg_types.push(s);
+        }
+    }
+
+    if let Some(f) =
+        crate::win32_fast::make_fast_bound_function(scope, &dll, &fn_name, &ret_type, &arg_types)
+    {
+        retval.set(f.into());
+    }
+}
+
 /// Calls an arbitrary Win32 function via libffi dynamic dispatch.
 /// Accepts a JSON string `{dll, fn, returnType, args:[{type,value}…]}` and
 /// returns `{"value": <result>}` or `{"error": "…"}`.
@@ -4093,6 +4181,7 @@ pub(crate) fn init_async_helpers(
     register!("__nsRunOnUIThread",              handle_run_on_ui_thread);
     register!("__nsWin32Call",                  handle_win32_call);
     register!("__nsWin32CallRaw",               handle_win32_call_raw);
+    register!("__nsWin32BindFast",              handle_win32_bind_fast);
     register!("__nsWin32Exports",               handle_win32_exports);
     register!("__ns__setTimeout",               crate::timers::handle_ns_set_timeout);
     register!("__ns__setInterval",              crate::timers::handle_ns_set_interval);

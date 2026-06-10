@@ -26,6 +26,7 @@ public static partial class Bridge
                 s_handles.TryRemove(id, out _);
                 if (s_nativePtrs.TryRemove(id, out var nativePtr))
                 {
+                    RemoveNativePtr(id, nativePtr);
                     try
                     {
                         Marshal.Release(nativePtr);
@@ -337,7 +338,7 @@ public static partial class Bridge
                 {
                     var p = ObtainNativePtr(value);
                     if (p != IntPtr.Zero)
-                        s_nativePtrs[id] = p;
+                        StoreNativePtr(id, p);
                 }
             }
             catch

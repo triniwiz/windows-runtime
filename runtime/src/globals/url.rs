@@ -6,6 +6,12 @@ thread_local! {
     static URL_CTOR: RefCell<Option<v8::Global<v8::Function>>> = const { RefCell::new(None) };
 }
 
+/// Called from `Runtime::drop` while the isolate is alive — the stored
+/// `v8::Global` must not outlive it.
+pub(crate) fn clear_thread_url_ctor() {
+    URL_CTOR.with(|c| *c.borrow_mut() = None);
+}
+
 struct UrlData {
     url: Url,
 }

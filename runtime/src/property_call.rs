@@ -142,11 +142,15 @@ fn substitute_type_vars(s: &str, type_args: &[String]) -> String {
 }
 
 /// Immutable per-property-method-type data cached after first construction.
-/// Key: (method_token as u64) << 1 | (is_initializer as u64).
+/// Class path key: (method_token as u64) << 1 | (is_initializer as u64).
+/// Interface path key: (token, declaring IID, is_setter) — the IID disambiguates
+/// generic interface instantiations that share metadata tokens.
 struct PropertyStaticInfo {
     cif: Rc<Cif>,
-    func: *mut c_void,
     iid: GUID,
+    /// Vtable slot index. The function pointer is re-read from the QI'd
+    /// interface's vtable per construction — implementations differ per class
+    /// even when the metadata token is shared (interface-declared members).
     index: usize,
     parameter_types: Vec<NativeType>,
     parse_parameter_types: Vec<NativeType>,
@@ -159,32 +163,27 @@ struct PropertyStaticInfo {
     number_of_abi_parameters: usize,
     return_kind: ReturnKind,
     param_sigs: Vec<String>,
+    type_args: Vec<String>,
 }
 
 thread_local! {
     static PROPERTY_STATIC_INFO_CACHE: RefCell<ahash::AHashMap<u64, Rc<PropertyStaticInfo>>>
         = RefCell::new(ahash::AHashMap::new());
+    /// Cache for the interface-routed constructors (generic vectors, maps, …).
+    /// Keyed by (method token | is_setter bit, declaring interface IID).
+    static INTERFACE_STATIC_INFO_CACHE: RefCell<ahash::AHashMap<(u64, u128), Rc<PropertyStaticInfo>>>
+        = RefCell::new(ahash::AHashMap::new());
 }
 
 pub struct PropertyCall {
-    index: usize,
-    number_of_parameters: usize,
-    number_of_abi_parameters: usize,
+    si: Rc<PropertyStaticInfo>,
     is_initializer: bool,
-    is_sealed: bool,
-    is_void: bool,
     is_setter: bool,
-    iid: GUID,
-    cif: Rc<Cif>,
-    func: *mut c_void,
+    /// Original (pre-QI) interface, kept alive for the duration of the call object.
+    #[allow(dead_code)]
     parent_interface: IUnknown,
     interface: IUnknown,
-    parameter_types: Vec<NativeType>,
-    parse_parameter_types: Vec<NativeType>,
-    parameters: Vec<ParameterDeclaration>,
-    return_type: String,
-    pub(crate) declaration: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>>,
-    type_args: Vec<String>,
+    func: *mut c_void,
     /// Pre-allocated argument buffer reused on every call to avoid per-call heap allocation.
     argument_buf: Vec<NativeValue>,
     /// Per-call parse-type tracker reused to avoid per-call heap allocation.
@@ -192,8 +191,6 @@ pub struct PropertyCall {
     /// Scratch buffer used when a WinRT property/method returns a value type
     /// or scalar that must be written into caller-owned storage.
     return_value_buf: [u8; 128],
-    pub(crate) return_kind: ReturnKind,
-    param_sigs: Vec<String>,
 }
 
 #[inline]
@@ -204,19 +201,59 @@ fn call_failure() -> HRESULT {
 
 impl PropertyCall {
     pub fn is_void(&self) -> bool {
-        self.is_void
+        self.si.is_void
     }
 
     pub fn return_type(&self) -> &str {
-        self.return_type.as_str()
+        self.si.return_type.as_str()
+    }
+
+    pub(crate) fn return_kind(&self) -> &ReturnKind {
+        &self.si.return_kind
     }
 
     pub fn parse_types_debug(&self) -> &[NativeType] {
-        &self.parse_parameter_types
+        &self.si.parse_parameter_types
     }
 
     pub fn abi_types_debug(&self) -> &[NativeType] {
-        &self.parameter_types
+        &self.si.parameter_types
+    }
+
+    fn from_static_info(
+        si: Rc<PropertyStaticInfo>,
+        interface: IUnknown,
+        is_setter: bool,
+        is_initializer: bool,
+    ) -> Option<Self> {
+        let vtable = interface.vtable();
+        let mut interface_ptr: *mut c_void = std::ptr::null_mut();
+        let result = unsafe {
+            ((*vtable).QueryInterface)(
+                interface.as_raw(),
+                &si.iid,
+                &mut interface_ptr as *mut _ as *mut *mut c_void,
+            )
+        };
+        if result.is_err() || interface_ptr.is_null() {
+            return None;
+        }
+        let queried_interface = unsafe { IUnknown::from_raw(interface_ptr) };
+        let vtable_ptr: *mut *mut c_void =
+            unsafe { std::mem::transmute(queried_interface.vtable()) };
+        let func = unsafe { *vtable_ptr.add(si.index) };
+        let cap = si.number_of_abi_parameters + 3;
+        Some(Self {
+            si,
+            is_initializer,
+            is_setter,
+            parent_interface: interface,
+            interface: queried_interface,
+            func,
+            return_value_buf: [0u8; 128],
+            argument_buf: Vec::with_capacity(cap),
+            argument_parse_types: Vec::with_capacity(cap),
+        })
     }
 
     pub fn new(
@@ -231,48 +268,10 @@ impl PropertyCall {
             property.getter()
         };
 
-        // Fast path: reuse cached static info, only QI needed.
+        // Fast path: reuse cached static info; only the QI is per-instance work.
         let cache_key = ((method.token().0 as u64) << 1) | (is_initializer as u64);
         if let Some(si) = PROPERTY_STATIC_INFO_CACHE.with(|c| c.borrow().get(&cache_key).cloned()) {
-            let parent_interface = interface.clone();
-            let vtable = interface.vtable();
-            let mut interface_ptr: *mut c_void = std::ptr::null_mut();
-            let result = unsafe {
-                ((*vtable).QueryInterface)(
-                    interface.as_raw(),
-                    &si.iid,
-                    &mut interface_ptr as *mut _ as *mut *mut c_void,
-                )
-            };
-            if result.is_err() || interface_ptr.is_null() {
-                return None;
-            }
-            let queried_interface = unsafe { IUnknown::from_raw(interface_ptr) };
-            return Some(Self {
-                index: si.index,
-                number_of_parameters: si.number_of_parameters,
-                number_of_abi_parameters: si.number_of_abi_parameters,
-                is_initializer,
-                is_sealed: si.is_sealed,
-                is_void: si.is_void,
-                is_setter,
-                iid: si.iid,
-                cif: Rc::clone(&si.cif),
-                func: si.func,
-                parent_interface,
-                interface: queried_interface,
-                parameter_types: si.parameter_types.clone(),
-                parse_parameter_types: si.parse_parameter_types.clone(),
-                parameters: si.parameters.clone(),
-                declaration: si.declaration.clone(),
-                return_type: si.return_type.clone(),
-                type_args: Vec::new(),
-                return_value_buf: [0u8; 128],
-                argument_buf: Vec::with_capacity(si.number_of_abi_parameters),
-                argument_parse_types: Vec::with_capacity(si.number_of_abi_parameters),
-                return_kind: si.return_kind.clone(),
-                param_sigs: si.param_sigs.clone(),
-            });
+            return Self::from_static_info(si, interface, is_setter, is_initializer);
         }
 
         let number_of_parameters = method.number_of_parameters();
@@ -465,48 +464,35 @@ impl PropertyCall {
         let return_kind = crate::classify_return(&return_type, is_void);
 
         let static_info = Rc::new(PropertyStaticInfo {
-            cif: Rc::clone(&cif),
-            func,
-            iid,
-            index,
-            parameter_types: parameter_types.clone(),
-            parse_parameter_types: parse_parameter_types.clone(),
-            parameters: parameters.clone(),
-            return_type: return_type.clone(),
-            is_void: method.is_void(),
-            is_sealed,
-            declaration: declaration.clone(),
-            number_of_parameters,
-            number_of_abi_parameters,
-            return_kind: return_kind.clone(),
-            param_sigs: param_sigs.clone(),
-        });
-        PROPERTY_STATIC_INFO_CACHE.with(|c| c.borrow_mut().insert(cache_key, static_info));
-
-        Some(Self {
-            index,
-            number_of_parameters,
-            number_of_abi_parameters,
-            is_initializer,
-            is_sealed,
-            is_void: method.is_void(),
-            iid,
             cif,
-            func,
-            parent_interface,
-            interface,
+            iid,
+            index,
             parameter_types,
             parse_parameter_types,
             parameters,
-            declaration,
             return_type,
-            is_setter,
-            type_args: Vec::new(),
-            return_value_buf: [0u8; 128],
-            argument_buf: Vec::with_capacity(number_of_abi_parameters),
-            argument_parse_types: Vec::with_capacity(number_of_abi_parameters),
+            is_void: method.is_void(),
+            is_sealed,
+            declaration,
+            number_of_parameters,
+            number_of_abi_parameters,
             return_kind,
             param_sigs,
+            type_args: Vec::new(),
+        });
+        PROPERTY_STATIC_INFO_CACHE.with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
+
+        let cap = number_of_abi_parameters + 3;
+        Some(Self {
+            si: static_info,
+            is_initializer,
+            is_setter,
+            parent_interface,
+            interface,
+            func,
+            return_value_buf: [0u8; 128],
+            argument_buf: Vec::with_capacity(cap),
+            argument_parse_types: Vec::with_capacity(cap),
         })
     }
 
@@ -526,6 +512,16 @@ impl PropertyCall {
         } else {
             property.getter()
         };
+
+        // Fast path: static info cached per (token, declaring IID) — generic
+        // instantiations share tokens, so the IID is part of the key.
+        let cache_key = (
+            ((method.token().0 as u64) << 1) | (is_setter as u64),
+            declaring_iid.to_u128(),
+        );
+        if let Some(si) = INTERFACE_STATIC_INFO_CACHE.with(|c| c.borrow().get(&cache_key).cloned()) {
+            return Self::from_static_info(si, interface, is_setter, is_initializer);
+        }
 
         let number_of_parameters = method.number_of_parameters();
         let mut index = 0_usize;
@@ -632,30 +628,36 @@ impl PropertyCall {
         index = index.saturating_add(base_offset);
         let func = unsafe { *vtable_ptr.offset(index as isize) };
 
-        Some(Self {
-            index,
-            number_of_parameters,
-            number_of_abi_parameters,
-            is_initializer,
-            is_sealed,
-            is_void,
-            iid: declaring_iid,
+        let static_info = Rc::new(PropertyStaticInfo {
             cif,
-            func,
-            parent_interface,
-            interface,
+            iid: declaring_iid,
+            index,
             parameter_types,
             parse_parameter_types,
             parameters: method.parameters().to_vec(),
-            declaration: None,
             return_type,
-            is_setter,
-            type_args,
-            return_value_buf: [0u8; 128],
-            argument_buf: Vec::with_capacity(number_of_abi_parameters),
-            argument_parse_types: Vec::with_capacity(number_of_abi_parameters),
+            is_void,
+            is_sealed,
+            declaration: None,
+            number_of_parameters,
+            number_of_abi_parameters,
             return_kind,
             param_sigs,
+            type_args,
+        });
+        INTERFACE_STATIC_INFO_CACHE.with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
+
+        let cap = number_of_abi_parameters + 3;
+        Some(Self {
+            si: static_info,
+            is_initializer,
+            is_setter,
+            parent_interface,
+            interface,
+            func,
+            return_value_buf: [0u8; 128],
+            argument_buf: Vec::with_capacity(cap),
+            argument_parse_types: Vec::with_capacity(cap),
         })
     }
 
@@ -667,6 +669,15 @@ impl PropertyCall {
         declaring_iid: GUID,
         type_args: Vec<String>,
     ) -> Option<Self> {
+        // Fast path: static info cached per (token, declaring IID).
+        let cache_key = (
+            (method.token().0 as u64) << 1,
+            declaring_iid.to_u128(),
+        );
+        if let Some(si) = INTERFACE_STATIC_INFO_CACHE.with(|c| c.borrow().get(&cache_key).cloned()) {
+            return Self::from_static_info(si, interface, false, false);
+        }
+
         let number_of_parameters = method.number_of_parameters();
         let mut index = 0_usize;
 
@@ -769,30 +780,36 @@ impl PropertyCall {
         index = index.saturating_add(base_offset);
         let func = unsafe { *vtable_ptr.offset(index as isize) };
 
-        Some(Self {
-            index,
-            number_of_parameters,
-            number_of_abi_parameters,
-            is_initializer: false,
-            is_sealed,
-            is_void,
-            iid: declaring_iid,
+        let static_info = Rc::new(PropertyStaticInfo {
             cif,
-            func,
-            parent_interface,
-            interface,
+            iid: declaring_iid,
+            index,
             parameter_types,
             parse_parameter_types,
             parameters: method.parameters().to_vec(),
-            declaration: None,
             return_type,
-            is_setter: false,
-            type_args,
-            return_value_buf: [0u8; 128],
-            argument_buf: Vec::with_capacity(number_of_abi_parameters),
-            argument_parse_types: Vec::with_capacity(number_of_abi_parameters),
+            is_void,
+            is_sealed,
+            declaration: None,
+            number_of_parameters,
+            number_of_abi_parameters,
             return_kind,
             param_sigs,
+            type_args,
+        });
+        INTERFACE_STATIC_INFO_CACHE.with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
+
+        let cap = number_of_abi_parameters + 3;
+        Some(Self {
+            si: static_info,
+            is_initializer: false,
+            is_setter: false,
+            parent_interface,
+            interface,
+            func,
+            return_value_buf: [0u8; 128],
+            argument_buf: Vec::with_capacity(cap),
+            argument_parse_types: Vec::with_capacity(cap),
         })
     }
 
@@ -803,7 +820,7 @@ impl PropertyCall {
     ) -> (HRESULT, *mut c_void, Vec<v8::Local<'s, v8::Value>>) {
         // Avoid heap allocation for the common 0-2 parameter case by using stack arrays.
         // Properties are almost always 0 params (getter) or 1 param (setter).
-        match self.parse_parameter_types.len() {
+        match self.si.parse_parameter_types.len() {
             0 => self.call_with_values(scope, &[]),
             1 => self.call_with_values(scope, &[args.get(0)]),
             2 => self.call_with_values(scope, &[args.get(0), args.get(1)]),
@@ -822,11 +839,11 @@ impl PropertyCall {
         scope: &mut v8::PinScope<'s, '_>,
         values: &[v8::Local<v8::Value>],
     ) -> (HRESULT, *mut c_void, Vec<v8::Local<'s, v8::Value>>) {
-        let is_void = self.is_void;
+        let is_void = self.si.is_void;
 
-        let is_value_type = matches!(self.return_kind, ReturnKind::Struct(_) | ReturnKind::Guid);
+        let is_value_type = matches!(self.si.return_kind, ReturnKind::Struct(_) | ReturnKind::Guid);
 
-        let is_scalar_return = matches!(self.return_type.as_str(),
+        let is_scalar_return = matches!(self.si.return_type.as_str(),
             "UInt8" | "Int8" | "UInt16" | "Int16" |
             "UInt32" | "Int32" | "UInt64" | "Int64" |
             "USize" | "ISize" | "Single" | "Double" |
@@ -835,7 +852,7 @@ impl PropertyCall {
 
         // HSTRING out-params must also land in a stable buffer; the local
         // `result` variable goes out of scope before the caller can read it.
-        let is_string_return = self.return_type.as_str() == "String";
+        let is_string_return = self.si.return_type.as_str() == "String";
 
         self.argument_buf.clear();
         self.argument_parse_types.clear();
@@ -848,11 +865,11 @@ impl PropertyCall {
         self.argument_buf.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
         self.argument_parse_types.push(None);
 
-        for (i, native_type) in self.parse_parameter_types.iter().enumerate() {
+        for (i, native_type) in self.si.parse_parameter_types.iter().enumerate() {
             let value = values.get(i).copied().unwrap_or_else(|| v8::undefined(scope).into());
 
-            let parameter = &self.parameters[i];
-            let param_sig = &self.param_sigs[i];
+            let parameter = &self.si.parameters[i];
+            let param_sig = &self.si.param_sigs[i];
             let is_sig_byref = param_sig.starts_with("ByRef ");
             if parameter.is_out() || is_sig_byref {
                 let slot_index = self.argument_buf.len();
@@ -903,7 +920,7 @@ impl PropertyCall {
                 NativeType::F32 => ffi_parse_f32_arg(value),
                 NativeType::F64 => ffi_parse_f64_arg(value),
                 NativeType::Pointer => {
-                    let parameter_signature: &str = &self.param_sigs[i];
+                    let parameter_signature: &str = &self.si.param_sigs[i];
 
                     // IReference<T> parameters: box JS primitives with the correct Create* call
                     // so XAML receives the right typed IPropertyValue (e.g. IReference<Double>).
@@ -958,10 +975,10 @@ impl PropertyCall {
                                     if let Some(ptr) = handle_ptr {
                                         Ok(NativeValue { pointer: ptr })
                                     } else if let Ok(func) = v8::Local::<v8::Function>::try_from(value) {
-                                        let parameter = &self.parameters[i];
+                                        let parameter = &self.si.parameters[i];
                                         let delegate_info = parameter.metadata().and_then(|meta| {
                                             let raw_iid = Signature::to_iid_string(meta, &parameter.type_());
-                                            let iid_name = substitute_type_vars(&raw_iid, &self.type_args);
+                                            let iid_name = substitute_type_vars(&raw_iid, &self.si.type_args);
                                             crate::delegate_info_from_type_sig(&iid_name)
                                         });
                                         if let Some((guid, param_types)) = delegate_info {
@@ -1072,7 +1089,7 @@ impl PropertyCall {
         let mut call_args: Vec<Arg> = Vec::with_capacity(self.argument_buf.len());
 
         for (i, v) in self.argument_buf.iter().enumerate() {
-            let Some(abi_native) = self.parameter_types.get(i) else {
+            let Some(abi_native) = self.si.parameter_types.get(i) else {
                 return (call_failure(), std::ptr::null_mut(), Vec::new());
             };
 
@@ -1093,7 +1110,7 @@ impl PropertyCall {
             call_args.push(unsafe { v.as_arg(&effective_native) });
         }
 
-        let ret = match catch_unwind(AssertUnwindSafe(|| unsafe { self.cif.call(CodePtr::from_ptr(self.func), &call_args) })) {
+        let ret = match catch_unwind(AssertUnwindSafe(|| unsafe { self.si.cif.call(CodePtr::from_ptr(self.func), &call_args) })) {
             Ok(code) => code,
             Err(_) => {
                 let msg = format!("WinRT property call panicked during invocation: returning E_FAIL");
@@ -1133,7 +1150,7 @@ impl PropertyCall {
                 continue;
             }
             // Borrow the pre-cached signature string — no String allocation needed.
-            let sig = &self.param_sigs[param_idx];
+            let sig = &self.si.param_sigs[param_idx];
             unsafe {
                 let v = match parse_native_type {
                     NativeType::Pointer | NativeType::Buffer | NativeType::Function => {

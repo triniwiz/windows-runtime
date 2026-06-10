@@ -21,6 +21,12 @@ thread_local! {
     static TASKS: RefCell<HashMap<i32, CallbackInfo>> = RefCell::new(HashMap::new());
 }
 
+/// Called from `Runtime::drop` while the isolate is alive — the stored
+/// `v8::Global`s must not outlive it.
+pub(crate) fn clear_thread_tasks() {
+    TASKS.with(|tasks| tasks.borrow_mut().clear());
+}
+
 struct TimerRef { due: Instant, id: i32 }
 thread_local! {
     // Per-thread channel used to receive fired timer ids targeted at this

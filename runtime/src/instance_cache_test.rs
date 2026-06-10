@@ -142,14 +142,15 @@ fn test_cache_hit_is_faster_than_miss() {
     );
 }
 
-/// Creating objects beyond the GC threshold must set GC_NUDGE_PENDING, signalling
-/// that an incremental GC has been requested to drain dead weak entries.
+/// Creating objects beyond the GC threshold must raise GC_NUDGE_NEXT_AT past
+/// its base value, signalling that an incremental GC was requested and the
+/// adaptive threshold advanced.
 #[test]
 fn test_gc_nudge_set_when_threshold_exceeded() {
     let mut runtime = Runtime::new(".");
 
-    // Reset flag in case a prior test left it set.
-    crate::GC_NUDGE_PENDING.with(|f| f.set(false));
+    // Reset the adaptive threshold in case a prior test on this thread moved it.
+    crate::GC_NUDGE_NEXT_AT.with(|f| f.set(crate::INSTANCE_CACHE_GC_THRESHOLD));
 
     // Create enough unique JsonValue objects to exceed the soft threshold.
     let count = crate::INSTANCE_CACHE_GC_THRESHOLD + 50;
@@ -164,17 +165,18 @@ fn test_gc_nudge_set_when_threshold_exceeded() {
     );
     runtime.run_script(&script, "gc_nudge_test.js");
 
-    // GC_NUDGE_PENDING must have been set at some point during the loop.
-    // (It may have been cleared by a subsequent GC, but the cache size alone
-    // is a reliable proxy — if it ever exceeded the threshold, the nudge fired.)
     let size = crate::INSTANCE_CACHE.with(|c| c.borrow().len());
     assert!(
         size > 0,
         "Expected at least some objects in the cache after creation"
     );
-    // The test is intentionally lenient: we just verify it doesn't panic and
-    // that GC_NUDGE_PENDING behaves correctly by checking it was set while the
-    // cache was large (covered in the size assertion above).
+    // All objects are strongly held by globals, so the cache exceeded the base
+    // threshold and the adaptive nudge threshold must have advanced beyond it.
+    let next_at = crate::GC_NUDGE_NEXT_AT.with(|f| f.get());
+    assert!(
+        next_at > crate::INSTANCE_CACHE_GC_THRESHOLD,
+        "Expected the adaptive GC nudge threshold to advance (got {next_at})"
+    );
 }
 
 /// Accessing a JsonArray element at the same index through two different array

@@ -29,10 +29,15 @@ use crate::{DeclarationFFI, ReturnKind};
 
 struct MethodStaticInfo {
     cif: Rc<Cif>,
-    func: *mut c_void,       // vtable slot — constant per WinRT COM interface type
     iid: GUID,
     pre_index: usize,
+    /// Vtable slot index for the method on its declaring interface. The actual
+    /// function pointer is re-read from the QI'd interface's vtable on every
+    /// construction: caching the pointer itself would be wrong for methods
+    /// declared on interfaces, where each implementing class has its own slot
+    /// implementation behind the same metadata token.
     index: usize,
+    method_name: String,
     parameter_types: Vec<NativeType>,
     parse_parameter_types: Vec<NativeType>,
     parameters: Vec<ParameterDeclaration>,
@@ -44,29 +49,38 @@ struct MethodStaticInfo {
     param_sigs: Vec<String>,
 }
 
+impl MethodStaticInfo {
+    fn error_stub() -> Rc<Self> {
+        Rc::new(Self {
+            cif: Rc::new(Cif::new(vec![], Type::i32())),
+            iid: IActivationFactory::IID,
+            pre_index: 0,
+            index: 0,
+            method_name: String::new(),
+            parameter_types: Vec::new(),
+            parse_parameter_types: Vec::new(),
+            parameters: Vec::new(),
+            return_type: String::new(),
+            is_void: true,
+            declaration: None,
+            number_of_parameters: 0,
+            return_kind: ReturnKind::Void,
+            param_sigs: Vec::new(),
+        })
+    }
+}
+
 thread_local! {
     static METHOD_STATIC_INFO_CACHE: RefCell<ahash::AHashMap<u64, Rc<MethodStaticInfo>>>
         = RefCell::new(ahash::AHashMap::new());
 }
 
 pub struct MethodCall {
-    index: usize,
-    method_name: String,
-    pre_index: usize,
-    number_of_parameters: usize,
-    number_of_abi_parameters: usize,
+    si: Rc<MethodStaticInfo>,
     is_initializer: bool,
     is_sealed: bool,
-    is_void: bool,
-    iid: GUID,
     interface: IUnknown,
-    cif: Rc<Cif>,
     func: *mut c_void,
-    parameter_types: Vec<NativeType>,
-    parse_parameter_types: Vec<NativeType>,
-    parameters: Vec<ParameterDeclaration>,
-    return_type: String,
-    pub(crate) declaration: Option<Arc<RwLock<dyn BaseClassDeclarationImpl>>>,
     /// Scratch buffer used when a WinRT method returns a value type (e.g. GUID, Rect)
     /// that is larger than, or cannot be safely aliased through, a single pointer slot.
     return_value_buf: [u8; 128],
@@ -77,8 +91,6 @@ pub struct MethodCall {
     /// Set when construction failed (e.g. QueryInterface returned E_NOINTERFACE for the IID).
     /// call() returns E_FAIL immediately instead of panicking.
     init_error: Option<String>,
-    pub(crate) return_kind: ReturnKind,
-    param_sigs: Vec<String>,
 }
 
 #[inline]
@@ -87,40 +99,30 @@ fn call_failure() -> HRESULT {
 }
 
 impl MethodCall {
-    fn new_init_error(interface: IUnknown, is_initializer: bool, is_sealed: bool, iid: GUID, error_msg: String) -> Self {
+    fn new_init_error(interface: IUnknown, is_initializer: bool, is_sealed: bool, _iid: GUID, error_msg: String) -> Self {
         Self {
-            cif: Rc::new(Cif::new(vec![], Type::i32())),
-            func: std::ptr::null_mut(),
-            index: 0,
-            method_name: String::new(),
-            pre_index: 0,
-            number_of_parameters: 0,
-            number_of_abi_parameters: 0,
+            si: MethodStaticInfo::error_stub(),
             is_initializer,
             is_sealed,
-            is_void: true,
-            iid,
             interface,
-            parameter_types: vec![],
-            parse_parameter_types: vec![],
-            parameters: vec![],
-            declaration: None,
-            return_type: String::new(),
+            func: std::ptr::null_mut(),
             return_value_buf: [0u8; 128],
             argument_buf: Vec::new(),
             argument_parse_types: Vec::new(),
             init_error: Some(error_msg),
-            return_kind: ReturnKind::Void,
-            param_sigs: Vec::new(),
         }
     }
 
     pub fn is_void(&self) -> bool {
-        self.is_void
+        self.si.is_void
     }
 
     pub fn return_type(&self) -> &str {
-        self.return_type.as_str()
+        self.si.return_type.as_str()
+    }
+
+    pub(crate) fn return_kind(&self) -> &ReturnKind {
+        &self.si.return_kind
     }
 
     pub fn init_error_message(&self) -> Option<&str> {
@@ -146,7 +148,7 @@ impl MethodCall {
         };
 
         // Fast path: if we've seen this method+sealed combination, reuse cached info.
-        // Skips find_declaring_interface_for_method + Cif::new + param processing (only 1 QI needed).
+        // Skips find_declaring_interface_for_method + Cif::new + param processing.
         let cache_key = ((method.token().0 as u64) << 1) | (is_sealed as u64);
         if let Some(si) = METHOD_STATIC_INFO_CACHE.with(|c| c.borrow().get(&cache_key).cloned()) {
             let vtable = interface.vtable();
@@ -165,31 +167,23 @@ impl MethodCall {
                         si.iid, crate::error::format_hresult_message(HRESULT(hr))));
             }
             let queried_interface = unsafe { IUnknown::from_raw(interface_ptr) };
+            // Re-read the function pointer from this instance's vtable: methods
+            // declared on interfaces share a metadata token across implementing
+            // classes, so the pointer must come from the actual object.
+            let vtable_ptr: *mut *mut c_void =
+                unsafe { std::mem::transmute(queried_interface.vtable()) };
+            let func = unsafe { *vtable_ptr.add(si.index) };
             let number_of_abi_parameters = si.parameter_types.len();
             return Self {
-                cif: Rc::clone(&si.cif),
-                func: si.func,
-                index: si.index,
-                pre_index: si.pre_index,
-                method_name: method.name().to_string(),
-                number_of_parameters: si.number_of_parameters,
-                number_of_abi_parameters,
+                si,
                 is_initializer,
                 is_sealed,
-                is_void: si.is_void,
-                iid: si.iid,
                 interface: queried_interface,
-                parameter_types: si.parameter_types.clone(),
-                parse_parameter_types: si.parse_parameter_types.clone(),
-                parameters: si.parameters.clone(),
-                declaration: si.declaration.clone(),
-                return_type: si.return_type.clone(),
+                func,
                 return_value_buf: [0u8; 128],
-                argument_buf: Vec::with_capacity(number_of_abi_parameters),
-                argument_parse_types: Vec::with_capacity(number_of_abi_parameters),
+                argument_buf: Vec::with_capacity(number_of_abi_parameters + 3),
+                argument_parse_types: Vec::with_capacity(number_of_abi_parameters + 3),
                 init_error: None,
-                return_kind: si.return_kind.clone(),
-                param_sigs: si.param_sigs.clone(),
             };
         }
 
@@ -434,47 +428,33 @@ impl MethodCall {
 
         // Store static info in cache so future calls on the same method type skip the slow path.
         let static_info = Rc::new(MethodStaticInfo {
-            cif: Rc::clone(&cif),
-            func,
-            iid,
-            pre_index,
-            index,
-            parameter_types: parameter_types.clone(),
-            parse_parameter_types: parse_parameter_types.clone(),
-            parameters: parameters.clone(),
-            return_type: return_type.clone(),
-            is_void,
-            declaration: declaration.clone(),
-            number_of_parameters,
-            return_kind: return_kind.clone(),
-            param_sigs: param_sigs.clone(),
-        });
-        METHOD_STATIC_INFO_CACHE.with(|c| c.borrow_mut().insert(cache_key, static_info));
-
-        Self {
             cif,
-            func,
-            index,
-            pre_index,
-            method_name: method.name().to_string(),
-            number_of_parameters,
-            number_of_abi_parameters,
-            is_initializer,
-            is_sealed,
-            is_void: method.is_void(),
             iid,
-            interface: queried_interface,
+            pre_index,
+            index,
+            method_name: method.name().to_string(),
             parameter_types,
             parse_parameter_types,
             parameters,
-            declaration,
             return_type,
-            return_value_buf: [0u8; 128],
-            argument_buf: Vec::with_capacity(number_of_abi_parameters),
-            argument_parse_types: Vec::with_capacity(number_of_abi_parameters),
-            init_error: None,
+            is_void,
+            declaration,
+            number_of_parameters,
             return_kind,
             param_sigs,
+        });
+        METHOD_STATIC_INFO_CACHE.with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
+
+        Self {
+            si: static_info,
+            is_initializer,
+            is_sealed,
+            interface: queried_interface,
+            func,
+            return_value_buf: [0u8; 128],
+            argument_buf: Vec::with_capacity(number_of_abi_parameters + 3),
+            argument_parse_types: Vec::with_capacity(number_of_abi_parameters + 3),
+            init_error: None,
         }
     }
 
@@ -492,13 +472,12 @@ impl MethodCall {
         }
 
         // Snapshot fields before the mutable borrow of argument_buf begins.
-        let _number_of_abi_parameters = self.number_of_abi_parameters;
         let is_initializer = self.is_initializer;
         let is_sealed = self.is_sealed;
-        let is_void = self.is_void;
-        let is_value_type = matches!(self.return_kind, ReturnKind::Struct(_) | ReturnKind::Guid);
+        let is_void = self.si.is_void;
+        let is_value_type = matches!(self.si.return_kind, ReturnKind::Struct(_) | ReturnKind::Guid);
 
-        let is_scalar_return = matches!(self.return_type.as_str(),
+        let is_scalar_return = matches!(self.si.return_type.as_str(),
             "UInt8" | "Int8" | "UInt16" | "Int16" |
             "UInt32" | "Int32" | "UInt64" | "Int64" |
             "USize" | "ISize" | "Single" | "Double" |
@@ -507,7 +486,7 @@ impl MethodCall {
 
         // HSTRING out-params must also land in a stable buffer so the returned
         // pointer remains valid after this call frame is unwound.
-        let is_string_return = self.return_type.as_str() == "String";
+        let is_string_return = self.si.return_type.as_str() == "String";
 
         self.argument_buf.clear();
         self.argument_parse_types.clear();
@@ -520,11 +499,11 @@ impl MethodCall {
         self.argument_buf.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
         self.argument_parse_types.push(None);
 
-        for (i, native_type) in self.parse_parameter_types.iter().enumerate() {
-            let parameter = &self.parameters[i];
+        for (i, native_type) in self.si.parse_parameter_types.iter().enumerate() {
+            let parameter = &self.si.parameters[i];
             // Use the pre-computed signature string (cached at construction time) to avoid
             // calling Signature::to_string() + metadata table reads on every invocation.
-            let param_sig = &self.param_sigs[i];
+            let param_sig = &self.si.param_sigs[i];
             let is_sig_byref = param_sig.starts_with("ByRef ");
 
             // Handle out (ByRef) parameters by allocating stable storage that
@@ -562,7 +541,7 @@ impl MethodCall {
                     }
                 }
 
-                // Store the parameter index so the marshaling loop can read self.param_sigs[i]
+                // Store the parameter index so the marshaling loop can read si.param_sigs[i]
                 // directly instead of carrying an owned String through the out_slots vector.
                 out_slots.push((slot_index, native_type.clone(), i, wrapper_obj));
                 continue;
@@ -614,7 +593,7 @@ impl MethodCall {
                     ffi_parse_f64_arg(value)
                 }
                 NativeType::Pointer => {
-                    let parameter_signature: &str = &self.param_sigs[i];
+                    let parameter_signature: &str = &self.si.param_sigs[i];
 
                     // IReference<T> parameters: box JS primitives with the correct Create* call
                     // so XAML receives the right typed IPropertyValue (e.g. IReference<Double>).
@@ -718,7 +697,7 @@ impl MethodCall {
                                     if let Some(ptr) = handle_ptr {
                                         Ok(NativeValue { pointer: ptr })
                                     } else if let Ok(func) = v8::Local::<v8::Function>::try_from(value) {
-                                        let parameter = &self.parameters[i];
+                                        let parameter = &self.si.parameters[i];
                                         let delegate_info = parameter.metadata().and_then(|meta| {
                                             let iid_name = Signature::to_iid_string(meta, &parameter.type_());
                                             crate::delegate_info_from_type_sig(&iid_name)
@@ -856,32 +835,32 @@ impl MethodCall {
             }
         }
 
-        let prep = match crate::ffi::prepare_string_storage(&self.argument_buf, &self.parameter_types, &self.argument_parse_types) {
+        let prep = match crate::ffi::prepare_string_storage(&self.argument_buf, &self.si.parameter_types, &self.argument_parse_types) {
             Ok(value) => value,
             Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
         };
 
         let func_to_call = self.func;
 
-        let call_args = crate::ffi::build_call_args(&prep, &self.argument_buf, &self.argument_parse_types);
+        let call_args = crate::ffi::build_call_args(&prep, &self.argument_buf, &self.si.parameter_types);
 
         // Guard against Rust panics crossing the FFI boundary and log common
         // COM HRESULTs (e.g. RPC_E_WRONG_THREAD) so callers can surface a
         // diagnostic to JS before a late destructor or release triggers a
         // process-level failure.
         let ret_i32_res = catch_unwind(AssertUnwindSafe(|| unsafe {
-            self.cif.call(CodePtr::from_ptr(func_to_call), &call_args)
+            self.si.cif.call(CodePtr::from_ptr(func_to_call), &call_args)
         }));
 
         let ret = match ret_i32_res {
             Ok(code) => code,
             Err(_) => {
-                let method_display = if self.method_name == ".ctor" {
+                let method_display = if self.si.method_name == ".ctor" {
                     "constructor"
-                } else if self.method_name == ".cctor" {
+                } else if self.si.method_name == ".cctor" {
                     "static constructor"
                 } else {
-                    self.method_name.as_str()
+                    self.si.method_name.as_str()
                 };
                 let msg = format!("WinRT call panicked during invocation of '{}': returning E_FAIL", method_display);
                 crate::store_last_js_error(msg);
@@ -895,12 +874,12 @@ impl MethodCall {
         let hr = HRESULT(ret);
         const RPC_E_WRONG_THREAD: u32 = 0x8001010E;
         if (hr.0 as u32) == RPC_E_WRONG_THREAD {
-            let method_display = if self.method_name == ".ctor" {
+            let method_display = if self.si.method_name == ".ctor" {
                 "constructor"
-            } else if self.method_name == ".cctor" {
+            } else if self.si.method_name == ".cctor" {
                 "static constructor"
             } else {
-                self.method_name.as_str()
+                self.si.method_name.as_str()
             };
             let detail = crate::error::format_hresult_message(hr);
             let msg = format!("{} when invoking '{}'", detail, method_display);
@@ -939,7 +918,7 @@ impl MethodCall {
                 continue;
             }
             // Borrow the pre-cached signature string (no String clone needed).
-            let sig = &self.param_sigs[param_idx];
+            let sig = &self.si.param_sigs[param_idx];
             unsafe {
                 let v = match parse_native_type {
                     NativeType::Pointer | NativeType::Buffer | NativeType::Function => {
@@ -999,7 +978,7 @@ impl MethodCall {
             return (call_failure(), 0);
         }
 
-        let is_void = self.is_void;
+        let is_void = self.si.is_void;
         self.argument_buf.clear();
         self.argument_buf.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
         self.argument_buf.push(NativeValue { pointer: ptr });
@@ -1009,12 +988,12 @@ impl MethodCall {
         }
         let mut call_args: Vec<Arg> = Vec::with_capacity(self.argument_buf.len());
         for (i, v) in self.argument_buf.iter().enumerate() {
-            let Some(native_type) = self.parameter_types.get(i) else {
+            let Some(native_type) = self.si.parameter_types.get(i) else {
                 return (call_failure(), 0);
             };
             call_args.push(unsafe { v.as_arg(native_type) });
         }
-        let ret: i32 = match catch_unwind(AssertUnwindSafe(|| unsafe { self.cif.call(CodePtr::from_ptr(self.func), &call_args) })) {
+        let ret: i32 = match catch_unwind(AssertUnwindSafe(|| unsafe { self.si.cif.call(CodePtr::from_ptr(self.func), &call_args) })) {
             Ok(code) => code,
             Err(_) => {
                 let msg = format!("WinRT event call panicked during invocation: returning E_FAIL");
@@ -1026,7 +1005,7 @@ impl MethodCall {
         if hr.is_err() {
             crate::store_last_js_error(format!(
                 "WinRT event add failed for '{}': {}",
-                self.method_name,
+                self.si.method_name,
                 crate::error::format_hresult_message(hr)
             ));
             return (hr, 0);
@@ -1051,12 +1030,12 @@ impl MethodCall {
         self.argument_buf.push(NativeValue { i64_value: token });
         let mut call_args: Vec<Arg> = Vec::with_capacity(self.argument_buf.len());
         for (i, v) in self.argument_buf.iter().enumerate() {
-            let Some(native_type) = self.parameter_types.get(i) else {
+            let Some(native_type) = self.si.parameter_types.get(i) else {
                 return call_failure();
             };
             call_args.push(unsafe { v.as_arg(native_type) });
         }
-        let ret: i32 = match catch_unwind(AssertUnwindSafe(|| unsafe { self.cif.call(CodePtr::from_ptr(self.func), &call_args) })) {
+        let ret: i32 = match catch_unwind(AssertUnwindSafe(|| unsafe { self.si.cif.call(CodePtr::from_ptr(self.func), &call_args) })) {
             Ok(code) => code,
             Err(_) => {
                 let msg = format!("WinRT event remove call panicked during invocation: returning E_FAIL");

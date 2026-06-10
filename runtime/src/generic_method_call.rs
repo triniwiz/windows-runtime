@@ -376,7 +376,7 @@ impl GenericMethodCall {
             Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
         };
 
-        let call_args = crate::ffi::build_call_args(&prep, &arguments, &argument_parse_types);
+        let call_args = crate::ffi::build_call_args(&prep, &arguments, &self.parameter_types);
 
         let ret_i32_res = catch_unwind(AssertUnwindSafe(|| unsafe {
             self.cif.call(CodePtr::from_ptr(self.func), &call_args)

@@ -1,3 +1,8 @@
+// The dispatch hot paths are dominated by small short-lived allocations, where
+// mimalloc beats the Windows heap.
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod class_helpers;
 pub(crate) mod dotnet;
 mod error;
@@ -22,10 +27,12 @@ mod type_description;
 pub mod ui_dispatcher;
 mod value;
 pub(crate) mod win32;
+pub(crate) mod win32_fast;
 pub(crate) mod win32_known_fns;
 mod worker_support;
 mod worker_threads;
 
+use crate::ns_proxy::CallbackThisObject;
 use crate::proxy_manifest_loader::SbgManifestLoader;
 use crate::value::{
     ffi_parse_bool_arg, ffi_parse_buffer_arg, ffi_parse_f32_arg, ffi_parse_f64_arg,
@@ -270,7 +277,7 @@ pub fn diag_libffi_create_string_value_via_runtime(s: &str) -> Option<String> {
             Err(_) => return None,
         };
 
-        let call_args = crate::ffi::build_call_args(&prep, &argument_buf, &argument_parse_types);
+        let call_args = crate::ffi::build_call_args(&prep, &argument_buf, &parameter_types);
 
         let cif = Cif::new(
             vec![Type::usize(), Type::usize(), Type::usize()],
@@ -317,29 +324,29 @@ thread_local!(pub(crate) static INSTANCE_CACHE: RefCell<HashMap<usize, v8::Weak<
 /// finalizers can drain dead entries.
 pub(crate) const INSTANCE_CACHE_GC_THRESHOLD: usize = 512;
 
-/// Set when the cache grows past INSTANCE_CACHE_GC_THRESHOLD. Cleared after the
-/// GC nudge is delivered. Using Cell<bool> avoids RefCell overhead on the fast path.
-thread_local!(pub(crate) static GC_NUDGE_PENDING: std::cell::Cell<bool> = std::cell::Cell::new(false));
+/// Next cache size at which to deliver a GC nudge. Doubles after each nudge:
+/// a fixed threshold oscillates in allocation loops (nudge → GC prunes below
+/// threshold → next insert re-nudges), serializing every creation behind
+/// incremental-marking work.
+thread_local!(pub(crate) static GC_NUDGE_NEXT_AT: std::cell::Cell<usize> = std::cell::Cell::new(INSTANCE_CACHE_GC_THRESHOLD));
 
 /// IActivationFactory cache: RoGetActivationFactory is expensive (COM broker round-trip) but factories
 /// are app-lifetime singletons — same class name always returns the same factory pointer.
 /// Keyed on the WinRT class full name (e.g. "Microsoft.UI.Xaml.Controls.TextBlock").
 thread_local!(static ACTIVATION_FACTORY_CACHE: RefCell<HashMap<String, IUnknown>> = RefCell::new(HashMap::new()));
 
-/// Called with an active isolate reference after inserting into the cache.
-/// Requests an incremental V8 GC when the soft threshold is exceeded.
+/// Called after inserting into the cache; re-arms once the cache genuinely
+/// shrinks back under the base threshold.
 #[inline]
 pub(crate) fn maybe_request_gc_nudge(cache_size: usize, isolate: &mut v8::Isolate) {
-    if cache_size > INSTANCE_CACHE_GC_THRESHOLD {
-        let already_pending = GC_NUDGE_PENDING.with(|f| f.get());
-        if !already_pending {
-            GC_NUDGE_PENDING.with(|f| f.set(true));
+    GC_NUDGE_NEXT_AT.with(|next| {
+        if cache_size >= next.get() {
             isolate.memory_pressure_notification(v8::MemoryPressureLevel::Moderate);
+            next.set(cache_size.saturating_mul(2).max(INSTANCE_CACHE_GC_THRESHOLD));
+        } else if cache_size < INSTANCE_CACHE_GC_THRESHOLD {
+            next.set(INSTANCE_CACHE_GC_THRESHOLD);
         }
-    } else {
-        // Cache shrank back below threshold (GC ran) — reset the flag.
-        GC_NUDGE_PENDING.with(|f| f.set(false));
-    }
+    });
 }
 
 pub(crate) fn proxy_manifests() -> &'static Mutex<Vec<String>> {
@@ -3929,6 +3936,21 @@ fn create_ns_ctor_instance_object<'a>(
         }
     }
 
+    // Member callbacks resolve the COM instance from internal field 0, so a
+    // template built for one instance serves all. The "L|" prefix keeps this
+    // builder's templates separate from ns_proxy's — the interceptor sets differ.
+    let template_key: String = match &parent {
+        Some(p) => format!("L|{}|{}", name, p.read().full_name()),
+        None => format!("L|{}", name),
+    };
+    let cached_tmpl: Option<v8::Global<v8::FunctionTemplate>> = scope
+        .get_slot::<crate::ns_proxy::InstanceTemplateCache>()
+        .and_then(|c| c.0.borrow().get(template_key.as_str()).cloned());
+    if let Some(tmpl_global) = cached_tmpl {
+        let tmpl = v8::Local::new(scope, &tmpl_global);
+        return crate::ns_proxy::finish_instance_object(tmpl, declaration, instance, identity_key, scope);
+    }
+
     let class_name = v8::String::new(scope, name).unwrap();
 
     let tmpl = FunctionTemplate::new(scope, handle_ns_func);
@@ -4011,7 +4033,7 @@ fn create_ns_ctor_instance_object<'a>(
                         {
                             let property_clone = property.clone();
                             drop(lock);
-                            let Some(ns_instance) = dec.instance.clone() else {
+                            let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else {
                                 return v8::Intercepted::kNo;
                             };
                             let Some(mut property_call) = PropertyCall::new_for_interface(
@@ -4084,7 +4106,7 @@ fn create_ns_ctor_instance_object<'a>(
                             iface.methods().iter().find(|m| m.name() == name.as_str())
                         {
                             let method_clone = method_decl.clone();
-                            let Some(ns_instance) = dec.instance.clone() else {
+                            let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else {
                                 drop(lock);
                                 return v8::Intercepted::kNo;
                             };
@@ -4222,7 +4244,7 @@ fn create_ns_ctor_instance_object<'a>(
                         {
                             let property_clone = property.clone();
                             drop(lock);
-                            let Some(ns_instance) = dec.instance.clone() else {
+                            let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else {
                                 return v8::Intercepted::kNo;
                             };
                             let Some(mut property_call) = PropertyCall::new_for_interface(
@@ -4294,7 +4316,7 @@ fn create_ns_ctor_instance_object<'a>(
                             iface.methods().iter().find(|m| m.name() == name.as_str())
                         {
                             let method_clone = method_decl.clone();
-                            let Some(ns_instance) = dec.instance.clone() else {
+                            let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else {
                                 drop(lock);
                                 return v8::Intercepted::kNo;
                             };
@@ -4427,7 +4449,7 @@ fn create_ns_ctor_instance_object<'a>(
                     }
 
                     if let Some(property) = find_class_property(clazz, &name) {
-                        let Some(ns_instance) = dec.instance.clone() else {
+                        let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else {
                             return v8::Intercepted::kNo;
                         };
                         let Some(mut property_call) =
@@ -4514,7 +4536,7 @@ fn create_ns_ctor_instance_object<'a>(
                                 else {
                                     return;
                                 };
-                                let Some(ns_instance) = dec.instance.clone() else {
+                                let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else {
                                     return;
                                 };
                                 let mut method =
@@ -4697,7 +4719,7 @@ fn create_ns_ctor_instance_object<'a>(
                             if property.setter().is_some() {
                                 let property_clone = property.clone();
                                 drop(lock);
-                                let Some(ns_instance) = dec.instance.clone() else {
+                                let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else {
                                     return v8::Intercepted::kNo;
                                 };
                                 let Some(mut property_call) = PropertyCall::new_for_interface(
@@ -4739,7 +4761,7 @@ fn create_ns_ctor_instance_object<'a>(
                             if property.setter().is_some() {
                                 let property_clone = property.clone();
                                 drop(lock);
-                                let Some(ns_instance) = dec.instance.clone() else {
+                                let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else {
                                     return v8::Intercepted::kNo;
                                 };
                                 let Some(mut property_call) = PropertyCall::new_for_interface(
@@ -4779,7 +4801,7 @@ fn create_ns_ctor_instance_object<'a>(
                             return v8::Intercepted::kNo;
                         }
 
-                        let Some(ns_instance) = dec.instance.clone() else {
+                        let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else {
                             return v8::Intercepted::kNo;
                         };
                         let Some(mut property_call) =
@@ -4897,7 +4919,9 @@ fn create_ns_ctor_instance_object<'a>(
 
                 let to_string = v8::String::new(scope, "toString").unwrap();
 
-                object_tmpl.set(to_string.into(), to_string_func.into());
+                // Instance-template properties are copied onto every object at
+                // new_instance; prototype members are shared.
+                proto.set(to_string.into(), to_string_func.into());
 
                 for method in class_methods.iter() {
                     let method_name = if method.overload_name().is_empty() {
@@ -4954,7 +4978,7 @@ fn create_ns_ctor_instance_object<'a>(
                         };
 
                         let _nam = method.name();
-                        let Some(ns_instance) = dec.instance.clone() else {
+                        let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else {
                             return;
                         };
                         let mut method =
@@ -5134,7 +5158,8 @@ fn create_ns_ctor_instance_object<'a>(
                             v8::PropertyAttribute::DONT_DELETE,
                         );
                     } else {
-                        object_tmpl.set_with_attr(
+                        // Prototype, not instance template — see toString above.
+                        proto.set_with_attr(
                             name.unwrap().into(),
                             func.into(),
                             v8::PropertyAttribute::DONT_DELETE,
@@ -5189,7 +5214,7 @@ fn create_ns_ctor_instance_object<'a>(
                                 return;
                             };
 
-                            let Some(ns_instance) = dec.instance.clone() else {
+                            let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else {
                                 return;
                             };
                             let Some(mut method) =
@@ -5351,7 +5376,7 @@ fn create_ns_ctor_instance_object<'a>(
                                     else {
                                         return;
                                     };
-                                    let Some(ns_instance) = dec.instance.clone() else {
+                                    let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else {
                                         return;
                                     };
                                     let Some(mut method) =
@@ -5384,7 +5409,8 @@ fn create_ns_ctor_instance_object<'a>(
                         );
                     } else {
                         let name = name.unwrap();
-                        object_tmpl.set_accessor_property(
+                        // Prototype, not instance template — see toString above.
+                        proto.set_accessor_property(
                             name.into(),
                             Some(getter),
                             setter,
@@ -5472,7 +5498,7 @@ fn create_ns_ctor_instance_object<'a>(
 
                                     let Some(method) = lock.as_any().downcast_ref::<MethodDeclaration>() else { return; };
 
-                                    let Some(ns_instance) = dec.instance.clone() else { return; };
+                                    let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else { return; };
                                     let mut method = MethodCall::new(
                                         method, method.is_sealed(), ns_instance, false,
                                     );
@@ -5619,7 +5645,7 @@ fn create_ns_ctor_instance_object<'a>(
 
                                     let Some(property) = lock.as_any().downcast_ref::<PropertyDeclaration>() else { return; };
 
-                                    let Some(ns_instance) = dec.instance.clone() else { return; };
+                                    let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else { return; };
                                     let mut method = MethodCall::new(
                                         property.getter(), false, ns_instance, false,
                                     );
@@ -5781,7 +5807,7 @@ fn create_ns_ctor_instance_object<'a>(
 
                                     let Some(method) = lock.as_any().downcast_ref::<MethodDeclaration>() else { return; };
 
-                                    let Some(ns_instance) = dec.instance.clone() else { return; };
+                                    let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else { return; };
                                     let mut method = MethodCall::new(
                                         method, method.is_sealed(), ns_instance, false,
                                     );
@@ -5928,7 +5954,7 @@ fn create_ns_ctor_instance_object<'a>(
 
                                     let Some(method) = lock.as_any().downcast_ref::<PropertyDeclaration>() else { return; };
 
-                                    let Some(ns_instance) = dec.instance.clone() else { return; };
+                                    let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else { return; };
                                     let Some(mut method) = PropertyCall::new(
                                         method, false, ns_instance, false,
                                     ) else { return; };
@@ -6078,7 +6104,7 @@ fn create_ns_ctor_instance_object<'a>(
                                     let lock = dec.read();
                                     let Some(method) = lock.as_any().downcast_ref::<MethodDeclaration>() else { return; };
 
-                                    let Some(ns_instance) = dec.instance.clone() else { return; };
+                                    let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else { return; };
                                     let mut method = MethodCall::new(
                                         method,
                                         method.is_sealed(),
@@ -6207,7 +6233,7 @@ fn create_ns_ctor_instance_object<'a>(
                                 return;
                             };
 
-                            let Some(ns_instance) = dec.instance.clone() else {
+                            let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else {
                                 return;
                             };
                             let mut method =
@@ -6374,7 +6400,7 @@ fn create_ns_ctor_instance_object<'a>(
                                 return;
                             };
 
-                            let Some(ns_instance) = dec.instance.clone() else {
+                            let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else {
                                 return;
                             };
                             let Some(mut method) =
@@ -6509,7 +6535,7 @@ fn create_ns_ctor_instance_object<'a>(
                                     let Some(setter) = prop.setter() else {
                                         return;
                                     };
-                                    let Some(ns_instance) = dec.instance.clone() else {
+                                    let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else {
                                         return;
                                     };
                                     let mut method =
@@ -6657,7 +6683,7 @@ fn create_ns_ctor_instance_object<'a>(
                                 return;
                             };
 
-                            let Some(ns_instance) = dec.instance.clone() else {
+                            let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else {
                                 return;
                             };
                             let mut method = GenericMethodCall::new(
@@ -6869,52 +6895,14 @@ fn create_ns_ctor_instance_object<'a>(
         }
     }
 
-    let object = match object_tmpl.new_instance(scope) {
-        Some(o) => o,
-        None => {
-            let msg = v8::String::new(scope, "Failed to create instance object").unwrap();
-            let err = v8::Exception::error(scope, msg.into());
-            scope.throw_exception(err);
-            return v8::null(scope).into();
+    {
+        let g = v8::Global::new(scope, tmpl);
+        if let Some(cache) = scope.get_slot::<crate::ns_proxy::InstanceTemplateCache>() {
+            cache.0.borrow_mut().insert(template_key, g);
         }
-    };
-
-    object.set_internal_field(0, ext.into());
-
-    // Per-instance side store for JS-assigned overrides and caching
-    let object_store = v8::Map::new(scope);
-    object.set_internal_field(1, object_store.into());
-
-    if let Some(handle_key) = v8::String::new(scope, "handle") {
-        let handle_value: Local<v8::Value> = if let Some(instance) = instance.as_ref() {
-            v8::External::new(scope, instance.as_raw() as *mut c_void).into()
-        } else {
-            v8::null(scope).into()
-        };
-        object.set(scope, handle_key.into(), handle_value);
     }
 
-    let ret = object;
-
-    if let Some(key) = identity_key {
-        let weak = v8::Weak::with_guaranteed_finalizer(
-            scope.as_mut(),
-            ret,
-            Box::new(move || {
-                INSTANCE_CACHE.with(|cache| {
-                    cache.borrow_mut().remove(&key);
-                });
-            }),
-        );
-        let new_size = INSTANCE_CACHE.with(|cache| {
-            let mut c = cache.borrow_mut();
-            c.insert(key, weak);
-            c.len()
-        });
-        maybe_request_gc_nudge(new_size, scope.as_mut());
-    }
-
-    ret.into()
+    crate::ns_proxy::finish_instance_object(tmpl, declaration, instance, identity_key, scope)
 }
 
 /// Converts a raw WinRT out-parameter result pointer to a `Local<v8::Value>`.
@@ -7438,7 +7426,7 @@ fn create_ns_ctor_object<'a>(
                     }
 
                     if let Some(property) = find_class_property(clazz, &name) {
-                        let Some(ns_instance) = dec.instance.clone() else {
+                        let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else {
                             return v8::Intercepted::kNo;
                         };
                         let Some(mut property_call) =
@@ -7525,7 +7513,7 @@ fn create_ns_ctor_object<'a>(
                                 else {
                                     return;
                                 };
-                                let Some(ns_instance) = dec.instance.clone() else {
+                                let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else {
                                     return;
                                 };
                                 let mut method =
@@ -9076,7 +9064,7 @@ fn handle_named_property_getter(
                                     return;
                                 };
 
-                                let Some(ns_instance) = dec.instance.clone() else {
+                                let Some(ns_instance) = crate::ns_proxy::this_instance(scope, args.this_object()).or_else(|| dec.instance.clone()) else {
                                     return;
                                 };
 
@@ -9788,6 +9776,7 @@ impl Runtime {
                 preload_sbg_manifest();
                 init_global(scope, context);
                 globals::console::init_console(scope, context);
+                globals::performance::install_fast_now(scope, context);
                 init_meta(scope, context);
                 crate::global_fns::init_async_helpers(scope, app_root);
                 crate::win32::prewarm_known_fns();
@@ -9801,6 +9790,7 @@ impl Runtime {
             let ctx_clone = global_context.clone();
             isolate.set_slot(ctx_clone);
         }
+        isolate.set_slot(crate::ns_proxy::InstanceTemplateCache::new());
         // Don't capture `&mut *isolate as *mut v8::Isolate` here: the wrapper's
         // address moves with the `OwnedIsolate` into `Self`, dangling our pointer.
         // The caller must invoke `register_delegate_isolate_ptr` after boxing.
@@ -10075,7 +10065,21 @@ impl Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
+        // Every thread-local that holds isolate-tied state (v8::Global, v8::Weak,
+        // raw isolate pointers) must be cleared here, while `self.isolate` is
+        // still alive. Anything left behind dangles into freed isolate memory
+        // and crashes the next Runtime created on this thread.
         INSTANCE_CACHE.with(|cache| cache.borrow_mut().clear());
+        ESM_MODULE_REGISTRY.with(|m| m.borrow_mut().clear());
+        ESM_HASH_TO_PATH.with(|m| m.borrow_mut().clear());
+        DOTNET_JS_CALLBACKS.with(|m| m.borrow_mut().clear());
+        DOTNET_ONESHOT_JS_CALLBACKS.with(|m| m.borrow_mut().clear());
+        crate::timers::clear_thread_tasks();
+        crate::globals::url::clear_thread_url_ctor();
+        crate::inspector::clear_thread_dispatchers();
+        crate::global_fns::clear_thread_dispatchers();
+        ISOLATE.with(|cell| *cell.borrow_mut() = None);
+        DELEGATE_ISOLATE_PTR.with(|cell| cell.set(std::ptr::null_mut()));
         if self.winrt_initialized {
             unsafe { RoUninitialize() };
         }
