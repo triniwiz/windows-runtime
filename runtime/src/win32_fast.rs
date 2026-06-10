@@ -1,3 +1,4 @@
+use libffi::middle::{Arg, Cif, CodePtr};
 /// V8 Fast API bindings for Win32 functions with purely numeric signatures.
 ///
 /// `__nsWin32BindFast(dll, fn, retType, [argTypes])` returns a JS `Function`
@@ -6,7 +7,6 @@
 /// no handle scope, no JS-value boxing. Unoptimized frames use `slow_call`,
 /// which must keep identical semantics.
 use std::ffi::c_void;
-use libffi::middle::{Arg, Cif, CodePtr};
 use v8::fast_api::{
     CFunction, CFunctionInfo, CTypeInfo, FastApiCallbackOptions, Flags, Int64Representation,
     Type as FastType,
@@ -128,7 +128,11 @@ impl BoundWin32Fn {
 unsafe fn bound_from_data(data: v8::Local<v8::Value>) -> Option<&'static BoundWin32Fn> {
     let ext = unsafe { data.cast::<v8::External>() };
     let ptr = ext.value() as *const BoundWin32Fn;
-    if ptr.is_null() { None } else { Some(unsafe { &*ptr }) }
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &*ptr })
+    }
 }
 
 // Fast entry points, one per arity. V8 calls these directly from optimized
@@ -209,16 +213,31 @@ static ARGS_2: [CTypeInfo; 4] = [RECV, F64ARG, F64ARG, OPTS];
 static ARGS_3: [CTypeInfo; 5] = [RECV, F64ARG, F64ARG, F64ARG, OPTS];
 static ARGS_4: [CTypeInfo; 6] = [RECV, F64ARG, F64ARG, F64ARG, F64ARG, OPTS];
 
-static INFO_0: SyncCFunctionInfo =
-    SyncCFunctionInfo(CFunctionInfo::new(RET_F64, &ARGS_0, Int64Representation::Number));
-static INFO_1: SyncCFunctionInfo =
-    SyncCFunctionInfo(CFunctionInfo::new(RET_F64, &ARGS_1, Int64Representation::Number));
-static INFO_2: SyncCFunctionInfo =
-    SyncCFunctionInfo(CFunctionInfo::new(RET_F64, &ARGS_2, Int64Representation::Number));
-static INFO_3: SyncCFunctionInfo =
-    SyncCFunctionInfo(CFunctionInfo::new(RET_F64, &ARGS_3, Int64Representation::Number));
-static INFO_4: SyncCFunctionInfo =
-    SyncCFunctionInfo(CFunctionInfo::new(RET_F64, &ARGS_4, Int64Representation::Number));
+static INFO_0: SyncCFunctionInfo = SyncCFunctionInfo(CFunctionInfo::new(
+    RET_F64,
+    &ARGS_0,
+    Int64Representation::Number,
+));
+static INFO_1: SyncCFunctionInfo = SyncCFunctionInfo(CFunctionInfo::new(
+    RET_F64,
+    &ARGS_1,
+    Int64Representation::Number,
+));
+static INFO_2: SyncCFunctionInfo = SyncCFunctionInfo(CFunctionInfo::new(
+    RET_F64,
+    &ARGS_2,
+    Int64Representation::Number,
+));
+static INFO_3: SyncCFunctionInfo = SyncCFunctionInfo(CFunctionInfo::new(
+    RET_F64,
+    &ARGS_3,
+    Int64Representation::Number,
+));
+static INFO_4: SyncCFunctionInfo = SyncCFunctionInfo(CFunctionInfo::new(
+    RET_F64,
+    &ARGS_4,
+    Int64Representation::Number,
+));
 
 fn slow_call(
     scope: &mut v8::PinScope<'_, '_>,

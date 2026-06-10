@@ -1,6 +1,8 @@
 use crate::globals::time::PROCESS_START;
 use std::time::Instant;
-use v8::fast_api::{CFunction, CFunctionInfo, CTypeInfo, Flags, Int64Representation, Type as FastType};
+use v8::fast_api::{
+    CFunction, CFunctionInfo, CTypeInfo, Flags, Int64Representation, Type as FastType,
+};
 
 pub fn init_performance(
     scope: &mut v8::PinScope<'_, '_, ()>,
@@ -8,10 +10,7 @@ pub fn init_performance(
 ) {
     let performance = v8::ObjectTemplate::new(scope);
     let now = v8::FunctionTemplate::new(scope, handle_now);
-    performance.set(
-        v8::String::new(scope, "now").unwrap().into(),
-        now.into(),
-    );
+    performance.set(v8::String::new(scope, "now").unwrap().into(), now.into());
     global.set(
         v8::String::new(scope, "performance").unwrap().into(),
         performance.into(),
@@ -58,11 +57,19 @@ pub fn install_fast_now(
 ) {
     let fast = CFunction::new(fast_now as *const std::ffi::c_void, &FAST_NOW_INFO.0);
     let tmpl = v8::FunctionTemplate::builder(handle_now).build_fast(scope, &[fast]);
-    let Some(func) = tmpl.get_function(scope) else { return };
+    let Some(func) = tmpl.get_function(scope) else {
+        return;
+    };
     let global = context.global(scope);
-    let Some(perf_key) = v8::String::new(scope, "performance") else { return };
-    let Some(perf_val) = global.get(scope, perf_key.into()) else { return };
-    let Some(perf_obj) = perf_val.to_object(scope) else { return };
+    let Some(perf_key) = v8::String::new(scope, "performance") else {
+        return;
+    };
+    let Some(perf_val) = global.get(scope, perf_key.into()) else {
+        return;
+    };
+    let Some(perf_obj) = perf_val.to_object(scope) else {
+        return;
+    };
     if let Some(now_key) = v8::String::new(scope, "now") {
         perf_obj.set(scope, now_key.into(), func.into());
     }

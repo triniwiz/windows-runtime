@@ -45,8 +45,10 @@ fn workers() -> &'static RwLock<HashMap<u64, WorkerHandle>> {
 }
 
 fn worker_bootstrap_script(source: &str, filename: &str) -> Result<String, String> {
-    let source_json = serde_json::to_string(source).map_err(|e| format!("Failed to serialize worker source: {e}"))?;
-    let filename_json = serde_json::to_string(filename).map_err(|e| format!("Failed to serialize worker filename: {e}"))?;
+    let source_json = serde_json::to_string(source)
+        .map_err(|e| format!("Failed to serialize worker source: {e}"))?;
+    let filename_json = serde_json::to_string(filename)
+        .map_err(|e| format!("Failed to serialize worker filename: {e}"))?;
 
     Ok(format!(
         r#"
@@ -134,8 +136,12 @@ pub fn create_worker(app_root: String, source: String, filename: String) -> Resu
 
             for result in runtime.drain_outbox_bytes() {
                 match result {
-                    Ok(bytes) => { let _ = evt_tx.send(WorkerEvent::Message(bytes)); }
-                    Err(err)  => { let _ = evt_tx.send(WorkerEvent::Error(err)); }
+                    Ok(bytes) => {
+                        let _ = evt_tx.send(WorkerEvent::Message(bytes));
+                    }
+                    Err(err) => {
+                        let _ = evt_tx.send(WorkerEvent::Error(err));
+                    }
                 }
             }
 
@@ -145,8 +151,12 @@ pub fn create_worker(app_root: String, source: String, filename: String) -> Resu
                         runtime.dispatch_to_worker(&bytes);
                         for result in runtime.drain_outbox_bytes() {
                             match result {
-                                Ok(b)   => { let _ = evt_tx.send(WorkerEvent::Message(b)); }
-                                Err(e)  => { let _ = evt_tx.send(WorkerEvent::Error(e)); }
+                                Ok(b) => {
+                                    let _ = evt_tx.send(WorkerEvent::Message(b));
+                                }
+                                Err(e) => {
+                                    let _ = evt_tx.send(WorkerEvent::Error(e));
+                                }
                             }
                         }
                     }
@@ -189,12 +199,12 @@ fn collect_events(rx: &Receiver<WorkerEvent>) -> Vec<PolledWorkerEvent> {
     loop {
         match rx.try_recv() {
             Ok(WorkerEvent::Message(bytes)) => events.push(PolledWorkerEvent::Message(bytes)),
-            Ok(WorkerEvent::Error(err))     => events.push(PolledWorkerEvent::Error(err)),
+            Ok(WorkerEvent::Error(err)) => events.push(PolledWorkerEvent::Error(err)),
             Ok(WorkerEvent::Exited) => {
                 events.push(PolledWorkerEvent::Exited);
                 break;
             }
-            Err(TryRecvError::Empty)        => break,
+            Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
                 events.push(PolledWorkerEvent::Exited);
                 break;
@@ -218,7 +228,10 @@ pub fn poll_events(worker_id: u64) -> Result<Vec<PolledWorkerEvent>, String> {
     Ok(collect_events(&guard))
 }
 
-pub fn poll_events_blocking(worker_id: u64, timeout_ms: u64) -> Result<Vec<PolledWorkerEvent>, String> {
+pub fn poll_events_blocking(
+    worker_id: u64,
+    timeout_ms: u64,
+) -> Result<Vec<PolledWorkerEvent>, String> {
     // Clone the Arc and immediately release the registry lock so that
     // create_worker / terminate_worker are not starved for the full timeout.
     let rx = {
@@ -234,9 +247,9 @@ pub fn poll_events_blocking(worker_id: u64, timeout_ms: u64) -> Result<Vec<Polle
 
     match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
         Ok(WorkerEvent::Message(bytes)) => events.push(PolledWorkerEvent::Message(bytes)),
-        Ok(WorkerEvent::Error(err))     => events.push(PolledWorkerEvent::Error(err)),
-        Ok(WorkerEvent::Exited)         => events.push(PolledWorkerEvent::Exited),
-        Err(_)                          => return Ok(events),
+        Ok(WorkerEvent::Error(err)) => events.push(PolledWorkerEvent::Error(err)),
+        Ok(WorkerEvent::Exited) => events.push(PolledWorkerEvent::Exited),
+        Err(_) => return Ok(events),
     }
 
     // Drain any additional events that arrived without blocking.

@@ -1,34 +1,46 @@
-use std::ffi::c_void;
-use std::rc::Rc;
-use std::cell::RefCell;
-use std::sync::Arc;
+use crate::error::AnyError;
+use crate::helpers::{ffi_native_type_from_signature, strip_generic_suffix};
+use crate::value::{
+    append_struct_field_bytes, ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length,
+    ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg,
+    ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg,
+    ffi_parse_pointer_arg, ffi_parse_query_interface_arg, ffi_parse_string_arg,
+    ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg,
+    ffi_parse_u8_arg, ffi_parse_usize_arg, read_value_from_ptr, set_out_param_value,
+    try_unwrap_out_param, write_v8_value_to_ptr, NativeType, NativeValue,
+};
+use crate::ReturnKind;
 use libffi::middle::*;
-use parking_lot::RwLock;
-use windows::core::{GUID, HRESULT, Interface, IUnknown, IInspectable};
-use windows::Win32::System::WinRT::IActivationFactory;
-use windows::Win32::System::WinRT::Metadata::CorTokenType;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
-use metadata::declarations::declaration::DeclarationKind;
-use metadata::declarations::struct_declaration::StructDeclaration;
-use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
+use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration::Declaration;
+use metadata::declarations::declaration::DeclarationKind;
+use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
+use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
 use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::declarations::parameter_declaration::ParameterDeclaration;
 use metadata::declarations::property_declaration::PropertyDeclaration;
-use metadata::declarations::class_declaration::ClassDeclaration;
+use metadata::declarations::struct_declaration::StructDeclaration;
 use metadata::declaring_interface_for_method::Metadata;
-use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
 use metadata::meta_data_reader::MetadataReader;
 use metadata::signature::Signature;
-use crate::error::AnyError;
-use crate::helpers::{ffi_native_type_from_signature, strip_generic_suffix};
-use crate::ReturnKind;
+use parking_lot::RwLock;
+use std::cell::RefCell;
+use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use crate::value::{append_struct_field_bytes, ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length, ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg, ffi_parse_i32_arg, ffi_parse_i64_arg, ffi_parse_i8_arg, ffi_parse_isize_arg, ffi_parse_pointer_arg, ffi_parse_query_interface_arg, ffi_parse_string_arg, ffi_parse_struct_arg, ffi_parse_u16_arg, ffi_parse_u32_arg, ffi_parse_u64_arg, ffi_parse_u8_arg, ffi_parse_usize_arg, NativeType, NativeValue, read_value_from_ptr, set_out_param_value, try_unwrap_out_param, write_v8_value_to_ptr};
+use std::rc::Rc;
+use std::sync::Arc;
+use windows::core::{IInspectable, IUnknown, Interface, GUID, HRESULT};
+use windows::Win32::System::WinRT::IActivationFactory;
+use windows::Win32::System::WinRT::Metadata::CorTokenType;
 
 #[inline]
 fn align_up(n: usize, a: usize) -> usize {
-    if a <= 1 { n } else { (n + a - 1) / a * a }
+    if a <= 1 {
+        n
+    } else {
+        (n + a - 1) / a * a
+    }
 }
 
 /// (size, alignment) in bytes for a struct field signature. Recurses into nested structs; WinRT enums
@@ -67,7 +79,9 @@ fn struct_size_align(sd: &StructDeclaration) -> (usize, usize) {
             let ts = Signature::to_string(m, &f.type_());
             let (fs, fa) = sig_size_align(&ts);
             size = align_up(size, fa) + fs;
-            if fa > align { align = fa; }
+            if fa > align {
+                align = fa;
+            }
         }
     }
     (align_up(size, align), align)
@@ -86,7 +100,10 @@ pub(crate) fn append_struct_object_bytes(
     let start = buf.len();
     let mut max_align = 1usize;
     for f in sd.fields().iter() {
-        let m = match f.base().metadata() { Some(m) => m, None => continue };
+        let m = match f.base().metadata() {
+            Some(m) => m,
+            None => continue,
+        };
         let ts = Signature::to_string(m, &f.type_());
         let fname = f.name().to_string();
         let fv = v8::String::new(scope, fname.as_str())
@@ -94,7 +111,9 @@ pub(crate) fn append_struct_object_bytes(
             .unwrap_or_else(|| v8::undefined(scope).into());
 
         let (fsize, falign) = sig_size_align(&ts);
-        if falign > max_align { max_align = falign; }
+        if falign > max_align {
+            max_align = falign;
+        }
         let pad = align_up(buf.len(), falign) - buf.len();
         buf.extend(std::iter::repeat(0u8).take(pad));
 
@@ -105,7 +124,9 @@ pub(crate) fn append_struct_object_bytes(
         if is_struct {
             let lookup = strip_generic_suffix(&ts);
             if !fv.is_null_or_undefined() && fv.is_object() {
-                if let (Some(decl), Some(fobj)) = (MetadataReader::find_by_name(lookup), fv.to_object(scope)) {
+                if let (Some(decl), Some(fobj)) =
+                    (MetadataReader::find_by_name(lookup), fv.to_object(scope))
+                {
                     let lock = decl.read();
                     if let Some(nsd) = lock.as_any().downcast_ref::<StructDeclaration>() {
                         append_struct_object_bytes(buf, scope, fobj, nsd);
@@ -284,15 +305,16 @@ impl PropertyCall {
             None => {
                 if let Some(metadata) = method.metadata() {
                     let containing_type = CorTokenType(
-                        Metadata::get_method_containing_class_token(metadata, method.token()) as i32,
+                        Metadata::get_method_containing_class_token(metadata, method.token())
+                            as i32,
                     );
 
                     if containing_type.0 != 0 {
-                        let interface_declaration = Arc::new(RwLock::new(InterfaceDeclaration::new(
-                            Some(metadata),
-                            containing_type,
-                        )));
-                        index = Metadata::find_method_index(metadata, containing_type, method.token());
+                        let interface_declaration = Arc::new(RwLock::new(
+                            InterfaceDeclaration::new(Some(metadata), containing_type),
+                        ));
+                        index =
+                            Metadata::find_method_index(metadata, containing_type, method.token());
                         let iid = interface_declaration.read().id();
                         declaration = Some(interface_declaration);
                         iid
@@ -334,7 +356,7 @@ impl PropertyCall {
             }
         };
 
-        let pre_index = index;
+        let _pre_index = index;
 
         let vtable = interface.vtable();
 
@@ -376,7 +398,8 @@ impl PropertyCall {
             }
         };
 
-        let mut parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters + other_params + 4);
+        let mut parameter_types: Vec<NativeType> =
+            Vec::with_capacity(number_of_parameters + other_params + 4);
         let mut parse_parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters);
         let mut param_sigs: Vec<String> = Vec::with_capacity(number_of_parameters);
         parameter_types.push(NativeType::Pointer);
@@ -417,22 +440,17 @@ impl PropertyCall {
             }
         }
 
-
         let number_of_abi_parameters = parameter_types.len();
 
-        let params =
-            parameter_types
-                .iter()
-                .cloned()
-                .map(libffi::middle::Type::try_from)
-                .collect::<std::result::Result<Vec<Type>, AnyError>>();
+        let params = parameter_types
+            .iter()
+            .cloned()
+            .map(libffi::middle::Type::try_from)
+            .collect::<std::result::Result<Vec<Type>, AnyError>>();
 
         let params = params.ok()?;
 
-        let cif = Rc::new(Cif::new(
-            params,
-            Type::i32(),
-        ));
+        let cif = Rc::new(Cif::new(params, Type::i32()));
 
         let parent_interface = interface.clone();
 
@@ -450,7 +468,9 @@ impl PropertyCall {
         };
 
         let base_offset = if supports_iinspectable.is_ok() && !inspectable_ptr.is_null() {
-            unsafe { IUnknown::from_raw(inspectable_ptr as *mut c_void); }
+            unsafe {
+                IUnknown::from_raw(inspectable_ptr as *mut c_void);
+            }
             6
         } else {
             3
@@ -480,7 +500,8 @@ impl PropertyCall {
             param_sigs,
             type_args: Vec::new(),
         });
-        PROPERTY_STATIC_INFO_CACHE.with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
+        PROPERTY_STATIC_INFO_CACHE
+            .with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
 
         let cap = number_of_abi_parameters + 3;
         Some(Self {
@@ -519,7 +540,8 @@ impl PropertyCall {
             ((method.token().0 as u64) << 1) | (is_setter as u64),
             declaring_iid.to_u128(),
         );
-        if let Some(si) = INTERFACE_STATIC_INFO_CACHE.with(|c| c.borrow().get(&cache_key).cloned()) {
+        if let Some(si) = INTERFACE_STATIC_INFO_CACHE.with(|c| c.borrow().get(&cache_key).cloned())
+        {
             return Self::from_static_info(si, interface, is_setter, is_initializer);
         }
 
@@ -528,9 +550,10 @@ impl PropertyCall {
 
         // Derive vtable index from the method's position in its containing interface.
         if let Some(metadata) = method.metadata() {
-            let containing_type = CorTokenType(
-                Metadata::get_method_containing_class_token(metadata, method.token()) as i32,
-            );
+            let containing_type = CorTokenType(Metadata::get_method_containing_class_token(
+                metadata,
+                method.token(),
+            ) as i32);
             if containing_type.0 != 0 {
                 index = Metadata::find_method_index(metadata, containing_type, method.token());
             }
@@ -561,7 +584,8 @@ impl PropertyCall {
 
         let other_params: usize = if is_void { 1 } else { 2 };
 
-        let mut parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters + other_params + 2);
+        let mut parameter_types: Vec<NativeType> =
+            Vec::with_capacity(number_of_parameters + other_params + 2);
         let mut parse_parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters);
         let mut param_sigs: Vec<String> = Vec::with_capacity(number_of_parameters);
         parameter_types.push(NativeType::Pointer);
@@ -579,7 +603,9 @@ impl PropertyCall {
                 parameter_types.push(NativeType::Pointer);
             } else {
                 let abi_native = crate::helpers::struct_native_type_for_sig(signature.as_str())
-                    .unwrap_or_else(|| crate::helpers::ffi_native_type_from_signature(signature.as_str()));
+                    .unwrap_or_else(|| {
+                        crate::helpers::ffi_native_type_from_signature(signature.as_str())
+                    });
                 if matches!(abi_native, NativeType::Buffer) {
                     parameter_types.push(NativeType::U32);
                     parameter_types.push(NativeType::Buffer);
@@ -619,7 +645,9 @@ impl PropertyCall {
         };
 
         let base_offset = if supports_iinspectable.is_ok() && !inspectable_ptr.is_null() {
-            unsafe { IUnknown::from_raw(inspectable_ptr as *mut c_void); }
+            unsafe {
+                IUnknown::from_raw(inspectable_ptr as *mut c_void);
+            }
             6
         } else {
             3
@@ -645,7 +673,8 @@ impl PropertyCall {
             param_sigs,
             type_args,
         });
-        INTERFACE_STATIC_INFO_CACHE.with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
+        INTERFACE_STATIC_INFO_CACHE
+            .with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
 
         let cap = number_of_abi_parameters + 3;
         Some(Self {
@@ -670,11 +699,9 @@ impl PropertyCall {
         type_args: Vec<String>,
     ) -> Option<Self> {
         // Fast path: static info cached per (token, declaring IID).
-        let cache_key = (
-            (method.token().0 as u64) << 1,
-            declaring_iid.to_u128(),
-        );
-        if let Some(si) = INTERFACE_STATIC_INFO_CACHE.with(|c| c.borrow().get(&cache_key).cloned()) {
+        let cache_key = ((method.token().0 as u64) << 1, declaring_iid.to_u128());
+        if let Some(si) = INTERFACE_STATIC_INFO_CACHE.with(|c| c.borrow().get(&cache_key).cloned())
+        {
             return Self::from_static_info(si, interface, false, false);
         }
 
@@ -686,7 +713,11 @@ impl PropertyCall {
                 metadata::declaring_interface_for_method::Metadata::get_method_containing_class_token(metadata, method.token()) as i32,
             );
             if containing_type.0 != 0 {
-                index = metadata::declaring_interface_for_method::Metadata::find_method_index(metadata, containing_type, method.token());
+                index = metadata::declaring_interface_for_method::Metadata::find_method_index(
+                    metadata,
+                    containing_type,
+                    method.token(),
+                );
             }
         }
 
@@ -714,7 +745,8 @@ impl PropertyCall {
 
         let other_params: usize = if is_void { 1 } else { 2 };
 
-        let mut parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters + other_params + 2);
+        let mut parameter_types: Vec<NativeType> =
+            Vec::with_capacity(number_of_parameters + other_params + 2);
         let mut parse_parameter_types: Vec<NativeType> = Vec::with_capacity(number_of_parameters);
         let mut param_sigs: Vec<String> = Vec::with_capacity(number_of_parameters);
         parameter_types.push(NativeType::Pointer);
@@ -731,7 +763,9 @@ impl PropertyCall {
                 parameter_types.push(NativeType::Pointer);
             } else {
                 let abi_native = crate::helpers::struct_native_type_for_sig(sig.as_str())
-                    .unwrap_or_else(|| crate::helpers::ffi_native_type_from_signature(sig.as_str()));
+                    .unwrap_or_else(|| {
+                        crate::helpers::ffi_native_type_from_signature(sig.as_str())
+                    });
                 if matches!(abi_native, NativeType::Buffer) {
                     parameter_types.push(NativeType::U32);
                     parameter_types.push(NativeType::Buffer);
@@ -771,7 +805,9 @@ impl PropertyCall {
         };
 
         let base_offset = if supports_iinspectable.is_ok() && !inspectable_ptr.is_null() {
-            unsafe { IUnknown::from_raw(inspectable_ptr as *mut c_void); }
+            unsafe {
+                IUnknown::from_raw(inspectable_ptr as *mut c_void);
+            }
             6
         } else {
             3
@@ -797,7 +833,8 @@ impl PropertyCall {
             param_sigs,
             type_args,
         });
-        INTERFACE_STATIC_INFO_CACHE.with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
+        INTERFACE_STATIC_INFO_CACHE
+            .with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
 
         let cap = number_of_abi_parameters + 3;
         Some(Self {
@@ -841,13 +878,27 @@ impl PropertyCall {
     ) -> (HRESULT, *mut c_void, Vec<v8::Local<'s, v8::Value>>) {
         let is_void = self.si.is_void;
 
-        let is_value_type = matches!(self.si.return_kind, ReturnKind::Struct(_) | ReturnKind::Guid);
+        let is_value_type = matches!(
+            self.si.return_kind,
+            ReturnKind::Struct(_) | ReturnKind::Guid
+        );
 
-        let is_scalar_return = matches!(self.si.return_type.as_str(),
-            "UInt8" | "Int8" | "UInt16" | "Int16" |
-            "UInt32" | "Int32" | "UInt64" | "Int64" |
-            "USize" | "ISize" | "Single" | "Double" |
-            "Boolean" | "Char16"
+        let is_scalar_return = matches!(
+            self.si.return_type.as_str(),
+            "UInt8"
+                | "Int8"
+                | "UInt16"
+                | "Int16"
+                | "UInt32"
+                | "Int32"
+                | "UInt64"
+                | "Int64"
+                | "USize"
+                | "ISize"
+                | "Single"
+                | "Double"
+                | "Boolean"
+                | "Char16"
         );
 
         // HSTRING out-params must also land in a stable buffer; the local
@@ -860,13 +911,19 @@ impl PropertyCall {
         let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
         // param_index (usize) replaces Option<String> — references self.param_sigs[i] directly,
         // saving one String clone per out-param per call.
-        let mut out_slots: Vec<(usize, NativeType, usize, Option<v8::Local<'s, v8::Object>>)> = Vec::new();
+        let mut out_slots: Vec<(usize, NativeType, usize, Option<v8::Local<'s, v8::Object>>)> =
+            Vec::new();
 
-        self.argument_buf.push(NativeValue { pointer: self.interface.as_raw() as *mut c_void });
+        self.argument_buf.push(NativeValue {
+            pointer: self.interface.as_raw() as *mut c_void,
+        });
         self.argument_parse_types.push(None);
 
         for (i, native_type) in self.si.parse_parameter_types.iter().enumerate() {
-            let value = values.get(i).copied().unwrap_or_else(|| v8::undefined(scope).into());
+            let value = values
+                .get(i)
+                .copied()
+                .unwrap_or_else(|| v8::undefined(scope).into());
 
             let parameter = &self.si.parameters[i];
             let param_sig = &self.si.param_sigs[i];
@@ -875,7 +932,10 @@ impl PropertyCall {
                 let slot_index = self.argument_buf.len();
                 let slot_size = match native_type {
                     NativeType::Struct(_) => native_type.size(),
-                    NativeType::Pointer | NativeType::Buffer | NativeType::Function | NativeType::String => std::mem::size_of::<usize>(),
+                    NativeType::Pointer
+                    | NativeType::Buffer
+                    | NativeType::Function
+                    | NativeType::String => std::mem::size_of::<usize>(),
                     _ => native_type.size(),
                 };
                 let mut buf: Vec<u8> = vec![0u8; slot_size];
@@ -905,7 +965,7 @@ impl PropertyCall {
             }
 
             let value = match *native_type {
-                NativeType::Void => { return (call_failure(), std::ptr::null_mut(), Vec::new()) }
+                NativeType::Void => return (call_failure(), std::ptr::null_mut(), Vec::new()),
                 NativeType::Bool => ffi_parse_bool_arg(value),
                 NativeType::U8 => ffi_parse_u8_arg(value),
                 NativeType::I8 => ffi_parse_i8_arg(value),
@@ -924,7 +984,8 @@ impl PropertyCall {
 
                     // IReference<T> parameters: box JS primitives with the correct Create* call
                     // so XAML receives the right typed IPropertyValue (e.g. IReference<Double>).
-                    if let Some(inner) = crate::helpers::ireference_inner_type(&parameter_signature) {
+                    if let Some(inner) = crate::helpers::ireference_inner_type(&parameter_signature)
+                    {
                         if let Some(nv) = crate::value::box_as_ireference(scope, value, inner) {
                             Ok(nv)
                         } else {
@@ -943,11 +1004,15 @@ impl PropertyCall {
                                     let mut sbuf: Vec<u8> = Vec::new();
                                     {
                                         let lock = declaration.read();
-                                        if let Some(sd) = lock.as_any().downcast_ref::<StructDeclaration>() {
+                                        if let Some(sd) =
+                                            lock.as_any().downcast_ref::<StructDeclaration>()
+                                        {
                                             append_struct_object_bytes(&mut sbuf, scope, obj, sd);
                                         }
                                     }
-                                    if sbuf.is_empty() { sbuf.push(0); }
+                                    if sbuf.is_empty() {
+                                        sbuf.push(0);
+                                    }
                                     let ptr = sbuf.as_mut_ptr() as *mut c_void;
                                     struct_scratch.push(sbuf);
                                     Ok(NativeValue { pointer: ptr })
@@ -959,26 +1024,33 @@ impl PropertyCall {
 
                                 // Delegate types: auto-wrap a JS function as a JsDelegate COM object,
                                 // or extract the raw pointer from { handle: External } (NSWinRT.asDelegate result).
-                                let is_delegate = matches!(kind,
-                                    DeclarationKind::Delegate |
-                                    DeclarationKind::GenericDelegate |
-                                    DeclarationKind::GenericDelegateInstance
+                                let is_delegate = matches!(
+                                    kind,
+                                    DeclarationKind::Delegate
+                                        | DeclarationKind::GenericDelegate
+                                        | DeclarationKind::GenericDelegateInstance
                                 );
 
                                 if is_delegate {
                                     let handle_ptr = value.to_object(scope).and_then(|obj| {
                                         let key = v8::String::new(scope, "handle")?;
                                         let hv = obj.get(scope, key.into())?;
-                                        v8::Local::<v8::External>::try_from(hv).ok().map(|e| e.value())
+                                        v8::Local::<v8::External>::try_from(hv)
+                                            .ok()
+                                            .map(|e| e.value())
                                     });
 
                                     if let Some(ptr) = handle_ptr {
                                         Ok(NativeValue { pointer: ptr })
-                                    } else if let Ok(func) = v8::Local::<v8::Function>::try_from(value) {
+                                    } else if let Ok(func) =
+                                        v8::Local::<v8::Function>::try_from(value)
+                                    {
                                         let parameter = &self.si.parameters[i];
                                         let delegate_info = parameter.metadata().and_then(|meta| {
-                                            let raw_iid = Signature::to_iid_string(meta, &parameter.type_());
-                                            let iid_name = substitute_type_vars(&raw_iid, &self.si.type_args);
+                                            let raw_iid =
+                                                Signature::to_iid_string(meta, &parameter.type_());
+                                            let iid_name =
+                                                substitute_type_vars(&raw_iid, &self.si.type_args);
                                             crate::delegate_info_from_type_sig(&iid_name)
                                         });
                                         if let Some((guid, param_types)) = delegate_info {
@@ -988,12 +1060,14 @@ impl PropertyCall {
                                                 param_types,
                                             });
                                             let delegate = Box::new(crate::JsDelegate {
-                                                vtable:    &crate::JS_DELEGATE_VTBL as *const _,
+                                                vtable: &crate::JS_DELEGATE_VTBL as *const _,
                                                 ref_count: AtomicU32::new(1),
                                                 guid,
-                                                data:      Box::into_raw(data),
+                                                data: Box::into_raw(data),
                                             });
-                                            Ok(NativeValue { pointer: Box::into_raw(delegate) as *mut c_void })
+                                            Ok(NativeValue {
+                                                pointer: Box::into_raw(delegate) as *mut c_void,
+                                            })
                                         } else {
                                             ffi_parse_pointer_arg(scope, value)
                                         }
@@ -1053,7 +1127,9 @@ impl PropertyCall {
                         Err(_) => return (call_failure(), std::ptr::null_mut(), Vec::new()),
                     };
 
-                    self.argument_buf.push(NativeValue { u32_value: byte_length });
+                    self.argument_buf.push(NativeValue {
+                        u32_value: byte_length,
+                    });
                     self.argument_parse_types.push(Some(native_type.clone()));
                     self.argument_buf.push(buffer_value);
                     self.argument_parse_types.push(Some(native_type.clone()));
@@ -1081,7 +1157,9 @@ impl PropertyCall {
                 self.argument_buf.push(NativeValue { pointer: buf_ptr });
                 self.argument_parse_types.push(None);
             } else {
-                self.argument_buf.push(NativeValue { pointer: &mut result as *mut _ as *mut c_void });
+                self.argument_buf.push(NativeValue {
+                    pointer: &mut result as *mut _ as *mut c_void,
+                });
                 self.argument_parse_types.push(None);
             }
         }
@@ -1110,10 +1188,13 @@ impl PropertyCall {
             call_args.push(unsafe { v.as_arg(&effective_native) });
         }
 
-        let ret = match catch_unwind(AssertUnwindSafe(|| unsafe { self.si.cif.call(CodePtr::from_ptr(self.func), &call_args) })) {
+        let ret = match catch_unwind(AssertUnwindSafe(|| unsafe {
+            self.si.cif.call(CodePtr::from_ptr(self.func), &call_args)
+        })) {
             Ok(code) => code,
             Err(_) => {
-                let msg = format!("WinRT property call panicked during invocation: returning E_FAIL");
+                let msg =
+                    format!("WinRT property call panicked during invocation: returning E_FAIL");
                 crate::store_last_js_error(msg);
                 return (call_failure(), std::ptr::null_mut(), Vec::new());
             }
@@ -1132,14 +1213,22 @@ impl PropertyCall {
             }
         }
 
-        if !self.is_initializer && !is_void && (is_value_type || is_scalar_return || is_string_return) {
+        if !self.is_initializer
+            && !is_void
+            && (is_value_type || is_scalar_return || is_string_return)
+        {
             result = self.return_value_buf.as_mut_ptr() as *mut c_void;
         }
 
         // Marshal out-parameters back into V8 values using the recorded slots.
         let mut out_values: Vec<v8::Local<'s, v8::Value>> = Vec::new();
         for (slot_index, parse_native_type, param_idx, wrapper_obj) in out_slots.into_iter() {
-            let storage_ptr = unsafe { self.argument_buf.get(slot_index).map(|v| v.pointer).unwrap_or(std::ptr::null_mut()) };
+            let storage_ptr = unsafe {
+                self.argument_buf
+                    .get(slot_index)
+                    .map(|v| v.pointer)
+                    .unwrap_or(std::ptr::null_mut())
+            };
             if storage_ptr.is_null() {
                 let v: v8::Local<v8::Value> = v8::null(scope).into();
                 if let Some(wrapper) = wrapper_obj {
@@ -1154,7 +1243,8 @@ impl PropertyCall {
             unsafe {
                 let v = match parse_native_type {
                     NativeType::Pointer | NativeType::Buffer | NativeType::Function => {
-                        let inner = std::ptr::read_unaligned(storage_ptr as *const usize) as *mut c_void;
+                        let inner =
+                            std::ptr::read_unaligned(storage_ptr as *const usize) as *mut c_void;
                         if inner.is_null() {
                             v8::null(scope).into()
                         } else if !sig.is_empty() && sig.contains('.') {
@@ -1165,19 +1255,36 @@ impl PropertyCall {
                             let lookup = strip_generic_suffix(lookup);
                             if let Some(declaration) = MetadataReader::find_by_name(lookup) {
                                 if matches!(declaration.read().kind(), DeclarationKind::Struct) {
-                                    crate::create_struct_object_from_raw(declaration, inner, scope).into()
+                                    crate::create_struct_object_from_raw(declaration, inner, scope)
+                                        .into()
                                 } else {
                                     let instance = unsafe { IUnknown::from_raw(inner) };
-                                    crate::ns_proxy::create_ns_ctor_instance_object(sig.as_str(), None, None, declaration, Some(instance), scope).into()
+                                    crate::ns_proxy::create_ns_ctor_instance_object(
+                                        sig.as_str(),
+                                        None,
+                                        None,
+                                        declaration,
+                                        Some(instance),
+                                        scope,
+                                    )
+                                    .into()
                                 }
                             } else {
-                                read_value_from_ptr(inner as *const c_void, scope, NativeType::Pointer)
+                                read_value_from_ptr(
+                                    inner as *const c_void,
+                                    scope,
+                                    NativeType::Pointer,
+                                )
                             }
                         } else {
                             read_value_from_ptr(inner as *const c_void, scope, NativeType::Pointer)
                         }
                     }
-                    _ => read_value_from_ptr(storage_ptr as *const c_void, scope, parse_native_type.clone()),
+                    _ => read_value_from_ptr(
+                        storage_ptr as *const c_void,
+                        scope,
+                        parse_native_type.clone(),
+                    ),
                 };
                 if let Some(wrapper) = wrapper_obj {
                     let _ = set_out_param_value(scope, wrapper, v);

@@ -148,10 +148,8 @@ unsafe extern "system" fn ns_veh(info: *mut VehExceptionPointers) -> i32 {
 }
 
 fn install_veh() {
-    VEH_INIT.call_once(|| {
-        unsafe {
-            AddVectoredExceptionHandler(1, ns_veh);
-        }
+    VEH_INIT.call_once(|| unsafe {
+        AddVectoredExceptionHandler(1, ns_veh);
     });
 }
 

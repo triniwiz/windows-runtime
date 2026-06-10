@@ -14,7 +14,8 @@ fn assert_js(rt: &mut Runtime, expr: &str, msg: &str) {
 
 /// Evaluate `expr` in `rt` and return the string representation.
 fn eval(rt: &mut Runtime, expr: &str) -> String {
-    rt.eval_script_to_string(expr).unwrap_or_else(|| "<eval failed>".to_string())
+    rt.eval_script_to_string(expr)
+        .unwrap_or_else(|| "<eval failed>".to_string())
 }
 
 // ── __time / performance.now ─────────────────────────────────────────────────
@@ -28,15 +29,21 @@ fn time_returns_positive_milliseconds() {
 #[test]
 fn time_is_monotonically_non_decreasing() {
     let mut rt = Runtime::new(".");
-    assert_js(&mut rt,
+    assert_js(
+        &mut rt,
         "(function(){ var a = __time(); var b = __time(); return b >= a; })()",
-        "expected __time monotonic");
+        "expected __time monotonic",
+    );
 }
 
 #[test]
 fn performance_now_is_positive() {
     let mut rt = Runtime::new(".");
-    assert_js(&mut rt, "performance.now() > 0", "expected performance.now() > 0");
+    assert_js(
+        &mut rt,
+        "performance.now() > 0",
+        "expected performance.now() > 0",
+    );
 }
 
 #[test]
@@ -53,9 +60,11 @@ fn performance_now_agrees_with_time() {
 #[test]
 fn runtime_version_is_set() {
     let mut rt = Runtime::new(".");
-    assert_js(&mut rt,
+    assert_js(
+        &mut rt,
         "typeof __runtimeVersion === 'string' && __runtimeVersion.length > 0",
-        "expected __runtimeVersion to be a non-empty string");
+        "expected __runtimeVersion to be a non-empty string",
+    );
 }
 
 // ── gc() ─────────────────────────────────────────────────────────────────────
@@ -79,32 +88,48 @@ fn url_parse_round_trip() {
 #[test]
 fn url_components_are_correct() {
     let mut rt = Runtime::new(".");
-    rt.run_script("var _u = new URL('https://example.com:8080/path?q=1#hash');", "setup.js");
-    assert_js(&mut rt, "_u.protocol === 'https:'",  "protocol");
+    rt.run_script(
+        "var _u = new URL('https://example.com:8080/path?q=1#hash');",
+        "setup.js",
+    );
+    assert_js(&mut rt, "_u.protocol === 'https:'", "protocol");
     assert_js(&mut rt, "_u.hostname === 'example.com'", "hostname");
-    assert_js(&mut rt, "_u.port     === '8080'",    "port");
-    assert_js(&mut rt, "_u.pathname === '/path'",   "pathname");
-    assert_js(&mut rt, "_u.search   === '?q=1'",    "search");
-    assert_js(&mut rt, "_u.hash     === '#hash'",   "hash");
-    assert_js(&mut rt, "_u.origin   === 'https://example.com:8080'", "origin");
+    assert_js(&mut rt, "_u.port     === '8080'", "port");
+    assert_js(&mut rt, "_u.pathname === '/path'", "pathname");
+    assert_js(&mut rt, "_u.search   === '?q=1'", "search");
+    assert_js(&mut rt, "_u.hash     === '#hash'", "hash");
+    assert_js(
+        &mut rt,
+        "_u.origin   === 'https://example.com:8080'",
+        "origin",
+    );
 }
 
 #[test]
 fn url_search_params_basic() {
     let mut rt = Runtime::new(".");
-    rt.run_script("var _p = new URLSearchParams('a=1&b=hello%20world');", "setup.js");
-    assert_js(&mut rt, "_p.get('a') === '1'",           "URLSearchParams a");
-    assert_js(&mut rt, "_p.get('b') === 'hello world'", "URLSearchParams b decode");
-    assert_js(&mut rt, "_p.has('a') === true",          "URLSearchParams has a");
-    assert_js(&mut rt, "_p.has('z') === false",         "URLSearchParams no z");
+    rt.run_script(
+        "var _p = new URLSearchParams('a=1&b=hello%20world');",
+        "setup.js",
+    );
+    assert_js(&mut rt, "_p.get('a') === '1'", "URLSearchParams a");
+    assert_js(
+        &mut rt,
+        "_p.get('b') === 'hello world'",
+        "URLSearchParams b decode",
+    );
+    assert_js(&mut rt, "_p.has('a') === true", "URLSearchParams has a");
+    assert_js(&mut rt, "_p.has('z') === false", "URLSearchParams no z");
 }
 
 #[test]
 fn url_relative_resolution() {
     let mut rt = Runtime::new(".");
-    assert_js(&mut rt,
+    assert_js(
+        &mut rt,
         "new URL('/other', 'https://example.com/page').href === 'https://example.com/other'",
-        "relative URL resolution");
+        "relative URL resolution",
+    );
 }
 
 // ── requestAnimationFrame ─────────────────────────────────────────────────────
@@ -113,49 +138,62 @@ fn url_relative_resolution() {
 fn raf_fires_callback_with_positive_timestamp() {
     let mut rt = Runtime::new(".");
     // Register the callback.
-    rt.run_script(r#"
+    rt.run_script(
+        r#"
         var _rafFired = false;
         var _rafTs    = -1;
         requestAnimationFrame(function(ts) {
             _rafFired = true;
             _rafTs    = ts;
         });
-    "#, "setup.js");
+    "#,
+        "setup.js",
+    );
 
     // Drain microtasks: __nsDwmFlush returns immediately on headless (no DWM)
     // or waits one VSync on a live display.  Either way the callback runs.
     rt.run_script("", "pump.js");
 
-    assert_js(&mut rt, "_rafFired === true",  "rAF callback not fired");
-    assert_js(&mut rt, "_rafTs    >= 0",      "rAF timestamp negative");
+    assert_js(&mut rt, "_rafFired === true", "rAF callback not fired");
+    assert_js(&mut rt, "_rafTs    >= 0", "rAF timestamp negative");
 }
 
 #[test]
 fn raf_callback_receives_increasing_timestamps() {
     let mut rt = Runtime::new(".");
-    rt.run_script(r#"
+    rt.run_script(
+        r#"
         var _ts1 = -1, _ts2 = -1;
         requestAnimationFrame(function(t1) {
             _ts1 = t1;
             requestAnimationFrame(function(t2) { _ts2 = t2; });
         });
-    "#, "setup.js");
+    "#,
+        "setup.js",
+    );
     rt.run_script("", "pump1.js");
     rt.run_script("", "pump2.js");
-    assert_js(&mut rt, "_ts1 >= 0",   "first rAF timestamp invalid");
-    assert_js(&mut rt, "_ts2 >= _ts1","second rAF not >= first");
+    assert_js(&mut rt, "_ts1 >= 0", "first rAF timestamp invalid");
+    assert_js(&mut rt, "_ts2 >= _ts1", "second rAF not >= first");
 }
 
 #[test]
 fn cancel_raf_prevents_callback() {
     let mut rt = Runtime::new(".");
-    rt.run_script(r#"
+    rt.run_script(
+        r#"
         var _called = false;
         var _id = requestAnimationFrame(function() { _called = true; });
         cancelAnimationFrame(_id);
-    "#, "setup.js");
+    "#,
+        "setup.js",
+    );
     rt.run_script("", "pump.js");
-    assert_js(&mut rt, "_called === false", "cancelAnimationFrame did not cancel");
+    assert_js(
+        &mut rt,
+        "_called === false",
+        "cancelAnimationFrame did not cancel",
+    );
 }
 
 // ── setTimeout / setInterval ─────────────────────────────────────────────────
@@ -165,10 +203,26 @@ fn cancel_raf_prevents_callback() {
 #[test]
 fn settimeout_exists_and_returns_id() {
     let mut rt = Runtime::new(".");
-    assert_js(&mut rt, "typeof __ns__setTimeout === 'function' || typeof setTimeout === 'function'",   "setTimeout not a function");
-    assert_js(&mut rt, "typeof __ns__clearTimeout === 'function' || typeof clearTimeout === 'function'", "clearTimeout not a function");
-    assert_js(&mut rt, "typeof __ns__setInterval === 'function' || typeof setInterval === 'function'",   "setInterval not a function");
-    assert_js(&mut rt, "typeof __ns__clearInterval === 'function' || typeof clearInterval === 'function'", "clearInterval not a function");
+    assert_js(
+        &mut rt,
+        "typeof __ns__setTimeout === 'function' || typeof setTimeout === 'function'",
+        "setTimeout not a function",
+    );
+    assert_js(
+        &mut rt,
+        "typeof __ns__clearTimeout === 'function' || typeof clearTimeout === 'function'",
+        "clearTimeout not a function",
+    );
+    assert_js(
+        &mut rt,
+        "typeof __ns__setInterval === 'function' || typeof setInterval === 'function'",
+        "setInterval not a function",
+    );
+    assert_js(
+        &mut rt,
+        "typeof __ns__clearInterval === 'function' || typeof clearInterval === 'function'",
+        "clearInterval not a function",
+    );
 }
 
 // ── Win32 FFI ─────────────────────────────────────────────────────────────────
@@ -177,9 +231,12 @@ fn settimeout_exists_and_returns_id() {
 fn win32_call_kernel32_get_tick_count() {
     let mut rt = Runtime::new(".");
     // GetTickCount64 lives in kernel32.dll, returns u64 (ms since boot).
-    let result = eval(&mut rt, r#"
+    let result = eval(
+        &mut rt,
+        r#"
         NSWinRT.win32.call('kernel32.dll', 'GetTickCount64', 'u64')
-    "#);
+    "#,
+    );
     let v: u64 = result.trim().parse().unwrap_or(0);
     assert!(v > 0, "GetTickCount64 returned 0 or failed: {result}");
 }
@@ -187,11 +244,14 @@ fn win32_call_kernel32_get_tick_count() {
 #[test]
 fn win32_bind_pattern() {
     let mut rt = Runtime::new(".");
-    let result = eval(&mut rt, r#"
+    let result = eval(
+        &mut rt,
+        r#"
         var kernel32 = NSWinRT.win32.bind('kernel32.dll', 'u64');
         var t = kernel32.GetTickCount64();
         typeof t === 'number' && t > 0
-    "#);
+    "#,
+    );
     assert_eq!(result, "true", "win32.bind().GetTickCount64() failed");
 }
 
@@ -206,28 +266,38 @@ fn win32_exports_returns_array() {
 #[test]
 fn win32_exports_contains_known_function() {
     let mut rt = Runtime::new(".");
-    assert_js(&mut rt,
+    assert_js(
+        &mut rt,
         "JSON.parse(__nsWin32Exports('kernel32.dll')).indexOf('GetTickCount64') >= 0",
-        "GetTickCount64 not in kernel32.dll exports");
+        "GetTickCount64 not in kernel32.dll exports",
+    );
 }
 
 #[test]
 fn win32_import_installs_global() {
     let mut rt = Runtime::new(".");
     // After import(), DLL exports become plain JS globals — call GetTickCount64() directly.
-    let result = eval(&mut rt, r#"
+    let result = eval(
+        &mut rt,
+        r#"
         NSWinRT.win32.import('kernel32.dll', 'u64');
         var t = GetTickCount64();
         typeof t === 'number' && t > 0
-    "#);
-    assert_eq!(result, "true", "win32.import() + direct GetTickCount64() call failed");
+    "#,
+    );
+    assert_eq!(
+        result, "true",
+        "win32.import() + direct GetTickCount64() call failed"
+    );
 }
 
 // ── .NET BCL (skipped when bridge DLL is not published) ──────────────────────
 
 fn dotnet_bridge_available() -> bool {
     std::path::PathBuf::from(".")
-        .join("dotnet-bridge").join("publish").join("DotNetBridge.dll")
+        .join("dotnet-bridge")
+        .join("publish")
+        .join("DotNetBridge.dll")
         .exists()
 }
 
@@ -238,12 +308,16 @@ fn dotnet_stopwatch_start_new_via_natural_namespace() {
         return;
     }
     let mut rt = Runtime::new(".");
-    assert_js(&mut rt, r#"
+    assert_js(
+        &mut rt,
+        r#"
         (function(){
             var sw = System.Diagnostics.Stopwatch.StartNew();
             return typeof sw === 'object' && sw.__handle != null;
         })()
-    "#, "Stopwatch.StartNew() should return a DotNetObject");
+    "#,
+        "Stopwatch.StartNew() should return a DotNetObject",
+    );
 }
 
 #[test]
@@ -307,70 +381,128 @@ fn winrt_jsonarray_indexof_out_wrapper() {
         eprintln!("SKIP: JsonArray not available: {}", result);
         return;
     }
-    if result.contains("marshalled for a different thread") || result.contains("ActivateInstance failed") || result.contains("apartment") {
-        eprintln!("SKIP: JsonArray activation failed due to apartment state: {}", result);
+    if result.contains("marshalled for a different thread")
+        || result.contains("ActivateInstance failed")
+        || result.contains("apartment")
+    {
+        eprintln!(
+            "SKIP: JsonArray activation failed due to apartment state: {}",
+            result
+        );
         return;
     }
 
-    assert!(result.contains("\"available\":true"), "JsonArray APIs not available: {}", result);
-    assert!(result.contains("\"found1\":true"), "IndexOf omitted-out failed: {}", result);
-    assert!(result.contains("\"found2\":true"), "IndexOf undefined-out failed: {}", result);
-    assert!(result.contains("\"found3\":true"), "IndexOf wrapper-out failed: {}", result);
-    assert!(result.contains("\"r3IsArray\":false"), "Explicit out wrapper should not return a tuple: {}", result);
-    assert!(result.contains("\"outvType\":\"number\""), "Out wrapper type not number: {}", result);
-    assert!(result.contains("\"outv\":0"), "Out wrapper value should be index 0: {}", result);
+    assert!(
+        result.contains("\"available\":true"),
+        "JsonArray APIs not available: {}",
+        result
+    );
+    assert!(
+        result.contains("\"found1\":true"),
+        "IndexOf omitted-out failed: {}",
+        result
+    );
+    assert!(
+        result.contains("\"found2\":true"),
+        "IndexOf undefined-out failed: {}",
+        result
+    );
+    assert!(
+        result.contains("\"found3\":true"),
+        "IndexOf wrapper-out failed: {}",
+        result
+    );
+    assert!(
+        result.contains("\"r3IsArray\":false"),
+        "Explicit out wrapper should not return a tuple: {}",
+        result
+    );
+    assert!(
+        result.contains("\"outvType\":\"number\""),
+        "Out wrapper type not number: {}",
+        result
+    );
+    assert!(
+        result.contains("\"outv\":0"),
+        "Out wrapper value should be index 0: {}",
+        result
+    );
 }
 
 #[test]
 fn dotnet_stopwatch_elapsed_is_numeric() {
-    if !dotnet_bridge_available() { return; }
+    if !dotnet_bridge_available() {
+        return;
+    }
     let mut rt = Runtime::new(".");
     // sw.Stop() — natural method call (no .call('Stop'))
     // sw.Elapsed — natural property access (no .get('Elapsed'))
-    assert_js(&mut rt, r#"
+    assert_js(
+        &mut rt,
+        r#"
         (function(){
             var sw = System.Diagnostics.Stopwatch.StartNew();
             sw.Stop();
             var elapsed = sw.Elapsed;
             return elapsed != null;
         })()
-    "#, "Stopwatch elapsed should not be null");
+    "#,
+        "Stopwatch elapsed should not be null",
+    );
 }
 
 #[test]
 fn dotnet_stringbuilder_constructor() {
-    if !dotnet_bridge_available() { return; }
+    if !dotnet_bridge_available() {
+        return;
+    }
     let mut rt = Runtime::new(".");
-    assert_js(&mut rt, r#"
+    assert_js(
+        &mut rt,
+        r#"
         (function(){
             var sb = new System.Text.StringBuilder(64);
             return typeof sb === 'object' && sb.__handle != null;
         })()
-    "#, "new System.Text.StringBuilder() should return a DotNetObject");
+    "#,
+        "new System.Text.StringBuilder() should return a DotNetObject",
+    );
 }
 
 #[test]
 fn dotnet_environment_machine_name_direct_property() {
-    if !dotnet_bridge_available() { return; }
+    if !dotnet_bridge_available() {
+        return;
+    }
     let mut rt = Runtime::new(".");
     // System.Environment.MachineName — static property accessed directly (no get_MachineName())
-    assert_js(&mut rt, r#"
+    assert_js(
+        &mut rt,
+        r#"
         (function(){
             var name = System.Environment.MachineName;
             return typeof name === 'string' && name.length > 0;
         })()
-    "#, "System.Environment.MachineName should be a non-empty string");
+    "#,
+        "System.Environment.MachineName should be a non-empty string",
+    );
 }
 
 #[test]
 fn dotnet_environment_get_machine_name() {
-    if !dotnet_bridge_available() { return; }
+    if !dotnet_bridge_available() {
+        return;
+    }
     let mut rt = Runtime::new(".");
     // Legacy get_ prefix still works for backwards compatibility.
-    assert_js(&mut rt, r#"
+    assert_js(
+        &mut rt,
+        r#"
         (function(){
             var name = System.Environment.get_MachineName();
             return typeof name === 'string' && name.length > 0;
         })()
-    "#, "System.Environment.get_MachineName() should still work");
+    "#,
+        "System.Environment.get_MachineName() should still work",
+    );
 }

@@ -1,3 +1,7 @@
+use ahash::AHashMap;
+use libffi::middle::{Arg, Cif, CodePtr, Type};
+use parking_lot::Mutex;
+use serde_json::Value;
 /// Dynamic Win32 FFI dispatch via libffi.
 ///
 /// Two call paths are available:
@@ -14,19 +18,13 @@
 /// Supported arg/return type strings:
 ///   "void" "bool" "i8" "i16" "i32" "i64" "u8" "u16" "u32" "u64"
 ///   "f32" "f64" "pointer" "wstr" "str"
-
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
-use ahash::AHashMap;
-use libffi::middle::{Arg, Cif, CodePtr, Type};
-use parking_lot::Mutex;
-use serde_json::Value;
 use windows::core::PCWSTR;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
-static DLL_CACHE: std::sync::OnceLock<Mutex<HashMap<String, usize>>> =
-    std::sync::OnceLock::new();
+static DLL_CACHE: std::sync::OnceLock<Mutex<HashMap<String, usize>>> = std::sync::OnceLock::new();
 
 fn dll_cache() -> &'static Mutex<HashMap<String, usize>> {
     DLL_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -77,8 +75,8 @@ fn get_or_build(
         }
         // Slow path: build once.
         let dll_handle = load_dll(dll)?;
-        let fn_ptr     = resolve_proc(dll_handle, fn_name)?;
-        let cif        = Cif::new(param_types.to_vec(), ffi_type_for(ret_type)?);
+        let fn_ptr = resolve_proc(dll_handle, fn_name)?;
+        let cif = Cif::new(param_types.to_vec(), ffi_type_for(ret_type)?);
         cache.borrow_mut().insert(key, CachedFn { fn_ptr, cif });
         Ok(())
     })
@@ -90,7 +88,9 @@ fn get_or_build(
 pub(crate) fn prewarm_known_fns() {
     use crate::win32_known_fns::KNOWN_FNS;
     for f in KNOWN_FNS {
-        let param_types: Vec<Type> = f.params.iter()
+        let param_types: Vec<Type> = f
+            .params
+            .iter()
             .filter_map(|t| ffi_type_for(t).ok())
             .collect();
         // If the DLL is absent or the function is missing, just skip it.
@@ -105,8 +105,7 @@ fn load_dll(name: &str) -> Result<usize, String> {
     }
     let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     let hmod = unsafe {
-        LoadLibraryW(PCWSTR(wide.as_ptr()))
-            .map_err(|e| format!("LoadLibraryW({name}): {e}"))?
+        LoadLibraryW(PCWSTR(wide.as_ptr())).map_err(|e| format!("LoadLibraryW({name}): {e}"))?
     };
     let handle = hmod.0 as usize;
     cache.insert(name.to_string(), handle);
@@ -114,8 +113,8 @@ fn load_dll(name: &str) -> Result<usize, String> {
 }
 
 fn resolve_proc(dll_handle: usize, func_name: &str) -> Result<*mut c_void, String> {
-    use windows::Win32::Foundation::HMODULE;
     use windows::core::PCSTR;
+    use windows::Win32::Foundation::HMODULE;
     let cname = format!("{func_name}\0");
     let hmod = HMODULE(dll_handle as *mut c_void);
     let ptr = unsafe { GetProcAddress(hmod, PCSTR(cname.as_ptr())) }
@@ -131,22 +130,22 @@ pub(crate) fn resolve_fn(dll: &str, func_name: &str) -> Result<*mut c_void, Stri
 
 pub(crate) fn ffi_type_for(ty: &str) -> Result<Type, String> {
     Ok(match ty {
-        "void"    => Type::void(),
-        "i8"      => Type::i8(),
-        "i16"     => Type::i16(),
-        "i32"     => Type::i32(),
-        "i64"     => Type::i64(),
-        "u8"      => Type::u8(),
-        "u16"     => Type::u16(),
-        "u32"     => Type::u32(),
-        "u64"     => Type::u64(),
-        "f32"     => Type::f32(),
-        "f64"     => Type::f64(),
-        "bool"    => Type::i32(),
+        "void" => Type::void(),
+        "i8" => Type::i8(),
+        "i16" => Type::i16(),
+        "i32" => Type::i32(),
+        "i64" => Type::i64(),
+        "u8" => Type::u8(),
+        "u16" => Type::u16(),
+        "u32" => Type::u32(),
+        "u64" => Type::u64(),
+        "f32" => Type::f32(),
+        "f64" => Type::f64(),
+        "bool" => Type::i32(),
         "pointer" => Type::pointer(),
-        "wstr"    => Type::pointer(),
-        "str"     => Type::pointer(),
-        other     => return Err(format!("Unknown FFI type: {other}")),
+        "wstr" => Type::pointer(),
+        "str" => Type::pointer(),
+        other => return Err(format!("Unknown FFI type: {other}")),
     })
 }
 
@@ -170,7 +169,7 @@ enum StoredArg {
     // so libffi can dereference it once to get the actual pointer for the call frame.
     Ptr { ptr_val: *const c_void },
     WStr { ptr_val: *const u16, _buf: Vec<u16> },
-    Str  { ptr_val: *const i8,  _buf: CString  },
+    Str { ptr_val: *const i8, _buf: CString },
 }
 
 // SAFETY: StoredArg is only used within a single-threaded call site.
@@ -180,19 +179,19 @@ unsafe impl Sync for StoredArg {}
 impl StoredArg {
     fn as_ffi_arg(&self) -> Arg<'_> {
         match self {
-            StoredArg::I8(v)               => Arg::new(v),
-            StoredArg::I16(v)              => Arg::new(v),
-            StoredArg::I32(v)              => Arg::new(v),
-            StoredArg::I64(v)              => Arg::new(v),
-            StoredArg::U8(v)               => Arg::new(v),
-            StoredArg::U16(v)              => Arg::new(v),
-            StoredArg::U32(v)              => Arg::new(v),
-            StoredArg::U64(v)              => Arg::new(v),
-            StoredArg::F32(v)              => Arg::new(v),
-            StoredArg::F64(v)              => Arg::new(v),
-            StoredArg::Ptr  { ptr_val, .. } => Arg::new(ptr_val),
+            StoredArg::I8(v) => Arg::new(v),
+            StoredArg::I16(v) => Arg::new(v),
+            StoredArg::I32(v) => Arg::new(v),
+            StoredArg::I64(v) => Arg::new(v),
+            StoredArg::U8(v) => Arg::new(v),
+            StoredArg::U16(v) => Arg::new(v),
+            StoredArg::U32(v) => Arg::new(v),
+            StoredArg::U64(v) => Arg::new(v),
+            StoredArg::F32(v) => Arg::new(v),
+            StoredArg::F64(v) => Arg::new(v),
+            StoredArg::Ptr { ptr_val, .. } => Arg::new(ptr_val),
             StoredArg::WStr { ptr_val, .. } => Arg::new(ptr_val),
-            StoredArg::Str  { ptr_val, .. } => Arg::new(ptr_val),
+            StoredArg::Str { ptr_val, .. } => Arg::new(ptr_val),
         }
     }
 }
@@ -200,11 +199,11 @@ impl StoredArg {
 fn marshal(ty: &str, val: &Value) -> Result<StoredArg, String> {
     let n = || val.as_f64().unwrap_or(0.0);
     Ok(match ty {
-        "i8"  => StoredArg::I8 (n() as i8),
+        "i8" => StoredArg::I8(n() as i8),
         "i16" => StoredArg::I16(n() as i16),
         "i32" => StoredArg::I32(n() as i32),
         "i64" => StoredArg::I64(n() as i64),
-        "u8"  => StoredArg::U8 (n() as u8),
+        "u8" => StoredArg::U8(n() as u8),
         "u16" => StoredArg::U16(n() as u16),
         "u32" => StoredArg::U32(n() as u32),
         "u64" => StoredArg::U64(val.as_u64().unwrap_or(n() as u64)),
@@ -216,7 +215,9 @@ fn marshal(ty: &str, val: &Value) -> Result<StoredArg, String> {
         }
         "pointer" => {
             let addr = val.as_u64().unwrap_or(n() as u64) as usize;
-            StoredArg::Ptr { ptr_val: addr as *const c_void }
+            StoredArg::Ptr {
+                ptr_val: addr as *const c_void,
+            }
         }
         "wstr" => {
             let s = val.as_str().unwrap_or("");
@@ -245,21 +246,29 @@ pub(crate) enum RawArgValue {
 }
 
 fn marshal_raw(ty: &str, val: &RawArgValue) -> Result<StoredArg, String> {
-    let n = || match val { RawArgValue::Number(f) => *f, RawArgValue::Str(_) => 0.0 };
-    let s = || match val { RawArgValue::Str(s) => s.as_str(), RawArgValue::Number(_) => "" };
+    let n = || match val {
+        RawArgValue::Number(f) => *f,
+        RawArgValue::Str(_) => 0.0,
+    };
+    let s = || match val {
+        RawArgValue::Str(s) => s.as_str(),
+        RawArgValue::Number(_) => "",
+    };
     Ok(match ty {
-        "i8"  => StoredArg::I8 (n() as i8),
+        "i8" => StoredArg::I8(n() as i8),
         "i16" => StoredArg::I16(n() as i16),
         "i32" => StoredArg::I32(n() as i32),
         "i64" => StoredArg::I64(n() as i64),
-        "u8"  => StoredArg::U8 (n() as u8),
+        "u8" => StoredArg::U8(n() as u8),
         "u16" => StoredArg::U16(n() as u16),
         "u32" => StoredArg::U32(n() as u32),
         "u64" => StoredArg::U64(n() as u64),
         "f32" => StoredArg::F32(n() as f32),
         "f64" => StoredArg::F64(n()),
         "bool" => StoredArg::I32(if n() != 0.0 { 1 } else { 0 }),
-        "pointer" => StoredArg::Ptr { ptr_val: n() as usize as *const c_void },
+        "pointer" => StoredArg::Ptr {
+            ptr_val: n() as usize as *const c_void,
+        },
         "wstr" => {
             let buf: Vec<u16> = s().encode_utf16().chain(std::iter::once(0)).collect();
             let ptr_val = buf.as_ptr();
@@ -304,32 +313,75 @@ pub(crate) fn call_win32_direct(
             arg_types.push(ffi_type_for(ty)?);
         }
         let dll_handle = load_dll(dll)?;
-        let fn_ptr     = resolve_proc(dll_handle, fn_name)?;
-        let cif        = Cif::new(arg_types, ffi_type_for(ret_type)?);
-        CIF_CACHE.with(|cache| cache.borrow_mut().insert(key.clone(), CachedFn { fn_ptr, cif }));
+        let fn_ptr = resolve_proc(dll_handle, fn_name)?;
+        let cif = Cif::new(arg_types, ffi_type_for(ret_type)?);
+        CIF_CACHE.with(|cache| {
+            cache
+                .borrow_mut()
+                .insert(key.clone(), CachedFn { fn_ptr, cif })
+        });
     }
 
     CIF_CACHE.with(|cache| {
         let borrow = cache.borrow();
-        let entry  = borrow.get(&key).unwrap();
-        let code   = CodePtr(entry.fn_ptr);
+        let entry = borrow.get(&key).unwrap();
+        let code = CodePtr(entry.fn_ptr);
         let ffi_args: Vec<Arg<'_>> = stored.iter().map(|s| s.as_ffi_arg()).collect();
 
         Ok(match ret_type {
-            "void"    => { unsafe { entry.cif.call::<()>(code, &ffi_args) }; Win32Result::Null }
-            "bool"    => { let v: i32 = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::Bool(v != 0) }
-            "i8"      => { let v: i8  = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::I64(v as i64) }
-            "i16"     => { let v: i16 = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::I64(v as i64) }
-            "i32"     => { let v: i32 = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::I64(v as i64) }
-            "i64"     => { let v: i64 = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::I64(v) }
-            "u8"      => { let v: u8  = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::U64(v as u64) }
-            "u16"     => { let v: u16 = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::U64(v as u64) }
-            "u32"     => { let v: u32 = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::U64(v as u64) }
-            "u64"     => { let v: u64 = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::U64(v) }
-            "f32"     => { let v: f32 = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::F64(v as f64) }
-            "f64"     => { let v: f64 = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::F64(v) }
-            "pointer" => { let v: usize = unsafe { entry.cif.call(code, &ffi_args) }; Win32Result::U64(v as u64) }
-            other     => return Err(format!("Unsupported return type: {other}")),
+            "void" => {
+                unsafe { entry.cif.call::<()>(code, &ffi_args) };
+                Win32Result::Null
+            }
+            "bool" => {
+                let v: i32 = unsafe { entry.cif.call(code, &ffi_args) };
+                Win32Result::Bool(v != 0)
+            }
+            "i8" => {
+                let v: i8 = unsafe { entry.cif.call(code, &ffi_args) };
+                Win32Result::I64(v as i64)
+            }
+            "i16" => {
+                let v: i16 = unsafe { entry.cif.call(code, &ffi_args) };
+                Win32Result::I64(v as i64)
+            }
+            "i32" => {
+                let v: i32 = unsafe { entry.cif.call(code, &ffi_args) };
+                Win32Result::I64(v as i64)
+            }
+            "i64" => {
+                let v: i64 = unsafe { entry.cif.call(code, &ffi_args) };
+                Win32Result::I64(v)
+            }
+            "u8" => {
+                let v: u8 = unsafe { entry.cif.call(code, &ffi_args) };
+                Win32Result::U64(v as u64)
+            }
+            "u16" => {
+                let v: u16 = unsafe { entry.cif.call(code, &ffi_args) };
+                Win32Result::U64(v as u64)
+            }
+            "u32" => {
+                let v: u32 = unsafe { entry.cif.call(code, &ffi_args) };
+                Win32Result::U64(v as u64)
+            }
+            "u64" => {
+                let v: u64 = unsafe { entry.cif.call(code, &ffi_args) };
+                Win32Result::U64(v)
+            }
+            "f32" => {
+                let v: f32 = unsafe { entry.cif.call(code, &ffi_args) };
+                Win32Result::F64(v as f64)
+            }
+            "f64" => {
+                let v: f64 = unsafe { entry.cif.call(code, &ffi_args) };
+                Win32Result::F64(v)
+            }
+            "pointer" => {
+                let v: usize = unsafe { entry.cif.call(code, &ffi_args) };
+                Win32Result::U64(v as u64)
+            }
+            other => return Err(format!("Unsupported return type: {other}")),
         })
     })
 }
@@ -365,7 +417,11 @@ pub(crate) fn list_exports(dll: &str) -> Result<Vec<String>, String> {
 
         // Export directory RVA is the first data-directory entry.
         // Its offset within the optional header is 96 (PE32) or 112 (PE32+).
-        let export_dir_off: usize = if opt_magic == 0x020B { 24 + 112 } else { 24 + 96 };
+        let export_dir_off: usize = if opt_magic == 0x020B {
+            24 + 112
+        } else {
+            24 + 96
+        };
         let export_rva = nt.add(export_dir_off).cast::<u32>().read_unaligned();
         if export_rva == 0 {
             return Ok(vec![]);
@@ -386,7 +442,7 @@ pub(crate) fn list_exports(dll: &str) -> Result<Vec<String>, String> {
         //  +32  AddressOfNames  ← array of RVAs to name strings
         //  +36  AddressOfNameOrdinals
         let number_of_names = exp.add(24).cast::<u32>().read_unaligned() as usize;
-        let names_rva       = exp.add(32).cast::<u32>().read_unaligned();
+        let names_rva = exp.add(32).cast::<u32>().read_unaligned();
 
         if names_rva == 0 || number_of_names == 0 {
             return Ok(vec![]);
@@ -413,19 +469,18 @@ pub(crate) fn list_exports(dll: &str) -> Result<Vec<String>, String> {
 /// Returns `{"value":<result>}` or `{"error":"…"}`.
 /// Uses the per-thread Cif cache; builds and caches the Cif on first call.
 pub(crate) fn call_win32_json(json: &str) -> Result<String, String> {
-    let req: Value = serde_json::from_str(json)
-        .map_err(|e| format!("JSON parse error: {e}"))?;
+    let req: Value = serde_json::from_str(json).map_err(|e| format!("JSON parse error: {e}"))?;
 
-    let dll       = req["dll"].as_str().ok_or("missing 'dll'")?;
+    let dll = req["dll"].as_str().ok_or("missing 'dll'")?;
     let func_name = req["fn"].as_str().ok_or("missing 'fn'")?;
-    let ret_type  = req["returnType"].as_str().unwrap_or("i32");
-    let args_arr  = req["args"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+    let ret_type = req["returnType"].as_str().unwrap_or("i32");
+    let args_arr = req["args"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
 
-    let mut arg_types: Vec<Type>      = Vec::with_capacity(args_arr.len());
-    let mut stored:    Vec<StoredArg> = Vec::with_capacity(args_arr.len());
+    let mut arg_types: Vec<Type> = Vec::with_capacity(args_arr.len());
+    let mut stored: Vec<StoredArg> = Vec::with_capacity(args_arr.len());
 
     for a in args_arr {
-        let ty  = a["type"].as_str().ok_or("arg missing 'type'")?;
+        let ty = a["type"].as_str().ok_or("arg missing 'type'")?;
         let val = &a["value"];
         arg_types.push(ffi_type_for(ty)?);
         stored.push(marshal(ty, val)?);
@@ -435,9 +490,9 @@ pub(crate) fn call_win32_json(json: &str) -> Result<String, String> {
     let key = cif_key(dll, func_name);
 
     CIF_CACHE.with(|cache| {
-        let borrow   = cache.borrow();
-        let entry    = borrow.get(&key).unwrap();
-        let code     = CodePtr(entry.fn_ptr);
+        let borrow = cache.borrow();
+        let entry = borrow.get(&key).unwrap();
+        let code = CodePtr(entry.fn_ptr);
         let ffi_args: Vec<Arg<'_>> = stored.iter().map(|s| s.as_ffi_arg()).collect();
 
         Ok(match ret_type {
@@ -445,19 +500,55 @@ pub(crate) fn call_win32_json(json: &str) -> Result<String, String> {
                 unsafe { entry.cif.call::<()>(code, &ffi_args) };
                 r#"{"value":null}"#.to_string()
             }
-            "i8"      => { let v: i8    = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-            "i16"     => { let v: i16   = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-            "i32"     => { let v: i32   = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-            "i64"     => { let v: i64   = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-            "u8"      => { let v: u8    = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-            "u16"     => { let v: u16   = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-            "u32"     => { let v: u32   = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-            "u64"     => { let v: u64   = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-            "f32"     => { let v: f32   = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-            "f64"     => { let v: f64   = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-            "bool"    => { let v: i32   = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{}}}"#, v != 0) }
-            "pointer" => { let v: usize = unsafe { entry.cif.call(code, &ffi_args) }; format!(r#"{{"value":{v}}}"#) }
-            other     => return Err(format!("Unsupported return type: {other}")),
+            "i8" => {
+                let v: i8 = unsafe { entry.cif.call(code, &ffi_args) };
+                format!(r#"{{"value":{v}}}"#)
+            }
+            "i16" => {
+                let v: i16 = unsafe { entry.cif.call(code, &ffi_args) };
+                format!(r#"{{"value":{v}}}"#)
+            }
+            "i32" => {
+                let v: i32 = unsafe { entry.cif.call(code, &ffi_args) };
+                format!(r#"{{"value":{v}}}"#)
+            }
+            "i64" => {
+                let v: i64 = unsafe { entry.cif.call(code, &ffi_args) };
+                format!(r#"{{"value":{v}}}"#)
+            }
+            "u8" => {
+                let v: u8 = unsafe { entry.cif.call(code, &ffi_args) };
+                format!(r#"{{"value":{v}}}"#)
+            }
+            "u16" => {
+                let v: u16 = unsafe { entry.cif.call(code, &ffi_args) };
+                format!(r#"{{"value":{v}}}"#)
+            }
+            "u32" => {
+                let v: u32 = unsafe { entry.cif.call(code, &ffi_args) };
+                format!(r#"{{"value":{v}}}"#)
+            }
+            "u64" => {
+                let v: u64 = unsafe { entry.cif.call(code, &ffi_args) };
+                format!(r#"{{"value":{v}}}"#)
+            }
+            "f32" => {
+                let v: f32 = unsafe { entry.cif.call(code, &ffi_args) };
+                format!(r#"{{"value":{v}}}"#)
+            }
+            "f64" => {
+                let v: f64 = unsafe { entry.cif.call(code, &ffi_args) };
+                format!(r#"{{"value":{v}}}"#)
+            }
+            "bool" => {
+                let v: i32 = unsafe { entry.cif.call(code, &ffi_args) };
+                format!(r#"{{"value":{}}}"#, v != 0)
+            }
+            "pointer" => {
+                let v: usize = unsafe { entry.cif.call(code, &ffi_args) };
+                format!(r#"{{"value":{v}}}"#)
+            }
+            other => return Err(format!("Unsupported return type: {other}")),
         })
     })
 }

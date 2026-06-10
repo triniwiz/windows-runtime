@@ -31,7 +31,10 @@ fn test_json_array_element_same_object() {
         String(a === b)
         "#,
     );
-    assert_eq!(result, "true", "Same COM object from GetObjectAt(0) twice must be ===");
+    assert_eq!(
+        result, "true",
+        "Same COM object from GetObjectAt(0) twice must be ==="
+    );
 }
 
 /// Accessing a nested JsonObject via GetNamedObject twice must yield the same proxy.
@@ -71,7 +74,10 @@ fn test_constructed_object_roundtrip_via_collection() {
         String(val === retrieved)
         "#,
     );
-    assert_eq!(result, "true", "Round-tripped WinRT value must be === to the original");
+    assert_eq!(
+        result, "true",
+        "Round-tripped WinRT value must be === to the original"
+    );
 }
 
 /// Creating the same WinRT type via two separate `new` calls must NOT be ===
@@ -88,7 +94,10 @@ fn test_distinct_constructed_objects_are_not_equal() {
         String(a === b)
         "#,
     );
-    assert_eq!(result, "false", "Two distinct WinRT instances must NOT be ===");
+    assert_eq!(
+        result, "false",
+        "Two distinct WinRT instances must NOT be ==="
+    );
 }
 
 /// The cache must not confuse two different objects even if one was GC'd and
@@ -114,26 +123,38 @@ fn test_cache_hit_is_faster_than_miss() {
     let mut runtime = Runtime::new(".");
 
     // Warm up: parse the object and get the child once (cache miss — builds template).
-    eval(&mut runtime, "const _root = Windows.Data.Json.JsonObject.Parse('{\"c\":{}}')");
+    eval(
+        &mut runtime,
+        "const _root = Windows.Data.Json.JsonObject.Parse('{\"c\":{}}')",
+    );
 
     // Time a cold access (cache miss on a fresh parse).
     let t0 = Instant::now();
     for _ in 0..100 {
-        eval(&mut runtime, "Windows.Data.Json.JsonObject.Parse('{\"c\":{}}').GetNamedObject('c')");
+        eval(
+            &mut runtime,
+            "Windows.Data.Json.JsonObject.Parse('{\"c\":{}}').GetNamedObject('c')",
+        );
     }
     let miss_avg_ns = t0.elapsed().as_nanos() / 100;
 
     // Time a hot access on the same object (cache hit every time).
-    eval(&mut runtime, "globalThis.__obj = Windows.Data.Json.JsonObject.Parse('{\"c\":{}}')");
+    eval(
+        &mut runtime,
+        "globalThis.__obj = Windows.Data.Json.JsonObject.Parse('{\"c\":{}}')",
+    );
     let t1 = Instant::now();
     for _ in 0..100 {
         eval(&mut runtime, "globalThis.__obj.GetNamedObject('c')");
     }
     let hit_avg_ns = t1.elapsed().as_nanos() / 100;
 
-    println!("cache miss avg: {} ns, cache hit avg: {} ns, speedup: {:.1}x",
-        miss_avg_ns, hit_avg_ns,
-        miss_avg_ns as f64 / hit_avg_ns.max(1) as f64);
+    println!(
+        "cache miss avg: {} ns, cache hit avg: {} ns, speedup: {:.1}x",
+        miss_avg_ns,
+        hit_avg_ns,
+        miss_avg_ns as f64 / hit_avg_ns.max(1) as f64
+    );
 
     // Cache hit should be at least 2x faster than building a fresh template.
     assert!(
@@ -196,5 +217,8 @@ fn test_element_identity_via_two_array_refs() {
         String(elem1 === elem2)
         "#,
     );
-    assert_eq!(result, "true", "Same element from two array refs must be ===");
+    assert_eq!(
+        result, "true",
+        "Same element from two array refs must be ==="
+    );
 }

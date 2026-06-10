@@ -1,10 +1,12 @@
-use std::any::Any;
-use std::ptr::addr_of_mut;
-use windows::core::PCWSTR;
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMAGE_CEE_CS_CALLCONV_GENERIC, IMetaDataImport2, mdtMethodDef};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::parameter_declaration::ParameterDeclaration;
 use crate::signature::Signature;
+use std::any::Any;
+use std::ptr::addr_of_mut;
+use windows::core::PCWSTR;
+use windows::Win32::System::WinRT::Metadata::{
+    mdtMethodDef, CorTokenType, IMetaDataImport2, IMAGE_CEE_CS_CALLCONV_GENERIC,
+};
 
 use crate::prelude::*;
 
@@ -33,8 +35,8 @@ impl MethodDeclaration {
 
         let mut parameters: Vec<ParameterDeclaration> = Vec::new();
 
-        let mut signature =  std::ptr::null_mut() as *mut u8;
-       // let signature_ptr = &mut signature;
+        let mut signature = std::ptr::null_mut() as *mut u8;
+        // let signature_ptr = &mut signature;
         let mut signature_size = 0;
         let mut return_type = PCCOR_SIGNATURE::default();
         let mut full_name = String::new();
@@ -64,80 +66,76 @@ impl MethodDeclaration {
                     if result.is_err() {
                         // Skip methods whose metadata can't be read
                     } else {
+                        let mut sig = PCCOR_SIGNATURE(signature);
 
-                    let mut sig = PCCOR_SIGNATURE(signature);
+                        if cor_sig_uncompress_calling_conv(&mut sig)
+                            == IMAGE_CEE_CS_CALLCONV_GENERIC.0 as u32
+                        {
+                            unimplemented!()
+                        }
 
-                    if cor_sig_uncompress_calling_conv(&mut sig)
-                        == IMAGE_CEE_CS_CALLCONV_GENERIC.0 as u32
-                    {
-                        unimplemented!()
-                    }
+                        let arguments_count = { cor_sig_uncompress_data(&mut sig) };
 
-                    let arguments_count =
-                        { cor_sig_uncompress_data(&mut sig) };
+                        return_type = Signature::consume_type(&mut sig);
 
-                    return_type = Signature::consume_type(&mut sig);
+                        let mut parameter_enumerator = std::ptr::null_mut();
+                        // todo
+                        let mut parameters_count = 0_u32;
+                        let mut parameter_tokens = [0; 1024];
 
-                    let mut parameter_enumerator = std::ptr::null_mut();
-                    // todo
-                    let mut parameters_count = 0_u32;
-                    let mut parameter_tokens = [0; 1024];
+                        let result = metadata.EnumParams(
+                            addr_of_mut!(parameter_enumerator),
+                            token.0 as u32,
+                            parameter_tokens.as_mut_ptr(),
+                            parameter_tokens.len() as u32,
+                            &mut parameters_count,
+                        );
+                        assert!(result.is_ok());
+                        assert!(
+                            parameters_count < (parameter_tokens.len().saturating_sub(1)) as u32
+                        );
 
-                    let result = metadata.EnumParams(
-                        addr_of_mut!(parameter_enumerator),
-                        token.0 as u32,
-                        parameter_tokens.as_mut_ptr(),
-                        parameter_tokens.len() as u32,
-                        &mut parameters_count,
-                    );
-                    assert!(result.is_ok());
-                    assert!(parameters_count < (parameter_tokens.len().saturating_sub(1)) as u32);
+                        metadata.CloseEnum(parameter_enumerator);
 
+                        let mut start_index = 0_usize;
 
-                    metadata.CloseEnum(parameter_enumerator);
+                        if arguments_count + 1 == parameters_count {
+                            start_index += 1;
+                        }
 
-                    let mut start_index = 0_usize;
+                        for i in start_index..parameters_count as usize {
+                            let sig_type = Signature::consume_type(&mut sig);
+                            parameters.push(ParameterDeclaration::new(
+                                Some(metadata),
+                                CorTokenType(parameter_tokens[i] as i32),
+                                sig_type,
+                            ))
+                        }
 
-                    if arguments_count + 1 == parameters_count {
-                        start_index += 1;
-                    }
+                        full_name = String::from_utf16_lossy(
+                            &name_data[0..name_length.saturating_sub(1) as usize],
+                        );
 
+                        overload_name = get_unary_custom_attribute_string_value(
+                            &metadata,
+                            token,
+                            OVERLOAD_ATTRIBUTE,
+                        );
 
-                    for i in start_index..parameters_count as usize {
-                        let sig_type = Signature::consume_type(&mut sig);
-                        parameters.push(ParameterDeclaration::new(
-                            Some(metadata),
-                            CorTokenType(parameter_tokens[i] as i32),
-                            sig_type,
-                        ))
-                    }
+                        is_default_overload =
+                            has_custom_attribute(metadata, token, DEFAULT_OVERLOAD_ATTRIBUTE);
 
-                    full_name = String::from_utf16_lossy(&name_data[0..name_length.saturating_sub(1) as usize]);
-
-                    overload_name = get_unary_custom_attribute_string_value(
-                        &metadata,
-                        token,
-                        OVERLOAD_ATTRIBUTE,
-                    );
-
-                    is_default_overload = has_custom_attribute(
-                        metadata,
-                        token,
-                        DEFAULT_OVERLOAD_ATTRIBUTE,
-                    );
-
-                    // Use the element-type byte directly rather than allocating a String.
-                    is_void = Signature::get_signature_element_type(&return_type)
-                        == windows::Win32::System::WinRT::Metadata::ELEMENT_TYPE_VOID;
-
+                        // Use the element-type byte directly rather than allocating a String.
+                        is_void = Signature::get_signature_element_type(&return_type)
+                            == windows::Win32::System::WinRT::Metadata::ELEMENT_TYPE_VOID;
                     } // end else (GetMethodProps succeeded)
                 }
             }
         }
 
         Self {
-            kind:DeclarationKind::Method,
-            metadata: metadata.map(|f|f.clone()),
+            kind: DeclarationKind::Method,
+            metadata: metadata.map(|f| f.clone()),
             token,
             parameters,
             return_type,
@@ -180,7 +178,6 @@ impl MethodDeclaration {
             };
             assert!(result.is_ok());
         }
-
 
         let name = PCWSTR(full_name_data.as_ptr());
 

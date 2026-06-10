@@ -1,15 +1,15 @@
 use std::any::Any;
 use std::ptr::addr_of_mut;
 
-use crate::prelude::*;
-use windows::core::GUID;
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2, mdtTypeSpec};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::delegate_declaration::{DelegateDeclaration, DelegateDeclarationImpl};
 use crate::declarations::method_declaration::MethodDeclaration;
 use crate::declarations::type_declaration::TypeDeclaration;
 use crate::generic_instance_id_builder::GenericInstanceIdBuilder;
+use crate::prelude::*;
 use crate::signature::Signature;
+use windows::core::GUID;
+use windows::Win32::System::WinRT::Metadata::{mdtTypeSpec, CorTokenType, IMetaDataImport2};
 
 #[derive(Clone, Debug)]
 pub struct GenericDelegateInstanceDeclaration {

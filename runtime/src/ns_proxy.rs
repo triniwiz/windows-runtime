@@ -1,7 +1,7 @@
 use crate::class_helpers::{
-    class_has_member_named, collect_class_methods, collect_class_properties,
-    collect_class_properties_with_declaring, find_class_method, find_class_property,
-    find_event_methods, find_static_property_declaring_class,
+    class_has_member_named, collect_class_methods, collect_class_properties_with_declaring,
+    find_class_method, find_class_property, find_event_methods,
+    find_static_property_declaring_class,
 };
 use crate::error;
 use crate::generic_method_call::GenericMethodCall;
@@ -16,9 +16,9 @@ use crate::value::{
     NativeValue, MAX_SAFE_INTEGER, MIN_SAFE_INTEGER,
 };
 use crate::{
-    class_activation_factory, classify_return, debug_output, delegate_info_from_add_method,
-    js_delegate_params_from_declaration, resolve_class_factory_from_parent, throw_js_error,
-    DeclarationFFI, JsDelegate, JsDelegateData, ReturnKind, JS_DELEGATE_VTBL,
+    class_activation_factory, delegate_info_from_add_method, js_delegate_params_from_declaration,
+    resolve_class_factory_from_parent, throw_js_error, DeclarationFFI, JsDelegate, JsDelegateData,
+    ReturnKind, JS_DELEGATE_VTBL,
 };
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use metadata::declarations::class_declaration::ClassDeclaration;
@@ -177,9 +177,15 @@ pub(crate) fn try_wrap_inspectable_pointer<'a>(
         .filter(|(_, d)| !matches!(d.read().kind(), DeclarationKind::Struct));
     match resolved {
         Some((cname, decl)) => {
-            let ret: Local<v8::Value> =
-                create_ns_ctor_instance_object(cname.as_str(), None, None, decl, Some(instance), scope)
-                    .into();
+            let ret: Local<v8::Value> = create_ns_ctor_instance_object(
+                cname.as_str(),
+                None,
+                None,
+                decl,
+                Some(instance),
+                scope,
+            )
+            .into();
             Some(ret)
         }
         None => {
@@ -394,53 +400,95 @@ pub(crate) fn handle_named_property_getter(
                                         return;
                                     }
 
-                                    let mut return_value_opt: Option<Local<v8::Value>> = match method.return_kind() {
+                                    let return_value_opt: Option<Local<v8::Value>> = match method
+                                        .return_kind()
+                                    {
                                         ReturnKind::Void => None,
                                         ReturnKind::Guid => {
-                                            let obj = unsafe { crate::guid_ptr_to_js_object(result, scope) };
+                                            let obj = unsafe {
+                                                crate::guid_ptr_to_js_object(result, scope)
+                                            };
                                             Some(obj.into())
                                         }
-                                        ReturnKind::Struct(declaration) => {
-                                            Some(crate::create_struct_object_from_raw(declaration.clone(), result, scope).into())
-                                        }
+                                        ReturnKind::Struct(declaration) => Some(
+                                            crate::create_struct_object_from_raw(
+                                                declaration.clone(),
+                                                result,
+                                                scope,
+                                            )
+                                            .into(),
+                                        ),
                                         ReturnKind::Object { decl, type_name }
                                         | ReturnKind::InterfaceObject { decl, type_name } => {
                                             if result.is_null() {
                                                 Some(v8::null(scope).into())
                                             } else {
-                                                let instance = unsafe { IUnknown::from_raw(result) };
-                                                Some(create_ns_ctor_instance_object(
-                                                    type_name.as_ref(), None, dec.parent.clone(), decl.clone(), Some(instance), scope,
-                                                ).into())
+                                                let instance =
+                                                    unsafe { IUnknown::from_raw(result) };
+                                                Some(
+                                                    create_ns_ctor_instance_object(
+                                                        type_name.as_ref(),
+                                                        None,
+                                                        dec.parent.clone(),
+                                                        decl.clone(),
+                                                        Some(instance),
+                                                        scope,
+                                                    )
+                                                    .into(),
+                                                )
                                             }
                                         }
                                         ReturnKind::DynamicObject => {
                                             if result.is_null() {
                                                 None
                                             } else {
-                                                let instance = unsafe { IUnknown::from_raw(result) };
+                                                let instance =
+                                                    unsafe { IUnknown::from_raw(result) };
                                                 let resolved = instance
                                                     .cast::<IInspectable>()
                                                     .ok()
-                                                    .and_then(|insp| insp.GetRuntimeClassName().ok())
+                                                    .and_then(|insp| {
+                                                        insp.GetRuntimeClassName().ok()
+                                                    })
                                                     .map(|cn| cn.to_string())
-                                                    .and_then(|n| MetadataReader::find_by_name(&n).map(|d| (n, d)))
-                                                    .filter(|(_, d)| !matches!(d.read().kind(), DeclarationKind::Struct));
+                                                    .and_then(|n| {
+                                                        MetadataReader::find_by_name(&n)
+                                                            .map(|d| (n, d))
+                                                    })
+                                                    .filter(|(_, d)| {
+                                                        !matches!(
+                                                            d.read().kind(),
+                                                            DeclarationKind::Struct
+                                                        )
+                                                    });
                                                 match resolved {
-                                                    Some((name, decl)) => {
-                                                        Some(create_ns_ctor_instance_object(
-                                                            name.as_str(), None, dec.parent.clone(), decl, Some(instance), scope,
-                                                        ).into())
-                                                    }
+                                                    Some((name, decl)) => Some(
+                                                        create_ns_ctor_instance_object(
+                                                            name.as_str(),
+                                                            None,
+                                                            dec.parent.clone(),
+                                                            decl,
+                                                            Some(instance),
+                                                            scope,
+                                                        )
+                                                        .into(),
+                                                    ),
                                                     None => {
-                                                        let _ = std::mem::ManuallyDrop::new(instance);
+                                                        let _ =
+                                                            std::mem::ManuallyDrop::new(instance);
                                                         None
                                                     }
                                                 }
                                             }
                                         }
                                         ReturnKind::Primitive(nt) => {
-                                            let v = unsafe { read_value_from_ptr(result as *const c_void, scope, nt.clone()) };
+                                            let v = unsafe {
+                                                read_value_from_ptr(
+                                                    result as *const c_void,
+                                                    scope,
+                                                    nt.clone(),
+                                                )
+                                            };
                                             Some(v)
                                         }
                                     };
@@ -616,31 +664,30 @@ pub(crate) fn handle_named_property_setter(
 
                 // Path A — `{ handle: External }` from a delegate constructor.
                 // Path B — plain JS function: auto-derive the delegate type and wrap it.
-                let effective_ptr: Option<*mut c_void> = if value.is_object() {
-                    value.to_object(scope).and_then(|obj| {
-                        let key = v8::String::new(scope, "handle")?;
-                        let handle_val = obj.get(scope, key.into())?;
-                        v8::Local::<v8::External>::try_from(handle_val)
-                            .ok()
-                            .map(|ext| ext.value())
-                    })
-                } else if let Ok(func) = v8::Local::<v8::Function>::try_from(value) {
-                    delegate_info_from_add_method(&add_method).map(|(guid, param_types)| {
-                        let data = Box::new(JsDelegateData {
-                            js_func: v8::Global::new(scope, func),
-                            param_types,
-                        });
-                        let delegate = Box::new(JsDelegate {
-                            vtable: &JS_DELEGATE_VTBL as *const _,
-                            ref_count: std::sync::atomic::AtomicU32::new(1),
-                            guid,
-                            data: Box::into_raw(data),
-                        });
-                        Box::into_raw(delegate) as *mut c_void
-                    })
-                } else {
-                    None
-                };
+                // Functions are objects too, so probe for a handle first and only then
+                // fall back to wrapping the value as a function.
+                let handle_ptr: Option<*mut c_void> = value.to_object(scope).and_then(|obj| {
+                    let key = v8::String::new(scope, "handle")?;
+                    let handle_val = obj.get(scope, key.into())?;
+                    v8::Local::<v8::External>::try_from(handle_val)
+                        .ok()
+                        .map(|ext| ext.value())
+                });
+                let effective_ptr: Option<*mut c_void> = handle_ptr.or_else(|| {
+                    let func = v8::Local::<v8::Function>::try_from(value).ok()?;
+                    let (guid, param_types) = delegate_info_from_add_method(&add_method)?;
+                    let data = Box::new(JsDelegateData {
+                        js_func: v8::Global::new(scope, func),
+                        param_types,
+                    });
+                    let delegate = Box::new(JsDelegate {
+                        vtable: &JS_DELEGATE_VTBL as *const _,
+                        ref_count: std::sync::atomic::AtomicU32::new(1),
+                        guid,
+                        data: Box::into_raw(data),
+                    });
+                    Some(Box::into_raw(delegate) as *mut c_void)
+                });
 
                 if let Some(delegate_ptr) = effective_ptr {
                     if let Some(instance) = instance {
@@ -715,7 +762,7 @@ fn instance_method_dispatch(
         return;
     }
 
-    let mut return_value_opt: Option<Local<v8::Value>> = match method.return_kind() {
+    let return_value_opt: Option<Local<v8::Value>> = match method.return_kind() {
         ReturnKind::Void => None,
         ReturnKind::Guid => {
             let obj = unsafe { crate::guid_ptr_to_js_object(result, scope) };
@@ -757,7 +804,12 @@ fn instance_method_dispatch(
                 match resolved {
                     Some((name, decl)) => {
                         let ret: Local<v8::Value> = create_ns_ctor_instance_object(
-                            name.as_str(), None, dec.parent.clone(), decl, Some(instance), scope,
+                            name.as_str(),
+                            None,
+                            dec.parent.clone(),
+                            decl,
+                            Some(instance),
+                            scope,
                         )
                         .into();
                         Some(ret)
@@ -882,17 +934,25 @@ pub(crate) fn handle_instance_property_getter(
                 let obj = unsafe { crate::guid_ptr_to_js_object(result, scope) };
                 Some(obj.into())
             }
-            ReturnKind::Struct(declaration) => {
-                Some(crate::create_struct_object_from_raw(declaration.clone(), result, scope).into())
-            }
+            ReturnKind::Struct(declaration) => Some(
+                crate::create_struct_object_from_raw(declaration.clone(), result, scope).into(),
+            ),
             ReturnKind::Object { decl, type_name } => {
                 if result.is_null() {
                     Some(v8::null(scope).into())
                 } else {
                     let instance = unsafe { IUnknown::from_raw(result) };
-                    Some(create_ns_ctor_instance_object(
-                        type_name.as_ref(), None, None, decl.clone(), Some(instance), scope,
-                    ).into())
+                    Some(
+                        create_ns_ctor_instance_object(
+                            type_name.as_ref(),
+                            None,
+                            None,
+                            decl.clone(),
+                            Some(instance),
+                            scope,
+                        )
+                        .into(),
+                    )
                 }
             }
             ReturnKind::InterfaceObject { decl, type_name } => {
@@ -908,14 +968,24 @@ pub(crate) fn handle_instance_property_getter(
                         .and_then(|n| MetadataReader::find_by_name(&n).map(|d| (n, d)))
                         .filter(|(_, d)| !matches!(d.read().kind(), DeclarationKind::Struct))
                         .unwrap_or_else(|| (type_name.to_string(), decl.clone()));
-                    Some(create_ns_ctor_instance_object(
-                        resolved_name.as_str(), None, None, resolved_decl, Some(instance), scope,
-                    ).into())
+                    Some(
+                        create_ns_ctor_instance_object(
+                            resolved_name.as_str(),
+                            None,
+                            None,
+                            resolved_decl,
+                            Some(instance),
+                            scope,
+                        )
+                        .into(),
+                    )
                 }
             }
             ReturnKind::DynamicObject => None,
             ReturnKind::Primitive(nt) => {
-                let v = unsafe { read_value_from_ptr(result as *const std::ffi::c_void, scope, nt.clone()) };
+                let v = unsafe {
+                    read_value_from_ptr(result as *const std::ffi::c_void, scope, nt.clone())
+                };
                 Some(v)
             }
         };
@@ -1117,31 +1187,30 @@ pub(crate) fn handle_instance_property_setter(
 
         // Path A — `{ handle: External }` from a delegate constructor.
         // Path B — plain JS function: auto-derive the delegate type and wrap it.
-        let effective_ptr: Option<*mut c_void> = if value.is_object() {
-            value.to_object(scope).and_then(|obj| {
-                let key = v8::String::new(scope, "handle")?;
-                let handle_val = obj.get(scope, key.into())?;
-                v8::Local::<v8::External>::try_from(handle_val)
-                    .ok()
-                    .map(|ext| ext.value())
-            })
-        } else if let Ok(func) = v8::Local::<v8::Function>::try_from(value) {
-            delegate_info_from_add_method(&add_method).map(|(guid, param_types)| {
-                let data = Box::new(JsDelegateData {
-                    js_func: v8::Global::new(scope, func),
-                    param_types,
-                });
-                let delegate = Box::new(JsDelegate {
-                    vtable: &JS_DELEGATE_VTBL as *const _,
-                    ref_count: std::sync::atomic::AtomicU32::new(1),
-                    guid,
-                    data: Box::into_raw(data),
-                });
-                Box::into_raw(delegate) as *mut c_void
-            })
-        } else {
-            None
-        };
+        // Functions are objects too, so probe for a handle first and only then
+        // fall back to wrapping the value as a function.
+        let handle_ptr: Option<*mut c_void> = value.to_object(scope).and_then(|obj| {
+            let key = v8::String::new(scope, "handle")?;
+            let handle_val = obj.get(scope, key.into())?;
+            v8::Local::<v8::External>::try_from(handle_val)
+                .ok()
+                .map(|ext| ext.value())
+        });
+        let effective_ptr: Option<*mut c_void> = handle_ptr.or_else(|| {
+            let func = v8::Local::<v8::Function>::try_from(value).ok()?;
+            let (guid, param_types) = delegate_info_from_add_method(&add_method)?;
+            let data = Box::new(JsDelegateData {
+                js_func: v8::Global::new(scope, func),
+                param_types,
+            });
+            let delegate = Box::new(JsDelegate {
+                vtable: &JS_DELEGATE_VTBL as *const _,
+                ref_count: std::sync::atomic::AtomicU32::new(1),
+                guid,
+                data: Box::into_raw(data),
+            });
+            Some(Box::into_raw(delegate) as *mut c_void)
+        });
 
         if let Some(delegate_ptr) = effective_ptr {
             if let Some(inst) = instance {
@@ -1208,7 +1277,7 @@ pub(crate) fn handle_instance_property_setter(
 fn v8_value_to_inspectable(
     scope: &mut v8::PinScope<'_, '_>,
     val: Local<v8::Value>,
-    dec: &DeclarationFFI,
+    _dec: &DeclarationFFI,
 ) -> Option<IInspectable> {
     if let Ok(sv) = v8::Local::<v8::String>::try_from(val) {
         let s = sv.to_rust_string_lossy(scope);
@@ -1712,13 +1781,13 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                         let dec = unsafe { &*dec };
                         let lock = dec.read();
                         let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
-                        let Some(__ns_inst) = this_instance(scope, args.this()).or_else(|| dec.instance.clone()) else { return; };
-                        let mut method = MethodCall::new(
-                            method,
-                            method.is_sealed(),
-                            __ns_inst,
-                            false,
-                        );
+                        let Some(__ns_inst) =
+                            this_instance(scope, args.this()).or_else(|| dec.instance.clone())
+                        else {
+                            return;
+                        };
+                        let mut method =
+                            MethodCall::new(method, method.is_sealed(), __ns_inst, false);
                         let (ret, result, _outs) = method.call(scope, &args);
 
                         if ret.is_err() {
@@ -1735,7 +1804,12 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                     Some(obj.into())
                                 }
                                 ReturnKind::Struct(declaration) => Some(
-                                    crate::create_struct_object_from_raw(declaration.clone(), result, scope).into()
+                                    crate::create_struct_object_from_raw(
+                                        declaration.clone(),
+                                        result,
+                                        scope,
+                                    )
+                                    .into(),
                                 ),
                                 ReturnKind::Object { decl, type_name }
                                 | ReturnKind::InterfaceObject { decl, type_name } => {
@@ -1743,14 +1817,28 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                         Some(v8::null(scope).into())
                                     } else {
                                         let instance = unsafe { IUnknown::from_raw(result) };
-                                        Some(create_ns_ctor_instance_object(
-                                            type_name.as_ref(), None, dec.parent.clone(), decl.clone(), Some(instance), scope,
-                                        ).into())
+                                        Some(
+                                            create_ns_ctor_instance_object(
+                                                type_name.as_ref(),
+                                                None,
+                                                dec.parent.clone(),
+                                                decl.clone(),
+                                                Some(instance),
+                                                scope,
+                                            )
+                                            .into(),
+                                        )
                                     }
                                 }
                                 ReturnKind::DynamicObject => None,
                                 ReturnKind::Primitive(nt) => {
-                                    let v = unsafe { read_value_from_ptr(result as *const std::ffi::c_void, scope, nt.clone()) };
+                                    let v = unsafe {
+                                        read_value_from_ptr(
+                                            result as *const std::ffi::c_void,
+                                            scope,
+                                            nt.clone(),
+                                        )
+                                    };
                                     Some(v)
                                 }
                             };
@@ -1862,7 +1950,12 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                         Some(obj.into())
                                     }
                                     ReturnKind::Struct(declaration) => Some(
-                                        crate::create_struct_object_from_raw(declaration.clone(), result, scope).into()
+                                        crate::create_struct_object_from_raw(
+                                            declaration.clone(),
+                                            result,
+                                            scope,
+                                        )
+                                        .into(),
                                     ),
                                     ReturnKind::Object { decl, type_name }
                                     | ReturnKind::InterfaceObject { decl, type_name } => {
@@ -1870,14 +1963,28 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                             Some(v8::null(scope).into())
                                         } else {
                                             let instance = unsafe { IUnknown::from_raw(result) };
-                                            Some(create_ns_ctor_instance_object(
-                                                type_name.as_ref(), None, None, decl.clone(), Some(instance), scope,
-                                            ).into())
+                                            Some(
+                                                create_ns_ctor_instance_object(
+                                                    type_name.as_ref(),
+                                                    None,
+                                                    None,
+                                                    decl.clone(),
+                                                    Some(instance),
+                                                    scope,
+                                                )
+                                                .into(),
+                                            )
                                         }
                                     }
                                     ReturnKind::DynamicObject => None,
                                     ReturnKind::Primitive(nt) => {
-                                        let v = unsafe { read_value_from_ptr(result as *const std::ffi::c_void, scope, nt.clone()) };
+                                        let v = unsafe {
+                                            read_value_from_ptr(
+                                                result as *const std::ffi::c_void,
+                                                scope,
+                                                nt.clone(),
+                                            )
+                                        };
                                         Some(v)
                                     }
                                 };
@@ -2351,13 +2458,13 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                             let dec = unsafe { &*dec };
                             let lock = dec.read();
                             let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
-                            let Some(__ns_inst) = this_instance(scope, args.this()).or_else(|| dec.instance.clone()) else { return; };
-                            let mut method = MethodCall::new(
-                                method,
-                                method.is_sealed(),
-                                __ns_inst,
-                                false,
-                            );
+                            let Some(__ns_inst) =
+                                this_instance(scope, args.this()).or_else(|| dec.instance.clone())
+                            else {
+                                return;
+                            };
+                            let mut method =
+                                MethodCall::new(method, method.is_sealed(), __ns_inst, false);
                             let (ret, result, _outs) = method.call(scope, &args);
                             if ret.is_err() {
                                 let detail = crate::error::format_hresult_message(ret);
@@ -2413,13 +2520,14 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                             let lock = dec.read();
                             let method =
                                 lock.as_any().downcast_ref::<PropertyDeclaration>().unwrap();
-                            let Some(__ns_inst) = this_instance(scope, args.this()).or_else(|| dec.instance.clone()) else { return; };
-                            let Some(mut method) = PropertyCall::new(
-                                method,
-                                false,
-                                __ns_inst,
-                                false,
-                            ) else {
+                            let Some(__ns_inst) =
+                                this_instance(scope, args.this()).or_else(|| dec.instance.clone())
+                            else {
+                                return;
+                            };
+                            let Some(mut method) =
+                                PropertyCall::new(method, false, __ns_inst, false)
+                            else {
                                 return;
                             };
                             let (ret, result, _outs) = method.call(scope, &args);
@@ -2464,13 +2572,13 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                         .downcast_ref::<PropertyDeclaration>()
                                         .unwrap();
                                     let setter = prop.setter().unwrap();
-                                    let Some(__ns_inst) = this_instance(scope, args.this()).or_else(|| dec.instance.clone()) else { return; };
-                                    let mut method = MethodCall::new(
-                                        setter,
-                                        false,
-                                        __ns_inst,
-                                        false,
-                                    );
+                                    let Some(__ns_inst) = this_instance(scope, args.this())
+                                        .or_else(|| dec.instance.clone())
+                                    else {
+                                        return;
+                                    };
+                                    let mut method =
+                                        MethodCall::new(setter, false, __ns_inst, false);
                                     let (ret, _, _outs) = method.call(scope, &args);
                                     if ret.is_err() {
                                         let detail = crate::error::format_hresult_message(ret);
@@ -2571,7 +2679,11 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                 .as_any()
                                 .downcast_ref::<GenericInterfaceDeclaration>()
                                 .unwrap();
-                            let Some(__ns_inst) = this_instance(scope, args.this()).or_else(|| dec.instance.clone()) else { return; };
+                            let Some(__ns_inst) =
+                                this_instance(scope, args.this()).or_else(|| dec.instance.clone())
+                            else {
+                                return;
+                            };
                             let mut method = GenericMethodCall::new(
                                 parent,
                                 method,

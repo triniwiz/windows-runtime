@@ -1,19 +1,19 @@
 use std::ffi::c_void;
-use windows::core::{GUID, HSTRING, IUnknown, Interface};
+use windows::core::{IUnknown, Interface, GUID, HSTRING};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::WinRT::Metadata::{
-    CLSID_CorMetaDataDispenser, IMetaDataDispenserEx, IMetaDataImport2, ofRead,
+    ofRead, CLSID_CorMetaDataDispenser, IMetaDataDispenserEx, IMetaDataImport2,
 };
 
 pub mod com_helpers;
-pub mod declarations;
-pub mod prelude;
-pub mod meta_data_reader;
-pub mod value;
-pub mod signature;
-pub mod generic_instance_id_builder;
 pub mod declaration_factory;
+pub mod declarations;
 pub mod declaring_interface_for_method;
+pub mod generic_instance_id_builder;
+pub mod meta_data_reader;
+pub mod prelude;
+pub mod signature;
+pub mod value;
 
 // ---------------------------------------------------------------------------
 // Vtable / COM helpers
@@ -133,8 +133,8 @@ mod tests {
     #[test]
     fn reads_unaligned_windows_guid_bytes() {
         let bytes = [
-            0x78, 0x56, 0x34, 0x12, 0xbc, 0x9a, 0xf0, 0xde, 0x12, 0x34, 0x56, 0x78,
-            0x9a, 0xbc, 0xde, 0xf0,
+            0x78, 0x56, 0x34, 0x12, 0xbc, 0x9a, 0xf0, 0xde, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc,
+            0xde, 0xf0,
         ];
 
         let guid = unsafe { get_guid(bytes.as_ptr()) };

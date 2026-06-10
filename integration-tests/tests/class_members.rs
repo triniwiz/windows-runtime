@@ -9,7 +9,8 @@ fn assert_js(rt: &mut Runtime, expr: &str, msg: &str) {
 }
 
 fn eval(rt: &mut Runtime, expr: &str) -> String {
-    rt.eval_script_to_string(expr).unwrap_or_else(|| "<eval failed>".to_string())
+    rt.eval_script_to_string(expr)
+        .unwrap_or_else(|| "<eval failed>".to_string())
 }
 
 // ── CLASS_MEMBERS_CACHE correctness ─────────────────────────────────────────
@@ -17,7 +18,10 @@ fn eval(rt: &mut Runtime, expr: &str) -> String {
 #[test]
 fn class_property_accessible_by_name() {
     let mut rt = Runtime::new(".");
-    let v = eval(&mut rt, "new Windows.Foundation.Uri('http://example.com/').AbsoluteUri");
+    let v = eval(
+        &mut rt,
+        "new Windows.Foundation.Uri('http://example.com/').AbsoluteUri",
+    );
     assert_eq!(v.trim(), "http://example.com/", "AbsoluteUri round-trip");
 }
 
@@ -187,21 +191,34 @@ fn string_property_value_is_not_garbage() {
     // producing garbage or a crash.  This asserts the actual string content.
     // Note: WinRT Uri uses Path (not AbsolutePath like .NET System.Uri).
     let mut rt = Runtime::new(".");
-    let v = eval(&mut rt, "new Windows.Foundation.Uri('http://example.com/path').Path");
+    let v = eval(
+        &mut rt,
+        "new Windows.Foundation.Uri('http://example.com/path').Path",
+    );
     assert_eq!(v.trim(), "/path", "Path should be '/path'");
 }
 
 #[test]
 fn string_property_host_roundtrip() {
     let mut rt = Runtime::new(".");
-    let v = eval(&mut rt, "new Windows.Foundation.Uri('http://myhost.example.com/').Host");
-    assert_eq!(v.trim(), "myhost.example.com", "Host should round-trip correctly");
+    let v = eval(
+        &mut rt,
+        "new Windows.Foundation.Uri('http://myhost.example.com/').Host",
+    );
+    assert_eq!(
+        v.trim(),
+        "myhost.example.com",
+        "Host should round-trip correctly"
+    );
 }
 
 #[test]
 fn string_property_scheme_roundtrip() {
     let mut rt = Runtime::new(".");
-    let v = eval(&mut rt, "new Windows.Foundation.Uri('https://example.com/').SchemeName");
+    let v = eval(
+        &mut rt,
+        "new Windows.Foundation.Uri('https://example.com/').SchemeName",
+    );
     assert_eq!(v.trim(), "https", "SchemeName should be 'https'");
 }
 
@@ -217,7 +234,7 @@ fn string_property_multiple_distinct_uris() {
     let h1 = eval(&mut rt, "globalThis.__u1.Host");
     let h2 = eval(&mut rt, "globalThis.__u2.Host");
     assert_eq!(h1.trim(), "alpha.example.com", "first host wrong: {h1:?}");
-    assert_eq!(h2.trim(), "beta.example.com",  "second host wrong: {h2:?}");
+    assert_eq!(h2.trim(), "beta.example.com", "second host wrong: {h2:?}");
     assert_ne!(h1, h2, "two different Uri hosts should differ");
 }
 
@@ -237,7 +254,10 @@ fn method_returning_string_is_typeof_string() {
 #[test]
 fn method_returning_string_value_matches() {
     let mut rt = Runtime::new(".");
-    let v = eval(&mut rt, "new Windows.Foundation.Uri('http://example.com/').ToString()");
+    let v = eval(
+        &mut rt,
+        "new Windows.Foundation.Uri('http://example.com/').ToString()",
+    );
     assert!(
         v.contains("example.com"),
         "Uri.ToString() should contain hostname, got: {v:?}",
@@ -262,7 +282,11 @@ fn json_value_create_and_get_string_roundtrip() {
         return;
     }
     let v = eval(&mut rt, "globalThis.__jv2.GetString()");
-    assert_eq!(v.trim(), "roundtrip-test", "GetString() should return the original string");
+    assert_eq!(
+        v.trim(),
+        "roundtrip-test",
+        "GetString() should return the original string"
+    );
 }
 
 #[test]

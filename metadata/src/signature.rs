@@ -1,8 +1,15 @@
 #![allow(non_upper_case_globals)]
 
-use std::mem::MaybeUninit;
-use windows::Win32::System::WinRT::Metadata::{ELEMENT_TYPE_VOID, ELEMENT_TYPE_BOOLEAN, ELEMENT_TYPE_CHAR, ELEMENT_TYPE_I1, ELEMENT_TYPE_U1, ELEMENT_TYPE_I2, ELEMENT_TYPE_U2, ELEMENT_TYPE_I4, ELEMENT_TYPE_U4, ELEMENT_TYPE_I8, ELEMENT_TYPE_U8, ELEMENT_TYPE_R4, ELEMENT_TYPE_R8, ELEMENT_TYPE_STRING, IMetaDataImport2, ELEMENT_TYPE_VALUETYPE, ELEMENT_TYPE_CLASS, ELEMENT_TYPE_OBJECT, ELEMENT_TYPE_SZARRAY, ELEMENT_TYPE_VAR, ELEMENT_TYPE_GENERICINST, ELEMENT_TYPE_BYREF, CorTokenType, CorElementType, mdtTypeDef, mdtTypeRef};
 use crate::prelude::*;
+use std::mem::MaybeUninit;
+use windows::Win32::System::WinRT::Metadata::{
+    mdtTypeDef, mdtTypeRef, CorElementType, CorTokenType, IMetaDataImport2, ELEMENT_TYPE_BOOLEAN,
+    ELEMENT_TYPE_BYREF, ELEMENT_TYPE_CHAR, ELEMENT_TYPE_CLASS, ELEMENT_TYPE_GENERICINST,
+    ELEMENT_TYPE_I1, ELEMENT_TYPE_I2, ELEMENT_TYPE_I4, ELEMENT_TYPE_I8, ELEMENT_TYPE_OBJECT,
+    ELEMENT_TYPE_R4, ELEMENT_TYPE_R8, ELEMENT_TYPE_STRING, ELEMENT_TYPE_SZARRAY, ELEMENT_TYPE_U1,
+    ELEMENT_TYPE_U2, ELEMENT_TYPE_U4, ELEMENT_TYPE_U8, ELEMENT_TYPE_VALUETYPE, ELEMENT_TYPE_VAR,
+    ELEMENT_TYPE_VOID,
+};
 
 const Guid: &str = "Guid";
 
@@ -11,14 +18,19 @@ const Guid: &str = "Guid";
 /// WinRT enums are always backed by a 32-bit integer on the ABI wire.
 fn is_enum_type(metadata: &IMetaDataImport2, token: CorTokenType) -> bool {
     let token_kind = CorTokenType(type_from_token(token));
-    
+
     // For TypeRef tokens, resolve to the TypeDef in the external metadata scope first.
     if token_kind == mdtTypeRef {
         // resolve_type_ref opens the metadata file that owns the referenced type and
         // returns both the external IMetaDataImport2 scope and the TypeDef token within it.
         let mut ext_metadata: MaybeUninit<IMetaDataImport2> = MaybeUninit::zeroed();
         let mut ext_token = token;
-        if resolve_type_ref(Some(metadata), token, unsafe { ext_metadata.assume_init_mut() }, &mut ext_token) {
+        if resolve_type_ref(
+            Some(metadata),
+            token,
+            unsafe { ext_metadata.assume_init_mut() },
+            &mut ext_token,
+        ) {
             return is_enum_type(unsafe { ext_metadata.assume_init_ref() }, ext_token);
         }
         return false;
@@ -55,7 +67,12 @@ fn get_fully_qualified_type_name(metadata: &IMetaDataImport2, token: CorTokenTyp
     if token_kind == mdtTypeRef {
         let mut ext_metadata: MaybeUninit<IMetaDataImport2> = MaybeUninit::zeroed();
         let mut ext_token = token;
-        if resolve_type_ref(Some(metadata), token, unsafe { ext_metadata.assume_init_mut() }, &mut ext_token) {
+        if resolve_type_ref(
+            Some(metadata),
+            token,
+            unsafe { ext_metadata.assume_init_mut() },
+            &mut ext_token,
+        ) {
             return get_type_name(unsafe { ext_metadata.assume_init_ref() }, ext_token);
         }
     }
@@ -71,20 +88,10 @@ impl Signature {
         let element_type = cor_sig_uncompress_element_type(signature);
 
         match element_type {
-            ELEMENT_TYPE_VOID
-            | ELEMENT_TYPE_BOOLEAN
-            | ELEMENT_TYPE_CHAR
-            | ELEMENT_TYPE_I1
-            | ELEMENT_TYPE_U1
-            | ELEMENT_TYPE_I2
-            | ELEMENT_TYPE_U2
-            | ELEMENT_TYPE_I4
-            | ELEMENT_TYPE_U4
-            | ELEMENT_TYPE_I8
-            | ELEMENT_TYPE_U8
-            | ELEMENT_TYPE_R4
-            | ELEMENT_TYPE_R8
-            | ELEMENT_TYPE_STRING => start,
+            ELEMENT_TYPE_VOID | ELEMENT_TYPE_BOOLEAN | ELEMENT_TYPE_CHAR | ELEMENT_TYPE_I1
+            | ELEMENT_TYPE_U1 | ELEMENT_TYPE_I2 | ELEMENT_TYPE_U2 | ELEMENT_TYPE_I4
+            | ELEMENT_TYPE_U4 | ELEMENT_TYPE_I8 | ELEMENT_TYPE_U8 | ELEMENT_TYPE_R4
+            | ELEMENT_TYPE_R8 | ELEMENT_TYPE_STRING => start,
             ELEMENT_TYPE_VALUETYPE => {
                 cor_sig_uncompress_token(signature);
                 start
@@ -122,7 +129,11 @@ impl Signature {
         }
     }
 
-    fn get_string(metadata: Option<&IMetaDataImport2>, signature: &PCCOR_SIGNATURE, preserve_arity: bool) -> String {
+    fn get_string(
+        metadata: Option<&IMetaDataImport2>,
+        signature: &PCCOR_SIGNATURE,
+        preserve_arity: bool,
+    ) -> String {
         let mut signature = signature.clone();
 
         let element_type = cor_sig_uncompress_element_type(&mut signature);
@@ -190,7 +201,8 @@ impl Signature {
                 let token = cor_sig_uncompress_token(&mut signature);
 
                 let mut result = if let Some(metadata_ref) = metadata {
-                    let mut name = get_fully_qualified_type_name(metadata_ref, CorTokenType(token as i32));
+                    let mut name =
+                        get_fully_qualified_type_name(metadata_ref, CorTokenType(token as i32));
                     if !preserve_arity {
                         if let Some(pos) = name.find('`') {
                             name.truncate(pos);
@@ -224,9 +236,7 @@ impl Signature {
                 result += Signature::get_string(metadata, &mut signature, preserve_arity).as_ref();
                 result
             }
-            _ => {
-                "Object".to_string()
-            }
+            _ => "Object".to_string(),
         };
     }
 
@@ -248,7 +258,10 @@ impl Signature {
     /// ("Int32") for ELEMENT_TYPE_VALUETYPE enums. Required for SetStruct field
     /// type names so that struct field signatures end up as `enum(name;i4)`
     /// rather than primitive `i4` in the composed PIID signature.
-    pub fn to_struct_field_name(metadata: &IMetaDataImport2, signature: &PCCOR_SIGNATURE) -> String {
+    pub fn to_struct_field_name(
+        metadata: &IMetaDataImport2,
+        signature: &PCCOR_SIGNATURE,
+    ) -> String {
         Signature::get_struct_field_name(metadata, signature)
     }
 
@@ -280,7 +293,10 @@ impl Signature {
         Signature::get_wire_signature(Some(metadata), signature)
     }
 
-    fn get_wire_signature(metadata: Option<&IMetaDataImport2>, signature: &PCCOR_SIGNATURE) -> String {
+    fn get_wire_signature(
+        metadata: Option<&IMetaDataImport2>,
+        signature: &PCCOR_SIGNATURE,
+    ) -> String {
         let mut signature = signature.clone();
         let element_type = cor_sig_uncompress_element_type(&mut signature);
 
@@ -334,7 +350,8 @@ impl Signature {
                 let open_name = get_fully_qualified_type_name(meta, CorTokenType(token as i32));
                 // open_name includes `N suffix (e.g. "Windows.Foundation.IReference`1")
                 let generic_arguments_count = cor_sig_uncompress_data(&mut signature);
-                let mut arg_sigs: Vec<String> = Vec::with_capacity(generic_arguments_count as usize);
+                let mut arg_sigs: Vec<String> =
+                    Vec::with_capacity(generic_arguments_count as usize);
                 for _ in 0..generic_arguments_count {
                     let mut sig_type = Signature::consume_type(&mut signature);
                     arg_sigs.push(Signature::get_wire_signature(metadata, &mut sig_type));
@@ -351,9 +368,7 @@ impl Signature {
                 let result = Signature::get_wire_signature(metadata, &mut signature);
                 format!("{}[]", result)
             }
-            ELEMENT_TYPE_BYREF => {
-                Signature::get_wire_signature(metadata, &mut signature)
-            }
+            ELEMENT_TYPE_BYREF => Signature::get_wire_signature(metadata, &mut signature),
             _ => "cinterface(IInspectable)".to_string(),
         }
     }
@@ -374,28 +389,64 @@ impl Signature {
         // Strip backtick-arity for matching the well-known list below.
         let base = open_name.split('`').next().unwrap_or(open_name);
         let piid: Option<&str> = match base {
-            "Windows.Foundation.IReference"               => Some("{61c17706-2d65-11e0-9ae8-d48564015472}"),
-            "Windows.Foundation.IAsyncOperation"          => Some("{9fc2b0bb-e446-44e2-aa61-9cab8f636af2}"),
-            "Windows.Foundation.IAsyncOperationWithProgress" => Some("{b5d036d7-e297-498f-ba60-0289e76e23dd}"),
-            "Windows.Foundation.IAsyncActionWithProgress" => Some("{1f6db258-e803-48a1-9546-eb7353398884}"),
-            "Windows.Foundation.AsyncOperationCompletedHandler" => Some("{fcdcf02c-e5d8-4478-915a-4d90b74b83a5}"),
-            "Windows.Foundation.AsyncOperationProgressHandler"  => Some("{55690902-0aab-421a-8778-f8ce5026d758}"),
-            "Windows.Foundation.AsyncOperationWithProgressCompletedHandler" => Some("{e85df41d-6aa7-46e3-a8e2-f009d840c627}"),
-            "Windows.Foundation.AsyncActionProgressHandler"     => Some("{6d844858-0cff-4590-ae89-95a5a5c8b4b8}"),
-            "Windows.Foundation.AsyncActionWithProgressCompletedHandler" => Some("{9c029f91-cc84-44fd-ac26-0a6cd0a47db4}"),
-            "Windows.Foundation.EventHandler"             => Some("{9de1c534-6ae1-11e0-84e1-18a905bcc53f}"),
-            "Windows.Foundation.TypedEventHandler"        => Some("{9de1c535-6ae1-11e0-84e1-18a905bcc53f}"),
-            "Windows.Foundation.Collections.IIterator"    => Some("{6a79e863-4300-459a-9966-cbb660963ee1}"),
-            "Windows.Foundation.Collections.IIterable"    => Some("{faa585ea-6214-4217-afda-7f46de5869b3}"),
-            "Windows.Foundation.Collections.IVectorView"  => Some("{bbe1fa4c-b0e3-4583-baef-1f1b2e483e56}"),
-            "Windows.Foundation.Collections.IVector"      => Some("{913337e9-11a1-4345-a3a2-4e7f956e222d}"),
-            "Windows.Foundation.Collections.IMap"         => Some("{3c2925fe-8519-45c1-aa79-197b6718c1c1}"),
-            "Windows.Foundation.Collections.IMapView"     => Some("{e480ce40-a338-4ada-adcf-272272e48cb9}"),
-            "Windows.Foundation.Collections.IKeyValuePair" => Some("{02b51929-c1c4-4a7e-8940-0312b5c18500}"),
-            "Windows.Foundation.Collections.IObservableVector" => Some("{5917eb53-50b4-4a0d-b309-65862b3f1dbc}"),
-            "Windows.Foundation.Collections.IObservableMap"    => Some("{65df2bf5-bf39-41b5-aebc-5a9d865e472b}"),
-            "Windows.Foundation.Collections.VectorChangedEventHandler" => Some("{0c051752-9fbf-4c70-aa0c-0e4c82d9a761}"),
-            "Windows.Foundation.Collections.MapChangedEventHandler" => Some("{179517f3-94ee-41f8-bddc-768a895544f3}"),
+            "Windows.Foundation.IReference" => Some("{61c17706-2d65-11e0-9ae8-d48564015472}"),
+            "Windows.Foundation.IAsyncOperation" => Some("{9fc2b0bb-e446-44e2-aa61-9cab8f636af2}"),
+            "Windows.Foundation.IAsyncOperationWithProgress" => {
+                Some("{b5d036d7-e297-498f-ba60-0289e76e23dd}")
+            }
+            "Windows.Foundation.IAsyncActionWithProgress" => {
+                Some("{1f6db258-e803-48a1-9546-eb7353398884}")
+            }
+            "Windows.Foundation.AsyncOperationCompletedHandler" => {
+                Some("{fcdcf02c-e5d8-4478-915a-4d90b74b83a5}")
+            }
+            "Windows.Foundation.AsyncOperationProgressHandler" => {
+                Some("{55690902-0aab-421a-8778-f8ce5026d758}")
+            }
+            "Windows.Foundation.AsyncOperationWithProgressCompletedHandler" => {
+                Some("{e85df41d-6aa7-46e3-a8e2-f009d840c627}")
+            }
+            "Windows.Foundation.AsyncActionProgressHandler" => {
+                Some("{6d844858-0cff-4590-ae89-95a5a5c8b4b8}")
+            }
+            "Windows.Foundation.AsyncActionWithProgressCompletedHandler" => {
+                Some("{9c029f91-cc84-44fd-ac26-0a6cd0a47db4}")
+            }
+            "Windows.Foundation.EventHandler" => Some("{9de1c534-6ae1-11e0-84e1-18a905bcc53f}"),
+            "Windows.Foundation.TypedEventHandler" => {
+                Some("{9de1c535-6ae1-11e0-84e1-18a905bcc53f}")
+            }
+            "Windows.Foundation.Collections.IIterator" => {
+                Some("{6a79e863-4300-459a-9966-cbb660963ee1}")
+            }
+            "Windows.Foundation.Collections.IIterable" => {
+                Some("{faa585ea-6214-4217-afda-7f46de5869b3}")
+            }
+            "Windows.Foundation.Collections.IVectorView" => {
+                Some("{bbe1fa4c-b0e3-4583-baef-1f1b2e483e56}")
+            }
+            "Windows.Foundation.Collections.IVector" => {
+                Some("{913337e9-11a1-4345-a3a2-4e7f956e222d}")
+            }
+            "Windows.Foundation.Collections.IMap" => Some("{3c2925fe-8519-45c1-aa79-197b6718c1c1}"),
+            "Windows.Foundation.Collections.IMapView" => {
+                Some("{e480ce40-a338-4ada-adcf-272272e48cb9}")
+            }
+            "Windows.Foundation.Collections.IKeyValuePair" => {
+                Some("{02b51929-c1c4-4a7e-8940-0312b5c18500}")
+            }
+            "Windows.Foundation.Collections.IObservableVector" => {
+                Some("{5917eb53-50b4-4a0d-b309-65862b3f1dbc}")
+            }
+            "Windows.Foundation.Collections.IObservableMap" => {
+                Some("{65df2bf5-bf39-41b5-aebc-5a9d865e472b}")
+            }
+            "Windows.Foundation.Collections.VectorChangedEventHandler" => {
+                Some("{0c051752-9fbf-4c70-aa0c-0e4c82d9a761}")
+            }
+            "Windows.Foundation.Collections.MapChangedEventHandler" => {
+                Some("{179517f3-94ee-41f8-bddc-768a895544f3}")
+            }
             _ => None,
         };
         match piid {
@@ -407,7 +458,6 @@ impl Signature {
     pub fn get_signature_element_type(signature: &PCCOR_SIGNATURE) -> CorElementType {
         let mut signature = signature.clone();
 
-         cor_sig_uncompress_element_type(&mut signature)
-
+        cor_sig_uncompress_element_type(&mut signature)
     }
 }

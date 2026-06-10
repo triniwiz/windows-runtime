@@ -1,9 +1,11 @@
+use crate::declarations::declaration::{Declaration, DeclarationKind};
+use crate::declarations::method_declaration::MethodDeclaration;
 use std::any::Any;
 use std::ptr::addr_of_mut;
 use windows::core::PCWSTR;
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMAGE_CEE_CS_CALLCONV_HASTHIS, IMetaDataImport2, mdtMethodDef, mdtProperty};
-use crate::declarations::declaration::{Declaration, DeclarationKind};
-use crate::declarations::method_declaration::MethodDeclaration;
+use windows::Win32::System::WinRT::Metadata::{
+    mdtMethodDef, mdtProperty, CorTokenType, IMetaDataImport2, IMAGE_CEE_CS_CALLCONV_HASTHIS,
+};
 
 use crate::prelude::*;
 
@@ -73,10 +75,7 @@ impl Declaration for PropertyDeclaration {
 }
 
 impl PropertyDeclaration {
-    fn make_getter(
-        metadata: Option<&IMetaDataImport2>,
-        token: CorTokenType,
-    ) -> MethodDeclaration {
+    fn make_getter(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> MethodDeclaration {
         let mut getter_token = 0_u32;
         match metadata {
             None => {}
@@ -143,7 +142,10 @@ impl PropertyDeclaration {
             return None;
         }
 
-        return Some(MethodDeclaration::new(metadata, CorTokenType(setter_token as i32)));
+        return Some(MethodDeclaration::new(
+            metadata,
+            CorTokenType(setter_token as i32),
+        ));
     }
 
     pub fn new(metadata: Option<&IMetaDataImport2>, token: CorTokenType) -> Self {
@@ -180,7 +182,9 @@ impl PropertyDeclaration {
             debug_assert!(result.is_ok());
 
             if name_length > 0 {
-                full_name = String::from_utf16_lossy(&full_name_data[..name_length.saturating_sub(1) as usize]);
+                full_name = String::from_utf16_lossy(
+                    &full_name_data[..name_length.saturating_sub(1) as usize],
+                );
             }
         }
 
@@ -188,14 +192,8 @@ impl PropertyDeclaration {
             kind: DeclarationKind::Property,
             metadata: metadata.map(|f| f.clone()),
             token,
-            getter: PropertyDeclaration::make_getter(
-                metadata.clone(),
-                token,
-            ),
-            setter: PropertyDeclaration::make_setter(
-                metadata.clone(),
-                token,
-            ),
+            getter: PropertyDeclaration::make_getter(metadata.clone(), token),
+            setter: PropertyDeclaration::make_setter(metadata.clone(), token),
             full_name,
         }
     }
@@ -231,7 +229,8 @@ impl PropertyDeclaration {
             debug_assert!(signature_count > 0);
         }
 
-        let signature = unsafe { std::slice::from_raw_parts(signature.0, signature_count as usize) };
+        let signature =
+            unsafe { std::slice::from_raw_parts(signature.0, signature_count as usize) };
 
         (signature[0] as i32 & IMAGE_CEE_CS_CALLCONV_HASTHIS.0) == 0
     }

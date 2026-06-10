@@ -27,5 +27,9 @@ fn json_tryparse_returns_out_value() {
         })()
     "#).unwrap_or_else(|| "<eval-failed>".to_string());
 
-    assert_eq!(res.trim(), "hello", "TryParse out-param roundtrip failed: got {res:?}");
+    assert_eq!(
+        res.trim(),
+        "hello",
+        "TryParse out-param roundtrip failed: got {res:?}"
+    );
 }

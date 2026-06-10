@@ -89,14 +89,20 @@ fn winrt_method_signature(
                 return Some((
                     "protected override",
                     "Windows.Foundation.Size",
-                    vec![["availableSize".to_string(), "Windows.Foundation.Size".to_string()]],
+                    vec![[
+                        "availableSize".to_string(),
+                        "Windows.Foundation.Size".to_string(),
+                    ]],
                 ))
             }
             "ArrangeOverride" => {
                 return Some((
                     "protected override",
                     "Windows.Foundation.Size",
-                    vec![["finalSize".to_string(), "Windows.Foundation.Size".to_string()]],
+                    vec![[
+                        "finalSize".to_string(),
+                        "Windows.Foundation.Size".to_string(),
+                    ]],
                 ))
             }
             _ => {}
@@ -726,4 +732,3 @@ fn find_bridge_dir(start: &PathBuf) -> Option<PathBuf> {
     }
     None
 }
-

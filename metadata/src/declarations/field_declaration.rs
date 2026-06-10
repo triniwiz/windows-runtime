@@ -1,7 +1,7 @@
+use crate::declarations::declaration::{Declaration, DeclarationKind};
 use std::any::Any;
 use std::fmt::{Display, Formatter};
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2, mdtFieldDef};
-use crate::declarations::declaration::{Declaration, DeclarationKind};
+use windows::Win32::System::WinRT::Metadata::{mdtFieldDef, CorTokenType, IMetaDataImport2};
 
 use crate::prelude::*;
 

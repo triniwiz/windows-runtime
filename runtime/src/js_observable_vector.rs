@@ -16,7 +16,6 @@ fn err_bounds() -> windows_core::Error {
     windows_core::Error::from_hresult(E_BOUNDS)
 }
 
-
 #[implement(IIterator<IInspectable>)]
 struct JsVectorIterator {
     items: Vec<IInspectable>,
@@ -49,7 +48,6 @@ impl IIterator_Impl<IInspectable> for JsVectorIterator_Impl {
         Ok(n as u32)
     }
 }
-
 
 #[implement(IVectorView<IInspectable>)]
 struct JsVectorView {
@@ -101,7 +99,6 @@ impl IVectorView_Impl<IInspectable> for JsVectorView_Impl {
     }
 }
 
-
 #[implement(IVectorChangedEventArgs)]
 struct JsVectorChangedEventArgs {
     index: u32,
@@ -116,7 +113,6 @@ impl IVectorChangedEventArgs_Impl for JsVectorChangedEventArgs_Impl {
         Ok(self.change)
     }
 }
-
 
 #[implement(IObservableVector<IInspectable>, IVector<IInspectable>, IIterable<IInspectable>)]
 struct JsVector {
@@ -194,7 +190,6 @@ impl IVector_Impl<IInspectable> for JsVector_Impl {
         Ok(false)
     }
     fn SetAt(&self, index: u32, value: Ref<IInspectable>) -> Result<()> {
-        
         {
             let mut items = self.items.borrow_mut();
             if (index as usize) >= items.len() {
@@ -285,7 +280,6 @@ impl IVector_Impl<IInspectable> for JsVector_Impl {
         Ok(())
     }
 }
-
 
 pub(crate) fn make_index_vector(count: u32) -> Result<IInspectable> {
     let mut items: Vec<IInspectable> = Vec::with_capacity(count as usize);
@@ -421,7 +415,8 @@ mod tests {
         let seen_clone = seen.clone();
 
         let handler = VectorChangedEventHandler::new(
-            move |sender: Ref<IObservableVector<WInspectable>>, args: Ref<IVectorChangedEventArgs>| {
+            move |sender: Ref<IObservableVector<WInspectable>>,
+                  args: Ref<IVectorChangedEventArgs>| {
                 let vec: IVector<WInspectable> = sender.ok()?.cast()?;
                 let size = vec.Size()?;
                 if size > 0 {

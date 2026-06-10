@@ -12,14 +12,13 @@
 /// allocation on the Rust side), and the response is a UTF-8 byte buffer
 /// freed via `ns_dotnet_free`.  This eliminates the UTF-16 encode/decode
 /// round-trip that the original char* ABI required.
-
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use windows::core::{HRESULT, PCSTR, PCWSTR};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
-use windows::core::{PCSTR, PCWSTR, HRESULT};
 
 /// Mode for initializing .NET host. Controlled by `NS_DOTNET_MODE` env var.
 #[derive(PartialEq, Eq)]
@@ -91,8 +90,7 @@ type FnBridgeFree = unsafe extern "C" fn(ptr: *mut u8);
 
 // RegisterJsCallback: C# stores this pointer so managed delegates can call
 // back into V8.  Signature: (callback_id, args_ptr, args_len, &resp_ptr, &resp_len) -> void
-pub(crate) type FnJsCallback =
-    unsafe extern "C" fn(i32, *const u8, i32, *mut *mut u8, *mut i32);
+pub(crate) type FnJsCallback = unsafe extern "C" fn(i32, *const u8, i32, *mut *mut u8, *mut i32);
 type FnRegisterJsCallback = unsafe extern "C" fn(callback: FnJsCallback) -> i32;
 
 struct DotNetHost {
@@ -194,8 +192,10 @@ fn build_host(bridge_dll: &str, runtime_config: &str) -> Result<DotNetHost, Stri
         }};
     }
 
-    let fn_init: FnInitForRuntimeConfig =
-        resolve!("hostfxr_initialize_for_runtime_config", FnInitForRuntimeConfig);
+    let fn_init: FnInitForRuntimeConfig = resolve!(
+        "hostfxr_initialize_for_runtime_config",
+        FnInitForRuntimeConfig
+    );
     let fn_get_delegate: FnGetRuntimeDelegate =
         resolve!("hostfxr_get_runtime_delegate", FnGetRuntimeDelegate);
     let _fn_close: FnClose = resolve!("hostfxr_close", FnClose);
@@ -218,7 +218,7 @@ fn build_host(bridge_dll: &str, runtime_config: &str) -> Result<DotNetHost, Stri
     }
     let load_asm: FnLoadAsmAndGetFnPtr = unsafe { std::mem::transmute(load_fn_ptr) };
 
-    let dll_wide  = to_wide_null(bridge_dll);
+    let dll_wide = to_wide_null(bridge_dll);
     let type_wide = to_wide_null("NativeScriptBridge.Bridge, DotNetBridge");
 
     // Sentinel defined by the .NET hosting API for [UnmanagedCallersOnly] methods.
@@ -243,22 +243,31 @@ fn build_host(bridge_dll: &str, runtime_config: &str) -> Result<DotNetHost, Stri
         if hr < 0 {
             let h = HRESULT(hr);
             let os_msg = crate::error::format_hresult_message(h);
-            return Err(format!("load_assembly_and_get_function_pointer({method}): {}", os_msg));
+            return Err(format!(
+                "load_assembly_and_get_function_pointer({method}): {}",
+                os_msg
+            ));
         }
         if fn_out.is_null() {
-            return Err(format!("load_assembly_and_get_function_pointer({method}): returned null"));
+            return Err(format!(
+                "load_assembly_and_get_function_pointer({method}): returned null"
+            ));
         }
         Ok(fn_out)
     };
 
-    let invoke:               FnBridgeInvoke          = unsafe { std::mem::transmute(bind("Invoke")?) };
-    let invoke_binary:        FnBridgeInvokeBinary     = unsafe { std::mem::transmute(bind("InvokeBinary")?) };
-    let free:                 FnBridgeFree             = unsafe { std::mem::transmute(bind("Free")?) };
-    let register_js_callback: FnRegisterJsCallback     = unsafe { std::mem::transmute(bind("RegisterJsCallback")?) };
+    let invoke: FnBridgeInvoke = unsafe { std::mem::transmute(bind("Invoke")?) };
+    let invoke_binary: FnBridgeInvokeBinary = unsafe { std::mem::transmute(bind("InvokeBinary")?) };
+    let free: FnBridgeFree = unsafe { std::mem::transmute(bind("Free")?) };
+    let register_js_callback: FnRegisterJsCallback =
+        unsafe { std::mem::transmute(bind("RegisterJsCallback")?) };
 
     Ok(DotNetHost {
         _hostfxr: hostfxr,
-        invoke, invoke_binary, free, register_js_callback,
+        invoke,
+        invoke_binary,
+        free,
+        register_js_callback,
     })
 }
 
@@ -290,7 +299,9 @@ fn find_bridge_and_config(app_root: &str) -> Option<(PathBuf, PathBuf)> {
             if depth > 6 {
                 continue;
             }
-            if !dir.is_dir() { continue; }
+            if !dir.is_dir() {
+                continue;
+            }
 
             let dll = dir.join("DotNetBridge.dll");
             let cfg = dir.join("DotNetBridge.runtimeconfig.json");
@@ -340,7 +351,9 @@ pub(crate) fn try_init_dotnet(app_root: &str) {
 /// Ensure the DotNet host is initialised (lazy). Uses stored `DOTNET_APP_ROOT` or
 /// falls back to current directory when app root is not set.
 fn ensure_dotnet_initialized() {
-    if DOTNET_HOST.get().is_some() { return; }
+    if DOTNET_HOST.get().is_some() {
+        return;
+    }
     let app_root = DOTNET_APP_ROOT.get().map(|s| s.as_str()).unwrap_or(".");
     try_init_dotnet(app_root);
     // If initialisation succeeded, register the JS callback function so managed
@@ -396,7 +409,10 @@ pub(crate) fn call_dotnet(request_json: &str) -> Result<String, String> {
         // These request/response traces are very verbose — only emit when
         // explicit verbose debugging is requested via `NS_DEBUG`.
         if std::env::var("NS_DEBUG").is_ok() {
-            crate::debug_output(&format!("[DOTNET] request: {}\n[DOTNET] response: {}\n", request_json, result));
+            crate::debug_output(&format!(
+                "[DOTNET] request: {}\n[DOTNET] response: {}\n",
+                request_json, result
+            ));
         }
     }
 
@@ -453,14 +469,17 @@ pub(crate) fn call_dotnet_binary(request: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
     use std::fs::{create_dir_all, File};
     use std::io::Write;
-    use std::env;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_temp_dir() -> std::path::PathBuf {
         let mut base = env::temp_dir();
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         base.push(format!("ns_dotnet_test_{}", nanos));
         base
     }
@@ -508,4 +527,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
-

@@ -1,9 +1,9 @@
-use std::sync::OnceLock;
-use regex::Regex;
 use crate::value::NativeType;
-use metadata::meta_data_reader::MetadataReader;
 use metadata::declarations::struct_declaration::StructDeclaration;
+use metadata::meta_data_reader::MetadataReader;
 use metadata::signature::Signature;
+use regex::Regex;
+use std::sync::OnceLock;
 
 static RE_GENERIC_COUNT: OnceLock<Regex> = OnceLock::new();
 static RE_GENERIC_PARAMS: OnceLock<Regex> = OnceLock::new();
@@ -125,20 +125,20 @@ pub(crate) fn ffi_native_type_from_signature(signature: &str) -> NativeType {
     }
 
     match by_ref_inner {
-        "Void"    => NativeType::Void,
-        "String"  => NativeType::Pointer,
-        "Char16"  => NativeType::U16,
+        "Void" => NativeType::Void,
+        "String" => NativeType::Pointer,
+        "Char16" => NativeType::U16,
         "Boolean" => NativeType::Bool,
         "UInt8" | "Uint8" | "Byte" => NativeType::U8,
         "Int8" | "SByte" => NativeType::I8,
-        "UInt16"  => NativeType::U16,
-        "UInt32"  => NativeType::U32,
-        "UInt64"  => NativeType::U64,
-        "Int16"   => NativeType::I16,
-        "Int32"   => NativeType::I32,
-        "Int64"   => NativeType::I64,
-        "Single"  => NativeType::F32,
-        "Double"  => NativeType::F64,
-        _         => NativeType::Pointer,
+        "UInt16" => NativeType::U16,
+        "UInt32" => NativeType::U32,
+        "UInt64" => NativeType::U64,
+        "Int16" => NativeType::I16,
+        "Int32" => NativeType::I32,
+        "Int64" => NativeType::I64,
+        "Single" => NativeType::F32,
+        "Double" => NativeType::F64,
+        _ => NativeType::Pointer,
     }
 }

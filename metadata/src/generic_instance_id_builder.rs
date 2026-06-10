@@ -1,12 +1,8 @@
-use std::ffi::OsString;
-use std::os::windows::prelude::OsStringExt;
-use windows::core::{GUID, HSTRING, PCWSTR, Ref};
-use windows::Win32::System::WinRT::Metadata::{IRoMetaDataLocator, IRoMetaDataLocator_Impl, IRoSimpleMetaDataBuilder, RoGetParameterizedTypeInstanceIID, RoParseTypeName};
 use crate::declarations::class_declaration::ClassDeclaration;
 use crate::declarations::declaration::{Declaration, DeclarationKind};
-use crate::declarations::delegate_declaration::{DelegateDeclaration, DelegateDeclarationImpl};
 use crate::declarations::delegate_declaration::generic_delegate_declaration::GenericDelegateDeclaration;
 use crate::declarations::delegate_declaration::generic_delegate_instance_declaration::GenericDelegateInstanceDeclaration;
+use crate::declarations::delegate_declaration::{DelegateDeclaration, DelegateDeclarationImpl};
 use crate::declarations::enum_declaration::EnumDeclaration;
 use crate::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
 use crate::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
@@ -14,6 +10,13 @@ use crate::declarations::interface_declaration::InterfaceDeclaration;
 use crate::declarations::struct_declaration::StructDeclaration;
 use crate::meta_data_reader::MetadataReader;
 use crate::signature::Signature;
+use std::ffi::OsString;
+use std::os::windows::prelude::OsStringExt;
+use windows::core::{Ref, GUID, HSTRING, PCWSTR};
+use windows::Win32::System::WinRT::Metadata::{
+    IRoMetaDataLocator, IRoMetaDataLocator_Impl, IRoSimpleMetaDataBuilder,
+    RoGetParameterizedTypeInstanceIID, RoParseTypeName,
+};
 
 pub struct GenericInstanceIdBuilder {}
 
@@ -21,7 +24,11 @@ pub struct GenericInstanceIdBuilder {}
 pub struct IRoMetaDataLocatorImpl;
 
 impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
-    fn Locate(&self, nameelement: &PCWSTR, metadatadestination: Ref<'_, IRoSimpleMetaDataBuilder>) -> windows::core::Result<()> {
+    fn Locate(
+        &self,
+        nameelement: &PCWSTR,
+        metadatadestination: Ref<'_, IRoSimpleMetaDataBuilder>,
+    ) -> windows::core::Result<()> {
         let name_os = OsString::from_wide(unsafe { nameelement.as_wide() });
         let name_str = name_os.to_string_lossy();
 
@@ -71,11 +78,8 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                         let interface_declaration_id = interface_declaration.id();
 
                         if let Ok(builder) = metadatadestination.ok() {
-                            let result = unsafe {
-                                builder.SetWinRtInterface(
-                                    interface_declaration_id
-                                )
-                            };
+                            let result =
+                                unsafe { builder.SetWinRtInterface(interface_declaration_id) };
 
                             debug_assert!(result.is_ok())
                         }
@@ -91,7 +95,8 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                             return unsafe {
                                 builder.SetParameterizedInterface(
                                     generic_interface_declaration.id(),
-                                    generic_interface_declaration.number_of_generic_parameters() as u32,
+                                    generic_interface_declaration.number_of_generic_parameters()
+                                        as u32,
                                 )
                             };
                         }
@@ -103,13 +108,12 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                             .downcast_ref::<EnumDeclaration>()
                             .unwrap();
                         let type_ = enum_declaration.type_();
-                        let full_name = HSTRING::from(
-                            enum_declaration.full_name()
-                        );
+                        let full_name = HSTRING::from(enum_declaration.full_name());
                         // Use the primitive's friendly name ("Int32"/"UInt32") so the runtime
                         // recognizes it as a built-in primitive. Wire format ("i4") triggers
                         // a recursive Locate that fails to resolve.
-                        let signature_str = enum_declaration.metadata()
+                        let signature_str = enum_declaration
+                            .metadata()
                             .map(|m| Signature::to_string(m, &type_))
                             .unwrap_or_else(|| "Int32".to_string());
                         let signature = HSTRING::from(signature_str.as_str());
@@ -117,12 +121,7 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                         if let Ok(builder) = metadatadestination.ok() {
                             let full_name = PCWSTR(full_name.as_ptr());
                             let signature = PCWSTR(signature.as_ptr());
-                            let result = unsafe {
-                                builder.SetEnum(
-                                    full_name,
-                                    signature,
-                                )
-                            };
+                            let result = unsafe { builder.SetEnum(full_name, signature) };
 
                             debug_assert!(result.is_ok());
                         }
@@ -130,8 +129,10 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                         return Ok(());
                     }
                     DeclarationKind::Struct => {
-                        let struct_declaration =
-                            declaration.as_any().downcast_ref::<StructDeclaration>().unwrap();
+                        let struct_declaration = declaration
+                            .as_any()
+                            .downcast_ref::<StructDeclaration>()
+                            .unwrap();
 
                         if let Ok(builder) = metadatadestination.ok() {
                             let mut field_names = Vec::new();
@@ -153,12 +154,8 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                                 .map(|field| PCWSTR(field.as_ptr()))
                                 .collect();
 
-                            let result = unsafe {
-                                builder.SetStruct(
-                                    full_name,
-                                    field_names.as_slice(),
-                                )
-                            };
+                            let result =
+                                unsafe { builder.SetStruct(full_name, field_names.as_slice()) };
 
                             debug_assert!(result.is_ok());
                         }
@@ -172,11 +169,7 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                             .unwrap();
 
                         if let Ok(builder) = metadatadestination.ok() {
-                            let result = unsafe {
-                                builder.SetDelegate(
-                                    delegate_declaration.id()
-                                )
-                            };
+                            let result = unsafe { builder.SetDelegate(delegate_declaration.id()) };
 
                             debug_assert!(result.is_ok());
                         }
@@ -189,15 +182,14 @@ impl IRoMetaDataLocator_Impl for IRoMetaDataLocatorImpl {
                             .downcast_ref::<GenericDelegateDeclaration>()
                             .unwrap();
 
-
                         if let Ok(builder) = metadatadestination.ok() {
                             let result = unsafe {
                                 builder.SetParameterizedDelegate(
                                     generic_delegate_declaration.id(),
-                                    generic_delegate_declaration.number_of_generic_parameters() as u32,
+                                    generic_delegate_declaration.number_of_generic_parameters()
+                                        as u32,
                                 )
                             };
-
 
                             debug_assert!(result.is_ok());
                         }
@@ -335,11 +327,7 @@ fn wire_signature_for_name(name: &str) -> Option<String> {
         DeclarationKind::Class => {
             let class = lock.as_any().downcast_ref::<ClassDeclaration>()?;
             let default_iface = class.default_interface()?;
-            Some(format!(
-                "rc({};{})",
-                name,
-                format_guid(&default_iface.id())
-            ))
+            Some(format!("rc({};{})", name, format_guid(&default_iface.id())))
         }
         DeclarationKind::Enum => {
             let enum_decl = lock.as_any().downcast_ref::<EnumDeclaration>()?;
@@ -395,8 +383,14 @@ fn split_type_args(inner: &str) -> Vec<String> {
     let mut cur = String::new();
     for ch in inner.chars() {
         match ch {
-            '<' => { depth += 1; cur.push(ch); }
-            '>' => { depth -= 1; cur.push(ch); }
+            '<' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            '>' => {
+                depth -= 1;
+                cur.push(ch);
+            }
             ',' if depth == 0 => {
                 args.push(cur.trim().to_string());
                 cur.clear();
@@ -418,8 +412,14 @@ fn format_guid(g: &GUID) -> String {
         g.data1,
         g.data2,
         g.data3,
-        g.data4[0], g.data4[1],
-        g.data4[2], g.data4[3], g.data4[4], g.data4[5], g.data4[6], g.data4[7],
+        g.data4[0],
+        g.data4[1],
+        g.data4[2],
+        g.data4[3],
+        g.data4[4],
+        g.data4[5],
+        g.data4[6],
+        g.data4[7],
     )
 }
 
@@ -430,10 +430,8 @@ fn compute_winrt_piid(signature: &str) -> GUID {
 
     // cppwinrt's WinRT namespace UUID (big-endian byte layout).
     const NAMESPACE: [u8; 16] = [
-        0x11, 0xf4, 0x7a, 0xd5,
-        0x7b, 0x73,
-        0x42, 0xc0,
-        0xab, 0xae, 0x87, 0x8b, 0x1e, 0x16, 0xad, 0xee,
+        0x11, 0xf4, 0x7a, 0xd5, 0x7b, 0x73, 0x42, 0xc0, 0xab, 0xae, 0x87, 0x8b, 0x1e, 0x16, 0xad,
+        0xee,
     ];
 
     let mut hasher = Sha1::new();

@@ -1,18 +1,18 @@
+use runtime_binding_gen::{RuntimeExtensionMetadata, RuntimeExtensionRegistry};
+use std::collections::HashMap;
 use std::fs;
+use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::collections::HashMap;
-use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, PeekMessageW, PM_REMOVE, TranslateMessage};
+use std::time::{Duration, Instant};
 use windows::core::{IUnknown, Interface};
-use std::mem::ManuallyDrop;
-use runtime_binding_gen::{RuntimeExtensionMetadata, RuntimeExtensionRegistry};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+};
 
-use crate::{throw_js_error, Runtime, ASYNC_PUMP_HOOK, proxy_manifests};
 use crate::type_description::build_runtime_type_descriptor;
+use crate::{proxy_manifests, throw_js_error, Runtime, ASYNC_PUMP_HOOK};
 use std::cell::RefCell;
-use std::sync::Arc;
-use serde_json::Value as JsonValue;
 use std::ffi::c_void;
 
 extern "system" {
@@ -37,7 +37,10 @@ pub(crate) fn clear_thread_dispatchers() {
 
 const INSPECTOR_DISPATCHERS_GLOBAL: &str = "__nsInspectorDomainDispatchers";
 
-pub(crate) fn value_to_string(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> Option<String> {
+pub(crate) fn value_to_string(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<v8::Value>,
+) -> Option<String> {
     let value = value.to_string(scope)?;
     Some(value.to_rust_string_lossy(scope))
 }
@@ -66,7 +69,9 @@ pub(crate) fn handle_run_on_ui_thread(
     crate::ui_dispatcher::post_to_ui_thread(move || {
         let isolate_ptr = crate::DELEGATE_ISOLATE_PTR.with(|c| c.get());
         if isolate_ptr.is_null() {
-            crate::DOTNET_JS_CALLBACKS.with(|m| { m.borrow_mut().remove(&cb_id); });
+            crate::DOTNET_JS_CALLBACKS.with(|m| {
+                m.borrow_mut().remove(&cb_id);
+            });
             return;
         }
         let isolate: &mut v8::Isolate = unsafe { &mut *isolate_ptr };
@@ -74,7 +79,9 @@ pub(crate) fn handle_run_on_ui_thread(
         let ctx_global = match scope.get_slot::<v8::Global<v8::Context>>() {
             Some(g) => g.clone(),
             None => {
-                crate::DOTNET_JS_CALLBACKS.with(|m| { m.borrow_mut().remove(&cb_id); });
+                crate::DOTNET_JS_CALLBACKS.with(|m| {
+                    m.borrow_mut().remove(&cb_id);
+                });
                 return;
             }
         };
@@ -82,9 +89,7 @@ pub(crate) fn handle_run_on_ui_thread(
         let scope = &mut v8::ContextScope::new(scope, context);
         v8::tc_scope!(tc, scope);
 
-        let func_global = crate::DOTNET_JS_CALLBACKS.with(|m| {
-            m.borrow().get(&cb_id).cloned()
-        });
+        let func_global = crate::DOTNET_JS_CALLBACKS.with(|m| m.borrow().get(&cb_id).cloned());
         let Some(func_global) = func_global else {
             return;
         };
@@ -101,11 +106,16 @@ pub(crate) fn handle_run_on_ui_thread(
             tc.reset();
         }
 
-        crate::DOTNET_JS_CALLBACKS.with(|m| { m.borrow_mut().remove(&cb_id); });
+        crate::DOTNET_JS_CALLBACKS.with(|m| {
+            m.borrow_mut().remove(&cb_id);
+        });
     });
 }
 
-fn value_to_json_string(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> Option<String> {
+fn value_to_json_string(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<v8::Value>,
+) -> Option<String> {
     let json = v8::json::stringify(scope, value)?;
     Some(json.to_rust_string_lossy(scope))
 }
@@ -126,21 +136,31 @@ fn try_get_async_status(
         .get(scope, status_key.into())
         .ok_or_else(|| "Async object does not expose Status".to_string())?;
 
-    if let Ok(value) = v8::Local::<v8::Int32>::try_from(status) { return Ok(value.value()); }
-    if let Ok(value) = v8::Local::<v8::Uint32>::try_from(status) { return Ok(value.value() as i32); }
-    if let Ok(value) = v8::Local::<v8::Number>::try_from(status) { return Ok(value.value() as i32); }
-    if let Some(value) = status.integer_value(scope) { return Ok(value as i32); }
+    if let Ok(value) = v8::Local::<v8::Int32>::try_from(status) {
+        return Ok(value.value());
+    }
+    if let Ok(value) = v8::Local::<v8::Uint32>::try_from(status) {
+        return Ok(value.value() as i32);
+    }
+    if let Ok(value) = v8::Local::<v8::Number>::try_from(status) {
+        return Ok(value.value() as i32);
+    }
+    if let Some(value) = status.integer_value(scope) {
+        return Ok(value as i32);
+    }
     if let Some(value) = status.number_value(scope) {
-        if value.is_finite() { return Ok(value as i32); }
+        if value.is_finite() {
+            return Ok(value as i32);
+        }
     }
     if let Some(value) = status.to_string(scope) {
         let s = value.to_rust_string_lossy(scope).to_ascii_lowercase();
         return match s.as_str() {
-            "started"             => Ok(0),
-            "completed"           => Ok(1),
+            "started" => Ok(0),
+            "completed" => Ok(1),
             "canceled" | "cancelled" => Ok(2),
-            "error"               => Ok(3),
-            _                     => Err(format!("Async Status is not a recognized value: {s}")),
+            "error" => Ok(3),
+            _ => Err(format!("Async Status is not a recognized value: {s}")),
         };
     }
     Err("Async Status is not a numeric value".to_string())
@@ -157,17 +177,23 @@ fn normalize_js_path(path: &str) -> PathBuf {
 }
 
 fn try_resolve_with_known_extensions(candidate: PathBuf) -> PathBuf {
-    if candidate.exists() { return candidate; }
+    if candidate.exists() {
+        return candidate;
+    }
     if candidate.extension().is_none() {
         for ext in ["js", "mjs", "cjs"] {
             let with_ext = candidate.with_extension(ext);
-            if with_ext.exists() { return with_ext; }
+            if with_ext.exists() {
+                return with_ext;
+            }
         }
     }
     if candidate.is_dir() {
         for index_file in ["index.js", "index.mjs", "index.cjs"] {
             let with_index = candidate.join(index_file);
-            if with_index.exists() { return with_index; }
+            if with_index.exists() {
+                return with_index;
+            }
         }
     }
     candidate
@@ -224,9 +250,17 @@ pub(crate) fn handle_host_wait_for_async(
     let timeout_ms = if args.length() >= 2 {
         let t = args.get(1);
         if let Some(v) = t.integer_value(scope) {
-            if v >= 0 { v as u64 } else { 0 }
+            if v >= 0 {
+                v as u64
+            } else {
+                0
+            }
         } else if let Some(v) = t.number_value(scope) {
-            if v.is_finite() && v >= 0.0 { v as u64 } else { 0 }
+            if v.is_finite() && v >= 0.0 {
+                v as u64
+            } else {
+                0
+            }
         } else {
             0
         }
@@ -236,16 +270,30 @@ pub(crate) fn handle_host_wait_for_async(
 
     match try_get_async_status(scope, op_value) {
         Ok(0) => {}
-        Ok(_) => { retval.set(op_value); return; }
-        Err(msg) => { throw_js_error(scope, msg.as_str()); return; }
+        Ok(_) => {
+            retval.set(op_value);
+            return;
+        }
+        Err(msg) => {
+            throw_js_error(scope, msg.as_str());
+            return;
+        }
     }
 
-    let deadline = if timeout_ms == 0 { None } else { Some(Instant::now() + Duration::from_millis(timeout_ms)) };
+    let deadline = if timeout_ms == 0 {
+        None
+    } else {
+        Some(Instant::now() + Duration::from_millis(timeout_ms))
+    };
     let mut message = MSG::default();
     loop {
         if let Some(deadline) = deadline {
             if Instant::now() >= deadline {
-                throw_js_error(scope, format!("Timed out waiting for WinRT async operation after {timeout_ms}ms").as_str());
+                throw_js_error(
+                    scope,
+                    format!("Timed out waiting for WinRT async operation after {timeout_ms}ms")
+                        .as_str(),
+                );
                 return;
             }
         }
@@ -258,27 +306,35 @@ pub(crate) fn handle_host_wait_for_async(
                     return;
                 }
                 while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.into() {
-                    unsafe { let _ = TranslateMessage(&message); DispatchMessageW(&message); }
+                    unsafe {
+                        let _ = TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
                 }
                 ASYNC_PUMP_HOOK.with(|hook| {
                     if let Ok(mut guard) = hook.try_borrow_mut() {
-                        if let Some(f) = guard.as_mut() { f(); }
+                        if let Some(f) = guard.as_mut() {
+                            f();
+                        }
                     }
                 });
                 std::thread::sleep(Duration::from_millis(5));
             }
-            Ok(_) => { retval.set(op_value); return; }
-            Err(msg) => { throw_js_error(scope, msg.as_str()); return; }
+            Ok(_) => {
+                retval.set(op_value);
+                return;
+            }
+            Err(msg) => {
+                throw_js_error(scope, msg.as_str());
+                return;
+            }
         }
     }
 }
 
 // Inspector helpers moved to `inspector.rs`.
 pub(crate) use crate::inspector::{
-    handle_register_domain_dispatcher,
-    handle_inspector_send_event,
-    handle_inspector_timestamp,
-    try_dispatch_inspector_message_to_js,
+    handle_inspector_send_event, handle_inspector_timestamp, handle_register_domain_dispatcher,
     maybe_attach_devtools,
 };
 
@@ -294,7 +350,10 @@ pub(crate) fn handle_enqueue_microtask(
     let callback = match v8::Local::<v8::Function>::try_from(args.get(0)) {
         Ok(cb) => cb,
         Err(_) => {
-            throw_js_error(scope, "__nsEnqueueMicrotask(callback) expects callback to be a function");
+            throw_js_error(
+                scope,
+                "__nsEnqueueMicrotask(callback) expects callback to be a function",
+            );
             return;
         }
     };
@@ -306,14 +365,24 @@ fn try_extract_pointer_from_value(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<v8::Value>,
 ) -> Option<*mut std::ffi::c_void> {
-    if value.is_null_or_undefined() { return Some(std::ptr::null_mut()); }
-    if let Ok(external) = v8::Local::<v8::External>::try_from(value) { return Some(external.value()); }
-    if !value.is_object() { return None; }
+    if value.is_null_or_undefined() {
+        return Some(std::ptr::null_mut());
+    }
+    if let Ok(external) = v8::Local::<v8::External>::try_from(value) {
+        return Some(external.value());
+    }
+    if !value.is_object() {
+        return None;
+    }
     let object = value.to_object(scope)?;
     if let Some(handle_key) = v8::String::new(scope, "handle") {
         if let Some(handle) = object.get(scope, handle_key.into()) {
-            if let Ok(external) = v8::Local::<v8::External>::try_from(handle) { return Some(external.value()); }
-            if handle.is_null_or_undefined() { return Some(std::ptr::null_mut()); }
+            if let Ok(external) = v8::Local::<v8::External>::try_from(handle) {
+                return Some(external.value());
+            }
+            if handle.is_null_or_undefined() {
+                return Some(std::ptr::null_mut());
+            }
         }
     }
     None
@@ -330,7 +399,10 @@ pub(crate) fn handle_pointer_key(
     }
     let pointer = match try_extract_pointer_from_value(scope, args.get(0)) {
         Some(p) => p,
-        None => { throw_js_error(scope, "Unable to extract native pointer from value"); return; }
+        None => {
+            throw_js_error(scope, "Unable to extract native pointer from value");
+            return;
+        }
     };
     let key = format!("0x{:x}", pointer as usize);
     if let Some(value) = v8::String::new(scope, key.as_str()) {
@@ -346,7 +418,10 @@ pub(crate) fn handle_buffer_to_pointer(
     mut retval: v8::ReturnValue,
 ) {
     if args.length() < 1 {
-        throw_js_error(scope, "__nsBufferToPointer expects an ArrayBuffer or ArrayBufferView");
+        throw_js_error(
+            scope,
+            "__nsBufferToPointer expects an ArrayBuffer or ArrayBufferView",
+        );
         return;
     }
     let value = args.get(0);
@@ -358,11 +433,16 @@ pub(crate) fn handle_buffer_to_pointer(
             throw_js_error(scope, "ArrayBufferView does not expose a backing buffer");
             return;
         };
-        buf.data().map_or(std::ptr::null_mut(), |d| unsafe { d.as_ptr().add(byte_offset) })
+        buf.data().map_or(std::ptr::null_mut(), |d| unsafe {
+            d.as_ptr().add(byte_offset)
+        })
     } else if value.is_null_or_undefined() {
         std::ptr::null_mut()
     } else {
-        throw_js_error(scope, "__nsBufferToPointer expects an ArrayBuffer or ArrayBufferView");
+        throw_js_error(
+            scope,
+            "__nsBufferToPointer expects an ArrayBuffer or ArrayBufferView",
+        );
         return;
     };
 
@@ -379,7 +459,10 @@ pub(crate) fn handle_proxy_write_text_file(
     mut retval: v8::ReturnValue,
 ) {
     if args.length() < 2 {
-        throw_js_error(scope, "__nsProxyWriteTextFile(path, content) expects 2 arguments");
+        throw_js_error(
+            scope,
+            "__nsProxyWriteTextFile(path, content) expects 2 arguments",
+        );
         return;
     }
     let Some(path) = value_to_string(scope, args.get(0)) else {
@@ -412,7 +495,10 @@ pub(crate) fn handle_proxy_compile_project(
     mut retval: v8::ReturnValue,
 ) {
     if args.length() < 1 {
-        throw_js_error(scope, "__nsProxyCompileProject(csprojPath[, configuration]) expects at least 1 argument");
+        throw_js_error(
+            scope,
+            "__nsProxyCompileProject(csprojPath[, configuration]) expects at least 1 argument",
+        );
         return;
     }
     let Some(project_path) = value_to_string(scope, args.get(0)) else {
@@ -425,11 +511,24 @@ pub(crate) fn handle_proxy_compile_project(
         "Debug".to_string()
     };
     let output = match Command::new("dotnet")
-        .args(["build", &project_path, "-c", &configuration, "-v", "minimal"])
+        .args([
+            "build",
+            &project_path,
+            "-c",
+            &configuration,
+            "-v",
+            "minimal",
+        ])
         .output()
     {
         Ok(o) => o,
-        Err(err) => { throw_js_error(scope, format!("Failed to execute dotnet build: {err}").as_str()); return; }
+        Err(err) => {
+            throw_js_error(
+                scope,
+                format!("Failed to execute dotnet build: {err}").as_str(),
+            );
+            return;
+        }
     };
 
     let result = v8::Object::new(scope);
@@ -447,8 +546,12 @@ pub(crate) fn handle_proxy_compile_project(
     }
     set_prop!("success", v8::Boolean::new(scope, success).into());
     set_prop!("exitCode", v8::Integer::new(scope, exit_code).into());
-    if let Some(v) = v8::String::new(scope, &stdout) { set_prop!("stdout", v.into()); }
-    if let Some(v) = v8::String::new(scope, &stderr) { set_prop!("stderr", v.into()); }
+    if let Some(v) = v8::String::new(scope, &stdout) {
+        set_prop!("stdout", v.into());
+    }
+    if let Some(v) = v8::String::new(scope, &stderr) {
+        set_prop!("stderr", v.into());
+    }
     retval.set(result.into());
 }
 
@@ -458,7 +561,10 @@ pub(crate) fn handle_proxy_register_manifest(
     mut retval: v8::ReturnValue,
 ) {
     if args.length() < 1 {
-        throw_js_error(scope, "__nsProxyRegisterManifest(manifestJson) expects 1 argument");
+        throw_js_error(
+            scope,
+            "__nsProxyRegisterManifest(manifestJson) expects 1 argument",
+        );
         return;
     }
     let Some(manifest) = value_to_string(scope, args.get(0)) else {
@@ -477,7 +583,10 @@ pub(crate) fn handle_proxy_auto_capture(
     mut retval: v8::ReturnValue,
 ) {
     if args.length() < 1 {
-        throw_js_error(scope, "__nsProxyAutoCapture(metadataJson) expects 1 argument");
+        throw_js_error(
+            scope,
+            "__nsProxyAutoCapture(metadataJson) expects 1 argument",
+        );
         return;
     }
     let Some(metadata_json) = value_to_string(scope, args.get(0)) else {
@@ -488,24 +597,39 @@ pub(crate) fn handle_proxy_auto_capture(
     if let Some(parent) = path_buf.parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(err) = fs::create_dir_all(parent) {
-                throw_js_error(scope, format!("Failed to create metadata directory: {err}").as_str());
+                throw_js_error(
+                    scope,
+                    format!("Failed to create metadata directory: {err}").as_str(),
+                );
                 return;
             }
         }
     }
-    let normalized = match serde_json::from_str::<Vec<RuntimeExtensionMetadata>>(metadata_json.as_str()) {
-        Ok(extensions) => {
-            let mut registry = RuntimeExtensionRegistry::new();
-            for ext in extensions.iter().cloned() { registry.register(ext); }
-            match serde_json::to_string_pretty(&extensions) {
-                Ok(json) => json,
-                Err(err) => { throw_js_error(scope, format!("Failed to normalize captured metadata: {err}").as_str()); return; }
+    let normalized =
+        match serde_json::from_str::<Vec<RuntimeExtensionMetadata>>(metadata_json.as_str()) {
+            Ok(extensions) => {
+                let mut registry = RuntimeExtensionRegistry::new();
+                for ext in extensions.iter().cloned() {
+                    registry.register(ext);
+                }
+                match serde_json::to_string_pretty(&extensions) {
+                    Ok(json) => json,
+                    Err(err) => {
+                        throw_js_error(
+                            scope,
+                            format!("Failed to normalize captured metadata: {err}").as_str(),
+                        );
+                        return;
+                    }
+                }
             }
-        }
-        Err(_) => metadata_json,
-    };
+            Err(_) => metadata_json,
+        };
     if let Err(err) = fs::write(&path_buf, normalized) {
-        throw_js_error(scope, format!("Failed to write captured metadata: {err}").as_str());
+        throw_js_error(
+            scope,
+            format!("Failed to write captured metadata: {err}").as_str(),
+        );
         return;
     }
     if let Some(path) = path_buf.to_str().and_then(|p| v8::String::new(scope, p)) {
@@ -543,10 +667,13 @@ pub(crate) fn handle_read_text_file(
 static PACKAGE_ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
 fn package_root() -> Option<&'static PathBuf> {
-    PACKAGE_ROOT.get_or_init(|| {
-        std::env::current_exe().ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-    }).as_ref()
+    PACKAGE_ROOT
+        .get_or_init(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        })
+        .as_ref()
 }
 
 /// `__nsMsAppxResolve(uri)` — synchronously resolve a `ms-appx:///` URI to a
@@ -566,7 +693,8 @@ pub(crate) fn handle_ms_appx_resolve(
     };
 
     const PREFIX: &str = "ms-appx:///";
-    let relative = if uri.len() >= PREFIX.len() && uri[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+    let relative = if uri.len() >= PREFIX.len() && uri[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+    {
         &uri[PREFIX.len()..]
     } else {
         uri.as_str()
@@ -594,7 +722,10 @@ pub(crate) fn handle_livesync_copy_file(
     mut retval: v8::ReturnValue,
 ) {
     if args.length() < 2 {
-        throw_js_error(scope, "__nsLiveSyncCopyFile(sourcePath, destPath) expects 2 arguments");
+        throw_js_error(
+            scope,
+            "__nsLiveSyncCopyFile(sourcePath, destPath) expects 2 arguments",
+        );
         return;
     }
     let Some(source_path) = value_to_string(scope, args.get(0)) else {
@@ -618,21 +749,36 @@ pub(crate) fn handle_resolve_module_path(
     mut retval: v8::ReturnValue,
 ) {
     if args.length() < 1 {
-        throw_js_error(scope, "__nsResolveModulePath(specifier[, parentPath, appRoot]) expects at least 1 argument");
+        throw_js_error(
+            scope,
+            "__nsResolveModulePath(specifier[, parentPath, appRoot]) expects at least 1 argument",
+        );
         return;
     }
     let Some(specifier) = value_to_string(scope, args.get(0)) else {
         throw_js_error(scope, "Unable to convert module specifier to string");
         return;
     };
-    let parent_path = if args.length() >= 2 { value_to_string(scope, args.get(1)) } else { None };
-    let app_root = if args.length() >= 3 { value_to_string(scope, args.get(2)).unwrap_or_default() } else { String::new() };
+    let parent_path = if args.length() >= 2 {
+        value_to_string(scope, args.get(1))
+    } else {
+        None
+    };
+    let app_root = if args.length() >= 3 {
+        value_to_string(scope, args.get(2)).unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     let mut candidate = if specifier.starts_with("./") || specifier.starts_with("../") {
         let parent = parent_path
             .map(|v| normalize_js_path(v.as_str()))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        let base = if parent.is_file() { parent.parent().map(Path::to_path_buf).unwrap_or(parent) } else { parent };
+        let base = if parent.is_file() {
+            parent.parent().map(Path::to_path_buf).unwrap_or(parent)
+        } else {
+            parent
+        };
         base.join(&specifier)
     } else {
         let direct = normalize_js_path(specifier.as_str());
@@ -677,7 +823,6 @@ pub(crate) fn handle_proxy_list_manifests(
     retval.set(array.into());
 }
 
-
 pub(crate) fn handle_describe_winrt_type(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -703,7 +848,10 @@ pub(crate) fn handle_describe_winrt_type(
                 retval.set_null();
             }
         }
-        Err(error) => throw_js_error(scope, format!("Failed to serialize WinRT descriptor: {error}").as_str()),
+        Err(error) => throw_js_error(
+            scope,
+            format!("Failed to serialize WinRT descriptor: {error}").as_str(),
+        ),
     }
 }
 
@@ -713,17 +861,23 @@ pub(crate) fn handle_worker_create_threaded(
     mut retval: v8::ReturnValue,
 ) {
     if args.length() < 3 {
-        throw_js_error(scope, "__nsWorkerCreateThreaded(source, filename, appRoot) expects 3 arguments");
+        throw_js_error(
+            scope,
+            "__nsWorkerCreateThreaded(source, filename, appRoot) expects 3 arguments",
+        );
         return;
     }
     let Some(source) = value_to_string(scope, args.get(0)) else {
-        throw_js_error(scope, "Unable to convert worker source to string"); return;
+        throw_js_error(scope, "Unable to convert worker source to string");
+        return;
     };
     let Some(filename) = value_to_string(scope, args.get(1)) else {
-        throw_js_error(scope, "Unable to convert worker filename to string"); return;
+        throw_js_error(scope, "Unable to convert worker filename to string");
+        return;
     };
     let Some(app_root) = value_to_string(scope, args.get(2)) else {
-        throw_js_error(scope, "Unable to convert appRoot to string"); return;
+        throw_js_error(scope, "Unable to convert appRoot to string");
+        return;
     };
     match crate::worker_threads::create_worker(app_root, source, filename) {
         Ok(worker_id) => retval.set_double(worker_id as f64),
@@ -737,11 +891,17 @@ pub(crate) fn handle_worker_post_message(
     _retval: v8::ReturnValue,
 ) {
     if args.length() < 2 {
-        throw_js_error(scope, "__nsWorkerPostMessage(workerId, value) expects 2 arguments");
+        throw_js_error(
+            scope,
+            "__nsWorkerPostMessage(workerId, value) expects 2 arguments",
+        );
         return;
     }
     let worker_id = args.get(0).number_value(scope).unwrap_or(-1.0);
-    if worker_id < 0.0 { throw_js_error(scope, "Invalid worker id"); return; }
+    if worker_id < 0.0 {
+        throw_js_error(scope, "Invalid worker id");
+        return;
+    }
     let value = args.get(1);
     let Some(bytes) = Runtime::serialize_value(scope, value) else {
         throw_js_error(scope, "DataCloneError: value could not be cloned.");
@@ -762,10 +922,16 @@ pub(crate) fn handle_worker_poll_messages(
         return;
     }
     let worker_id = args.get(0).number_value(scope).unwrap_or(-1.0);
-    if worker_id < 0.0 { throw_js_error(scope, "Invalid worker id"); return; }
+    if worker_id < 0.0 {
+        throw_js_error(scope, "Invalid worker id");
+        return;
+    }
     let events = match crate::worker_threads::poll_events(worker_id as u64) {
         Ok(e) => e,
-        Err(err) => { throw_js_error(scope, err.as_str()); return; }
+        Err(err) => {
+            throw_js_error(scope, err.as_str());
+            return;
+        }
     };
     let array = v8::Array::new(scope, events.len() as i32);
     for (index, event) in events.into_iter().enumerate() {
@@ -786,7 +952,10 @@ pub(crate) fn handle_worker_terminate(
         return;
     }
     let worker_id = args.get(0).number_value(scope).unwrap_or(-1.0);
-    if worker_id < 0.0 { throw_js_error(scope, "Invalid worker id"); return; }
+    if worker_id < 0.0 {
+        throw_js_error(scope, "Invalid worker id");
+        return;
+    }
     if let Err(err) = crate::worker_threads::terminate_worker(worker_id as u64) {
         throw_js_error(scope, err.as_str());
     }
@@ -798,16 +967,29 @@ pub(crate) fn handle_worker_poll_messages_blocking(
     mut retval: v8::ReturnValue,
 ) {
     if args.length() < 2 {
-        throw_js_error(scope, "__nsWorkerPollMessagesBlocking(workerId, timeoutMs) expects 2 arguments");
+        throw_js_error(
+            scope,
+            "__nsWorkerPollMessagesBlocking(workerId, timeoutMs) expects 2 arguments",
+        );
         return;
     }
     let worker_id = args.get(0).number_value(scope).unwrap_or(-1.0);
-    if worker_id < 0.0 { throw_js_error(scope, "Invalid worker id"); return; }
+    if worker_id < 0.0 {
+        throw_js_error(scope, "Invalid worker id");
+        return;
+    }
     let timeout_ms = args.get(1).number_value(scope).unwrap_or(0.0);
-    let timeout_ms = if timeout_ms.is_sign_negative() { 0_u64 } else { timeout_ms as u64 };
+    let timeout_ms = if timeout_ms.is_sign_negative() {
+        0_u64
+    } else {
+        timeout_ms as u64
+    };
     let events = match crate::worker_threads::poll_events_blocking(worker_id as u64, timeout_ms) {
         Ok(e) => e,
-        Err(err) => { throw_js_error(scope, err.as_str()); return; }
+        Err(err) => {
+            throw_js_error(scope, err.as_str());
+            return;
+        }
     };
     let array = v8::Array::new(scope, events.len() as i32);
     for (index, event) in events.into_iter().enumerate() {
@@ -1295,6 +1477,37 @@ const HELPER_SOURCE: &str = r#"
                     asDataView(value).setFloat64(offset >>> 0, +input, littleEndian !== false);
                     return value;
                 },
+                // reference(typeName, value) — explicit IReference<T> boxing.
+                // Normally the runtime boxes automatically from the method signature;
+                // use this for advanced cases. Accepts short and fully-qualified names:
+                // "Double" | "Int32" | "TimeSpan" | "Windows.Foundation.DateTime" | etc.
+                reference: function (typeName, value) {
+                    if (typeof globalThis.__nsCreateReference !== 'function') { return null; }
+                    return globalThis.__nsCreateReference(typeName, value);
+                },
+                // Typed concrete-value helpers
+                // These create a concrete typed IPropertyValue (not a nullable IReference)
+                // so the WinRT runtime can pick the correct overload when a parameter is
+                // typed as Object/IInspectable.  Pass the returned object directly to
+                // any WinRT method that would otherwise receive an untyped JS number.
+                float: function (n) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('Single', +n); },
+                double: function (n) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('Double', +n); },
+                int: function (n) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('Int32', +n); },
+                uint: function (n) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('UInt32', +n); },
+                long: function (n) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('Int64', +n); },
+                ulong: function (n) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('UInt64', +n); },
+                short: function (n) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('Int16', +n); },
+                ushort: function (n) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('UInt16', +n); },
+                byte: function (n) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('UInt8', +n); },
+                char: function (c) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('Char16', c); },
+                bool: function (v) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('Boolean', !!v); },
+                // Date/time helpers
+                timeSpan: function (ms) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('TimeSpan', +ms); },
+                dateTime: function (msOrDate) {
+                    var ms = (msOrDate instanceof Date) ? msOrDate.getTime() : +msOrDate;
+                    return globalThis.__nsTypedValue && globalThis.__nsTypedValue('DateTime', ms);
+                },
+                guid: function (str) { return globalThis.__nsTypedValue && globalThis.__nsTypedValue('Guid', String(str)); },
             };
 
             // Expose top-level `interop` alias.
@@ -3156,7 +3369,10 @@ pub(crate) fn handle_dotnet_invoke_binary(
     mut retval: v8::ReturnValue,
 ) {
     if args.length() < 4 {
-        throw_js_error(scope, "__nsDotNetInvokeBin: expected (handle, typeName, assembly, method, ...args)");
+        throw_js_error(
+            scope,
+            "__nsDotNetInvokeBin: expected (handle, typeName, assembly, method, ...args)",
+        );
         return;
     }
 
@@ -3171,17 +3387,20 @@ pub(crate) fn handle_dotnet_invoke_binary(
         -1
     };
 
-    let type_name = args.get(1)
+    let type_name = args
+        .get(1)
         .to_string(scope)
         .map(|s| s.to_rust_string_lossy(scope))
         .unwrap_or_default();
 
-    let assembly = args.get(2)
+    let assembly = args
+        .get(2)
         .to_string(scope)
         .map(|s| s.to_rust_string_lossy(scope))
         .unwrap_or_default();
 
-    let method = args.get(3)
+    let method = args
+        .get(3)
         .to_string(scope)
         .map(|s| s.to_rust_string_lossy(scope))
         .unwrap_or_default();
@@ -3191,15 +3410,15 @@ pub(crate) fn handle_dotnet_invoke_binary(
     // Determine opcode.
     let op: u8 = if handle >= 0 {
         match method.as_str() {
-            "__release"   => 0x04,
+            "__release" => 0x04,
             "__members__" => 0x05,
-            _             => 0x01,
+            _ => 0x01,
         }
     } else {
         match method.as_str() {
             "__members__" => 0x06,
-            ".ctor"       => 0x03,
-            _             => 0x02,
+            ".ctor" => 0x03,
+            _ => 0x02,
         }
     };
 
@@ -3228,7 +3447,7 @@ pub(crate) fn handle_dotnet_invoke_binary(
     match crate::dotnet::call_dotnet_binary(&req) {
         Ok(response) => match bin_read_response(scope, &response) {
             Ok(v8_val) => retval.set(v8_val),
-            Err(e)     => throw_js_error(scope, &e),
+            Err(e) => throw_js_error(scope, &e),
         },
         Err(e) => throw_js_error(scope, &e),
     }
@@ -3247,7 +3466,9 @@ pub(crate) unsafe extern "C" fn invoke_dotnet_js_callback(
     _resp_len: *mut i32,
 ) {
     let isolate_ptr = crate::DELEGATE_ISOLATE_PTR.with(|c| c.get());
-    if isolate_ptr.is_null() { return; }
+    if isolate_ptr.is_null() {
+        return;
+    }
 
     let isolate: &mut v8::Isolate = &mut *isolate_ptr;
     v8::scope!(scope, isolate);
@@ -3259,10 +3480,10 @@ pub(crate) unsafe extern "C" fn invoke_dotnet_js_callback(
     let scope = &mut v8::ContextScope::new(scope, context);
     v8::tc_scope!(tc, scope);
 
-    let func_global = crate::DOTNET_JS_CALLBACKS.with(|m| {
-        m.borrow().get(&callback_id).cloned()
-    });
-    let Some(func_global) = func_global else { return; };
+    let func_global = crate::DOTNET_JS_CALLBACKS.with(|m| m.borrow().get(&callback_id).cloned());
+    let Some(func_global) = func_global else {
+        return;
+    };
     let func = v8::Local::new(tc, &func_global);
     let recv: v8::Local<v8::Value> = v8::undefined(tc).into();
 
@@ -3299,21 +3520,33 @@ pub(crate) unsafe extern "C" fn invoke_dotnet_js_callback(
 
     if out_buf.is_empty() {
         // No response: leave resp pointers null / zero.
-        if !_resp_ptr.is_null() { *_resp_ptr = std::ptr::null_mut(); }
-        if !_resp_len.is_null() { *_resp_len = 0; }
+        if !_resp_ptr.is_null() {
+            *_resp_ptr = std::ptr::null_mut();
+        }
+        if !_resp_len.is_null() {
+            *_resp_len = 0;
+        }
     } else {
         // Allocate memory using LocalAlloc so managed Marshal.FreeHGlobal can free it.
         let size = out_buf.len();
         unsafe {
             let p = LocalAlloc(LMEM_FIXED, size);
             if p.is_null() {
-                if !_resp_ptr.is_null() { *_resp_ptr = std::ptr::null_mut(); }
-                if !_resp_len.is_null() { *_resp_len = 0; }
+                if !_resp_ptr.is_null() {
+                    *_resp_ptr = std::ptr::null_mut();
+                }
+                if !_resp_len.is_null() {
+                    *_resp_len = 0;
+                }
             } else {
                 let dest = p as *mut u8;
                 std::ptr::copy_nonoverlapping(out_buf.as_ptr(), dest, size);
-                if !_resp_ptr.is_null() { *_resp_ptr = dest; }
-                if !_resp_len.is_null() { *_resp_len = size as i32; }
+                if !_resp_ptr.is_null() {
+                    *_resp_ptr = dest;
+                }
+                if !_resp_len.is_null() {
+                    *_resp_len = size as i32;
+                }
             }
         }
     }
@@ -3322,7 +3555,9 @@ pub(crate) unsafe extern "C" fn invoke_dotnet_js_callback(
         let mut set = s.borrow_mut();
         if set.contains(&callback_id) {
             // Remove the stored JS function and clear the oneshot marker.
-            crate::DOTNET_JS_CALLBACKS.with(|m| { m.borrow_mut().remove(&callback_id); });
+            crate::DOTNET_JS_CALLBACKS.with(|m| {
+                m.borrow_mut().remove(&callback_id);
+            });
             set.remove(&callback_id);
         }
     });
@@ -3332,12 +3567,16 @@ fn parse_dotnet_callback_args<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     bytes: &[u8],
 ) -> Vec<v8::Local<'s, v8::Value>> {
-    if bytes.is_empty() { return vec![]; }
+    if bytes.is_empty() {
+        return vec![];
+    }
     let count = bytes[0] as usize;
     let mut pos = 1usize;
     let mut result = Vec::with_capacity(count);
     for _ in 0..count {
-        if pos >= bytes.len() { break; }
+        if pos >= bytes.len() {
+            break;
+        }
         match bin_read_value(scope, bytes, &mut pos) {
             Ok(v) => result.push(v),
             Err(_) => break,
@@ -3356,17 +3595,24 @@ pub(crate) fn handle_dotnet_create_delegate(
     mut retval: v8::ReturnValue,
 ) {
     if args.length() < 2 {
-        throw_js_error(scope, "__nsDotNetCreateDelegate(typeName, fn): expected 2 arguments");
+        throw_js_error(
+            scope,
+            "__nsDotNetCreateDelegate(typeName, fn): expected 2 arguments",
+        );
         return;
     }
 
-    let type_name = args.get(0)
+    let type_name = args
+        .get(0)
         .to_string(scope)
         .map(|s| s.to_rust_string_lossy(scope))
         .unwrap_or_default();
 
     let Ok(func) = v8::Local::<v8::Function>::try_from(args.get(1)) else {
-        throw_js_error(scope, "__nsDotNetCreateDelegate: second argument must be a function");
+        throw_js_error(
+            scope,
+            "__nsDotNetCreateDelegate: second argument must be a function",
+        );
         return;
     };
 
@@ -3383,7 +3629,7 @@ pub(crate) fn handle_dotnet_create_delegate(
 
     match crate::dotnet::call_dotnet_binary(&req) {
         Ok(response) => match bin_read_response(scope, &response) {
-            Ok(v)  => retval.set(v),
+            Ok(v) => retval.set(v),
             Err(e) => throw_js_error(scope, &e),
         },
         Err(e) => throw_js_error(scope, &e),
@@ -3398,16 +3644,21 @@ pub(crate) fn handle_dotnet_create_js_subclass(
     mut retval: v8::ReturnValue,
 ) {
     if args.length() < 3 {
-        throw_js_error(scope, "__nsDotNetCreateJsSubclass(assembly, typeName, fn): expected 3 arguments");
+        throw_js_error(
+            scope,
+            "__nsDotNetCreateJsSubclass(assembly, typeName, fn): expected 3 arguments",
+        );
         return;
     }
 
-    let assembly = args.get(0)
+    let assembly = args
+        .get(0)
         .to_string(scope)
         .map(|s| s.to_rust_string_lossy(scope))
         .unwrap_or_default();
 
-    let type_name = args.get(1)
+    let type_name = args
+        .get(1)
         .to_string(scope)
         .map(|s| s.to_rust_string_lossy(scope))
         .unwrap_or_default();
@@ -3415,7 +3666,10 @@ pub(crate) fn handle_dotnet_create_js_subclass(
     // Accept a function as the callback.
     let cb_val = args.get(2);
     let Ok(cb_fn) = v8::Local::<v8::Function>::try_from(cb_val) else {
-        throw_js_error(scope, "__nsDotNetCreateJsSubclass: third argument must be a function");
+        throw_js_error(
+            scope,
+            "__nsDotNetCreateJsSubclass: third argument must be a function",
+        );
         return;
     };
 
@@ -3432,7 +3686,7 @@ pub(crate) fn handle_dotnet_create_js_subclass(
 
     match crate::dotnet::call_dotnet_binary(&req) {
         Ok(response) => match bin_read_response(scope, &response) {
-            Ok(v)  => retval.set(v),
+            Ok(v) => retval.set(v),
             Err(e) => throw_js_error(scope, &e),
         },
         Err(e) => throw_js_error(scope, &e),
@@ -3450,7 +3704,10 @@ pub(crate) fn handle_dotnet_await_task(
     _retval: v8::ReturnValue,
 ) {
     if args.length() < 3 {
-        throw_js_error(scope, "__nsDotNetAwaitTask(handleId, resolve, reject): expected 3 arguments");
+        throw_js_error(
+            scope,
+            "__nsDotNetAwaitTask(handleId, resolve, reject): expected 3 arguments",
+        );
         return;
     }
 
@@ -3459,26 +3716,35 @@ pub(crate) fn handle_dotnet_await_task(
     } else if let Ok(n) = v8::Local::<v8::Number>::try_from(args.get(0)) {
         n.value() as i32
     } else {
-        throw_js_error(scope, "__nsDotNetAwaitTask: first argument must be a handle id (integer)");
+        throw_js_error(
+            scope,
+            "__nsDotNetAwaitTask: first argument must be a handle id (integer)",
+        );
         return;
     };
 
     let Ok(resolve_fn) = v8::Local::<v8::Function>::try_from(args.get(1)) else {
-        throw_js_error(scope, "__nsDotNetAwaitTask: second argument must be a resolve function");
+        throw_js_error(
+            scope,
+            "__nsDotNetAwaitTask: second argument must be a resolve function",
+        );
         return;
     };
     let Ok(reject_fn) = v8::Local::<v8::Function>::try_from(args.get(2)) else {
-        throw_js_error(scope, "__nsDotNetAwaitTask: third argument must be a reject function");
+        throw_js_error(
+            scope,
+            "__nsDotNetAwaitTask: third argument must be a reject function",
+        );
         return;
     };
 
     let resolve_id = crate::DOTNET_NEXT_CB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let reject_id  = crate::DOTNET_NEXT_CB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let reject_id = crate::DOTNET_NEXT_CB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     crate::DOTNET_JS_CALLBACKS.with(|m| {
         let mut map = m.borrow_mut();
         map.insert(resolve_id, v8::Global::new(scope, resolve_fn));
-        map.insert(reject_id,  v8::Global::new(scope, reject_fn));
+        map.insert(reject_id, v8::Global::new(scope, reject_fn));
     });
 
     // Binary instance call: 0x01 | handle(i32) | "__dotnet_await__"(str16) | 2 | i32 resolveId | i32 rejectId
@@ -3487,8 +3753,10 @@ pub(crate) fn handle_dotnet_await_task(
     req.extend_from_slice(&handle_id.to_le_bytes());
     bin_write_str16(&mut req, b"__dotnet_await__");
     req.push(2u8);
-    req.push(0x03u8); req.extend_from_slice(&resolve_id.to_le_bytes());
-    req.push(0x03u8); req.extend_from_slice(&reject_id.to_le_bytes());
+    req.push(0x03u8);
+    req.extend_from_slice(&resolve_id.to_le_bytes());
+    req.push(0x03u8);
+    req.extend_from_slice(&reject_id.to_le_bytes());
 
     if let Err(e) = crate::dotnet::call_dotnet_binary(&req) {
         crate::DOTNET_JS_CALLBACKS.with(|m| {
@@ -3500,8 +3768,15 @@ pub(crate) fn handle_dotnet_await_task(
     }
 }
 
-fn bin_write_v8_arg(buf: &mut Vec<u8>, scope: &mut v8::PinScope<'_, '_>, arg: v8::Local<v8::Value>) {
-    if arg.is_null_or_undefined() { buf.push(0x00); return; }
+fn bin_write_v8_arg(
+    buf: &mut Vec<u8>,
+    scope: &mut v8::PinScope<'_, '_>,
+    arg: v8::Local<v8::Value>,
+) {
+    if arg.is_null_or_undefined() {
+        buf.push(0x00);
+        return;
+    }
 
     if arg.is_boolean() {
         buf.push(if arg.is_true() { 0x02 } else { 0x01 });
@@ -3582,20 +3857,30 @@ fn bin_write_v8_arg(buf: &mut Vec<u8>, scope: &mut v8::PinScope<'_, '_>, arg: v8
             bin_write_str16(buf, &bytes);
             return;
         }
-        }
+    }
 
     // Final fallback: null
     buf.push(0x00);
-    }
+}
 
 fn bin_write_str32(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     buf.extend_from_slice(bytes);
 }
 
-fn bin_write_v8_value(buf: &mut Vec<u8>, scope: &mut v8::PinScope<'_, '_>, arg: v8::Local<v8::Value>) {
-    if arg.is_null_or_undefined() { buf.push(0x00); return; }
-    if arg.is_boolean() { buf.push(if arg.is_true() { 0x02 } else { 0x01 }); return; }
+fn bin_write_v8_value(
+    buf: &mut Vec<u8>,
+    scope: &mut v8::PinScope<'_, '_>,
+    arg: v8::Local<v8::Value>,
+) {
+    if arg.is_null_or_undefined() {
+        buf.push(0x00);
+        return;
+    }
+    if arg.is_boolean() {
+        buf.push(if arg.is_true() { 0x02 } else { 0x01 });
+        return;
+    }
 
     // Integer before general number
     if let Ok(n) = v8::Local::<v8::Integer>::try_from(arg) {
@@ -3686,7 +3971,9 @@ fn bin_read_response<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     bytes: &[u8],
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    if bytes.is_empty() { return Ok(v8::null(scope).into()); }
+    if bytes.is_empty() {
+        return Ok(v8::null(scope).into());
+    }
     let mut pos = 0usize;
     bin_read_value(scope, bytes, &mut pos)
 }
@@ -3705,31 +3992,40 @@ fn bin_read_value<'s>(
         0x02 => Ok(v8::Boolean::new(scope, true).into()),
 
         0x03 => {
-            let v = i32::from_le_bytes(bytes[*pos..*pos+4].try_into().map_err(|_| "i32 read")?);
+            let v = i32::from_le_bytes(bytes[*pos..*pos + 4].try_into().map_err(|_| "i32 read")?);
             *pos += 4;
             Ok(v8::Integer::new(scope, v).into())
         }
 
         0x04 => {
-            let bits = u64::from_le_bytes(bytes[*pos..*pos+8].try_into().map_err(|_| "f64 read")?);
+            let bits =
+                u64::from_le_bytes(bytes[*pos..*pos + 8].try_into().map_err(|_| "f64 read")?);
             *pos += 8;
             Ok(v8::Number::new(scope, f64::from_bits(bits)).into())
         }
 
-        0x05 => { // string: u32 len + utf8
-            let len = u32::from_le_bytes(bytes[*pos..*pos+4].try_into().map_err(|_| "str len")?) as usize;
+        0x05 => {
+            // string: u32 len + utf8
+            let len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().map_err(|_| "str len")?)
+                as usize;
             *pos += 4;
-            let s = std::str::from_utf8(&bytes[*pos..*pos+len]).map_err(|_| "utf8")?;
+            let s = std::str::from_utf8(&bytes[*pos..*pos + len]).map_err(|_| "utf8")?;
             *pos += len;
-            Ok(v8::String::new(scope, s).map(Into::into).unwrap_or_else(|| v8::null(scope).into()))
+            Ok(v8::String::new(scope, s)
+                .map(Into::into)
+                .unwrap_or_else(|| v8::null(scope).into()))
         }
 
-        0x06 | 0x0C => { // handle → JS object {__handle, __type} ; 0x0C adds __isTask:true
-            let id = i32::from_le_bytes(bytes[*pos..*pos+4].try_into().map_err(|_| "handle id")?);
+        0x06 | 0x0C => {
+            // handle → JS object {__handle, __type} ; 0x0C adds __isTask:true
+            let id = i32::from_le_bytes(bytes[*pos..*pos + 4].try_into().map_err(|_| "handle id")?);
             *pos += 4;
-            let type_len = u16::from_le_bytes(bytes[*pos..*pos+2].try_into().map_err(|_| "type len")?) as usize;
+            let type_len =
+                u16::from_le_bytes(bytes[*pos..*pos + 2].try_into().map_err(|_| "type len")?)
+                    as usize;
             *pos += 2;
-            let type_name = std::str::from_utf8(&bytes[*pos..*pos+type_len]).map_err(|_| "utf8")?;
+            let type_name =
+                std::str::from_utf8(&bytes[*pos..*pos + type_len]).map_err(|_| "utf8")?;
             *pos += type_len;
 
             let obj = v8::Object::new(scope);
@@ -3750,13 +4046,23 @@ fn bin_read_value<'s>(
                 *pos += 1;
                 if flag != 0 {
                     if bytes.len() - *pos >= 8 {
-                        let raw = i64::from_le_bytes(bytes[*pos..*pos+8].try_into().map_err(|_| "i64 read")?);
+                        let raw = i64::from_le_bytes(
+                            bytes[*pos..*pos + 8].try_into().map_err(|_| "i64 read")?,
+                        );
                         *pos += 8;
                         let nk = v8::String::new(scope, "__native_ptr").ok_or("v8 str")?;
                         if raw >= 0 {
-                            obj.set(scope, nk.into(), v8::BigInt::new_from_u64(scope, raw as u64).into());
+                            obj.set(
+                                scope,
+                                nk.into(),
+                                v8::BigInt::new_from_u64(scope, raw as u64).into(),
+                            );
                         } else {
-                            obj.set(scope, nk.into(), v8::BigInt::new_from_i64(scope, raw).into());
+                            obj.set(
+                                scope,
+                                nk.into(),
+                                v8::BigInt::new_from_i64(scope, raw).into(),
+                            );
                         }
                     }
                 }
@@ -3764,8 +4070,11 @@ fn bin_read_value<'s>(
             Ok(obj.into())
         }
 
-        0x07 => { // array: u32 count + N items
-            let count = u32::from_le_bytes(bytes[*pos..*pos+4].try_into().map_err(|_| "arr count")?) as usize;
+        0x07 => {
+            // array: u32 count + N items
+            let count =
+                u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().map_err(|_| "arr count")?)
+                    as usize;
             *pos += 4;
             let arr = v8::Array::new(scope, count as i32);
             for i in 0..count {
@@ -3775,18 +4084,32 @@ fn bin_read_value<'s>(
             Ok(arr.into())
         }
 
-        0x08 => { // members: 8 string arrays — methods/props/staticMethods/staticProps + readonly/writeonly variants
+        0x08 => {
+            // members: 8 string arrays — methods/props/staticMethods/staticProps + readonly/writeonly variants
             let obj = v8::Object::new(scope);
-            for key in ["methods", "properties", "staticMethods", "staticProperties",
-                        "readonlyProperties", "readonlyStaticProperties",
-                        "writeonlyProperties", "writeonlyStaticProperties"] {
-                let count = u16::from_le_bytes(bytes[*pos..*pos+2].try_into().map_err(|_| "member count")?) as usize;
+            for key in [
+                "methods",
+                "properties",
+                "staticMethods",
+                "staticProperties",
+                "readonlyProperties",
+                "readonlyStaticProperties",
+                "writeonlyProperties",
+                "writeonlyStaticProperties",
+            ] {
+                let count = u16::from_le_bytes(
+                    bytes[*pos..*pos + 2]
+                        .try_into()
+                        .map_err(|_| "member count")?,
+                ) as usize;
                 *pos += 2;
                 let arr = v8::Array::new(scope, count as i32);
                 for i in 0..count {
-                    let len = u16::from_le_bytes(bytes[*pos..*pos+2].try_into().map_err(|_| "str len")?) as usize;
+                    let len = u16::from_le_bytes(
+                        bytes[*pos..*pos + 2].try_into().map_err(|_| "str len")?,
+                    ) as usize;
                     *pos += 2;
-                    let s = std::str::from_utf8(&bytes[*pos..*pos+len]).map_err(|_| "utf8")?;
+                    let s = std::str::from_utf8(&bytes[*pos..*pos + len]).map_err(|_| "utf8")?;
                     *pos += len;
                     if let Some(sv) = v8::String::new(scope, s) {
                         arr.set_index(scope, i as u32, sv.into());
@@ -3798,10 +4121,12 @@ fn bin_read_value<'s>(
             Ok(obj.into())
         }
 
-        0xFF => { // error: u32 len + utf8 message
-            let len = u32::from_le_bytes(bytes[*pos..*pos+4].try_into().map_err(|_| "err len")?) as usize;
+        0xFF => {
+            // error: u32 len + utf8 message
+            let len = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().map_err(|_| "err len")?)
+                as usize;
             *pos += 4;
-            let msg = std::str::from_utf8(&bytes[*pos..*pos+len]).map_err(|_| "utf8")?;
+            let msg = std::str::from_utf8(&bytes[*pos..*pos + len]).map_err(|_| "utf8")?;
             Err(msg.to_string())
         }
 
@@ -3816,7 +4141,9 @@ pub(crate) fn handle_win32_exports(
     args: v8::FunctionCallbackArguments,
     mut retval: v8::ReturnValue,
 ) {
-    let Some(dll_v) = args.get(0).to_string(scope) else { return };
+    let Some(dll_v) = args.get(0).to_string(scope) else {
+        return;
+    };
     let dll = dll_v.to_rust_string_lossy(scope);
     let names = match crate::win32::list_exports(&dll) {
         Ok(v) => v,
@@ -3848,7 +4175,8 @@ pub(crate) fn handle_dwm_flush(
     let ts = crate::globals::time::PROCESS_START
         .get_or_init(std::time::Instant::now)
         .elapsed()
-        .as_nanos() as f64 / 1_000_000.0;
+        .as_nanos() as f64
+        / 1_000_000.0;
     retval.set_double(ts);
 }
 
@@ -3860,7 +4188,8 @@ pub(crate) fn handle_tns_uptime(
     let ts = crate::globals::time::PROCESS_START
         .get_or_init(std::time::Instant::now)
         .elapsed()
-        .as_nanos() as f64 / 1_000_000.0;
+        .as_nanos() as f64
+        / 1_000_000.0;
     retval.set_double(ts);
 }
 
@@ -3873,9 +4202,17 @@ pub(crate) fn handle_ns_uuid(
         Ok(g) => {
             let s = format!(
                 "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                g.data1, g.data2, g.data3,
-                g.data4[0], g.data4[1], g.data4[2], g.data4[3],
-                g.data4[4], g.data4[5], g.data4[6], g.data4[7],
+                g.data1,
+                g.data2,
+                g.data3,
+                g.data4[0],
+                g.data4[1],
+                g.data4[2],
+                g.data4[3],
+                g.data4[4],
+                g.data4[5],
+                g.data4[6],
+                g.data4[7],
             );
             if let Some(v) = v8::String::new(scope, &s) {
                 retval.set(v.into());
@@ -3944,7 +4281,6 @@ pub(crate) fn handle_get_last_js_error(
     retval.set(v8::null(scope).into());
 }
 
-
 // __nsTypedValue(typeName, value) — box a JS value as a concrete WinRT IPropertyValue.
 //   Useful for passing typed primitives to Object/IInspectable parameters and for
 //   method overload disambiguation.
@@ -3953,7 +4289,8 @@ pub(crate) fn handle_get_last_js_error(
 //   PropertyValue::Create* produces an object implementing both IPropertyValue AND
 //   IReference<T>, so both helpers share the same Rust implementation.
 //
-// Supported type names:
+// Supported type names (a "Windows.Foundation." prefix is also accepted, e.g.
+// "Windows.Foundation.TimeSpan"):
 //   "Single" | "Double" | "Int32" | "UInt32" | "Int64" | "UInt64" | "Int16" |
 //   "UInt16" | "Byte"/"UInt8" | "Char16" | "Boolean" | "String" |
 //   "TimeSpan" (accepts ms number or {Duration:ticks}) |
@@ -4002,7 +4339,10 @@ pub(crate) fn handle_create_reference(
     retval: v8::ReturnValue,
 ) {
     if args.length() < 2 {
-        crate::throw_js_error(scope, "__nsCreateReference(typeName, value) expects 2 arguments");
+        crate::throw_js_error(
+            scope,
+            "__nsCreateReference(typeName, value) expects 2 arguments",
+        );
         return;
     }
     let Some(tn) = args.get(0).to_string(scope) else {
@@ -4026,29 +4366,35 @@ pub(crate) fn handle_win32_call_raw(
         return;
     }
     let Some(dll_v) = args.get(0).to_string(scope) else {
-        throw_js_error(scope, "__nsWin32CallRaw: dll must be a string"); return;
+        throw_js_error(scope, "__nsWin32CallRaw: dll must be a string");
+        return;
     };
     let Some(fn_v) = args.get(1).to_string(scope) else {
-        throw_js_error(scope, "__nsWin32CallRaw: fn must be a string"); return;
+        throw_js_error(scope, "__nsWin32CallRaw: fn must be a string");
+        return;
     };
     let Some(ret_v) = args.get(2).to_string(scope) else {
-        throw_js_error(scope, "__nsWin32CallRaw: retType must be a string"); return;
+        throw_js_error(scope, "__nsWin32CallRaw: retType must be a string");
+        return;
     };
-    let dll      = dll_v.to_rust_string_lossy(scope);
-    let fn_name  = fn_v.to_rust_string_lossy(scope);
+    let dll = dll_v.to_rust_string_lossy(scope);
+    let fn_name = fn_v.to_rust_string_lossy(scope);
     let ret_type = ret_v.to_rust_string_lossy(scope);
 
     let pair_count = ((args.length() - 3) / 2) as usize;
-    let mut type_strs: Vec<String>                    = Vec::with_capacity(pair_count);
-    let mut raw_vals:  Vec<crate::win32::RawArgValue> = Vec::with_capacity(pair_count);
+    let mut type_strs: Vec<String> = Vec::with_capacity(pair_count);
+    let mut raw_vals: Vec<crate::win32::RawArgValue> = Vec::with_capacity(pair_count);
 
     let mut i: i32 = 3;
     while i + 1 < args.length() {
-        let Some(ty_v) = args.get(i).to_string(scope) else { break };
+        let Some(ty_v) = args.get(i).to_string(scope) else {
+            break;
+        };
         let ty_str = ty_v.to_rust_string_lossy(scope);
         let v8_val = args.get(i + 1);
         let raw_val = if ty_str == "wstr" || ty_str == "str" {
-            let s = v8_val.to_string(scope)
+            let s = v8_val
+                .to_string(scope)
                 .map(|sv| sv.to_rust_string_lossy(scope))
                 .unwrap_or_default();
             crate::win32::RawArgValue::Str(s)
@@ -4061,18 +4407,16 @@ pub(crate) fn handle_win32_call_raw(
         i += 2;
     }
 
-    let arg_pairs: Vec<(&str, crate::win32::RawArgValue)> = type_strs.iter()
-        .map(|s| s.as_str())
-        .zip(raw_vals)
-        .collect();
+    let arg_pairs: Vec<(&str, crate::win32::RawArgValue)> =
+        type_strs.iter().map(|s| s.as_str()).zip(raw_vals).collect();
 
     match crate::win32::call_win32_direct(&dll, &fn_name, &ret_type, &arg_pairs) {
         Ok(result) => match result {
-            crate::win32::Win32Result::Null    => retval.set(v8::null(scope).into()),
+            crate::win32::Win32Result::Null => retval.set(v8::null(scope).into()),
             crate::win32::Win32Result::Bool(b) => retval.set_bool(b),
-            crate::win32::Win32Result::I64(v)  => retval.set_double(v as f64),
-            crate::win32::Win32Result::U64(v)  => retval.set_double(v as f64),
-            crate::win32::Win32Result::F64(v)  => retval.set_double(v),
+            crate::win32::Win32Result::I64(v) => retval.set_double(v as f64),
+            crate::win32::Win32Result::U64(v) => retval.set_double(v as f64),
+            crate::win32::Win32Result::F64(v) => retval.set_double(v),
         },
         Err(e) => throw_js_error(scope, &e),
     }
@@ -4090,16 +4434,28 @@ pub(crate) fn handle_win32_bind_fast(
     if args.length() < 3 {
         return;
     }
-    let Some(dll) = value_to_string(scope, args.get(0)) else { return };
-    let Some(fn_name) = value_to_string(scope, args.get(1)) else { return };
-    let Some(ret_type) = value_to_string(scope, args.get(2)) else { return };
+    let Some(dll) = value_to_string(scope, args.get(0)) else {
+        return;
+    };
+    let Some(fn_name) = value_to_string(scope, args.get(1)) else {
+        return;
+    };
+    let Some(ret_type) = value_to_string(scope, args.get(2)) else {
+        return;
+    };
 
     let mut arg_types: Vec<String> = Vec::new();
     if args.length() >= 4 {
-        let Ok(arr) = v8::Local::<v8::Array>::try_from(args.get(3)) else { return };
+        let Ok(arr) = v8::Local::<v8::Array>::try_from(args.get(3)) else {
+            return;
+        };
         for i in 0..arr.length() {
-            let Some(v) = arr.get_index(scope, i) else { return };
-            let Some(s) = value_to_string(scope, v) else { return };
+            let Some(v) = arr.get_index(scope, i) else {
+                return;
+            };
+            let Some(s) = value_to_string(scope, v) else {
+                return;
+            };
             arg_types.push(s);
         }
     }
@@ -4129,7 +4485,7 @@ pub(crate) fn handle_win32_call(
     };
     let json = json_v.to_rust_string_lossy(scope);
     let result_json = match crate::win32::call_win32_json(&json) {
-        Ok(v)  => v,
+        Ok(v) => v,
         Err(e) => format!(r#"{{"error":{}}}"#, serde_json::to_string(&e).unwrap()),
     };
     if let Some(s) = v8::String::new(scope, &result_json) {
@@ -4147,67 +4503,90 @@ pub(crate) fn init_async_helpers(
     // One macro call per builtin replaces 4 lines of boilerplate.
     macro_rules! register {
         ($name:literal, $handler:expr) => {{
-            if let (Some(n), Some(f)) = (v8::String::new(scope, $name), v8::Function::new(scope, $handler)) {
-                global.define_own_property(scope, n.into(), f.into(), v8::PropertyAttribute::READ_ONLY);
+            if let (Some(n), Some(f)) = (
+                v8::String::new(scope, $name),
+                v8::Function::new(scope, $handler),
+            ) {
+                global.define_own_property(
+                    scope,
+                    n.into(),
+                    f.into(),
+                    v8::PropertyAttribute::READ_ONLY,
+                );
             }
         }};
     }
 
-    register!("__nsHostWaitForAsync",           handle_host_wait_for_async);
-    register!("__nsEnqueueMicrotask",           handle_enqueue_microtask);
-    register!("__nsPointerKey",                 handle_pointer_key);
-    register!("__nsBufferToPointer",            handle_buffer_to_pointer);
-    register!("__nsProxyWriteTextFile",         handle_proxy_write_text_file);
-    register!("__nsProxyCompileProject",        handle_proxy_compile_project);
-    register!("__nsProxyRegisterManifest",      handle_proxy_register_manifest);
-    register!("__nsProxyListManifests",         handle_proxy_list_manifests);
-    register!("__nsProxyAutoCapture",           handle_proxy_auto_capture);
-    register!("__nsReadTextFile",               handle_read_text_file);
-    register!("__nsResolveModulePath",          handle_resolve_module_path);
-    register!("__nsDescribeWinRTType",          handle_describe_winrt_type);
-    register!("__nsWorkerCreateThreaded",       handle_worker_create_threaded);
-    register!("__nsWorkerPostMessage",          handle_worker_post_message);
-    register!("__nsWorkerPollMessages",         handle_worker_poll_messages);
-    register!("__nsWorkerTerminate",            handle_worker_terminate);
-    register!("__nsWorkerPollMessagesBlocking", handle_worker_poll_messages_blocking);
-    register!("__nsLiveSyncCopyFile",           handle_livesync_copy_file);
-    register!("__nsAsDelegate",                 crate::handle_as_delegate);
-    register!("__nsMakeItemsSource",            crate::handle_make_items_source);
-    register!("__nsDotNetInvoke",               handle_dotnet_invoke);
-    register!("__nsDotNetInvokeBin",            handle_dotnet_invoke_binary);
-    register!("__nsDotNetCreateDelegate",       handle_dotnet_create_delegate);
-    register!("__nsDotNetCreateJsSubclass",     handle_dotnet_create_js_subclass);
-    register!("__nsDotNetAwaitTask",            handle_dotnet_await_task);
-    register!("__nsRunOnUIThread",              handle_run_on_ui_thread);
-    register!("__nsWin32Call",                  handle_win32_call);
-    register!("__nsWin32CallRaw",               handle_win32_call_raw);
-    register!("__nsWin32BindFast",              handle_win32_bind_fast);
-    register!("__nsWin32Exports",               handle_win32_exports);
-    register!("__ns__setTimeout",               crate::timers::handle_ns_set_timeout);
-    register!("__ns__setInterval",              crate::timers::handle_ns_set_interval);
-    register!("__ns__clearTimeout",             crate::timers::handle_ns_clear_timeout);
-    register!("__ns__clearInterval",            crate::timers::handle_ns_clear_interval);
-    register!("__nsDwmFlush",                   handle_dwm_flush);
-    register!("__tns_uptime",                   handle_tns_uptime);
-    register!("__nsUUID",                       handle_ns_uuid);
-    register!("__nsIsUiThread",                 handle_is_ui_thread);
-    register!("__nsThreadInfo",                 handle_thread_info);
-    register!("__nsGetLastJsError",             handle_get_last_js_error);
-    register!("__nsTypedValue",                  handle_typed_value);
-    register!("__nsCreateReference",            handle_create_reference);
-    register!("__nsMsAppxResolve",              handle_ms_appx_resolve);
+    register!("__nsHostWaitForAsync", handle_host_wait_for_async);
+    register!("__nsEnqueueMicrotask", handle_enqueue_microtask);
+    register!("__nsPointerKey", handle_pointer_key);
+    register!("__nsBufferToPointer", handle_buffer_to_pointer);
+    register!("__nsProxyWriteTextFile", handle_proxy_write_text_file);
+    register!("__nsProxyCompileProject", handle_proxy_compile_project);
+    register!("__nsProxyRegisterManifest", handle_proxy_register_manifest);
+    register!("__nsProxyListManifests", handle_proxy_list_manifests);
+    register!("__nsProxyAutoCapture", handle_proxy_auto_capture);
+    register!("__nsReadTextFile", handle_read_text_file);
+    register!("__nsResolveModulePath", handle_resolve_module_path);
+    register!("__nsDescribeWinRTType", handle_describe_winrt_type);
+    register!("__nsWorkerCreateThreaded", handle_worker_create_threaded);
+    register!("__nsWorkerPostMessage", handle_worker_post_message);
+    register!("__nsWorkerPollMessages", handle_worker_poll_messages);
+    register!("__nsWorkerTerminate", handle_worker_terminate);
+    register!(
+        "__nsWorkerPollMessagesBlocking",
+        handle_worker_poll_messages_blocking
+    );
+    register!("__nsLiveSyncCopyFile", handle_livesync_copy_file);
+    register!("__nsAsDelegate", crate::handle_as_delegate);
+    register!("__nsMakeItemsSource", crate::handle_make_items_source);
+    register!("__nsDotNetInvoke", handle_dotnet_invoke);
+    register!("__nsDotNetInvokeBin", handle_dotnet_invoke_binary);
+    register!("__nsDotNetCreateDelegate", handle_dotnet_create_delegate);
+    register!(
+        "__nsDotNetCreateJsSubclass",
+        handle_dotnet_create_js_subclass
+    );
+    register!("__nsDotNetAwaitTask", handle_dotnet_await_task);
+    register!("__nsRunOnUIThread", handle_run_on_ui_thread);
+    register!("__nsWin32Call", handle_win32_call);
+    register!("__nsWin32CallRaw", handle_win32_call_raw);
+    register!("__nsWin32BindFast", handle_win32_bind_fast);
+    register!("__nsWin32Exports", handle_win32_exports);
+    register!("__ns__setTimeout", crate::timers::handle_ns_set_timeout);
+    register!("__ns__setInterval", crate::timers::handle_ns_set_interval);
+    register!("__ns__clearTimeout", crate::timers::handle_ns_clear_timeout);
+    register!(
+        "__ns__clearInterval",
+        crate::timers::handle_ns_clear_interval
+    );
+    register!("__nsDwmFlush", handle_dwm_flush);
+    register!("__tns_uptime", handle_tns_uptime);
+    register!("__nsUUID", handle_ns_uuid);
+    register!("__nsIsUiThread", handle_is_ui_thread);
+    register!("__nsThreadInfo", handle_thread_info);
+    register!("__nsGetLastJsError", handle_get_last_js_error);
+    register!("__nsTypedValue", handle_typed_value);
+    register!("__nsCreateReference", handle_create_reference);
+    register!("__nsMsAppxResolve", handle_ms_appx_resolve);
 
     // DevTools host hooks: allow JS to register domain dispatchers and
     // post events/timestamps to the DevTools server when enabled.
-    register!("__registerDomainDispatcher",     handle_register_domain_dispatcher);
-    register!("__inspectorSendEvent",           handle_inspector_send_event);
-    register!("__inspectorTimestamp",           handle_inspector_timestamp);
+    register!(
+        "__registerDomainDispatcher",
+        handle_register_domain_dispatcher
+    );
+    register!("__inspectorSendEvent", handle_inspector_send_event);
+    register!("__inspectorTimestamp", handle_inspector_timestamp);
 
     // Initialize native timers scheduler (non-blocking). This registers a
     // pump into `ASYNC_PUMP_HOOK` so blocking waits will also process timers.
     crate::timers::init();
 
-    if let (Some(k), Some(v)) = (v8::String::new(scope, "__nsAppRoot"), v8::String::new(scope, app_root)) {
+    if let (Some(k), Some(v)) = (
+        v8::String::new(scope, "__nsAppRoot"),
+        v8::String::new(scope, app_root),
+    ) {
         global.define_own_property(scope, k.into(), v.into(), v8::PropertyAttribute::READ_ONLY);
     }
 
@@ -4233,4 +4612,6 @@ pub(crate) fn init_async_helpers(
     crate::worker_support::install_worker_runtime(scope);
     crate::hmr_support::install_hmr_support(scope);
     crate::livesync::install_livesync_support(scope);
+    // Attempt to attach the DevTools server (no-op if built without `devtools`).
+    maybe_attach_devtools(scope);
 }

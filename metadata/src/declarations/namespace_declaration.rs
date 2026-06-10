@@ -1,16 +1,16 @@
+use crate::declarations::declaration::{Declaration, DeclarationKind};
+use crate::declarations::type_declaration::TypeDeclaration;
 use std::any::Any;
 use std::mem::MaybeUninit;
 use windows::core::HSTRING;
 use windows::Win32::System::WinRT::Metadata::{CorTokenType, RoResolveNamespace};
-use crate::declarations::declaration::{Declaration, DeclarationKind};
-use crate::declarations::type_declaration::TypeDeclaration;
 
 #[derive(Clone, Debug)]
 pub struct NamespaceDeclaration {
     base: TypeDeclaration,
     children: Vec<String>,
     full_name: String,
-    name: String
+    name: String,
 }
 
 impl Declaration for NamespaceDeclaration {
@@ -51,10 +51,9 @@ impl NamespaceDeclaration {
                 None,
                 None,
                 Some(&mut namespaces_count),
-                Some(spaces.as_mut_ptr())
+                Some(spaces.as_mut_ptr()),
             );
         }
-
 
         let namespaces = unsafe { spaces.assume_init() };
         // Modern Rust panics if `from_raw_parts` is given a null/unaligned ptr,
@@ -66,13 +65,10 @@ impl NamespaceDeclaration {
             unsafe { std::slice::from_raw_parts(namespaces, namespaces_count as usize).to_vec() }
         };
 
-
         let children: Vec<_> = unsafe {
             namespaces
                 .into_iter()
-                .map(|val| {
-                    val.to_string_lossy()
-                })
+                .map(|val| val.to_string_lossy())
                 .collect()
         };
         // The search for the "Windows" namespace on Windows Phone 8.1 fails both on a device and on an emulator with corrupted metadata error.
@@ -90,7 +86,7 @@ impl NamespaceDeclaration {
             base: TypeDeclaration::new(DeclarationKind::Namespace, None, CorTokenType::default()),
             children,
             full_name: full_name.to_string(),
-            name
+            name,
         }
     }
     pub fn children(&self) -> &[String] {

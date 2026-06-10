@@ -1,7 +1,7 @@
+use anyhow::Error;
 use std::borrow::Cow;
 use std::fmt;
 use std::fmt::{Display, Formatter};
-use anyhow::Error;
 
 /// A simple error type that lets the creator specify both the error message and
 /// the error class name. This type is private; externally it only ever appears
@@ -29,15 +29,12 @@ pub fn get_custom_error_class(error: &Error) -> Option<&'static str> {
 
 pub type AnyError = anyhow::Error;
 
-pub fn custom_error(
-    class: &'static str,
-    message: impl Into<Cow<'static, str>>,
-) -> Error {
+pub fn custom_error(class: &'static str, message: impl Into<Cow<'static, str>>) -> Error {
     CustomError {
         class,
         message: message.into(),
     }
-        .into()
+    .into()
 }
 
 pub fn generic_error(message: impl Into<Cow<'static, str>>) -> Error {

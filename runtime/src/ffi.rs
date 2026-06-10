@@ -1,10 +1,8 @@
-use std::ffi::c_void;
-use std::mem::ManuallyDrop;
-use windows::core::HSTRING;
+use crate::error::generic_error;
 use crate::value::NativeType;
 use crate::value::NativeValue;
-use crate::error::generic_error;
 use libffi::middle::Arg;
+use windows::core::HSTRING;
 
 /// Stable storage for HSTRING arguments across a libffi call.
 ///
@@ -127,7 +125,10 @@ pub fn build_call_args<'a>(
         if let Some(idx) = prep.string_index_for_slot.get(i).and_then(|o| *o) {
             call_args.push(Arg::new(&prep.string_handle_values[idx]));
         } else {
-            let effective = prep.effective_natives.get(i).unwrap_or(&POINTER_FALLBACK_REF);
+            let effective = prep
+                .effective_natives
+                .get(i)
+                .unwrap_or(&POINTER_FALLBACK_REF);
             call_args.push(unsafe { v.as_arg(effective) });
         }
     }

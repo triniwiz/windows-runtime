@@ -1,12 +1,26 @@
+use ahash::AHashMap;
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::fmt::Debug;
 use std::mem::MaybeUninit;
-use ahash::AHashMap;
-use windows::core::{GUID, HSTRING, Interface, PCSTR, PCWSTR, Type};
-use windows::Win32::System::WinRT::Metadata::{tdAbstract, tdAnsiClass, tdAutoClass, tdAutoLayout, tdBeforeFieldInit, tdClass, tdClassSemanticsMask, tdCustomFormatClass, tdExplicitLayout, tdForwarder, tdHasSecurity, tdImport, tdInterface, tdLayoutMask, tdNestedAssembly, tdNestedFamANDAssem, tdNestedFamORAssem, tdNestedFamily, tdNestedPrivate, tdNestedPublic, tdNotPublic, tdPublic, tdRTSpecialName, tdSealed, tdSequentialLayout, tdSerializable, tdSpecialName, tdStringFormatMask, tdUnicodeClass, tdVisibilityMask, tdWindowsRuntime, CorTokenType, IMetaDataImport2, mdtTypeDef, mdtTypeRef, mdMemberAccessMask, mdPrivateScope, mdPrivate, mdFamANDAssem, mdAssem, mdFamily, mdFamORAssem, mdPublic, mdStatic, mdFinal, mdVirtual, mdHideBySig, mdVtableLayoutMask, mdReuseSlot, mdNewSlot, mdCheckAccessOnOverride, mdAbstract, mdSpecialName, mdPinvokeImpl, mdUnmanagedExport, mdRTSpecialName, COR_CTOR_METHOD_NAME, COR_CTOR_METHOD_NAME_W, COR_CCTOR_METHOD_NAME, COR_CCTOR_METHOD_NAME_W, mdHasSecurity, mdRequireSecObject, prSpecialName, prHasDefault, prRTSpecialName, RoGetMetaDataFile, IMetaDataDispenserEx, evSpecialName, evRTSpecialName, CorElementType, mdtTypeSpec, mdtBaseType};
 use std::os::windows::prelude::*;
 use std::ptr::addr_of_mut;
+use windows::core::{Interface, Type, GUID, HSTRING, PCSTR, PCWSTR};
+use windows::Win32::System::WinRT::Metadata::{
+    evRTSpecialName, evSpecialName, mdAbstract, mdAssem, mdCheckAccessOnOverride, mdFamANDAssem,
+    mdFamORAssem, mdFamily, mdFinal, mdHasSecurity, mdHideBySig, mdMemberAccessMask, mdNewSlot,
+    mdPinvokeImpl, mdPrivate, mdPrivateScope, mdPublic, mdRTSpecialName, mdRequireSecObject,
+    mdReuseSlot, mdSpecialName, mdStatic, mdUnmanagedExport, mdVirtual, mdVtableLayoutMask,
+    mdtBaseType, mdtTypeDef, mdtTypeRef, mdtTypeSpec, prHasDefault, prRTSpecialName, prSpecialName,
+    tdAbstract, tdAnsiClass, tdAutoClass, tdAutoLayout, tdBeforeFieldInit, tdClass,
+    tdClassSemanticsMask, tdCustomFormatClass, tdExplicitLayout, tdForwarder, tdHasSecurity,
+    tdImport, tdInterface, tdLayoutMask, tdNestedAssembly, tdNestedFamANDAssem, tdNestedFamORAssem,
+    tdNestedFamily, tdNestedPrivate, tdNestedPublic, tdNotPublic, tdPublic, tdRTSpecialName,
+    tdSealed, tdSequentialLayout, tdSerializable, tdSpecialName, tdStringFormatMask,
+    tdUnicodeClass, tdVisibilityMask, tdWindowsRuntime, CorElementType, CorTokenType,
+    IMetaDataDispenserEx, IMetaDataImport2, RoGetMetaDataFile, COR_CCTOR_METHOD_NAME,
+    COR_CCTOR_METHOD_NAME_W, COR_CTOR_METHOD_NAME, COR_CTOR_METHOD_NAME_W,
+};
 
 pub const LOCALE_SYSTEM_DEFAULT: u32 = 0x0800;
 
@@ -28,10 +42,10 @@ pub fn cor_sig_uncompress_calling_conv(p_data: &mut PCCOR_SIGNATURE) -> u32 {
     data as u32
 }
 
-
 pub fn cor_sig_uncompress_data(p_data: &mut PCCOR_SIGNATURE) -> u32 {
     // Handle smallest data inline.
-    if (unsafe { **(&mut p_data.0) } & 0x80) == 0x00 { // 0??? ????
+    if (unsafe { **(&mut p_data.0) } & 0x80) == 0x00 {
+        // 0??? ????
         let p_data = &mut p_data.0;
         let data = unsafe { **p_data };
         unsafe { *p_data = p_data.offset(1) };
@@ -46,13 +60,15 @@ pub fn cor_sig_uncompress_big_data(p_data: &mut PCCOR_SIGNATURE) -> u32 {
 
     let p_data = &mut p_data.0;
     // Medium.
-    if (unsafe { **p_data } & 0xC0) == 0x80 { // 10?? ????
+    if (unsafe { **p_data } & 0xC0) == 0x80 {
+        // 10?? ????
         res = (unsafe { **p_data } & 0x3f) as u32;
         res <<= 8;
         unsafe { *p_data = p_data.offset(1) };
         res |= unsafe { **p_data } as u32;
         unsafe { *p_data = p_data.offset(1) };
-    } else { // 110? ????
+    } else {
+        // 110? ????
         res = (unsafe { **p_data } & 0x1f) as u32;
         res <<= 24;
         unsafe { *p_data = p_data.offset(1) };
@@ -68,7 +84,12 @@ pub fn cor_sig_uncompress_big_data(p_data: &mut PCCOR_SIGNATURE) -> u32 {
 }
 
 // SELECTANY const mdToken g_tkCorEncodeToken[4] ={mdtTypeDef, mdtTypeRef, mdtTypeSpec, mdtBaseType};
-pub const g_tkCorEncodeToken: [u32; 4] = [mdtTypeDef.0 as u32, mdtTypeRef.0 as u32, mdtTypeSpec.0 as u32, mdtBaseType.0 as u32];
+pub const g_tkCorEncodeToken: [u32; 4] = [
+    mdtTypeDef.0 as u32,
+    mdtTypeRef.0 as u32,
+    mdtTypeSpec.0 as u32,
+    mdtBaseType.0 as u32,
+];
 pub fn cor_sig_uncompress_token(p_data: &mut PCCOR_SIGNATURE) -> u32 {
     let mut tk = 0_u32;
     let mut tk_type = 0_u32;
@@ -80,13 +101,13 @@ pub fn cor_sig_uncompress_token(p_data: &mut PCCOR_SIGNATURE) -> u32 {
 }
 
 pub fn TokenFromRid(rid: u32, tktype: u32) -> u32 {
-    (rid) | (tktype) 
+    (rid) | (tktype)
 }
 
 pub fn cor_sig_uncompress_element_type(p_data: &mut PCCOR_SIGNATURE) -> CorElementType {
     if p_data.is_empty() {
         // todo ve
-        return CorElementType::default()
+        return CorElementType::default();
     }
     let p_data = &mut p_data.0;
     let data = unsafe { **p_data };
@@ -95,7 +116,8 @@ pub fn cor_sig_uncompress_element_type(p_data: &mut PCCOR_SIGNATURE) -> CorEleme
 }
 
 pub fn str_from_u8_nul_utf8(utf8_src: &[u8]) -> Result<&str, std::str::Utf8Error> {
-    let nul_range_end = utf8_src.iter()
+    let nul_range_end = utf8_src
+        .iter()
         .position(|&c| c == b'\0')
         .unwrap_or(utf8_src.len()); // default to length if no `\0` present
     ::std::str::from_utf8(&utf8_src[0..nul_range_end])
@@ -112,7 +134,7 @@ impl PCCOR_SIGNATURE {
 
     pub fn from_ptr(value: *mut u8) -> Self {
         if value.is_null() {
-           return  Self(std::ptr::null_mut());
+            return Self(std::ptr::null_mut());
         }
         let mut ptr = MaybeUninit::uninit();
         ptr.write(value);
@@ -131,7 +153,6 @@ impl PCCOR_SIGNATURE {
         self.0
     }
 }
-
 
 impl Clone for PCCOR_SIGNATURE {
     fn clone(&self) -> Self {
@@ -167,7 +188,6 @@ pub const SYSTEM_ENUM: &str = "System.Enum";
 pub const SYSTEM_VALUETYPE: &str = "System.ValueType";
 pub const SYSTEM_MULTICASTDELEGATE: &str = "System.MulticastDelegate";
 
-
 #[repr(C)]
 #[derive(Debug)]
 pub struct IGUID {
@@ -187,7 +207,9 @@ pub fn get_guid_attribute_value(metadata: Option<&IMetaDataImport2>, token: CorT
         None => {}
         Some(metadata) => {
             let cache_key = metadata_token_cache_key(metadata, token);
-            if let Some(cached) = GUID_ATTRIBUTE_CACHE.with(|cache| cache.borrow().get(&cache_key).copied()) {
+            if let Some(cached) =
+                GUID_ATTRIBUTE_CACHE.with(|cache| cache.borrow().get(&cache_key).copied())
+            {
                 return cached;
             }
 
@@ -255,9 +277,7 @@ pub fn has_custom_attribute(
     result.is_ok() && !data.is_null() && size > 0
 }
 
-pub fn get_string_value_from_blob(
-    signature: &PCCOR_SIGNATURE,
-) -> String {
+pub fn get_string_value_from_blob(signature: &PCCOR_SIGNATURE) -> String {
     assert!(!signature.is_empty());
 
     if *signature == u8::MAX {
@@ -285,8 +305,14 @@ pub fn get_unary_custom_attribute_string_value(
     let name = HSTRING::from(attribute_name);
     let name = PCWSTR(name.as_ptr());
     let mut size = 0_u32;
-    let result =
-        unsafe { metadata.GetCustomAttributeByName(token.0 as u32, name, addr_of_mut!(data) as *const *const c_void, &mut size) };
+    let result = unsafe {
+        metadata.GetCustomAttributeByName(
+            token.0 as u32,
+            name,
+            addr_of_mut!(data) as *const *const c_void,
+            &mut size,
+        )
+    };
     debug_assert!(result.is_ok());
 
     if result.is_err() {
@@ -320,27 +346,27 @@ pub fn resolve_type_ref(
             let mut data = [0_u16; MAX_IDENTIFIER_LENGTH];
             let mut length = 0_u32;
             let result = unsafe {
-                metadata.GetTypeRefProps(
-                    token.0 as u32,
-                    0 as _,
-                    Some(&mut data),
-                    &mut length,
-                )
+                metadata.GetTypeRefProps(token.0 as u32, 0 as _, Some(&mut data), &mut length)
             };
             debug_assert!(result.is_ok());
             let string = HSTRING::from_wide(&data[..length.saturating_sub(1) as usize]);
 
             let dispenser: MaybeUninit<IMetaDataDispenserEx> = MaybeUninit::zeroed();
-            let mut value = external_token.0 as u32;//0_u32;
+            let mut value = external_token.0 as u32; //0_u32;
 
             unsafe {
                 let ret = RoGetMetaDataFile(
                     &string,
                     dispenser.assume_init_ref(),
                     None,
-                    Some(std::mem::transmute::<&mut IMetaDataImport2, *mut IMetaDataImport2>(external_metadata) as *mut Option<IMetaDataImport2>),
+                    Some(
+                        std::mem::transmute::<&mut IMetaDataImport2, *mut IMetaDataImport2>(
+                            external_metadata,
+                        ) as *mut Option<IMetaDataImport2>,
+                    ),
                     Some(&mut value),
-                ).is_ok();
+                )
+                .is_ok();
 
                 external_token.0 = value as i32;
 
@@ -364,7 +390,15 @@ pub fn get_type_name(metadata: &IMetaDataImport2, token: CorTokenType) -> String
             // assert!(result.is_ok());
             // let mut buf = vec![0_u16; length as usize];
             let mut buf = [0_u16; MAX_IDENTIFIER_LENGTH];
-            let result = unsafe { metadata.GetTypeDefProps(token.0 as u32, Some(buf.as_mut_slice()), &mut length, 0 as _, 0 as _) };
+            let result = unsafe {
+                metadata.GetTypeDefProps(
+                    token.0 as u32,
+                    Some(buf.as_mut_slice()),
+                    &mut length,
+                    0 as _,
+                    0 as _,
+                )
+            };
             assert!(result.is_ok());
             String::from_utf16_lossy(&buf[..length.saturating_sub(1) as usize])
         }
@@ -375,7 +409,14 @@ pub fn get_type_name(metadata: &IMetaDataImport2, token: CorTokenType) -> String
 
             let mut buf = [0_u16; MAX_IDENTIFIER_LENGTH];
 
-            let result = unsafe { metadata.GetTypeRefProps(token.0 as u32, 0 as _, Some(buf.as_mut_slice()), &mut length) };
+            let result = unsafe {
+                metadata.GetTypeRefProps(
+                    token.0 as u32,
+                    0 as _,
+                    Some(buf.as_mut_slice()),
+                    &mut length,
+                )
+            };
             assert!(result.is_ok());
 
             String::from_utf16_lossy(&buf[..length.saturating_sub(1) as usize])
@@ -391,65 +432,68 @@ pub fn get_type_name(metadata: &IMetaDataImport2, token: CorTokenType) -> String
     name
 }
 
+pub const fn is_ev_special_name(x: i32) -> bool {
+    ((x) & evSpecialName.0) == evSpecialName.0
+}
 
-pub const fn is_ev_special_name(x: i32) -> bool { ((x) & evSpecialName.0) == evSpecialName.0 }
-
-pub const fn is_ev_rtspecial_name(x: i32) -> bool { ((x) & evRTSpecialName.0) == evRTSpecialName.0 }
+pub const fn is_ev_rtspecial_name(x: i32) -> bool {
+    ((x) & evRTSpecialName.0) == evRTSpecialName.0
+}
 
 pub const fn is_td_not_public(x: i32) -> bool {
     ((x) & tdVisibilityMask.0) == tdNotPublic.0
 }
 
 pub const fn is_td_public(x: i32) -> bool {
-    ((x) & tdVisibilityMask.0) == tdPublic.0 
+    ((x) & tdVisibilityMask.0) == tdPublic.0
 }
 
 pub const fn is_td_nested_public(x: i32) -> bool {
-    ((x) & tdVisibilityMask.0) == tdNestedPublic.0 
+    ((x) & tdVisibilityMask.0) == tdNestedPublic.0
 }
 
 pub const fn is_td_nested_private(x: i32) -> bool {
-    ((x) & tdVisibilityMask.0) == tdNestedPrivate.0 
+    ((x) & tdVisibilityMask.0) == tdNestedPrivate.0
 }
 
 pub const fn is_td_nested_family(x: i32) -> bool {
-    ((x) & tdVisibilityMask.0) == tdNestedFamily.0 
+    ((x) & tdVisibilityMask.0) == tdNestedFamily.0
 }
 
 pub const fn is_td_nested_assembly(x: i32) -> bool {
-    ((x) & tdVisibilityMask.0) == tdNestedAssembly.0 
+    ((x) & tdVisibilityMask.0) == tdNestedAssembly.0
 }
 
 pub const fn is_td_nested_fam_andassem(x: i32) -> bool {
-    ((x) & tdVisibilityMask.0) == tdNestedFamANDAssem.0 
+    ((x) & tdVisibilityMask.0) == tdNestedFamANDAssem.0
 }
 
 pub const fn is_td_nested_fam_orassem(x: i32) -> bool {
-    ((x) & tdVisibilityMask.0) == tdNestedFamORAssem.0 
+    ((x) & tdVisibilityMask.0) == tdNestedFamORAssem.0
 }
 
 pub const fn is_td_nested(x: i32) -> bool {
-    ((x) & tdVisibilityMask.0) >= tdNestedPublic.0 
+    ((x) & tdVisibilityMask.0) >= tdNestedPublic.0
 }
 
 pub const fn is_td_auto_layout(x: i32) -> bool {
-    ((x) & tdLayoutMask.0) == tdAutoLayout.0 
+    ((x) & tdLayoutMask.0) == tdAutoLayout.0
 }
 
 pub const fn is_td_sequential_layout(x: i32) -> bool {
-    ((x) & tdLayoutMask.0) == tdSequentialLayout.0 
+    ((x) & tdLayoutMask.0) == tdSequentialLayout.0
 }
 
 pub const fn is_td_explicit_layout(x: i32) -> bool {
-    ((x) & tdLayoutMask.0) == tdExplicitLayout.0 
+    ((x) & tdLayoutMask.0) == tdExplicitLayout.0
 }
 
 pub const fn is_td_class(x: i32) -> bool {
-    ((x) & tdClassSemanticsMask.0) == tdClass.0 
+    ((x) & tdClassSemanticsMask.0) == tdClass.0
 }
 
 pub const fn is_td_interface(x: i32) -> bool {
-    ((x) & tdClassSemanticsMask.0) == tdInterface.0 
+    ((x) & tdClassSemanticsMask.0) == tdInterface.0
 }
 
 pub const fn is_td_abstract(x: i32) -> bool {
@@ -477,19 +521,19 @@ pub const fn is_td_windows_runtime(x: i32) -> bool {
 }
 
 pub const fn is_td_ansi_class(x: i32) -> bool {
-    ((x) & tdStringFormatMask.0) == tdAnsiClass.0 
+    ((x) & tdStringFormatMask.0) == tdAnsiClass.0
 }
 
 pub const fn is_td_unicode_class(x: i32) -> bool {
-    ((x) & tdStringFormatMask.0) == tdUnicodeClass.0 
+    ((x) & tdStringFormatMask.0) == tdUnicodeClass.0
 }
 
 pub const fn is_td_auto_class(x: i32) -> bool {
-    ((x) & tdStringFormatMask.0) == tdAutoClass.0 
+    ((x) & tdStringFormatMask.0) == tdAutoClass.0
 }
 
 pub const fn is_td_custom_format_class(x: i32) -> bool {
-    ((x) & tdStringFormatMask.0) == tdCustomFormatClass.0 
+    ((x) & tdStringFormatMask.0) == tdCustomFormatClass.0
 }
 
 pub const fn is_td_before_field_init(x: i32) -> bool {
@@ -512,30 +556,29 @@ pub fn type_from_token(tk: CorTokenType) -> i32 {
     (tk.0 as u32 & 0xff000000 as u32) as i32
 }
 
-
 // Macros for accessing the members of CorMethodAttr.
 pub const fn is_md_private_scope(x: i32) -> bool {
-    ((x) & mdMemberAccessMask.0) == mdPrivateScope.0 
+    ((x) & mdMemberAccessMask.0) == mdPrivateScope.0
 }
 
 pub const fn is_md_private(x: i32) -> bool {
-    ((x) & mdMemberAccessMask.0) == mdPrivate.0 
+    ((x) & mdMemberAccessMask.0) == mdPrivate.0
 }
 
 pub const fn is_md_fam_andassem(x: i32) -> bool {
-    ((x) & mdMemberAccessMask.0) == mdFamANDAssem.0 
+    ((x) & mdMemberAccessMask.0) == mdFamANDAssem.0
 }
 
 pub const fn is_md_assem(x: i32) -> bool {
-    ((x) & mdMemberAccessMask.0) == mdAssem.0 
+    ((x) & mdMemberAccessMask.0) == mdAssem.0
 }
 
 pub const fn is_md_family(x: i32) -> bool {
-    ((x) & mdMemberAccessMask.0) == mdFamily.0 
+    ((x) & mdMemberAccessMask.0) == mdFamily.0
 }
 
 pub const fn is_md_fam_orassem(x: i32) -> bool {
-    ((x) & mdMemberAccessMask.0) == mdFamORAssem.0 
+    ((x) & mdMemberAccessMask.0) == mdFamORAssem.0
 }
 
 pub const fn is_md_public(x: i32) -> bool {
@@ -559,11 +602,11 @@ pub const fn is_md_hide_by_sig(x: i32) -> bool {
 }
 
 pub const fn is_md_reuse_slot(x: i32) -> bool {
-    ((x) & mdVtableLayoutMask.0) == mdReuseSlot.0 
+    ((x) & mdVtableLayoutMask.0) == mdReuseSlot.0
 }
 
 pub const fn is_md_new_slot(x: i32) -> bool {
-    ((x) & mdVtableLayoutMask.0) == mdNewSlot.0 
+    ((x) & mdVtableLayoutMask.0) == mdNewSlot.0
 }
 
 pub const fn is_md_check_access_on_override(x: i32) -> bool {
@@ -591,19 +634,19 @@ pub const fn is_md_rtspecial_name(x: i32) -> bool {
 }
 
 pub fn is_md_instance_initializer(x: i32, str: &PCSTR) -> bool {
-    ((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && *str != COR_CTOR_METHOD_NAME 
+    ((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && *str != COR_CTOR_METHOD_NAME
 }
 
 pub fn is_md_instance_initializer_w(x: i32, str: &PCWSTR) -> bool {
-    ((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && *str != COR_CTOR_METHOD_NAME_W 
+    ((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && *str != COR_CTOR_METHOD_NAME_W
 }
 
 pub fn is_md_class_constructor(x: i32, str: &PCSTR) -> bool {
-    ((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && str != &COR_CCTOR_METHOD_NAME 
+    ((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && str != &COR_CCTOR_METHOD_NAME
 }
 
 pub fn is_md_class_constructor_w(x: i32, str: &PCWSTR) -> bool {
-    ((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && str != &COR_CCTOR_METHOD_NAME_W 
+    ((x) & mdRTSpecialName.0) == mdRTSpecialName.0 && str != &COR_CCTOR_METHOD_NAME_W
 }
 
 pub const fn is_md_has_security(x: i32) -> bool {
@@ -625,7 +668,6 @@ pub const fn is_pr_rtspecial_name(x: i32) -> bool {
 pub const fn is_pr_has_default(x: i32) -> bool {
     ((x) & prHasDefault.0) == prHasDefault.0
 }
-
 
 /*
 pub const mdTokenNil  = ((mdToken)0)

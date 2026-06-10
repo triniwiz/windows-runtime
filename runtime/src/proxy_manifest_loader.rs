@@ -14,10 +14,10 @@ use std::path::Path;
 pub struct LoadedManifest {
     /// Assembly path
     pub assembly_path: Option<String>,
-    
+
     /// Proxy classes available
     pub proxy_classes: HashMap<String, ProxyClassInfo>,
-    
+
     /// Manifest version
     pub version: String,
 }
@@ -33,16 +33,16 @@ pub struct ProxyClassInfo {
 
     /// Whether the runtime synthesized the JS-visible type name
     pub is_auto_generated_name: bool,
-    
+
     /// Full namespace path
     pub namespace: String,
-    
+
     /// Base class
     pub base_class: Option<String>,
-    
+
     /// Methods available
     pub methods: Vec<ProxyMethodInfo>,
-    
+
     /// Properties available
     pub properties: Vec<ProxyPropertyInfo>,
 }
@@ -79,8 +79,8 @@ impl SbgManifestLoader {
 
     /// Load a manifest from a file
     pub fn load_manifest_file(&mut self, path: &Path) -> Result<()> {
-        let content = fs::read_to_string(path)
-            .map_err(|e| anyhow!("Failed to read manifest file: {}", e))?;
+        let content =
+            fs::read_to_string(path).map_err(|e| anyhow!("Failed to read manifest file: {}", e))?;
 
         let raw_manifest: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| anyhow!("Failed to parse manifest JSON: {}", e))?;
@@ -148,8 +148,7 @@ impl SbgManifestLoader {
                     if let Some(props_arr) = class_val.get("properties").and_then(|p| p.as_array())
                     {
                         for prop_val in props_arr {
-                            if let Some(prop_name) = prop_val.get("name").and_then(|n| n.as_str())
-                            {
+                            if let Some(prop_name) = prop_val.get("name").and_then(|n| n.as_str()) {
                                 let prop_type = prop_val
                                     .get("prop_type")
                                     .and_then(|t| t.as_str())

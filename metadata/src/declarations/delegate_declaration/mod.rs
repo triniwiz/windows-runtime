@@ -1,15 +1,14 @@
 pub mod generic_delegate_declaration;
 pub mod generic_delegate_instance_declaration;
 
-
-use std::any::Any;
-use std::fmt::{Debug, Formatter};
-use windows::core::{GUID, HSTRING, PCWSTR};
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::method_declaration::MethodDeclaration;
 use crate::declarations::type_declaration::TypeDeclaration;
 use crate::prelude::get_guid_attribute_value;
+use std::any::Any;
+use std::fmt::{Debug, Formatter};
+use windows::core::{GUID, HSTRING, PCWSTR};
+use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 
 const INVOKE_METHOD_NAME: &str = "Invoke";
 
@@ -41,16 +40,13 @@ pub trait DelegateDeclarationImpl: dyn_clone::DynClone {
     fn id(&self) -> GUID {
         match self.base().metadata.as_ref() {
             None => GUID::zeroed(),
-            Some(metadata) => {
-                get_guid_attribute_value(Some(metadata), self.base().token())
-            }
+            Some(metadata) => get_guid_attribute_value(Some(metadata), self.base().token()),
         }
     }
     fn invoke_method(&self) -> &MethodDeclaration;
 }
 
 dyn_clone::clone_trait_object!(DelegateDeclarationImpl);
-
 
 impl Debug for dyn DelegateDeclarationImpl {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -79,11 +75,7 @@ impl<'a> DelegateDeclaration {
         token: CorTokenType,
     ) -> Self {
         Self {
-            base: TypeDeclaration::new(
-                kind,
-                metadata,
-                token,
-            ),
+            base: TypeDeclaration::new(kind, metadata, token),
             invoke_method: MethodDeclaration::new(
                 metadata,
                 get_invoke_method_token(metadata, token),

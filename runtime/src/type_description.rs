@@ -1,13 +1,15 @@
+use crate::class_helpers::split_type_name;
 use metadata::declarations::base_class_declaration::BaseClassDeclarationImpl;
 use metadata::declarations::class_declaration::ClassDeclaration;
 use metadata::declarations::declaration::{Declaration, DeclarationKind};
-use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::declarations::interface_declaration::generic_interface_declaration::GenericInterfaceDeclaration;
 use metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration;
+use metadata::declarations::interface_declaration::InterfaceDeclaration;
 use metadata::meta_data_reader::MetadataReader;
 use metadata::signature::Signature;
-use runtime_binding_gen::{RuntimeMethodMetadata, RuntimeParameterMetadata, RuntimePropertyMetadata};
-use crate::class_helpers::split_type_name;
+use runtime_binding_gen::{
+    RuntimeMethodMetadata, RuntimeParameterMetadata, RuntimePropertyMetadata,
+};
 
 pub(crate) fn runtime_method_metadata_from_method(
     method: &metadata::declarations::method_declaration::MethodDeclaration,
@@ -97,20 +99,29 @@ pub(crate) fn build_runtime_type_descriptor(type_name: &str) -> Option<serde_jso
     match lock.kind() {
         DeclarationKind::Class => {
             let class = lock.as_any().downcast_ref::<ClassDeclaration>()?;
-            Some(base_declaration_descriptor(full_name, namespace, class_name, class))
+            Some(base_declaration_descriptor(
+                full_name, namespace, class_name, class,
+            ))
         }
-        DeclarationKind::Interface => lock
-            .as_any()
-            .downcast_ref::<InterfaceDeclaration>()
-            .map(|interface| base_declaration_descriptor(full_name, namespace, class_name, interface)),
+        DeclarationKind::Interface => {
+            lock.as_any()
+                .downcast_ref::<InterfaceDeclaration>()
+                .map(|interface| {
+                    base_declaration_descriptor(full_name, namespace, class_name, interface)
+                })
+        }
         DeclarationKind::GenericInterface => lock
             .as_any()
             .downcast_ref::<GenericInterfaceDeclaration>()
-            .map(|interface| base_declaration_descriptor(full_name, namespace, class_name, interface)),
+            .map(|interface| {
+                base_declaration_descriptor(full_name, namespace, class_name, interface)
+            }),
         DeclarationKind::GenericInterfaceInstance => lock
             .as_any()
             .downcast_ref::<GenericInterfaceInstanceDeclaration>()
-            .map(|interface| base_declaration_descriptor(full_name, namespace, class_name, interface)),
+            .map(|interface| {
+                base_declaration_descriptor(full_name, namespace, class_name, interface)
+            }),
         _ => None,
     }
 }

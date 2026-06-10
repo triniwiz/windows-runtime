@@ -1,12 +1,12 @@
-use std::any::Any;
-use std::fmt::{Debug, Formatter};
-use windows::core::PCWSTR;
-use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 use crate::declaration_factory::DeclarationFactory;
 use crate::declarations::declaration::{Declaration, DeclarationKind};
 use crate::declarations::delegate_declaration::{DelegateDeclaration, DelegateDeclarationImpl};
 use crate::declarations::method_declaration::MethodDeclaration;
 use crate::prelude::*;
+use std::any::Any;
+use std::fmt::{Debug, Formatter};
+use windows::core::PCWSTR;
+use windows::Win32::System::WinRT::Metadata::{CorTokenType, IMetaDataImport2};
 
 #[derive(Clone)]
 pub struct EventDeclaration {
@@ -38,7 +38,6 @@ impl EventDeclaration {
     ) -> MethodDeclaration {
         let mut add_method_token = 0 as u32;
         if let Some(metadata) = metadata {
-
             let result = unsafe {
                 metadata.GetEventProps(
                     token.0 as u32,
@@ -58,10 +57,7 @@ impl EventDeclaration {
             };
             debug_assert!(result.is_ok());
         }
-        MethodDeclaration::new(
-            metadata,
-            CorTokenType(add_method_token as i32),
-        )
+        MethodDeclaration::new(metadata, CorTokenType(add_method_token as i32))
     }
 
     pub fn make_remove_method(
@@ -93,10 +89,7 @@ impl EventDeclaration {
                 debug_assert!(result.is_ok());
             }
         }
-        MethodDeclaration::new(
-            metadata,
-            CorTokenType(remove_method_token as i32),
-        )
+        MethodDeclaration::new(metadata, CorTokenType(remove_method_token as i32))
     }
 
     pub fn make_type(
@@ -137,7 +130,6 @@ impl EventDeclaration {
         let mut full_name = String::new();
 
         if let Some(metadata) = metadata {
-
             let mut name_data = [0_u16; MAX_IDENTIFIER_LENGTH];
             let mut name_data_length = 0;
 
@@ -163,27 +155,19 @@ impl EventDeclaration {
             debug_assert!(result.is_ok());
 
             if name_data_length > 0 {
-                full_name = String::from_utf16_lossy(&name_data[..name_data_length.saturating_sub(1) as usize]);
+                full_name = String::from_utf16_lossy(
+                    &name_data[..name_data_length.saturating_sub(1) as usize],
+                );
             }
         }
-
 
         Self {
             kind: DeclarationKind::Event,
             metadata: metadata.map(|f| f.clone()),
             token,
-            type_: EventDeclaration::make_type(
-                metadata,
-                token,
-            ),
-            add_method: EventDeclaration::make_add_method(
-                metadata,
-                token,
-            ),
-            remove_method: EventDeclaration::make_remove_method(
-                metadata,
-                token,
-            ),
+            type_: EventDeclaration::make_type(metadata, token),
+            add_method: EventDeclaration::make_add_method(metadata, token),
+            remove_method: EventDeclaration::make_remove_method(metadata, token),
             full_name,
         }
     }
@@ -197,7 +181,13 @@ impl EventDeclaration {
     }
 
     pub fn type_(&self) -> Option<&DelegateDeclaration> {
-        self.type_.as_ref().map(|f|f.as_declaration().as_any().downcast_ref::<DelegateDeclaration>())
+        self.type_
+            .as_ref()
+            .map(|f| {
+                f.as_declaration()
+                    .as_any()
+                    .downcast_ref::<DelegateDeclaration>()
+            })
             .flatten()
     }
 
@@ -230,21 +220,23 @@ impl Declaration for EventDeclaration {
     fn is_exported(&self) -> bool {
         let mut flags = 0;
         if let Some(metadata) = self.metadata.as_ref() {
-            let result = unsafe { metadata.GetEventProps(
-                self.token.0 as u32,
-                0 as _,
-                None,
-                0 as _,
-                0 as _,
-                &mut flags,
-                0 as _,
-                0 as _,
-                0 as _,
-                0 as _,
-                0 as _,
-                0 as _,
-                0 as _,
-            )};
+            let result = unsafe {
+                metadata.GetEventProps(
+                    self.token.0 as u32,
+                    0 as _,
+                    None,
+                    0 as _,
+                    0 as _,
+                    &mut flags,
+                    0 as _,
+                    0 as _,
+                    0 as _,
+                    0 as _,
+                    0 as _,
+                    0 as _,
+                    0 as _,
+                )
+            };
             debug_assert!(result.is_ok());
         }
         if is_ev_special_name(flags as i32) {
