@@ -981,7 +981,7 @@ pub(crate) fn handle_instance_property_getter(
                     )
                 }
             }
-            ReturnKind::DynamicObject => None,
+            ReturnKind::DynamicObject => try_wrap_inspectable_pointer(result, scope),
             ReturnKind::Primitive(nt) => {
                 let v = unsafe {
                     read_value_from_ptr(result as *const std::ffi::c_void, scope, nt.clone())
@@ -1830,7 +1830,9 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                         )
                                     }
                                 }
-                                ReturnKind::DynamicObject => None,
+                                ReturnKind::DynamicObject => {
+                                    try_wrap_inspectable_pointer(result, scope)
+                                }
                                 ReturnKind::Primitive(nt) => {
                                     let v = unsafe {
                                         read_value_from_ptr(
@@ -1976,7 +1978,9 @@ pub(crate) fn create_ns_ctor_instance_object<'a>(
                                             )
                                         }
                                     }
-                                    ReturnKind::DynamicObject => None,
+                                    ReturnKind::DynamicObject => {
+                                        try_wrap_inspectable_pointer(result, scope)
+                                    }
                                     ReturnKind::Primitive(nt) => {
                                         let v = unsafe {
                                             read_value_from_ptr(
