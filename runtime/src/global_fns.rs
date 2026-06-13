@@ -669,6 +669,25 @@ pub(crate) fn handle_read_text_file(
     }
 }
 
+pub(crate) fn handle_register_winmd(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 1 {
+        throw_js_error(scope, "__nsRegisterWinmd(path) expects 1 argument");
+        return;
+    }
+    let Some(path) = value_to_string(scope, args.get(0)) else {
+        throw_js_error(scope, "Unable to convert path argument to string");
+        return;
+    };
+    match metadata::meta_data_reader::MetadataReader::register_winmd_file(path.as_str()) {
+        Ok(()) => retval.set_bool(true),
+        Err(err) => throw_js_error(scope, format!("__nsRegisterWinmd: {err}").as_str()),
+    }
+}
+
 static PACKAGE_ROOT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
 fn package_root() -> Option<&'static PathBuf> {
@@ -4538,6 +4557,7 @@ pub(crate) fn init_async_helpers(
     register!("__nsProxyListManifests", handle_proxy_list_manifests);
     register!("__nsProxyAutoCapture", handle_proxy_auto_capture);
     register!("__nsReadTextFile", handle_read_text_file);
+    register!("__nsRegisterWinmd", handle_register_winmd);
     register!("__nsResolveModulePath", handle_resolve_module_path);
     register!("__nsDescribeWinRTType", handle_describe_winrt_type);
     register!("__nsWorkerCreateThreaded", handle_worker_create_threaded);

@@ -16,10 +16,11 @@ use std::ffi::OsString;
 use std::mem::MaybeUninit;
 use std::os::windows::prelude::OsStringExt;
 use std::sync::Arc;
-use windows::core::{HSTRING, PCWSTR};
+use windows::core::{Interface, HSTRING, PCWSTR};
 use windows::Win32::Foundation::RO_E_METADATA_NAME_IS_NAMESPACE;
 use windows::Win32::System::WinRT::Metadata::{
-    mdtTypeDef, mdtTypeRef, CorTokenType, IMetaDataDispenserEx, IMetaDataImport2, RoGetMetaDataFile,
+    mdtTypeDef, mdtTypeRef, ofRead, CorTokenType, IMetaDataDispenserEx, IMetaDataImport2,
+    MetaDataGetDispenser, RoGetMetaDataFile, CLSID_CorMetaDataDispenser,
 };
 
 // Thread-local cache for resolved declarations.  V8 (and therefore all metadata
@@ -30,6 +31,17 @@ thread_local! {
         RefCell::new(AHashMap::new());
     static DECLARATION_MISS_CACHE: RefCell<AHashSet<String>> =
         RefCell::new(AHashSet::new());
+    // Sideloaded app-local .winmd scopes (e.g. Microsoft.Web.WebView2.Core.winmd).
+    // RoGetMetaDataFile only resolves system/app-package metadata, so third-party
+    // WinRT components are consulted here as a fallback. Each entry keeps the
+    // opened import scope plus its typedef names (for namespace synthesis).
+    static SIDELOADED_SCOPES: RefCell<Vec<SideloadedScope>> = RefCell::new(Vec::new());
+    static SIDELOADED_PATHS: RefCell<AHashSet<String>> = RefCell::new(AHashSet::new());
+}
+
+struct SideloadedScope {
+    import: IMetaDataImport2,
+    type_names: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -107,8 +119,12 @@ impl MetadataReader {
                     Some(&mut open_token),
                 )
             };
-            if open_result.is_ok() {
-                let open_metadata = unsafe { open_metadata.assume_init() };
+            let resolved = if open_result.is_ok() {
+                Some((unsafe { open_metadata.assume_init() }, open_token))
+            } else {
+                Self::find_typedef_sideloaded(open_name)
+            };
+            if let Some((open_metadata, open_token)) = resolved {
                 let open_token = CorTokenType(open_token as i32);
                 let mut flags = 0u32;
                 let mut _parent = 0u32;
@@ -155,11 +171,30 @@ impl MetadataReader {
             if error.code() == RO_E_METADATA_NAME_IS_NAMESPACE {
                 return Some(Arc::new(RwLock::new(NamespaceDeclaration::new(full_name))));
             }
+            // Sideloaded app-local winmd fallback (third-party WinRT components,
+            // e.g. Microsoft.Web.WebView2.Core, which RoGetMetaDataFile can't see).
+            if let Some((metadata, token)) = Self::find_typedef_sideloaded(full_name) {
+                return Self::declaration_from_typedef(&metadata, token, full_name);
+            }
+            // Synthesize intermediate namespaces (e.g. "Microsoft.Web") so JS
+            // dotted traversal can reach sideloaded types.
+            if Self::sideloaded_namespace_exists(full_name) {
+                return Some(Arc::new(RwLock::new(NamespaceDeclaration::new(full_name))));
+            }
             return None;
         }
 
         let metadata = unsafe { metadata.assume_init() };
+        Self::declaration_from_typedef(&metadata, token, full_name)
+    }
 
+    /// Classifies a resolved typedef (flags + System.* parent) into the matching
+    /// Declaration. Shared by the RoGetMetaDataFile and sideloaded-winmd paths.
+    fn declaration_from_typedef(
+        metadata: &IMetaDataImport2,
+        token: u32,
+        full_name: &str,
+    ) -> Option<Arc<RwLock<dyn Declaration>>> {
         let mut flags = 0;
         let mut parent_token = 0;
 
@@ -211,30 +246,30 @@ impl MetadataReader {
 
             if parent_name_string == SYSTEM_ENUM {
                 return Some(Arc::new(RwLock::new(EnumDeclaration::new(
-                    Some(&metadata),
+                    Some(metadata),
                     CorTokenType(token as i32),
                 ))));
             } else if parent_name_string == SYSTEM_VALUETYPE {
                 return Some(Arc::new(RwLock::new(StructDeclaration::new(
-                    Some(&metadata),
+                    Some(metadata),
                     CorTokenType(token as i32),
                 ))));
             } else if parent_name_string == SYSTEM_MULTICASTDELEGATE {
                 return if full_name.contains("`") {
                     Some(Arc::new(RwLock::new(GenericDelegateDeclaration::new(
-                        Some(&metadata),
+                        Some(metadata),
                         CorTokenType(token as i32),
                     ))))
                 } else {
                     Some(Arc::new(RwLock::new(DelegateDeclaration::new(
-                        Some(&metadata),
+                        Some(metadata),
                         CorTokenType(token as i32),
                     ))))
                 };
             }
 
             return Some(Arc::new(RwLock::new(ClassDeclaration::new(
-                Some(&metadata),
+                Some(metadata),
                 CorTokenType(token as i32),
             ))));
         }
@@ -242,12 +277,12 @@ impl MetadataReader {
         if is_td_interface(flags as i32) {
             return if full_name.contains("`") {
                 Some(Arc::new(RwLock::new(GenericInterfaceDeclaration::new(
-                    Some(&metadata),
+                    Some(metadata),
                     CorTokenType(token as i32),
                 ))))
             } else {
                 Some(Arc::new(RwLock::new(InterfaceDeclaration::new(
-                    Some(&metadata),
+                    Some(metadata),
                     CorTokenType(token as i32),
                 ))))
             };
@@ -257,5 +292,175 @@ impl MetadataReader {
         // recognised WinRT declaration.  Return None rather than panicking so
         // callers can handle unknown types gracefully.
         None
-    } // end find_by_name_uncached
+    } // end declaration_from_typedef
+
+    /// Opens an app-local .winmd file and adds it to the sideloaded scopes that
+    /// `find_by_name` consults when `RoGetMetaDataFile` can't resolve a name
+    /// (third-party WinRT components, e.g. Microsoft.Web.WebView2.Core.winmd).
+    /// Idempotent per canonical path. Clears the miss cache so names that failed
+    /// to resolve before registration succeed afterwards.
+    ///
+    /// Scopes are per-thread (like the declaration cache): each Runtime thread
+    /// registers its own set, which `Runtime::new`'s auto-scan does automatically.
+    pub fn register_winmd_file(path: &str) -> Result<(), String> {
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|e| format!("winmd not found '{}': {}", path, e))?
+            .to_string_lossy()
+            .to_string();
+        let already_registered =
+            SIDELOADED_PATHS.with(|p| !p.borrow_mut().insert(canonical.clone()));
+        if already_registered {
+            return Ok(());
+        }
+
+        let mut dispenser_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        unsafe {
+            MetaDataGetDispenser(
+                &CLSID_CorMetaDataDispenser,
+                &IMetaDataDispenserEx::IID,
+                &mut dispenser_ptr,
+            )
+        }
+        .map_err(|e| format!("MetaDataGetDispenser failed: {}", e))?;
+        let dispenser = unsafe { IMetaDataDispenserEx::from_raw(dispenser_ptr) };
+
+        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        let unknown = unsafe {
+            dispenser.OpenScope(
+                PCWSTR(wide.as_ptr()),
+                ofRead.0 as u32,
+                &IMetaDataImport2::IID,
+            )
+        }
+        .map_err(|e| format!("OpenScope failed for '{}': {}", path, e))?;
+        let import = unknown
+            .cast::<IMetaDataImport2>()
+            .map_err(|e| format!("IMetaDataImport2 cast failed for '{}': {}", path, e))?;
+
+        let type_names = enumerate_typedef_names(&import);
+
+        SIDELOADED_SCOPES.with(|scopes| {
+            scopes.borrow_mut().push(SideloadedScope {
+                import,
+                type_names,
+            });
+        });
+        DECLARATION_MISS_CACHE.with(|cache| cache.borrow_mut().clear());
+        Ok(())
+    }
+
+    /// Looks a full type name up in the sideloaded scopes only.
+    fn find_typedef_sideloaded(full_name: &str) -> Option<(IMetaDataImport2, u32)> {
+        const MD_TYPEDEF_NIL: u32 = 0x0200_0000;
+        let wide: Vec<u16> = full_name.encode_utf16().chain(std::iter::once(0)).collect();
+        SIDELOADED_SCOPES.with(|scopes| {
+            for scope in scopes.borrow().iter() {
+                let mut token = 0u32;
+                let found = unsafe {
+                    scope
+                        .import
+                        .FindTypeDefByName(PCWSTR(wide.as_ptr()), 0, &mut token)
+                }
+                .is_ok();
+                if found && token != 0 && token != MD_TYPEDEF_NIL {
+                    return Some((scope.import.clone(), token));
+                }
+            }
+            None
+        })
+    }
+
+    /// True when `prefix` is a namespace segment of any sideloaded type
+    /// (e.g. "Microsoft.Web" for Microsoft.Web.WebView2.Core.CoreWebView2).
+    fn sideloaded_namespace_exists(prefix: &str) -> bool {
+        let with_dot = format!("{}.", prefix);
+        SIDELOADED_SCOPES.with(|scopes| {
+            scopes
+                .borrow()
+                .iter()
+                .any(|s| s.type_names.iter().any(|n| n.starts_with(&with_dot)))
+        })
+    }
+}
+
+#[cfg(test)]
+mod sideload_tests {
+    use super::*;
+    use crate::declarations::declaration::DeclarationKind;
+
+    // Present on every Windows installation; opened via the dispenser exactly
+    // like a third-party winmd would be.
+    const FIXTURE: &str = "C:\\Windows\\System32\\WinMetadata\\Windows.Globalization.winmd";
+
+    #[test]
+    fn register_winmd_rejects_missing_file() {
+        assert!(MetadataReader::register_winmd_file("C:\\does\\not\\exist.winmd").is_err());
+    }
+
+    #[test]
+    fn register_winmd_loads_and_resolves_typedefs() {
+        MetadataReader::register_winmd_file(FIXTURE).expect("register fixture winmd");
+        // Idempotent re-register.
+        MetadataReader::register_winmd_file(FIXTURE).expect("re-register fixture winmd");
+
+        let (import, token) =
+            MetadataReader::find_typedef_sideloaded("Windows.Globalization.Calendar")
+                .expect("Calendar typedef in sideloaded scope");
+        let decl = MetadataReader::declaration_from_typedef(
+            &import,
+            token,
+            "Windows.Globalization.Calendar",
+        )
+        .expect("declaration built from sideloaded typedef");
+        assert_eq!(decl.read().kind(), DeclarationKind::Class);
+
+        assert!(
+            MetadataReader::find_typedef_sideloaded("Windows.Globalization.NoSuchType").is_none()
+        );
+    }
+
+    #[test]
+    fn sideloaded_namespaces_synthesize() {
+        MetadataReader::register_winmd_file(FIXTURE).expect("register fixture winmd");
+        assert!(MetadataReader::sideloaded_namespace_exists(
+            "Windows.Globalization"
+        ));
+        assert!(!MetadataReader::sideloaded_namespace_exists(
+            "Windows.Bogus"
+        ));
+    }
+}
+
+/// Collects every typedef's full name from an opened metadata scope; used to
+/// synthesize namespace declarations for dotted traversal of sideloaded types.
+fn enumerate_typedef_names(import: &IMetaDataImport2) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut henum: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut tokens = [0u32; 64];
+    loop {
+        let mut count = 0u32;
+        let result = unsafe {
+            import.EnumTypeDefs(&mut henum, tokens.as_mut_ptr(), tokens.len() as u32, &mut count)
+        };
+        if result.is_err() || count == 0 {
+            break;
+        }
+        for &td in &tokens[..count as usize] {
+            let mut name_buf = [0u16; MAX_IDENTIFIER_LENGTH];
+            let mut size = 0u32;
+            let ok = unsafe {
+                import.GetTypeDefProps(td, Some(&mut name_buf), &mut size, 0 as _, 0 as _)
+            }
+            .is_ok();
+            if ok && size > 1 {
+                names.push(String::from_utf16_lossy(
+                    &name_buf[..size.saturating_sub(1) as usize],
+                ));
+            }
+        }
+    }
+    if !henum.is_null() {
+        unsafe { import.CloseEnum(henum) };
+    }
+    names
 }

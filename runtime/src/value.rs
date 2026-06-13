@@ -863,12 +863,47 @@ fn try_get_external_handle(
 /// `"Char16"`, `"TimeSpan"` (accepts ms number), `"DateTime"` (accepts ms-since-epoch),
 /// `"Guid"` (accepts "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" string), etc.
 /// Returns `None` when the value/type combination cannot be boxed.
+/// Read a JS value as i64, accepting Number or BigInt. i64 struct fields (DateTime.UniversalTime)
+/// exceed 2^53, so callers pass a BigInt; `number_value()` returns 0 on a BigInt.
+fn v8_to_i64(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> i64 {
+    if let Ok(bi) = v8::Local::<v8::BigInt>::try_from(value) {
+        return bi.i64_value().0;
+    }
+    value.number_value(scope).unwrap_or(0.0) as i64
+}
+
+/// Read an i64 field (Number or BigInt) off a JS object; 0 if absent.
+fn read_i64_field(scope: &mut v8::PinScope<'_, '_>, obj_val: v8::Local<v8::Value>, field: &str) -> i64 {
+    if let Some(obj) = obj_val.to_object(scope) {
+        if let Some(k) = v8::String::new(scope, field) {
+            if let Some(v) = obj.get(scope, k.into()) {
+                return v8_to_i64(scope, v);
+            }
+        }
+    }
+    0
+}
+
 pub fn box_as_typed_value(
     scope: &mut v8::PinScope<'_, '_>,
     arg: v8::Local<v8::Value>,
     type_name: &str,
 ) -> Option<NativeValue> {
     use windows::Foundation::PropertyValue;
+
+    // Already-boxed value (a `PropertyValue.Create*` result or any wrapped COM value) → pass its
+    // handle straight through; re-reading fields off the wrapper would yield 0 (double-boxing).
+    // Plain struct objects like { Duration: 123 } have no `handle`, so this skips them.
+    if arg.is_object() {
+        if let Some(obj) = arg.to_object(scope) {
+            if let Some(ptr) = try_get_external_handle(scope, obj) {
+                if !ptr.is_null() {
+                    return Some(NativeValue { pointer: ptr });
+                }
+            }
+        }
+    }
+
     macro_rules! box_insp {
         ($expr:expr) => {{
             let v = $expr.ok()?;
@@ -894,8 +929,9 @@ pub fn box_as_typed_value(
         "Single" => box_num!(|n: f64| PropertyValue::CreateSingle(n as f32)),
         "Int32" | "IntI32" => box_num!(|n: f64| PropertyValue::CreateInt32(n as i32)),
         "UInt32" => box_num!(|n: f64| PropertyValue::CreateUInt32(n as u32)),
-        "Int64" => box_num!(|n: f64| PropertyValue::CreateInt64(n as i64)),
-        "UInt64" => box_num!(|n: f64| PropertyValue::CreateUInt64(n as u64)),
+        // Int64/UInt64 may exceed 2^53 — read via BigInt-aware helper, not number_value.
+        "Int64" => box_insp!(PropertyValue::CreateInt64(v8_to_i64(scope, arg))),
+        "UInt64" => box_insp!(PropertyValue::CreateUInt64(v8_to_i64(scope, arg) as u64)),
         "Int16" => box_num!(|n: f64| PropertyValue::CreateInt16(n as i16)),
         "UInt16" => box_num!(|n: f64| PropertyValue::CreateUInt16(n as u16)),
         "UInt8" | "Uint8" | "Byte" => box_num!(|n: f64| PropertyValue::CreateUInt8(n as u8)),
@@ -924,14 +960,8 @@ pub fn box_as_typed_value(
         // handled — pass the raw ticks integer directly.
         "TimeSpan" => {
             let ticks = if arg.is_object() {
-                let obj = arg.to_object(scope)?;
-                if let Some(k) = v8::String::new(scope, "Duration") {
-                    obj.get(scope, k.into())
-                        .and_then(|v| v.number_value(scope))
-                        .unwrap_or(0.0) as i64
-                } else {
-                    0
-                }
+                // struct { Duration: <100ns ticks> } — Number or BigInt
+                read_i64_field(scope, arg, "Duration")
             } else {
                 // treat as milliseconds → convert to 100ns ticks
                 (arg.number_value(scope)? * 10_000.0) as i64
@@ -942,14 +972,8 @@ pub fn box_as_typed_value(
         // DateTime: accept JS milliseconds since Unix epoch; struct { UniversalTime } also works.
         "DateTime" => {
             let universal_time = if arg.is_object() {
-                let obj = arg.to_object(scope)?;
-                if let Some(k) = v8::String::new(scope, "UniversalTime") {
-                    obj.get(scope, k.into())
-                        .and_then(|v| v.number_value(scope))
-                        .unwrap_or(0.0) as i64
-                } else {
-                    0
-                }
+                // struct { UniversalTime: <100ns ticks since 1601> } — Number or BigInt
+                read_i64_field(scope, arg, "UniversalTime")
             } else {
                 // JS ms since 1970-01-01 → WinRT 100ns ticks since 1601-01-01
                 const EPOCH_DIFF_TICKS: i64 = 11_644_473_600_000 * 10_000;
@@ -1233,8 +1257,9 @@ pub(crate) fn append_struct_field_bytes(
         NativeType::F32 => buf.extend_from_slice(&(num as f32).to_le_bytes()),
         NativeType::I32 => buf.extend_from_slice(&(num as i32).to_le_bytes()),
         NativeType::U32 => buf.extend_from_slice(&(num as u32).to_le_bytes()),
-        NativeType::I64 => buf.extend_from_slice(&(num as i64).to_le_bytes()),
-        NativeType::U64 => buf.extend_from_slice(&(num as u64).to_le_bytes()),
+        // i64/u64 fields can exceed 2^53 — read via BigInt-aware helper, not f64.
+        NativeType::I64 => buf.extend_from_slice(&v8_to_i64(scope, value).to_le_bytes()),
+        NativeType::U64 => buf.extend_from_slice(&(v8_to_i64(scope, value) as u64).to_le_bytes()),
         NativeType::I16 => buf.extend_from_slice(&(num as i16).to_le_bytes()),
         NativeType::U16 => buf.extend_from_slice(&(num as u16).to_le_bytes()),
         NativeType::I8 => buf.extend_from_slice(&(num as i8).to_le_bytes()),

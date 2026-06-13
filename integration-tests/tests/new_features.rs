@@ -506,3 +506,154 @@ fn dotnet_environment_get_machine_name() {
         "System.Environment.get_MachineName() should still work",
     );
 }
+
+#[test]
+fn event_reads_null_before_assignment() {
+    let mut rt = Runtime::new(".");
+    assert_js(
+        &mut rt,
+        r#"
+        (function(){
+            var ps = new Windows.Foundation.Collections.PropertySet();
+            return ps.MapChanged === null;
+        })()
+    "#,
+        "unset WinRT event should read back as null (not undefined)",
+    );
+}
+
+#[test]
+fn event_reads_assigned_handler() {
+    let mut rt = Runtime::new(".");
+    assert_js(
+        &mut rt,
+        r#"
+        (function(){
+            var ps = new Windows.Foundation.Collections.PropertySet();
+            var h = function(sender, args){};
+            ps.MapChanged = h;
+            return ps.MapChanged === h;
+        })()
+    "#,
+        "WinRT event should read back the exact handler that was assigned",
+    );
+}
+
+#[test]
+fn event_reassignment_reflects_latest_handler() {
+    let mut rt = Runtime::new(".");
+    assert_js(
+        &mut rt,
+        r#"
+        (function(){
+            var ps = new Windows.Foundation.Collections.PropertySet();
+            var first = function(){};
+            var second = function(){};
+            ps.MapChanged = first;
+            ps.MapChanged = second;
+            return ps.MapChanged === second && ps.MapChanged !== first;
+        })()
+    "#,
+        "re-assigning a WinRT event should read back the latest handler",
+    );
+}
+
+#[test]
+fn event_fires_handler_on_insert() {
+    let mut rt = Runtime::new(".");
+    // Delegates reach JS via DELEGATE_ISOLATE_PTR, which the embedding host
+    // registers after construction — mirror that here.
+    rt.register_delegate_isolate_ptr();
+    // PropertySet raises MapChanged synchronously on Insert.
+    assert_js(
+        &mut rt,
+        r#"
+        (function(){
+            var ps = new Windows.Foundation.Collections.PropertySet();
+            var count = 0;
+            ps.MapChanged = function(sender, args){ count++; };
+            ps.Insert('k1', 1);
+            return count === 1;
+        })()
+    "#,
+        "MapChanged handler should fire once per Insert",
+    );
+}
+
+#[test]
+fn event_reassignment_replaces_subscription() {
+    let mut rt = Runtime::new(".");
+    rt.register_delegate_isolate_ptr();
+    // Re-assigning must remove the old subscription (token continuity): after
+    // swapping handlers, an Insert fires only the new one, exactly once.
+    assert_js(
+        &mut rt,
+        r#"
+        (function(){
+            var ps = new Windows.Foundation.Collections.PropertySet();
+            var firstCount = 0, secondCount = 0;
+            ps.MapChanged = function(){ firstCount++; };
+            ps.MapChanged = function(){ secondCount++; };
+            ps.Insert('k1', 1);
+            return firstCount === 0 && secondCount === 1;
+        })()
+    "#,
+        "re-assignment should unsubscribe the previous handler",
+    );
+}
+
+#[test]
+fn event_null_assignment_unsubscribes() {
+    let mut rt = Runtime::new(".");
+    rt.register_delegate_isolate_ptr();
+    assert_js(
+        &mut rt,
+        r#"
+        (function(){
+            var ps = new Windows.Foundation.Collections.PropertySet();
+            var count = 0;
+            ps.MapChanged = function(){ count++; };
+            ps.Insert('k1', 1);
+            ps.MapChanged = null;
+            ps.Insert('k2', 2);
+            return count === 1 && ps.MapChanged === null;
+        })()
+    "#,
+        "assigning null should unsubscribe and read back as null",
+    );
+}
+
+// Sideloaded winmd metadata (third-party WinRT components like WebView2).
+
+#[test]
+fn register_winmd_js_api() {
+    let mut rt = Runtime::new(".");
+    assert_js(
+        &mut rt,
+        r#"
+        (function(){
+            if (typeof __nsRegisterWinmd !== 'function') return false;
+            var ok = __nsRegisterWinmd('C:\\Windows\\System32\\WinMetadata\\Windows.Globalization.winmd') === true;
+            var threw = false;
+            try { __nsRegisterWinmd('C:\\does\\not\\exist.winmd'); } catch (e) { threw = true; }
+            return ok && threw;
+        })()
+    "#,
+        "__nsRegisterWinmd should load real winmds and throw on missing files",
+    );
+}
+
+#[test]
+fn event_supports_in_operator() {
+    let mut rt = Runtime::new(".");
+    assert_js(
+        &mut rt,
+        r#"
+        (function(){
+            var ps = new Windows.Foundation.Collections.PropertySet();
+            return ('MapChanged' in ps) && !('NotARealEvent' in ps);
+        })()
+    "#,
+        "'EventName' in instance should be true for declared WinRT events",
+    );
+}

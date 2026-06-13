@@ -377,3 +377,26 @@ pub(crate) fn find_event_methods(
     }
     None
 }
+
+pub(crate) fn find_interface_event_methods(
+    declaration: &dyn Declaration,
+    name: &str,
+) -> Option<(MethodDeclaration, MethodDeclaration)> {
+    let events: &[EventDeclaration] = if let Some(iface) = declaration
+        .as_any()
+        .downcast_ref::<metadata::declarations::interface_declaration::InterfaceDeclaration>()
+    {
+        iface.events()
+    } else if let Some(iface) = declaration
+        .as_any()
+        .downcast_ref::<metadata::declarations::interface_declaration::generic_interface_instance_declaration::GenericInterfaceInstanceDeclaration>()
+    {
+        iface.events()
+    } else {
+        return None;
+    };
+    events
+        .iter()
+        .find(|e| e.name() == name)
+        .map(|e| (e.add_method().clone(), e.remove_method().clone()))
+}

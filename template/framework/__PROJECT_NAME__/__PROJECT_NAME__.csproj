@@ -54,6 +54,34 @@
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.1742" />
   </ItemGroup>
 
+  <PropertyGroup>
+    <!-- Deploys Microsoft.Web.WebView2.Core.winmd (~120 KB) next to the exe so the runtime can
+         project CoreWebView2 members (Navigate, Stop, …) dynamically. Set to false (App_Resources
+         props or /p:) for apps that never use WebView. -->
+    <NSIncludeWebView2Metadata Condition="'$(NSIncludeWebView2Metadata)' == ''">true</NSIncludeWebView2Metadata>
+  </PropertyGroup>
+
+  <!-- WinRT metadata for WebView2. The .NET build never deploys .winmd files (compiled apps bake
+       their projections at compile time), but the NativeScript runtime resolves WinRT types
+       dynamically and auto-scans the output dir for *.winmd on startup — without it, CoreWebView2
+       members (Navigate, Stop, …) don't project. WebView2 arrives transitively via
+       Microsoft.WindowsAppSDK, so we locate the winmd next to the resolved Core dll (it sits one
+       package's lib\). Version-agnostic: no pinned PackageReference, tracks whatever WebView2 version
+       WindowsAppSDK pulls in. WinUI resolves the Core dll from runtimes\<rid>\native_uap\, so the
+       winmd sits three directories up, in <pkgroot>\lib\. -->
+  <Target Name="NSDeployWebView2CoreMetadata"
+          AfterTargets="CopyFilesToOutputDirectory"
+          Condition="'$(NSIncludeWebView2Metadata)' == 'true'">
+    <PropertyGroup>
+      <_NSWebView2CoreDll>@(ReferenceCopyLocalPaths->WithMetadataValue('Filename','Microsoft.Web.WebView2.Core')->WithMetadataValue('Extension','.dll'))</_NSWebView2CoreDll>
+      <_NSWebView2CoreWinmd Condition="'$(_NSWebView2CoreDll)' != ''">$([System.IO.Path]::GetFullPath('$([System.IO.Path]::GetDirectoryName($(_NSWebView2CoreDll)))\..\..\..\lib\Microsoft.Web.WebView2.Core.winmd'))</_NSWebView2CoreWinmd>
+    </PropertyGroup>
+    <Copy SourceFiles="$(_NSWebView2CoreWinmd)"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true"
+          Condition="'$(_NSWebView2CoreWinmd)' != '' and Exists('$(_NSWebView2CoreWinmd)')" />
+  </Target>
+
   <ItemGroup>
     <AppxManifest Include="Package.appxmanifest" />
     <Content Include="Properties\Default.rd.xml" />
@@ -200,7 +228,17 @@
   <!-- Allow project-level Windows overrides: place App_Resources\Windows\app.csproj to extend/override generated settings -->
   <Import Project="App_Resources\Windows\app.csproj" Condition="Exists('App_Resources\Windows\app.csproj')" />
 
+  <!-- App-level hook evaluated BEFORE plugins, analogous to Android's
+       App_Resources/Android/before-plugins.gradle. Place App_Resources\Windows\before-plugins.props
+       to declare NuGet package sources/feeds, pin or override versions, or set any properties/items
+       that plugin PackageReferences (added by each plugin's plugin.props) should resolve against. -->
+  <Import Project="App_Resources\Windows\before-plugins.props" Condition="Exists('App_Resources\Windows\before-plugins.props')" />
+
   <!-- CLI-generated plugin imports (managed by the CLI during prepare) -->
   <Import Project="plugins\Plugins.props" Condition="Exists('plugins\Plugins.props')" />
   <Import Project="plugins\Plugins.targets" Condition="Exists('plugins\Plugins.targets')" />
+
+  <!-- App-level hook evaluated AFTER plugins, analogous to Android's App_Resources/Android/app.gradle.
+       Place App_Resources\Windows\after-plugins.props to override or extend anything a plugin set. -->
+  <Import Project="App_Resources\Windows\after-plugins.props" Condition="Exists('App_Resources\Windows\after-plugins.props')" />
 </Project>

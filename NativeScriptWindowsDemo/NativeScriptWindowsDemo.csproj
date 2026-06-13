@@ -81,6 +81,23 @@
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.1742" />
   </ItemGroup>
 
+  <PropertyGroup>
+    <!-- Deploys the WebView2 WinRT metadata (~120 KB); set false to trim. -->
+    <NSIncludeWebView2Metadata Condition="'$(NSIncludeWebView2Metadata)' == ''">true</NSIncludeWebView2Metadata>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- WinRT metadata for WebView2: the runtime resolves WinRT types
+         dynamically and auto-scans the output dir for *.winmd; without this
+         CoreWebView2 members (e.g. Navigate) don't project. See the template
+         csproj for details. -->
+    <Content Include="$(PkgMicrosoft_Web_WebView2)\lib\Microsoft.Web.WebView2.Core.winmd"
+             Link="Microsoft.Web.WebView2.Core.winmd"
+             Condition="'$(NSIncludeWebView2Metadata)' == 'true' and '$(PkgMicrosoft_Web_WebView2)' != '' and Exists('$(PkgMicrosoft_Web_WebView2)\lib\Microsoft.Web.WebView2.Core.winmd')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
   <ItemGroup>
     <AppxManifest Include="Package.appxmanifest" />
     <Content Include="Properties\Default.rd.xml" />

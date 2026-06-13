@@ -1140,7 +1140,17 @@ impl MethodCall {
         self.argument_buf.push(NativeValue {
             pointer: self.interface.as_raw() as *mut c_void,
         });
-        self.argument_buf.push(NativeValue { i64_value: token });
+        // NativeType::Struct: as_arg dereferences the pointer field, so pass
+        // &token_storage. Passing the token directly as i64 is read as an
+        // address — remove silently no-ops and the old handler keeps firing.
+        let mut token_storage: i64 = token;
+        let token_arg = match self.si.parameter_types.get(1) {
+            Some(NativeType::Struct(_)) => NativeValue {
+                pointer: &mut token_storage as *mut i64 as *mut c_void,
+            },
+            _ => NativeValue { i64_value: token },
+        };
+        self.argument_buf.push(token_arg);
         let mut call_args: Vec<Arg> = Vec::with_capacity(self.argument_buf.len());
         for (i, v) in self.argument_buf.iter().enumerate() {
             let Some(native_type) = self.si.parameter_types.get(i) else {

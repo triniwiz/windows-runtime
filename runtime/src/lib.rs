@@ -376,6 +376,19 @@ thread_local!(pub(crate) static GC_NUDGE_NEXT_AT: std::cell::Cell<usize> = std::
 // Keyed on the WinRT class full name (e.g. "Microsoft.UI.Xaml.Controls.TextBlock").
 thread_local!(static ACTIVATION_FACTORY_CACHE: RefCell<HashMap<String, IUnknown>> = RefCell::new(HashMap::new()));
 
+pub(crate) struct EventRegistration {
+    pub(crate) token: i64,
+    pub(crate) handler: v8::Global<v8::Value>,
+}
+
+// Keyed on COM identity, not the JS proxy: if a proxy is GC'd and the same native
+// object is re-wrapped, the old token must still be findable to avoid double-fire.
+thread_local!(pub(crate) static EVENT_REGISTRY: RefCell<HashMap<usize, HashMap<String, EventRegistration>>> = RefCell::new(HashMap::new()));
+
+pub(crate) fn com_identity(unk: &IUnknown) -> Option<usize> {
+    unk.cast::<IUnknown>().ok().map(|id| id.as_raw() as usize)
+}
+
 /// Called after inserting into the cache; re-arms once the cache genuinely
 /// shrinks back under the base threshold.
 #[inline]
@@ -845,7 +858,6 @@ pub(crate) struct DeclarationFFI {
     pub(crate) instance: Option<IUnknown>,
     pub(crate) parent: Option<Arc<RwLock<dyn Declaration>>>,
     pub(crate) struct_instance: Option<(Vec<u8>, Vec<NativeType>)>,
-    pub(crate) event_tokens: std::collections::HashMap<String, i64>,
     /// For inherited static properties/methods: the fully-qualified name of the
     /// WinRT class that declares them. Resolved lazily via class_activation_factory
     /// on first access so that constructors don't pay the cost of RoGetActivationFactory
@@ -864,7 +876,6 @@ impl DeclarationFFI {
             instance: None,
             parent: None,
             struct_instance: None,
-            event_tokens: std::collections::HashMap::new(),
             static_factory_class: None,
         }
     }
@@ -878,7 +889,6 @@ impl DeclarationFFI {
             instance,
             parent: None,
             struct_instance: None,
-            event_tokens: std::collections::HashMap::new(),
             static_factory_class: None,
         }
     }
@@ -2124,6 +2134,17 @@ fn create_ns_ctor_instance_object<'a>(
                     }
 
                     let Some(clazz) = lock.as_any().downcast_ref::<ClassDeclaration>() else {
+                        if crate::class_helpers::find_interface_event_methods(&*lock, &name)
+                            .is_some()
+                        {
+                            let handler = crate::ns_proxy::read_winrt_event(
+                                scope,
+                                dec.instance.as_ref(),
+                                &name,
+                            );
+                            rv.set(handler);
+                            return v8::Intercepted::kYes;
+                        }
                         return v8::Intercepted::kNo;
                     };
 
@@ -2384,6 +2405,13 @@ fn create_ns_ctor_instance_object<'a>(
                         return v8::Intercepted::kYes;
                     }
 
+                    if find_event_methods(clazz, &name).is_some() {
+                        let handler =
+                            crate::ns_proxy::read_winrt_event(scope, dec.instance.as_ref(), &name);
+                        rv.set(handler);
+                        return v8::Intercepted::kYes;
+                    }
+
                     v8::Intercepted::kNo
                 },
             )
@@ -2505,6 +2533,20 @@ fn create_ns_ctor_instance_object<'a>(
                     }
 
                     let Some(clazz) = lock.as_any().downcast_ref::<ClassDeclaration>() else {
+                        if let Some((add_method, remove_method)) =
+                            crate::class_helpers::find_interface_event_methods(&*lock, &name)
+                        {
+                            let instance = dec.instance.clone();
+                            drop(lock);
+                            return crate::ns_proxy::wire_winrt_event(
+                                scope,
+                                &name,
+                                instance,
+                                &add_method,
+                                &remove_method,
+                                val,
+                            );
+                        }
                         return v8::Intercepted::kNo;
                     };
 
@@ -2543,76 +2585,14 @@ fn create_ns_ctor_instance_object<'a>(
                     if let Some((add_method, remove_method)) = find_event_methods(clazz, &name) {
                         let instance = dec.instance.clone();
                         drop(lock);
-
-                        if let Some(&old_token) = dec.event_tokens.get(&name) {
-                            if let Some(inst) = instance.clone() {
-                                let mut mc = MethodCall::new(
-                                    &remove_method,
-                                    remove_method.is_sealed(),
-                                    inst,
-                                    false,
-                                );
-                                let _ = mc.call_with_event_token(old_token);
-                            }
-                            dec.event_tokens.remove(&name);
-                        }
-
-                        // Path A — `{ handle: External }` from a delegate constructor or
-                        // NSWinRT.asDelegate. Checked first, but functions are objects too,
-                        // so fall through to Path B (auto-wrap) when there's no handle.
-                        let handle_ptr: Option<*mut c_void> =
-                            val.to_object(scope).and_then(|obj| {
-                                let handle_key = v8::String::new(scope, "handle")?;
-                                let handle_val = obj.get(scope, handle_key.into())?;
-                                v8::Local::<v8::External>::try_from(handle_val)
-                                    .ok()
-                                    .map(|ext| ext.value())
-                            });
-
-                        // Path B — plain JS function: derive the delegate type from the
-                        // add method's first parameter and wrap it as a JsDelegate.
-                        let effective_ptr: Option<*mut c_void> = handle_ptr.or_else(|| {
-                            let func = v8::Local::<v8::Function>::try_from(val).ok()?;
-                            let (guid, param_types) = delegate_info_from_add_method(&add_method)?;
-                            let data = Box::new(JsDelegateData {
-                                js_func: v8::Global::new(scope, func),
-                                param_types,
-                            });
-                            let delegate = Box::new(JsDelegate {
-                                vtable: &JS_DELEGATE_VTBL as *const _,
-                                ref_count: AtomicU32::new(1),
-                                guid,
-                                data: Box::into_raw(data),
-                            });
-                            Some(Box::into_raw(delegate) as *mut c_void)
-                        });
-
-                        if let Some(delegate_ptr) = effective_ptr {
-                            if let Some(inst) = instance {
-                                let mut mc = MethodCall::new(
-                                    &add_method,
-                                    add_method.is_sealed(),
-                                    inst,
-                                    false,
-                                );
-                                let (ret, token) = mc.call_with_raw_ptr(delegate_ptr);
-                                if ret.is_ok() {
-                                    dec.event_tokens.insert(name, token);
-                                } else {
-                                    let detail = format!(
-                                        "Event add '{}' failed: {} (0x{:08X})",
-                                        name,
-                                        ret.message(),
-                                        ret.0 as u32
-                                    );
-                                    let message = v8::String::new(scope, &detail).unwrap();
-                                    let error = v8::Exception::error(scope, message);
-                                    scope.throw_exception(error);
-                                }
-                            }
-                        }
-
-                        return v8::Intercepted::kYes;
+                        return crate::ns_proxy::wire_winrt_event(
+                            scope,
+                            &name,
+                            instance,
+                            &add_method,
+                            &remove_method,
+                            val,
+                        );
                     }
 
                     v8::Intercepted::kNo
@@ -6581,91 +6561,37 @@ fn handle_named_property_setter(
             if let Some((add_method, remove_method)) = find_event_methods(class, &name) {
                 let instance = dec.instance.clone();
                 drop(lock);
-
-                // Remove existing handler if there is one.
-                let token_key = format!("__tok_{}__", name);
-                if let Some(tok_key_str) = v8::String::new(scope, &token_key) {
-                    if let Some(tok_val) = store.get(scope, tok_key_str.into()) {
-                        if let Ok(tok_ext) = v8::Local::<v8::External>::try_from(tok_val) {
-                            let token = tok_ext.value() as i64;
-                            if let Some(instance) = instance.clone() {
-                                let mut mc = MethodCall::new(
-                                    &remove_method,
-                                    remove_method.is_sealed(),
-                                    instance,
-                                    false,
-                                );
-                                mc.call_with_event_token(token);
-                            }
-                            // Clear the stored token.
-                            let undef = v8::undefined(scope);
-                            store.set(scope, tok_key_str.into(), undef.into());
-                        }
-                    }
-                }
-
-                // Register the new delegate.
-                //
-                // Path A — explicit `{ handle: External }` object from a delegate constructor
-                //           or `__nsAsDelegate(typeName, fn)`: extract the raw pointer directly.
-                // Path B — plain JS function: auto-derive the delegate type from the add_method's
-                //           first parameter and wrap on the fly (correct parameterized IID).
-                // Functions are objects too, so probe for a handle first and only then
-                // fall back to wrapping the value as a function.
-                let handle_ptr: Option<*mut c_void> = value.to_object(scope).and_then(|obj| {
-                    let key = v8::String::new(scope, "handle")?;
-                    let handle_val = obj.get(scope, key.into())?;
-                    v8::Local::<v8::External>::try_from(handle_val)
-                        .ok()
-                        .map(|ext| ext.value())
-                });
-                let effective_ptr: Option<*mut c_void> = handle_ptr.or_else(|| {
-                    let func = v8::Local::<v8::Function>::try_from(value).ok()?;
-                    let (guid, param_types) = delegate_info_from_add_method(&add_method)?;
-                    let data = Box::new(JsDelegateData {
-                        js_func: v8::Global::new(scope, func),
-                        param_types,
-                    });
-                    let delegate = Box::new(JsDelegate {
-                        vtable: &JS_DELEGATE_VTBL as *const _,
-                        ref_count: AtomicU32::new(1),
-                        guid,
-                        data: Box::into_raw(data),
-                    });
-                    Some(Box::into_raw(delegate) as *mut c_void)
-                });
-
-                if let Some(delegate_ptr) = effective_ptr {
-                    if let Some(instance) = instance {
-                        let mut mc =
-                            MethodCall::new(&add_method, add_method.is_sealed(), instance, false);
-                        let (ret, token) = mc.call_with_raw_ptr(delegate_ptr);
-                        if ret.is_err() {
-                            let detail = format!(
-                                "Event add '{}' failed: {} (0x{:08X})",
-                                name,
-                                ret.message(),
-                                ret.0 as u32
-                            );
-                            let message = v8::String::new(scope, &detail).unwrap();
-                            let error = v8::Exception::error(scope, message);
-                            scope.throw_exception(error);
-                            return v8::Intercepted::kYes;
-                        }
-                        if let Some(tok_key_str) = v8::String::new(scope, &token_key) {
-                            let tok_ptr = token as *mut c_void;
-                            store.set(
-                                scope,
-                                tok_key_str.into(),
-                                v8::External::new(scope, tok_ptr).into(),
-                            );
-                        }
-                    }
-                }
-
-                store.set(scope, key.into(), value);
-                return v8::Intercepted::kYes;
+                return crate::ns_proxy::wire_winrt_event(
+                    scope,
+                    &name,
+                    instance,
+                    &add_method,
+                    &remove_method,
+                    value,
+                );
             }
+        }
+    }
+
+    if !is_reserved
+        && matches!(
+            kind,
+            DeclarationKind::Interface | DeclarationKind::GenericInterfaceInstance
+        )
+    {
+        if let Some((add_method, remove_method)) =
+            crate::class_helpers::find_interface_event_methods(&*lock, &name)
+        {
+            let instance = dec.instance.clone();
+            drop(lock);
+            return crate::ns_proxy::wire_winrt_event(
+                scope,
+                &name,
+                instance,
+                &add_method,
+                &remove_method,
+                value,
+            );
         }
     }
 
@@ -6851,6 +6777,13 @@ fn handle_named_property_getter(
                         rv.set(func);
                         return v8::Intercepted::kYes;
                     }
+
+                    if dec.instance.is_some() && find_event_methods(clazz_dec, &name).is_some() {
+                        let handler =
+                            crate::ns_proxy::read_winrt_event(scope, dec.instance.as_ref(), &name);
+                        rv.set(handler);
+                        return v8::Intercepted::kYes;
+                    }
                 }
             }
             DeclarationKind::Interface
@@ -6872,6 +6805,15 @@ fn handle_named_property_getter(
                             }
                         }
                     }
+                }
+
+                if dec.instance.is_some()
+                    && crate::class_helpers::find_interface_event_methods(&*lock, &name).is_some()
+                {
+                    let handler =
+                        crate::ns_proxy::read_winrt_event(scope, dec.instance.as_ref(), &name);
+                    rv.set(handler);
+                    return v8::Intercepted::kYes;
                 }
             }
             DeclarationKind::Enum => {
@@ -7446,6 +7388,37 @@ impl Runtime {
             Err(_) => false,
         };
 
+        // RoGetMetaDataFile only resolves system/app-package metadata; third-party
+        // .winmd files (e.g. WebView2) must be registered manually or scanned here.
+        let scan_dirs = [
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.to_path_buf())),
+            Some(std::path::PathBuf::from(app_root)),
+        ];
+        for dir in scan_dirs.into_iter().flatten() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_winmd = path
+                    .extension()
+                    .map_or(false, |ext| ext.eq_ignore_ascii_case("winmd"));
+                if is_winmd {
+                    if let Some(path_str) = path.to_str() {
+                        if let Err(err) =
+                            metadata::meta_data_reader::MetadataReader::register_winmd_file(
+                                path_str,
+                            )
+                        {
+                            eprintln!("[NativeScript] winmd sideload skipped: {}", err);
+                        }
+                    }
+                }
+            }
+        }
+
         // Create the message-only HWND for native UI-thread dispatch. Must run
         // on the UI thread (here, in Runtime::new) before any cross-thread posts.
         crate::ui_dispatcher::init_ui_dispatcher();
@@ -7852,6 +7825,7 @@ impl Drop for Runtime {
         // still alive. Anything left behind dangles into freed isolate memory
         // and crashes the next Runtime created on this thread.
         INSTANCE_CACHE.with(|cache| cache.borrow_mut().clear());
+        EVENT_REGISTRY.with(|m| m.borrow_mut().clear());
         ESM_MODULE_REGISTRY.with(|m| m.borrow_mut().clear());
         ESM_HASH_TO_PATH.with(|m| m.borrow_mut().clear());
         DOTNET_JS_CALLBACKS.with(|m| m.borrow_mut().clear());

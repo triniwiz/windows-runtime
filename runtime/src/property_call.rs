@@ -1136,7 +1136,45 @@ impl PropertyCall {
                     continue;
                 }
                 NativeType::Function => ffi_parse_function_arg(scope, value),
-                NativeType::Struct(_) => ffi_parse_struct_arg(scope, value),
+                NativeType::Struct(_) => {
+                    // By-value struct param: accept a plain JS object { field: value } by serialising
+                    // it to the struct's bytes (mirrors the Pointer path); else fall back to ArrayBuffer.
+                    // libffi reads the value from the pointer, so the scratch buffer must outlive the call.
+                    let mut handled: Option<NativeValue> = None;
+                    if value.is_object()
+                        && !value.is_array_buffer()
+                        && !value.is_array_buffer_view()
+                    {
+                        let sig: &str = &self.si.param_sigs[i];
+                        let lookup = crate::helpers::strip_generic_suffix(sig);
+                        if let (Some(decl), Some(obj)) =
+                            (MetadataReader::find_by_name(lookup), value.to_object(scope))
+                        {
+                            let is_struct = decl.read().kind() == DeclarationKind::Struct;
+                            if is_struct {
+                                let mut sbuf: Vec<u8> = Vec::new();
+                                {
+                                    let lock = decl.read();
+                                    if let Some(sd) =
+                                        lock.as_any().downcast_ref::<StructDeclaration>()
+                                    {
+                                        append_struct_object_bytes(&mut sbuf, scope, obj, sd);
+                                    }
+                                }
+                                if sbuf.is_empty() {
+                                    sbuf.push(0);
+                                }
+                                let ptr = sbuf.as_mut_ptr() as *mut c_void;
+                                struct_scratch.push(sbuf);
+                                handled = Some(NativeValue { pointer: ptr });
+                            }
+                        }
+                    }
+                    match handled {
+                        Some(nv) => Ok(nv),
+                        None => ffi_parse_struct_arg(scope, value),
+                    }
+                }
                 NativeType::String => ffi_parse_string_arg(scope, value),
             };
 

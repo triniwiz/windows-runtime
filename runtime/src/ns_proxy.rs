@@ -1,6 +1,6 @@
 use crate::class_helpers::{
     class_has_member_named, collect_class_methods, collect_class_properties_with_declaring,
-    find_class_method, find_class_property, find_event_methods,
+    find_class_method, find_class_property, find_event_methods, find_interface_event_methods,
     find_static_property_declaring_class,
 };
 use crate::error;
@@ -142,6 +142,115 @@ pub(crate) fn handle_indexed_property_getter(
     mut _rv: v8::ReturnValue<v8::Value>,
 ) -> v8::Intercepted {
     v8::Intercepted::kNo
+}
+
+pub(crate) fn wire_winrt_event(
+    scope: &mut v8::PinScope<'_, '_>,
+    name: &str,
+    instance: Option<IUnknown>,
+    add_method: &MethodDeclaration,
+    remove_method: &MethodDeclaration,
+    value: Local<v8::Value>,
+) -> v8::Intercepted {
+    let identity = instance.as_ref().and_then(crate::com_identity);
+
+    if let Some(id) = identity {
+        let old = crate::EVENT_REGISTRY.with(|r| {
+            r.borrow_mut()
+                .get_mut(&id)
+                .and_then(|events| events.remove(name))
+        });
+        if let Some(old) = old {
+            if let Some(inst) = instance.clone() {
+                let mut mc =
+                    MethodCall::new(remove_method, remove_method.is_sealed(), inst, false);
+                let _ = mc.call_with_event_token(old.token);
+            }
+        }
+    }
+
+    // Assigning null/undefined just unsubscribes. Bail before the handle probe:
+    // ToObject(null) would throw a TypeError into the assigning script.
+    if value.is_null_or_undefined() {
+        return v8::Intercepted::kYes;
+    }
+
+    let Some(inst) = instance else {
+        // No COM instance to attach to (e.g. a ctor object without a factory):
+        // the unsubscribe bookkeeping above is all that can be done.
+        return v8::Intercepted::kYes;
+    };
+
+    let handle_ptr: Option<*mut c_void> = value.to_object(scope).and_then(|obj| {
+        let key = v8::String::new(scope, "handle")?;
+        let handle_val = obj.get(scope, key.into())?;
+        v8::Local::<v8::External>::try_from(handle_val)
+            .ok()
+            .map(|ext| ext.value())
+    });
+    let effective_ptr: Option<*mut c_void> = handle_ptr.or_else(|| {
+        let func = v8::Local::<v8::Function>::try_from(value).ok()?;
+        let (guid, param_types) = delegate_info_from_add_method(add_method)?;
+        let data = Box::new(JsDelegateData {
+            js_func: v8::Global::new(scope, func),
+            param_types,
+        });
+        let delegate = Box::new(JsDelegate {
+            vtable: &JS_DELEGATE_VTBL as *const _,
+            ref_count: std::sync::atomic::AtomicU32::new(1),
+            guid,
+            data: Box::into_raw(data),
+        });
+        Some(Box::into_raw(delegate) as *mut c_void)
+    });
+
+    if let Some(delegate_ptr) = effective_ptr {
+        let mut mc = MethodCall::new(add_method, add_method.is_sealed(), inst, false);
+        let (ret, token) = mc.call_with_raw_ptr(delegate_ptr);
+        if ret.is_err() {
+            let detail = format!(
+                "Event add '{}' failed: {} (0x{:08X})",
+                name,
+                ret.message(),
+                ret.0 as u32
+            );
+            let message = v8::String::new(scope, &detail).unwrap();
+            let error = v8::Exception::error(scope, message);
+            scope.throw_exception(error);
+            return v8::Intercepted::kYes;
+        }
+        if let Some(id) = identity {
+            crate::EVENT_REGISTRY.with(|r| {
+                r.borrow_mut().entry(id).or_default().insert(
+                    name.to_string(),
+                    crate::EventRegistration {
+                        token,
+                        handler: v8::Global::new(scope, value),
+                    },
+                );
+            });
+        }
+    }
+    v8::Intercepted::kYes
+}
+
+pub(crate) fn read_winrt_event<'a>(
+    scope: &mut v8::PinScope<'a, '_>,
+    instance: Option<&IUnknown>,
+    name: &str,
+) -> Local<'a, v8::Value> {
+    if let Some(id) = instance.and_then(crate::com_identity) {
+        let handler = crate::EVENT_REGISTRY.with(|r| {
+            r.borrow()
+                .get(&id)
+                .and_then(|events| events.get(name))
+                .map(|e| e.handler.clone())
+        });
+        if let Some(global) = handler {
+            return v8::Local::new(scope, &global);
+        }
+    }
+    v8::null(scope).into()
 }
 
 pub(crate) fn handle_named_property_query(
@@ -527,6 +636,12 @@ pub(crate) fn handle_named_property_getter(
                             return v8::Intercepted::kYes;
                         }
                     }
+
+                    if dec.instance.is_some() && find_event_methods(clazz_dec, &name).is_some() {
+                        let handler = read_winrt_event(scope, dec.instance.as_ref(), &name);
+                        rv.set(handler);
+                        return v8::Intercepted::kYes;
+                    }
                 }
             }
             DeclarationKind::Interface
@@ -548,6 +663,13 @@ pub(crate) fn handle_named_property_getter(
                             }
                         }
                     }
+                }
+
+                if dec.instance.is_some() && find_interface_event_methods(&*lock, &name).is_some()
+                {
+                    let handler = read_winrt_event(scope, dec.instance.as_ref(), &name);
+                    rv.set(handler);
+                    return v8::Intercepted::kYes;
                 }
             }
             DeclarationKind::Enum => {
@@ -641,85 +763,29 @@ pub(crate) fn handle_named_property_setter(
             if let Some((add_method, remove_method)) = find_event_methods(class, &name) {
                 let instance = dec.instance.clone();
                 drop(lock);
-
-                let token_key = format!("__tok_{}__", name);
-                if let Some(tok_key_str) = v8::String::new(scope, &token_key) {
-                    if let Some(tok_val) = store.get(scope, tok_key_str.into()) {
-                        if let Ok(tok_ext) = v8::Local::<v8::External>::try_from(tok_val) {
-                            let token = tok_ext.value() as i64;
-                            if let Some(instance) = instance.clone() {
-                                let mut mc = MethodCall::new(
-                                    &remove_method,
-                                    remove_method.is_sealed(),
-                                    instance,
-                                    false,
-                                );
-                                mc.call_with_event_token(token);
-                            }
-                            let undef = v8::undefined(scope);
-                            store.set(scope, tok_key_str.into(), undef.into());
-                        }
-                    }
-                }
-
-                // Path A — `{ handle: External }` from a delegate constructor.
-                // Path B — plain JS function: auto-derive the delegate type and wrap it.
-                // Functions are objects too, so probe for a handle first and only then
-                // fall back to wrapping the value as a function.
-                let handle_ptr: Option<*mut c_void> = value.to_object(scope).and_then(|obj| {
-                    let key = v8::String::new(scope, "handle")?;
-                    let handle_val = obj.get(scope, key.into())?;
-                    v8::Local::<v8::External>::try_from(handle_val)
-                        .ok()
-                        .map(|ext| ext.value())
-                });
-                let effective_ptr: Option<*mut c_void> = handle_ptr.or_else(|| {
-                    let func = v8::Local::<v8::Function>::try_from(value).ok()?;
-                    let (guid, param_types) = delegate_info_from_add_method(&add_method)?;
-                    let data = Box::new(JsDelegateData {
-                        js_func: v8::Global::new(scope, func),
-                        param_types,
-                    });
-                    let delegate = Box::new(JsDelegate {
-                        vtable: &JS_DELEGATE_VTBL as *const _,
-                        ref_count: std::sync::atomic::AtomicU32::new(1),
-                        guid,
-                        data: Box::into_raw(data),
-                    });
-                    Some(Box::into_raw(delegate) as *mut c_void)
-                });
-
-                if let Some(delegate_ptr) = effective_ptr {
-                    if let Some(instance) = instance {
-                        let mut mc =
-                            MethodCall::new(&add_method, add_method.is_sealed(), instance, false);
-                        let (ret, token) = mc.call_with_raw_ptr(delegate_ptr);
-                        if ret.is_err() {
-                            let detail = format!(
-                                "Event add '{}' failed: {} (0x{:08X})",
-                                name,
-                                ret.message(),
-                                ret.0 as u32
-                            );
-                            let message = v8::String::new(scope, &detail).unwrap();
-                            let error = v8::Exception::error(scope, message);
-                            scope.throw_exception(error);
-                            return v8::Intercepted::kYes;
-                        }
-                        if let Some(tok_key_str) = v8::String::new(scope, &token_key) {
-                            let tok_ptr = token as *mut c_void;
-                            store.set(
-                                scope,
-                                tok_key_str.into(),
-                                v8::External::new(scope, tok_ptr).into(),
-                            );
-                        }
-                    }
-                }
-
-                store.set(scope, key.into(), value);
-                return v8::Intercepted::kYes;
+                return wire_winrt_event(
+                    scope,
+                    &name,
+                    instance,
+                    &add_method,
+                    &remove_method,
+                    value,
+                );
             }
+        }
+    }
+
+    // Interface-typed wrappers: wire events declared on the interface itself.
+    if !is_reserved
+        && matches!(
+            kind,
+            DeclarationKind::Interface | DeclarationKind::GenericInterfaceInstance
+        )
+    {
+        if let Some((add_method, remove_method)) = find_interface_event_methods(&*lock, &name) {
+            let instance = dec.instance.clone();
+            drop(lock);
+            return wire_winrt_event(scope, &name, instance, &add_method, &remove_method, value);
         }
     }
 
@@ -882,6 +948,11 @@ pub(crate) fn handle_instance_property_getter(
     let lock = dec.read();
 
     let Some(clazz) = lock.as_any().downcast_ref::<ClassDeclaration>() else {
+        if find_interface_event_methods(&*lock, &name).is_some() {
+            let handler = read_winrt_event(scope, dec.instance.as_ref(), &name);
+            rv.set(handler);
+            return v8::Intercepted::kYes;
+        }
         return v8::Intercepted::kNo;
     };
 
@@ -1034,6 +1105,12 @@ pub(crate) fn handle_instance_property_getter(
         return v8::Intercepted::kYes;
     }
 
+    if find_event_methods(clazz, &name).is_some() {
+        let handler = read_winrt_event(scope, dec.instance.as_ref(), &name);
+        rv.set(handler);
+        return v8::Intercepted::kYes;
+    }
+
     v8::Intercepted::kNo
 }
 
@@ -1142,6 +1219,11 @@ pub(crate) fn handle_instance_property_setter(
     }
 
     let Some(clazz) = lock.as_any().downcast_ref::<ClassDeclaration>() else {
+        if let Some((add_method, remove_method)) = find_interface_event_methods(&*lock, &name) {
+            let instance = dec.instance.clone();
+            drop(lock);
+            return wire_winrt_event(scope, &name, instance, &add_method, &remove_method, value);
+        }
         return v8::Intercepted::kNo;
     };
 
@@ -1175,64 +1257,7 @@ pub(crate) fn handle_instance_property_setter(
     if let Some((add_method, remove_method)) = find_event_methods(clazz, &name) {
         let instance = dec.instance.clone();
         drop(lock);
-
-        if let Some(&old_token) = dec.event_tokens.get(&name) {
-            if let Some(inst) = instance.clone() {
-                let mut mc =
-                    MethodCall::new(&remove_method, remove_method.is_sealed(), inst, false);
-                mc.call_with_event_token(old_token);
-            }
-            dec.event_tokens.remove(&name);
-        }
-
-        // Path A — `{ handle: External }` from a delegate constructor.
-        // Path B — plain JS function: auto-derive the delegate type and wrap it.
-        // Functions are objects too, so probe for a handle first and only then
-        // fall back to wrapping the value as a function.
-        let handle_ptr: Option<*mut c_void> = value.to_object(scope).and_then(|obj| {
-            let key = v8::String::new(scope, "handle")?;
-            let handle_val = obj.get(scope, key.into())?;
-            v8::Local::<v8::External>::try_from(handle_val)
-                .ok()
-                .map(|ext| ext.value())
-        });
-        let effective_ptr: Option<*mut c_void> = handle_ptr.or_else(|| {
-            let func = v8::Local::<v8::Function>::try_from(value).ok()?;
-            let (guid, param_types) = delegate_info_from_add_method(&add_method)?;
-            let data = Box::new(JsDelegateData {
-                js_func: v8::Global::new(scope, func),
-                param_types,
-            });
-            let delegate = Box::new(JsDelegate {
-                vtable: &JS_DELEGATE_VTBL as *const _,
-                ref_count: std::sync::atomic::AtomicU32::new(1),
-                guid,
-                data: Box::into_raw(data),
-            });
-            Some(Box::into_raw(delegate) as *mut c_void)
-        });
-
-        if let Some(delegate_ptr) = effective_ptr {
-            if let Some(inst) = instance {
-                let mut mc = MethodCall::new(&add_method, add_method.is_sealed(), inst, false);
-                let (ret, token) = mc.call_with_raw_ptr(delegate_ptr);
-                if ret.is_ok() {
-                    dec.event_tokens.insert(name, token);
-                } else {
-                    let detail = format!(
-                        "Event add '{}' failed: {} (0x{:08X})",
-                        name,
-                        ret.message(),
-                        ret.0 as u32
-                    );
-                    let message = v8::String::new(scope, &detail).unwrap();
-                    let error = v8::Exception::error(scope, message);
-                    scope.throw_exception(error);
-                }
-            }
-        }
-
-        return v8::Intercepted::kYes;
+        return wire_winrt_event(scope, &name, instance, &add_method, &remove_method, value);
     }
 
     // Not a class property or event: try mapping bracket-assignment
