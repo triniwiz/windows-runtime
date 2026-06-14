@@ -101,6 +101,11 @@ impl MetadataReader {
             return Some(Arc::new(RwLock::new(NamespaceDeclaration::new(""))));
         }
 
+    
+        if let Some(mapped) = projected_value_type_alias(full_name) {
+            return MetadataReader::find_by_name(mapped);
+        }
+
         // Closed generic instance (e.g. "IAsyncOperation`1<Windows.Foundation.Uri>").
         // Look up the open generic, then wrap it as a GenericInterfaceInstanceDeclaration
         // so that the correct parameterized COM IID is used for QueryInterface.
@@ -383,6 +388,21 @@ impl MetadataReader {
     }
 }
 
+fn projected_value_type_alias(full_name: &str) -> Option<&'static str> {
+    Some(match full_name {
+        "System.TimeSpan" => "Windows.Foundation.TimeSpan",
+        "System.DateTimeOffset" => "Windows.Foundation.DateTime",
+        "System.Numerics.Vector2" => "Windows.Foundation.Numerics.Vector2",
+        "System.Numerics.Vector3" => "Windows.Foundation.Numerics.Vector3",
+        "System.Numerics.Vector4" => "Windows.Foundation.Numerics.Vector4",
+        "System.Numerics.Matrix3x2" => "Windows.Foundation.Numerics.Matrix3x2",
+        "System.Numerics.Matrix4x4" => "Windows.Foundation.Numerics.Matrix4x4",
+        "System.Numerics.Quaternion" => "Windows.Foundation.Numerics.Quaternion",
+        "System.Numerics.Plane" => "Windows.Foundation.Numerics.Plane",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod sideload_tests {
     use super::*;
@@ -428,6 +448,38 @@ mod sideload_tests {
         assert!(!MetadataReader::sideloaded_namespace_exists(
             "Windows.Bogus"
         ));
+    }
+
+    #[test]
+    fn projected_value_type_alias_maps_known_and_skips_base_types() {
+        assert_eq!(
+            projected_value_type_alias("System.TimeSpan"),
+            Some("Windows.Foundation.TimeSpan")
+        );
+        assert_eq!(
+            projected_value_type_alias("System.DateTimeOffset"),
+            Some("Windows.Foundation.DateTime")
+        );
+        assert_eq!(
+            projected_value_type_alias("System.Numerics.Vector3"),
+            Some("Windows.Foundation.Numerics.Vector3")
+        );
+        // BCL base types must keep resolving as themselves, not be remapped.
+        assert_eq!(projected_value_type_alias("System.ValueType"), None);
+        assert_eq!(projected_value_type_alias("System.Enum"), None);
+        assert_eq!(projected_value_type_alias("Windows.Foundation.TimeSpan"), None);
+    }
+
+    #[test]
+    fn projected_value_type_resolves_to_winrt_struct() {
+        // The projected `System.TimeSpan` name (as WinUI's `Duration` struct encodes
+        // its field) must resolve to the real `Windows.Foundation.TimeSpan` struct so
+        // nested value-struct marshaling can recurse into it.
+        let decl = MetadataReader::find_by_name("System.TimeSpan")
+            .expect("System.TimeSpan resolves via projected alias");
+        let lock = decl.read();
+        assert_eq!(lock.kind(), DeclarationKind::Struct);
+        assert_eq!(lock.full_name(), "Windows.Foundation.TimeSpan");
     }
 }
 

@@ -20,7 +20,6 @@
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <Nullable>disable</Nullable>
-    <CsWinRTComponent>true</CsWinRTComponent>
     <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
     <!-- Parent of the project directory — contains the pre-built libs/ folder from the npm package -->
     <NSWindowsRoot>$(MSBuildProjectDirectory)\..</NSWindowsRoot>
