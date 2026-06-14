@@ -9,12 +9,18 @@ using Windows.Storage;
 
 namespace __PROJECT_NAME__
 {
-    sealed partial class App : Application
+    public interface INativeScriptApp
+    {
+        Microsoft.UI.Xaml.Window MainWindow { get; }
+        Microsoft.UI.Xaml.Window Window { get; }
+    }
+
+    sealed partial class App : Application, INativeScriptApp
     {
         private const string LastLaunchArgsKey = "LastLaunchArgs";
         private readonly RuntimeHost _runtimeHost = new RuntimeHost();
 
-        public static Window CurrentWindow { get; private set; }
+        internal static Window CurrentWindow { get; private set; }
         public Window MainWindow => CurrentWindow;
         public Window Window => CurrentWindow;
 

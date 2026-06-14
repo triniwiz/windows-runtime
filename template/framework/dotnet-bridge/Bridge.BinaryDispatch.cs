@@ -110,6 +110,13 @@ public static partial class Bridge
             return CreateJsSubclass(NullIfEmpty(assembly), typeName, callbackId);
         }
 
+        if (op == 0x0B) // get CLR-only property by raw IInspectable ptr (CLR reflection fallback)
+        {
+            var instancePtr = new IntPtr(r.ReadI64());
+            var propName    = r.ReadString16();
+            return ClrGetProperty(instancePtr, propName);
+        }
+
         // Static ops: 0x02 = call, 0x03 = constructor
         var typeNameS = r.ReadString16();
         var assemblyS = r.ReadString16();
@@ -306,6 +313,41 @@ public static partial class Bridge
         if (value.GetType() == targetType) return value;
         try { return Convert.ChangeType(value, targetType); }
         catch { return value; }
+    }
+
+    // CLR reflection fallback for properties that exist only in managed code and are
+    // therefore invisible to the WinRT metadata layer (e.g. App.MainWindow on a class
+    // that derives from Microsoft.UI.Xaml.Application but adds CLR-only members).
+    // Called by binary opcode 0x0B from the Rust runtime's property interceptor.
+    // Throws MissingMemberException when the property doesn't exist so the Rust side
+    // can distinguish "not found" (0xFF error → kNo) from "found but null" (0x00 → JS null).
+    private static DispatchResult ClrGetProperty(IntPtr instancePtr, string propName)
+    {
+        if (instancePtr == IntPtr.Zero)
+            throw new ArgumentException("Null instance pointer");
+
+        object? target;
+        // Prefer the existing managed wrapper (CCW/RCW identity) over creating a new RCW.
+        if (s_nativePtrsReverse.TryGetValue(instancePtr, out var ownerHandle)
+            && s_handles.TryGetValue(ownerHandle, out target))
+        { /* use cached */ }
+        else
+        {
+            try   { target = Marshal.GetObjectForIUnknown(instancePtr); }
+            catch (Exception e) { throw new InvalidOperationException($"GetObjectForIUnknown failed: {e.Message}"); }
+        }
+
+        if (target is null)
+            throw new InvalidOperationException("Instance resolved to null");
+
+        var type  = target.GetType();
+        var flags = BindingFlags.Public | BindingFlags.Instance;
+        var prop  = GetCachedProp(type, propName, 0, flags);
+
+        if (prop is null)
+            throw new MissingMemberException($"CLR property '{propName}' not found on {type.FullName}");
+
+        return Box(prop.GetValue(target));
     }
 
     private static string? NullIfEmpty(string s) => s.Length == 0 ? null : s;

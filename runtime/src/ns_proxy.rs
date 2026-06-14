@@ -917,6 +917,111 @@ fn instance_method_dispatch(
     }
 }
 
+/// Tries to find a property by looking up the instance's WinRT runtime class name in the
+/// sideloaded WinMDs rather than the static (projected) type. Called when the static type
+/// lookup misses — e.g. `Microsoft.UI.Xaml.Application` doesn't expose `MainWindow`, but
+/// a sideloaded `App.winmd` describes the concrete `nativescriptwindowspokedex.App` class
+/// which does. Returns `None` when the runtime class equals the static type (already
+/// searched), when no sideloaded WinMD describes it, or when the property isn't there.
+fn find_runtime_class_property(
+    instance: &impl Interface,
+    prop_name: &str,
+    static_type_name: &str,
+) -> Option<PropertyDeclaration> {
+    let runtime_name = instance
+        .cast::<IInspectable>()
+        .ok()?
+        .GetRuntimeClassName()
+        .ok()
+        .map(|s| s.to_string())?;
+
+    if runtime_name.is_empty() || runtime_name == static_type_name {
+        return None;
+    }
+
+    let decl = MetadataReader::find_by_name(&runtime_name)?;
+    let lock = decl.read();
+    let runtime_clazz = lock.as_any().downcast_ref::<ClassDeclaration>()?;
+    find_class_property(runtime_clazz, prop_name)
+}
+
+/// Sends opcode 0x0B to the dotnet bridge and converts the binary response to a V8 value.
+/// Returns None when the bridge signals "property not found" (0xFF error response) so the
+/// caller can fall through to `v8::Intercepted::kNo`.
+fn try_clr_property_get<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    instance_raw: *mut std::ffi::c_void,
+    prop_name: &str,
+) -> Option<Local<'s, v8::Value>> {
+    let ptr_i64 = instance_raw as i64;
+    if ptr_i64 == 0 {
+        return None;
+    }
+    let name_bytes = prop_name.as_bytes();
+    // Request: [0x0B][ptr i64 LE][name-len u16 LE][name UTF-8]
+    let mut req = Vec::with_capacity(11 + name_bytes.len());
+    req.push(0x0Bu8);
+    req.extend_from_slice(&ptr_i64.to_le_bytes());
+    req.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+    req.extend_from_slice(name_bytes);
+
+    let resp = crate::dotnet::call_dotnet_binary(&req).ok()?;
+    parse_clr_bin_response(scope, &resp)
+}
+
+/// Parses the binary response from opcode 0x0B into a V8 value.
+/// Returns None for error (0xFF) or unrecognised tags so the caller returns kNo.
+/// Returns Some(v8::null) for a legitimate null property value (0x00).
+fn parse_clr_bin_response<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    resp: &[u8],
+) -> Option<Local<'s, v8::Value>> {
+    let tag = *resp.first()?;
+    match tag {
+        0x00 => Some(v8::null(scope).into()),
+        0x01 => Some(v8::Boolean::new(scope, false).into()),
+        0x02 => Some(v8::Boolean::new(scope, true).into()),
+        0x03 => {
+            if resp.len() < 5 { return None; }
+            let v = i32::from_le_bytes(resp[1..5].try_into().ok()?);
+            Some(v8::Integer::new(scope, v).into())
+        }
+        0x04 => {
+            if resp.len() < 9 { return None; }
+            let v = f64::from_le_bytes(resp[1..9].try_into().ok()?);
+            Some(v8::Number::new(scope, v).into())
+        }
+        0x05 => {
+            if resp.len() < 5 { return None; }
+            let slen = u32::from_le_bytes(resp[1..5].try_into().ok()?) as usize;
+            if resp.len() < 5 + slen { return None; }
+            let s = std::str::from_utf8(&resp[5..5 + slen]).ok()?;
+            Some(v8::String::new(scope, s)?.into())
+        }
+        // 0x06 Handle: [i32 handle][u16 type-name-len][type-name][u8 has_ptr][i64 ptr?]
+        // Box() always calls ObtainNativePtr for WinRT objects, so the native ptr is present.
+        // Use it directly to create a JS proxy; the handle keeps the managed object alive.
+        0x06 => {
+            if resp.len() < 7 { return None; }
+            let name_len = u16::from_le_bytes([resp[5], resp[6]]) as usize;
+            let after = 7 + name_len;
+            if resp.len() <= after { return None; }
+            if resp[after] == 1 && resp.len() >= after + 9 {
+                let ptr = i64::from_le_bytes(resp[after + 1..after + 9].try_into().ok()?);
+                if ptr != 0 {
+                    return try_wrap_inspectable_pointer(
+                        ptr as *mut std::ffi::c_void,
+                        scope,
+                    );
+                }
+            }
+            None
+        }
+        0xFF => None, // error / property not found
+        _ => None,
+    }
+}
+
 pub(crate) fn handle_instance_property_getter(
     scope: &mut v8::PinScope<'_, '_>,
     key: Local<v8::Name>,
@@ -956,7 +1061,16 @@ pub(crate) fn handle_instance_property_getter(
         return v8::Intercepted::kNo;
     };
 
-    if let Some(property) = find_class_property(clazz, &name) {
+    // Primary lookup: static WinRT type from bundled WinMD.
+    // Fallback: sideloaded WinMD keyed by the instance's IInspectable runtime class name.
+    // Both paths produce a PropertyDeclaration so the single invocation block below handles both.
+    let found_property = find_class_property(clazz, &name).or_else(|| {
+        dec.instance
+            .as_ref()
+            .and_then(|inst| find_runtime_class_property(inst, &name, clazz.full_name()))
+    });
+
+    if let Some(property) = found_property {
         // Static properties (e.g. UIElement.PointerPressedEvent) must be called via
         // the declaring class's activation factory, not the instance pointer.
         let instance_for_call = if property.is_static() {
@@ -1109,6 +1223,18 @@ pub(crate) fn handle_instance_property_getter(
         let handler = read_winrt_event(scope, dec.instance.as_ref(), &name);
         rv.set(handler);
         return v8::Intercepted::kYes;
+    }
+
+    // CLR reflection fallback: the property isn't in WinRT metadata but may exist as a
+    // CLR-only member on a managed subclass (e.g. App.MainWindow on a class that derives
+    // from Microsoft.UI.Xaml.Application). Ask the dotnet bridge to reflect on the actual
+    // runtime type via opcode 0x0B. Only attempted when an instance pointer is available.
+    if let Some(instance) = &dec.instance {
+        let raw_ptr = unsafe { instance.as_raw() };
+        if let Some(val) = try_clr_property_get(scope, raw_ptr, &name) {
+            rv.set(val);
+            return v8::Intercepted::kYes;
+        }
     }
 
     v8::Intercepted::kNo
