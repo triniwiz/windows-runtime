@@ -8183,6 +8183,9 @@ mod color_test;
 mod error_handling_test;
 
 #[cfg(test)]
+mod module_load_test;
+
+#[cfg(test)]
 mod instance_cache_test;
 
 #[cfg(test)]

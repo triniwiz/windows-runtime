@@ -653,10 +653,23 @@ pub(crate) fn handle_read_text_file(
         throw_js_error(scope, "__nsReadTextFile(path) expects 1 argument");
         return;
     }
-    let Some(path) = value_to_string(scope, args.get(0)) else {
+    // Reject null/undefined explicitly. value_to_string would otherwise coerce them
+    // to the literal strings "null"/"undefined", leading to a confusing "file not
+    // found" deeper in the call. A bad module path (e.g. loadModule(null)) must throw
+    // a clear JS error here rather than panic the runtime.
+    let path_arg = args.get(0);
+    if path_arg.is_null_or_undefined() {
+        throw_js_error(scope, "__nsReadTextFile: path is null or undefined");
+        return;
+    }
+    let Some(path) = value_to_string(scope, path_arg) else {
         throw_js_error(scope, "Unable to convert path argument to string");
         return;
     };
+    if path.is_empty() {
+        throw_js_error(scope, "__nsReadTextFile: path is empty");
+        return;
+    }
     match fs::read_to_string(Path::new(path.as_str())) {
         Ok(content) => {
             if let Some(value) = v8::String::new(scope, content.as_str()) {
@@ -779,10 +792,27 @@ pub(crate) fn handle_resolve_module_path(
         );
         return;
     }
-    let Some(specifier) = value_to_string(scope, args.get(0)) else {
+    // Reject null/undefined explicitly so a bad `loadModule(null)` surfaces as a clean
+    // JS error instead of being coerced to the literal string "null" and then failing
+    // deeper in the resolver. The module resolver returns null when it can't find a
+    // registered module matching a path (e.g. an unregistered CSS file); passing that
+    // null through must throw, never panic the runtime.
+    let specifier_arg = args.get(0);
+    if specifier_arg.is_null_or_undefined() {
+        throw_js_error(
+            scope,
+            "__nsResolveModulePath: module specifier is null or undefined",
+        );
+        return;
+    }
+    let Some(specifier) = value_to_string(scope, specifier_arg) else {
         throw_js_error(scope, "Unable to convert module specifier to string");
         return;
     };
+    if specifier.is_empty() {
+        throw_js_error(scope, "__nsResolveModulePath: module specifier is empty");
+        return;
+    }
     let parent_path = if args.length() >= 2 {
         value_to_string(scope, args.get(1))
     } else {
@@ -3285,6 +3315,13 @@ const HELPER_SOURCE: &str = r#"
             var cjsCache = new Map();
 
             function resolveSpecifier(specifier, callerFile) {
+                // Guard non-string / empty specifiers (e.g. loadModule(null) when the
+                // module resolver can't find a registered module for a path). Throw a
+                // clear error instead of letting `specifier.charAt(0)` raise a cryptic
+                // TypeError or reaching native code with a coerced "null".
+                if (typeof specifier !== 'string' || specifier.length === 0) {
+                    throw new Error('Cannot find module: ' + String(specifier));
+                }
                 if (typeof globalThis.__nsResolveModulePath !== 'function') return null;
                 var appRoot = (globalThis.__nsAppRoot || '').replace(/[\\/]+$/, '');
 
