@@ -54,6 +54,8 @@ use windows::Win32::UI::Shell::IInitializeWithWindow;
 // template/property mutations that can corrupt V8 descriptor arrays.
 thread_local!(static CREATING_CTORS: RefCell<Vec<String>> = RefCell::new(Vec::new()));
 
+thread_local!(static SHARED_METHOD_FNS: RefCell<ahash::AHashMap<String, v8::Global<v8::Function>>> = RefCell::new(ahash::AHashMap::new()));
+
 /// Per-isolate cache of instance wrapper templates, keyed by resolved runtime
 /// class name. Stored in an isolate slot so the `v8::Global`s die with their
 /// isolate instead of dangling in a thread_local.
@@ -806,13 +808,20 @@ fn instance_method_dispatch(
     let dec = dec.value() as *mut DeclarationFFI;
     let dec = unsafe { &*dec };
     let lock = dec.read();
-    let method = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
-    let mut method = MethodCall::new(
-        method,
-        method.is_sealed(),
-        dec.instance.clone().unwrap(),
-        false,
-    );
+    let method_decl = lock.as_any().downcast_ref::<MethodDeclaration>().unwrap();
+    let instance = match this_instance(scope, args.this()) {
+        Some(i) => i,
+        None => match dec.instance.clone() {
+            Some(i) => i,
+            None => {
+                let msg = v8::String::new(scope, "NativeScript: method invoked with no native instance").unwrap();
+                let err = v8::Exception::error(scope, msg);
+                scope.throw_exception(err);
+                return;
+            }
+        },
+    };
+    let mut method = MethodCall::new(method_decl, method_decl.is_sealed(), instance, false);
     let (ret, result, _outs) = method.call(scope, &args);
 
     if ret.is_err() {
@@ -1184,38 +1193,29 @@ pub(crate) fn handle_instance_property_getter(
     }
 
     if let Some(method) = find_class_method(clazz, &name) {
-        let cache_key = format!("__nswinrt_method_cache__{}", name);
-        let cache_key = v8::String::new(scope, &cache_key).unwrap();
-        let method_cache = args
-            .holder()
-            .get_internal_field(scope, 1)
-            .map(|store_field| unsafe { store_field.cast::<v8::Map>() });
-
-        if let Some(store) = method_cache {
-            if let Some(cached) = store.get(scope, cache_key.into()) {
-                if !cached.is_null_or_undefined() {
-                    rv.set(cached);
-                    return v8::Intercepted::kYes;
-                }
-            }
+        let key = format!("{}::{}", clazz.full_name(), name);
+        if let Some(func) =
+            SHARED_METHOD_FNS.with(|c| c.borrow().get(&key).map(|g| v8::Local::new(scope, g)))
+        {
+            rv.set(func.into());
+            return v8::Intercepted::kYes;
         }
 
         let method_dec = Arc::new(RwLock::new(method.clone()));
-        let method_ffi = DeclarationFFI::new_with_instance(method_dec, dec.instance.clone());
+        let method_ffi = DeclarationFFI::new_with_instance(method_dec, None);
         let method_ffi = Box::into_raw(Box::new(method_ffi));
         let ext = v8::External::new(scope, method_ffi as _);
 
-        let builder = v8::Function::builder(instance_method_dispatch)
+        let function = v8::Function::builder(instance_method_dispatch)
             .data(ext.into())
             .build(scope)
             .unwrap();
 
-        let function: Local<v8::Value> = builder.into();
-        if let Some(store) = method_cache {
-            store.set(scope, cache_key.into(), function);
-        }
+        SHARED_METHOD_FNS.with(|c| {
+            c.borrow_mut().insert(key, v8::Global::new(scope, function));
+        });
 
-        rv.set(function);
+        rv.set(function.into());
         return v8::Intercepted::kYes;
     }
 
