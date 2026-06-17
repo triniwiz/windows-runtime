@@ -295,6 +295,81 @@ pub(crate) fn make_index_vector(count: u32) -> Result<IInspectable> {
     Ok(vector.cast()?)
 }
 
+/// Append boxed Int32 indices to an existing index vector until it reaches `new_count`, so a XAML
+/// ItemsSource grows in place. Each Append fires VectorChanged(ItemInserted) → WinUI realizes just the
+/// new rows (preserving scroll + already-realized cells) instead of re-binding the whole list.
+pub(crate) fn extend_index_vector(inspectable: &IInspectable, new_count: u32) -> Result<()> {
+    let vec: IVector<IInspectable> = inspectable.cast()?;
+    let mut size = vec.Size()?;
+    while size < new_count {
+        vec.Append(&PropertyValue::CreateInt32(size as i32)?)?;
+        size += 1;
+    }
+    Ok(())
+}
+
+/// Insert `count` placeholder entries at `index` (each fires VectorChanged(ItemInserted)), so a XAML
+/// ItemsSource gains rows at an arbitrary position — preserving scroll + already-realized cells,
+/// instead of replacing the whole source. The boxed values are positional placeholders only:
+/// ListView reads its row data by container index, never by the stored value (which is why an
+/// insert/remove doesn't need to renumber the trailing entries). Used for ObservableArray
+/// add/unshift/splice. Bounds: `index <= size`.
+pub(crate) fn insert_index_vector(inspectable: &IInspectable, index: u32, count: u32) -> Result<()> {
+    let vec: IVector<IInspectable> = inspectable.cast()?;
+    for k in 0..count {
+        let at = index + k;
+        vec.InsertAt(at, &PropertyValue::CreateInt32(at as i32)?)?;
+    }
+    Ok(())
+}
+
+/// Remove `count` entries starting at `index` (each fires VectorChanged(ItemRemoved) at `index`,
+/// since the following entries shift down to `index` after each removal). Used for ObservableArray
+/// delete/pop/splice. Stops early if the vector runs out.
+pub(crate) fn remove_index_vector(inspectable: &IInspectable, index: u32, count: u32) -> Result<()> {
+    let vec: IVector<IInspectable> = inspectable.cast()?;
+    for _ in 0..count {
+        if index >= vec.Size()? {
+            break;
+        }
+        vec.RemoveAt(index)?;
+    }
+    Ok(())
+}
+
+/// Rebuild the vector to `new_count` placeholder entries and fire a SINGLE VectorChanged(Reset).
+/// WinRT has no range event (IVectorChangedEventArgs is per-item or whole-collection Reset), so a
+/// BULK change — a wholesale replace, a large splice, a filter swap — is best expressed as one Reset
+/// rather than N per-item events (which are O(n²) for front/middle removes and flood WinUI). On a
+/// virtualized ListView a Reset re-realizes only the visible containers (off-screen rows rebind
+/// lazily), and it keeps the SAME ItemsSource instance — the closest WinRT analog to an iOS/Android
+/// range reload.
+pub(crate) fn reset_index_vector(inspectable: &IInspectable, new_count: u32) -> Result<()> {
+    let vec: IVector<IInspectable> = inspectable.cast()?;
+    let mut values: Vec<Option<IInspectable>> = Vec::with_capacity(new_count as usize);
+    for i in 0..new_count {
+        values.push(Some(PropertyValue::CreateInt32(i as i32)?));
+    }
+    vec.ReplaceAll(&values)?; // clears + repopulates + fires exactly one VectorChanged(Reset)
+    Ok(())
+}
+
+/// Fire VectorChanged(ItemChanged) for `count` entries starting at `index` (via SetAt with a fresh
+/// boxed value) so WinUI re-realizes just those containers without changing the count — used for
+/// ObservableArray setItem/update. Clamps to the current size.
+pub(crate) fn update_index_vector(inspectable: &IInspectable, index: u32, count: u32) -> Result<()> {
+    let vec: IVector<IInspectable> = inspectable.cast()?;
+    let size = vec.Size()?;
+    for k in 0..count {
+        let at = index + k;
+        if at >= size {
+            break;
+        }
+        vec.SetAt(at, &PropertyValue::CreateInt32(at as i32)?)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

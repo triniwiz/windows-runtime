@@ -3252,6 +3252,33 @@ const HELPER_SOURCE: &str = r#"
                     return globalThis.__nsMakeItemsSource(count >>> 0);
                 return null;
             };
+            // Grow a source built by makeItemsSource to `newCount` items in place (fires VectorChanged
+            // so WinUI adds only the new rows — preserves scroll). Used by ListView infinite-scroll.
+            globalThis.NSWinRT.extendItemsSource = function(source, newCount) {
+                if (source && typeof globalThis.__nsExtendItemsSource === 'function')
+                    globalThis.__nsExtendItemsSource(source, newCount >>> 0);
+            };
+            // Granular in-place edits of a makeItemsSource source (fire VectorChanged so WinUI updates
+            // only the affected rows — no full re-realize). Used by ListView for ObservableArray
+            // add/delete/update/splice instead of refresh(). index/count are clamped to uint32.
+            globalThis.NSWinRT.insertItemsSource = function(source, index, count) {
+                if (source && typeof globalThis.__nsInsertItemsSource === 'function')
+                    globalThis.__nsInsertItemsSource(source, index >>> 0, count >>> 0);
+            };
+            globalThis.NSWinRT.removeItemsSource = function(source, index, count) {
+                if (source && typeof globalThis.__nsRemoveItemsSource === 'function')
+                    globalThis.__nsRemoveItemsSource(source, index >>> 0, count >>> 0);
+            };
+            globalThis.NSWinRT.updateItemsSource = function(source, index, count) {
+                if (source && typeof globalThis.__nsUpdateItemsSource === 'function')
+                    globalThis.__nsUpdateItemsSource(source, index >>> 0, count >>> 0);
+            };
+            // Bulk change → rebuild to `count` rows + fire ONE VectorChanged(Reset). WinRT has no range
+            // event, so this is the single-event way to apply a wholesale replace / large splice.
+            globalThis.NSWinRT.resetItemsSource = function(source, count) {
+                if (source && typeof globalThis.__nsResetItemsSource === 'function')
+                    globalThis.__nsResetItemsSource(source, count >>> 0);
+            };
         })();
 
         (function () {
@@ -4571,6 +4598,11 @@ pub(crate) fn init_async_helpers(
     register!("__nsLiveSyncCopyFile", handle_livesync_copy_file);
     register!("__nsAsDelegate", crate::handle_as_delegate);
     register!("__nsMakeItemsSource", crate::handle_make_items_source);
+    register!("__nsExtendItemsSource", crate::handle_extend_items_source);
+    register!("__nsInsertItemsSource", crate::handle_insert_items_source);
+    register!("__nsRemoveItemsSource", crate::handle_remove_items_source);
+    register!("__nsUpdateItemsSource", crate::handle_update_items_source);
+    register!("__nsResetItemsSource", crate::handle_reset_items_source);
     register!("__nsDotNetInvoke", handle_dotnet_invoke);
     register!("__nsDotNetInvokeBin", handle_dotnet_invoke_binary);
     register!("__nsDotNetCreateDelegate", handle_dotnet_create_delegate);
