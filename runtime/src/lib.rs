@@ -1210,6 +1210,25 @@ pub fn set_log_dir(dir: String) {
     let _ = LOG_DIR.set(dir);
 }
 
+/// Disk path for a chunk's V8 bytecode cache, keyed by filename + a hash of the source. A livesync
+/// edit changes the source → different hash → cache miss → recompile (never stale bytecode). Lives
+/// under the app's writable local folder (LOG_DIR). Returns None before that folder is known.
+fn code_cache_path(filename: &str, script: &str) -> Option<std::path::PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let dir = LOG_DIR.get()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    script.hash(&mut hasher);
+    let base = std::path::Path::new(filename)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("chunk");
+    Some(
+        std::path::Path::new(dir)
+            .join("v8-codecache")
+            .join(format!("{base}.{:016x}.jsc", hasher.finish())),
+    )
+}
+
 /// Enable or disable logging to console at runtime. Default is `true`.
 pub fn set_log_to_console(enabled: bool) {
     LOG_TO_CONSOLE
@@ -7122,6 +7141,13 @@ fn js_delegate_run(
                     // receives a fully typed proxy (with property/method access)
                     // rather than an opaque plain object.
                     let proxy = (|| -> Option<v8::Local<v8::Value>> {
+                        if let Some(key) = com_identity(&owned) {
+                            let hit = INSTANCE_CACHE
+                                .with(|cache| cache.borrow().get(&key).and_then(|w| w.to_local(tc)));
+                            if let Some(local) = hit {
+                                return Some(local.into());
+                            }
+                        }
                         let inspectable = owned.cast::<IInspectable>().ok()?;
                         let class_name = inspectable.GetRuntimeClassName().ok()?;
                         let name_str = class_name.to_string();
@@ -7367,6 +7393,131 @@ pub(crate) fn handle_make_items_source(
             );
         }
     }
+}
+
+/// __nsExtendItemsSource({ handle }, newCount) — grow an existing items source (from
+/// __nsMakeItemsSource) in place to `newCount` items, firing VectorChanged so WinUI adds only the new
+/// rows (preserves scroll position + already-realized cells). Used by the ListView for infinite-scroll
+/// append instead of replacing the whole ItemsSource.
+pub(crate) fn handle_extend_items_source(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    _retval: v8::ReturnValue,
+) {
+    let Some(obj) = args.get(0).to_object(scope) else {
+        return;
+    };
+    let Some(key) = v8::String::new(scope, "handle") else {
+        return;
+    };
+    let Some(handle_val) = obj.get(scope, key.into()) else {
+        return;
+    };
+    if !handle_val.is_external() {
+        return;
+    }
+    let ext = unsafe { handle_val.cast::<v8::External>() };
+    let raw = ext.value() as *mut c_void;
+    if raw.is_null() {
+        return;
+    }
+    let new_count = if args.length() >= 2 {
+        args.get(1).integer_value(scope).unwrap_or(0).max(0) as u32
+    } else {
+        0
+    };
+    // Borrow the IInspectable the External owns without releasing it (the External keeps ownership).
+    let inspectable =
+        std::mem::ManuallyDrop::new(unsafe { windows_core::IInspectable::from_raw(raw) });
+    let _ = crate::js_observable_vector::extend_index_vector(&inspectable, new_count);
+}
+
+/// Borrow (without releasing) the IInspectable that __nsMakeItemsSource's `{ handle }` External owns.
+/// Returns None when the handle arg is missing/non-external/null. The External keeps ownership, so the
+/// returned value is wrapped in ManuallyDrop and must not be dropped by the caller.
+fn items_source_handle(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments,
+) -> Option<std::mem::ManuallyDrop<windows_core::IInspectable>> {
+    let obj = args.get(0).to_object(scope)?;
+    let key = v8::String::new(scope, "handle")?;
+    let handle_val = obj.get(scope, key.into())?;
+    if !handle_val.is_external() {
+        return None;
+    }
+    let ext = unsafe { handle_val.cast::<v8::External>() };
+    let raw = ext.value() as *mut c_void;
+    if raw.is_null() {
+        return None;
+    }
+    Some(std::mem::ManuallyDrop::new(unsafe {
+        windows_core::IInspectable::from_raw(raw)
+    }))
+}
+
+/// __nsInsertItemsSource({ handle }, index, count) — insert `count` rows at `index` into an items
+/// source (from __nsMakeItemsSource), firing VectorChanged(ItemInserted) so WinUI adds only the new
+/// rows. Used by the ListView for granular ObservableArray add/splice without a full rebuild.
+pub(crate) fn handle_insert_items_source(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    _retval: v8::ReturnValue,
+) {
+    let Some(inspectable) = items_source_handle(scope, &args) else {
+        return;
+    };
+    let index = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u32;
+    let count = args.get(2).integer_value(scope).unwrap_or(0).max(0) as u32;
+    let _ = crate::js_observable_vector::insert_index_vector(&inspectable, index, count);
+}
+
+/// __nsRemoveItemsSource({ handle }, index, count) — remove `count` rows at `index`, firing
+/// VectorChanged(ItemRemoved) so WinUI drops only those rows. Granular ObservableArray delete/splice.
+pub(crate) fn handle_remove_items_source(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    _retval: v8::ReturnValue,
+) {
+    let Some(inspectable) = items_source_handle(scope, &args) else {
+        return;
+    };
+    let index = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u32;
+    let count = args.get(2).integer_value(scope).unwrap_or(0).max(0) as u32;
+    let _ = crate::js_observable_vector::remove_index_vector(&inspectable, index, count);
+}
+
+/// __nsResetItemsSource({ handle }, newCount) — rebuild the items source to `newCount` rows and fire a
+/// SINGLE VectorChanged(Reset). WinRT has no range event, so this is the one-event way to apply a bulk
+/// change (wholesale replace / large splice / filter); WinUI re-realizes only the visible containers.
+pub(crate) fn handle_reset_items_source(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    _retval: v8::ReturnValue,
+) {
+    let Some(inspectable) = items_source_handle(scope, &args) else {
+        return;
+    };
+    let new_count = if args.length() >= 2 {
+        args.get(1).integer_value(scope).unwrap_or(0).max(0) as u32
+    } else {
+        0
+    };
+    let _ = crate::js_observable_vector::reset_index_vector(&inspectable, new_count);
+}
+
+/// __nsUpdateItemsSource({ handle }, index, count) — fire VectorChanged(ItemChanged) for `count` rows
+/// at `index` (count unchanged) so WinUI re-realizes just those containers. Granular setItem/update.
+pub(crate) fn handle_update_items_source(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    _retval: v8::ReturnValue,
+) {
+    let Some(inspectable) = items_source_handle(scope, &args) else {
+        return;
+    };
+    let index = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u32;
+    let count = args.get(2).integer_value(scope).unwrap_or(0).max(0) as u32;
+    let _ = crate::js_observable_vector::update_index_vector(&inspectable, index, count);
 }
 
 impl Runtime {
@@ -7696,7 +7847,50 @@ impl Runtime {
                 None,
             )
         });
-        if let Some(compiled) = v8::Script::compile(tc, code, origin.as_ref()) {
+        // Bytecode-cache large chunks (vendor.js/bundle.js) so subsequent cold starts skip the
+        // parse+compile of multi-MB sources. Small scripts skip it (caching overhead > benefit). The
+        // cache is keyed by content hash, so a livesync edit simply misses and recompiles.
+        let cache_path = if script.len() >= 65536 {
+            code_cache_path(filename, script)
+        } else {
+            None
+        };
+        let cached_bytes = cache_path.as_ref().and_then(|p| std::fs::read(p).ok());
+
+        let mut consumed_from_cache = false;
+        let compiled = if let Some(bytes) = cached_bytes {
+            consumed_from_cache = true;
+            let cached = v8::script_compiler::CachedData::new(&bytes);
+            let mut source =
+                v8::script_compiler::Source::new_with_cached_data(code, origin.as_ref(), cached);
+            v8::script_compiler::compile(
+                tc,
+                &mut source,
+                v8::script_compiler::CompileOptions::ConsumeCodeCache,
+                v8::script_compiler::NoCacheReason::NoReason,
+            )
+        } else {
+            let mut source = v8::script_compiler::Source::new(code, origin.as_ref());
+            v8::script_compiler::compile(
+                tc,
+                &mut source,
+                v8::script_compiler::CompileOptions::NoCompileOptions,
+                v8::script_compiler::NoCacheReason::NoReason,
+            )
+        };
+
+        if let Some(compiled) = compiled {
+            // First compile of this content: produce + persist the bytecode for the next launch.
+            if !consumed_from_cache {
+                if let Some(path) = cache_path.as_ref() {
+                    if let Some(cached) = compiled.get_unbound_script(tc).create_code_cache() {
+                        if let Some(parent) = path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = std::fs::write(path, &**cached);
+                    }
+                }
+            }
             compiled.run(tc);
         }
 
