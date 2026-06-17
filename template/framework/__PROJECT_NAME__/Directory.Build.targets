@@ -46,9 +46,16 @@
   <Target Name="ApplyManifestOverrides" BeforeTargets="BeforeBuild" Condition="Exists('$(MSBuildProjectDirectory)\Package.appxmanifest')">
     <Message Text="Applying manifest overrides (VisualElements, logos, splash) via XmlPoke..." Importance="High" />
 
-    <!-- DisplayName -->
+    <!-- DisplayName (app tile / taskbar / Start / alt-tab) -->
     <XmlPoke XmlInputPath="$(MSBuildProjectDirectory)\Package.appxmanifest"
              Query="/*[local-name()='Package']/*[local-name()='Applications']/*[local-name()='Application']/*[local-name()='VisualElements']/@DisplayName"
+             Value="$(AppDisplayName)"
+             Condition="'$(AppDisplayName)' != ''" />
+
+    <!-- Package DisplayName (Properties) — keep it in sync with the app name instead of leaving the
+         raw project name. The XmlPoke above only touches the per-app VisualElements name. -->
+    <XmlPoke XmlInputPath="$(MSBuildProjectDirectory)\Package.appxmanifest"
+             Query="/*[local-name()='Package']/*[local-name()='Properties']/*[local-name()='DisplayName']"
              Value="$(AppDisplayName)"
              Condition="'$(AppDisplayName)' != ''" />
 
