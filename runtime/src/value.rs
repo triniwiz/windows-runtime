@@ -355,6 +355,32 @@ impl NativeValue {
 // accessed concurrently.
 unsafe impl Send for NativeValue {}
 
+/// Marshal a V8 string to an HSTRING by copying UTF-16 code units straight across, skipping the
+/// UTF-16→UTF-8→UTF-16 double transcode (and the intermediate Rust String allocation) that
+/// `to_rust_string_lossy()` + `HSTRING::from()` incur. V8 strings and HSTRING are both UTF-16, so
+/// `write_v2` fills a u16 buffer and `HSTRING::from_wide` copies it in — one transcode-free copy each
+/// way.
+#[inline]
+fn hstring_from_v8_string(scope: &mut v8::PinScope<'_, '_>, s: v8::Local<v8::String>) -> HSTRING {
+    let len = s.length();
+    if len == 0 {
+        return HSTRING::new();
+    }
+    let mut buf: Vec<u16> = vec![0u16; len];
+    s.write_v2(scope, 0, &mut buf, v8::WriteFlags::empty());
+    HSTRING::from_wide(&buf)
+}
+
+/// As `hstring_from_v8_string`, but coerces a non-string JS value via ToString first (matching
+/// `Value::to_rust_string_lossy`'s behavior). Empty HSTRING if coercion fails.
+#[inline]
+fn hstring_from_v8_value(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> HSTRING {
+    match value.to_string(scope) {
+        Some(s) => hstring_from_v8_string(scope, s),
+        None => HSTRING::new(),
+    }
+}
+
 #[inline]
 pub fn ffi_parse_string_arg(
     scope: &mut v8::PinScope<'_, '_>,
@@ -383,9 +409,8 @@ pub fn ffi_parse_string_arg(
     let string_value = v8::Local::<v8::String>::try_from(arg)
         .map_err(|_| type_error("Invalid FFI String type, expected String"))?;
 
-    let string = string_value.to_rust_string_lossy(scope);
     Ok(NativeValue {
-        string: ManuallyDrop::new(HSTRING::from(string)),
+        string: ManuallyDrop::new(hstring_from_v8_string(scope, string_value)),
     })
 }
 
@@ -952,8 +977,7 @@ pub fn box_as_typed_value(
             box_insp!(PropertyValue::CreateBoolean(b))
         }
         "String" => {
-            let s = arg.to_rust_string_lossy(scope);
-            let hs = windows::core::HSTRING::from(s.as_str());
+            let hs = hstring_from_v8_value(scope, arg);
             box_insp!(PropertyValue::CreateString(&hs))
         }
         // TimeSpan: accept a number of milliseconds; struct { Duration } (100ns ticks) is also
@@ -1050,8 +1074,7 @@ pub fn ffi_parse_pointer_arg(
     // Box primitive JS values as WinRT IPropertyValue (IInspectable) so they can be
     // passed to Object-typed parameters like Header, Content, or IVector<Object>.Append.
     if arg.is_string() {
-        let s = arg.to_rust_string_lossy(scope);
-        let hstring = HSTRING::from(s.as_str());
+        let hstring = hstring_from_v8_value(scope, arg);
         if let Ok(inspectable) = PropertyValue::CreateString(&hstring) {
             let ptr = inspectable.as_raw() as *mut c_void;
             // WinRT callees AddRef when storing; our reference is intentionally leaked
@@ -1704,8 +1727,7 @@ pub fn write_v8_value_to_ptr(
             // Fallback: convert JS string -> HSTRING and store raw handle (transfer ownership)
             let s = v8::Local::<v8::String>::try_from(arg)
                 .map_err(|_| type_error("Invalid FFI String type, expected String"))?;
-            let rust = s.to_rust_string_lossy(scope);
-            let h: HSTRING = HSTRING::from(rust.as_str());
+            let h: HSTRING = hstring_from_v8_string(scope, s);
             let raw_usize: usize = unsafe { std::mem::transmute(h) };
             unsafe {
                 write_unaligned(dst as *mut usize, raw_usize);
