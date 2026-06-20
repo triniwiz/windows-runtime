@@ -453,6 +453,63 @@ fn typed_array_to_windows_buffer_exposes_length() {
 }
 
 #[test]
+fn windows_buffer_to_array_buffer_zero_copy_read() {
+    run_js_assert(
+        "windows_buffer_to_array_buffer_zero_copy_read",
+        r#"
+            const cb = Windows.Security.Cryptography.CryptographicBuffer;
+            const input = new Uint8Array([1, 2, 3, 254]);
+            const winBuf = cb.CreateFromByteArray(input);
+
+            const ab = interop.arrayBufferFromBuffer(winBuf);
+            if (!(ab instanceof ArrayBuffer)) {
+                throw new Error(`Expected ArrayBuffer, got ${Object.prototype.toString.call(ab)}`);
+            }
+            if (ab.byteLength !== 4) {
+                throw new Error(`Expected byteLength=4, got ${ab.byteLength}`);
+            }
+
+            const view = new Uint8Array(ab);
+            const expected = [1, 2, 3, 254];
+            for (let i = 0; i < expected.length; i++) {
+                if (view[i] !== expected[i]) {
+                    throw new Error(`Mismatch at ${i}: got ${view[i]}, expected ${expected[i]}`);
+                }
+            }
+        "#,
+    );
+}
+
+#[test]
+fn windows_buffer_to_array_buffer_writes_through() {
+    run_js_assert(
+        "windows_buffer_to_array_buffer_writes_through",
+        r#"
+            const cb = Windows.Security.Cryptography.CryptographicBuffer;
+            const input = new Uint8Array([0, 0, 0, 0]);
+            const winBuf = cb.CreateFromByteArray(input);
+
+            // Mutate through the zero-copy view, then read the bytes back out of the
+            // WinRT buffer via DataReader to prove the write aliased native storage.
+            const view = new Uint8Array(interop.arrayBufferFromBuffer(winBuf));
+            view[0] = 10;
+            view[1] = 20;
+            view[2] = 30;
+            view[3] = 40;
+
+            const reader = Windows.Storage.Streams.DataReader.FromBuffer(winBuf);
+            const got = [reader.ReadByte(), reader.ReadByte(), reader.ReadByte(), reader.ReadByte()];
+            const expected = [10, 20, 30, 40];
+            for (let i = 0; i < expected.length; i++) {
+                if (got[i] !== expected[i]) {
+                    throw new Error(`Mismatch at ${i}: got ${got[i]}, expected ${expected[i]}`);
+                }
+            }
+        "#,
+    );
+}
+
+#[test]
 fn native_wrong_type_throws() {
     run_js_assert(
         "native_wrong_type_throws",

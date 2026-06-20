@@ -46,6 +46,7 @@ features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "System",
+    "Storage_Streams",
     "Data_Json",
     "UI_Composition",
     "Foundation_Numerics",

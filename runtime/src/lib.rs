@@ -7531,6 +7531,10 @@ impl Runtime {
             v8::V8::initialize();
         });
 
+        // A prior Runtime on this thread may have set the teardown flag; clear it
+        // so this runtime's backing-store deleters release COM refs normally.
+        crate::global_fns::set_com_teardown(false);
+
         let winrt_initialized = match unsafe { RoInitialize(RO_INIT_SINGLETHREADED) } {
             Ok(_) => true,
             // Any failure (including RPC_E_CHANGED_MODE=0x80010106 and the ASTA apartment
@@ -8034,6 +8038,10 @@ impl Drop for Runtime {
         // stops; reset so a future Runtime on this thread can schedule drains.
         MICROTASK_DRAIN_QUEUED.with(|cell| cell.set(false));
         if self.winrt_initialized {
+            // Signal backing-store deleters (e.g. zero-copy IBuffer ArrayBuffers)
+            // to skip COM Release once the isolate is disposed below — that runs
+            // after RoUninitialize, so Release would hit a dead apartment.
+            crate::global_fns::set_com_teardown(true);
             unsafe { RoUninitialize() };
         }
     }

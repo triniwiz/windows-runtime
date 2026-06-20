@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 use windows::core::{IUnknown, Interface};
+use windows::Storage::Streams::IBuffer;
+use windows::Win32::System::WinRT::IBufferByteAccess;
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
 };
@@ -28,6 +30,19 @@ use runtime_devtools::{DevtoolsServer, DevtoolsServerConfig};
 thread_local!(static DEVTOOLS_SERVER: RefCell<Option<DevtoolsServer>> = RefCell::new(None));
 
 thread_local!(static INSPECTOR_DOMAIN_DISPATCHERS: RefCell<HashMap<String, v8::Global<v8::Value>>> = RefCell::new(HashMap::new()));
+
+// Set once `Runtime::drop` has torn down the WinRT apartment (RoUninitialize).
+// Backing-store deleters that hold COM refs consult this so they skip the
+// Release during isolate disposal (which runs after RoUninitialize): the OS
+// reclaims those refs at process exit, and calling Release on a dead apartment
+// would access-violate. During normal GC the flag is false and refs are freed.
+thread_local!(static COM_TEARDOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+
+/// Mark that this thread's COM apartment is being torn down. Called from
+/// `Runtime::new` (reset) and `Runtime::drop` (set).
+pub(crate) fn set_com_teardown(value: bool) {
+    COM_TEARDOWN.with(|c| c.set(value));
+}
 
 /// Drop cached inspector dispatcher handles (isolate-tied `v8::Global`s).
 /// Called from `Runtime::drop` while the isolate is still alive.
@@ -456,6 +471,109 @@ pub(crate) fn handle_buffer_to_pointer(
     } else {
         retval.set(v8::External::new(scope, pointer).into());
     }
+}
+
+/// Backing-store deleter that releases the COM reference kept alive for the
+/// lifetime of the aliasing ArrayBuffer. `deleter_data` is a `Box<IBuffer>`.
+unsafe extern "C" fn release_ibuffer_keepalive(
+    _data: *mut c_void,
+    _byte_length: usize,
+    deleter_data: *mut c_void,
+) {
+    if deleter_data.is_null() {
+        return;
+    }
+    let keep_alive = unsafe { Box::from_raw(deleter_data as *mut IBuffer) };
+    if COM_TEARDOWN.with(|c| c.get()) {
+        // Apartment is gone; releasing now would access-violate. Leak the ref —
+        // the process is exiting and the OS reclaims it.
+        std::mem::forget(keep_alive);
+    } else {
+        drop(keep_alive);
+    }
+}
+
+/// `__nsArrayBufferFromBuffer(buffer)` — wrap a `Windows.Storage.Streams.IBuffer`
+/// as a zero-copy `ArrayBuffer` aliasing the buffer's native storage. The ArrayBuffer
+/// covers `IBuffer.Length` (valid bytes). The IBuffer is AddRef'd and released only
+/// once V8 collects the ArrayBuffer, so reads/writes through the view are safe and
+/// propagate to the underlying WinRT buffer.
+pub(crate) fn handle_array_buffer_from_buffer(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue,
+) {
+    if args.length() < 1 {
+        throw_js_error(
+            scope,
+            "__nsArrayBufferFromBuffer expects a Windows.Storage.Streams.IBuffer",
+        );
+        return;
+    }
+
+    let Ok(obj) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
+        throw_js_error(
+            scope,
+            "__nsArrayBufferFromBuffer expects a WinRT IBuffer object",
+        );
+        return;
+    };
+
+    let Some(instance) = crate::ns_proxy::this_instance(scope, obj) else {
+        throw_js_error(
+            scope,
+            "__nsArrayBufferFromBuffer: value is not a WinRT object (no COM instance)",
+        );
+        return;
+    };
+
+    // QI for the valid length and the raw data pointer. Both views address the
+    // same underlying object, so a single AddRef'd ref keeps the storage alive.
+    let Ok(buffer) = instance.cast::<IBuffer>() else {
+        throw_js_error(
+            scope,
+            "__nsArrayBufferFromBuffer: value does not implement Windows.Storage.Streams.IBuffer",
+        );
+        return;
+    };
+    let Ok(byte_access) = instance.cast::<IBufferByteAccess>() else {
+        throw_js_error(
+            scope,
+            "__nsArrayBufferFromBuffer: IBuffer does not expose IBufferByteAccess",
+        );
+        return;
+    };
+
+    let len = buffer.Length().unwrap_or(0) as usize;
+    let data = match unsafe { byte_access.Buffer() } {
+        Ok(p) => p,
+        Err(_) => {
+            throw_js_error(scope, "__nsArrayBufferFromBuffer: failed to obtain IBuffer data pointer");
+            return;
+        }
+    };
+
+    if data.is_null() || len == 0 {
+        // Nothing to alias — hand back an empty, owned ArrayBuffer.
+        let ab = v8::ArrayBuffer::new(scope, 0);
+        retval.set(ab.into());
+        return;
+    }
+
+    // Hand an AddRef'd IBuffer to the deleter so the native storage outlives the
+    // ArrayBuffer; `byte_access` is dropped here but the object stays alive.
+    let keep_alive = Box::into_raw(Box::new(buffer)) as *mut c_void;
+    let backing = unsafe {
+        v8::ArrayBuffer::new_backing_store_from_ptr(
+            data as *mut c_void,
+            len,
+            release_ibuffer_keepalive,
+            keep_alive,
+        )
+    };
+    let shared = backing.make_shared();
+    let ab = v8::ArrayBuffer::with_backing_store(scope, &shared);
+    retval.set(ab.into());
 }
 
 pub(crate) fn handle_proxy_write_text_file(
@@ -1488,6 +1606,20 @@ const HELPER_SOURCE: &str = r#"
                 fromWinRTDateTimeTicks: fromWinRTDateTimeTicks,
                 pointerKey: pointerKey,
                 pointerFromBuffer: pointerFromBuffer,
+                // arrayBufferFromBuffer(buffer) — zero-copy view over a
+                // Windows.Storage.Streams.IBuffer. The returned ArrayBuffer aliases
+                // the buffer's native storage (covers IBuffer.Length valid bytes) and
+                // keeps the IBuffer alive until it is collected. Use `.byteLength` on
+                // the result, or wrap in a Uint8Array/DataView to read or write through.
+                arrayBufferFromBuffer: function (buffer) {
+                    if (buffer == null) {
+                        return null;
+                    }
+                    if (typeof globalThis.__nsArrayBufferFromBuffer !== 'function') {
+                        throw new Error('NSWinRT.interop.arrayBufferFromBuffer is unavailable in this runtime');
+                    }
+                    return globalThis.__nsArrayBufferFromBuffer(buffer);
+                },
                 trackBufferSource: trackBufferSource,
                 resolveTrackedBuffer: resolveTrackedBuffer,
                 byteLengthOf: function (value) {
@@ -4615,6 +4747,7 @@ pub(crate) fn init_async_helpers(
     register!("__nsEnqueueMicrotask", handle_enqueue_microtask);
     register!("__nsPointerKey", handle_pointer_key);
     register!("__nsBufferToPointer", handle_buffer_to_pointer);
+    register!("__nsArrayBufferFromBuffer", handle_array_buffer_from_buffer);
     register!("__nsProxyWriteTextFile", handle_proxy_write_text_file);
     register!("__nsProxyCompileProject", handle_proxy_compile_project);
     register!("__nsProxyRegisterManifest", handle_proxy_register_manifest);
