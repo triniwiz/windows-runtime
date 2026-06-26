@@ -464,14 +464,9 @@ pub(crate) fn handle_named_property_getter(
                 let clazz_dec = lock.as_any().downcast_ref::<ClassDeclaration>();
 
                 if let Some(clazz_dec) = clazz_dec {
-                    for method in collect_class_methods(clazz_dec) {
-                        let mut method_name = method.overload_name();
-                        if method_name.is_empty() {
-                            method_name = method.name();
-                        }
-
-                        if method_name == name {
-                            let declaration = Arc::new(RwLock::new(method.clone()));
+                    if let Some(method) = find_class_method(clazz_dec, &name) {
+                        {
+                            let declaration = Arc::new(RwLock::new(method));
                             let declaration =
                                 Box::into_raw(Box::new(DeclarationFFI::new_with_instance(
                                     declaration,
