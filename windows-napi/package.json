@@ -1,0 +1,53 @@
+{
+  "name": "@nativescript/windows-napi",
+  "version": "0.1.0",
+  "description": "Node-API WinRT interop for Windows.",
+  "main": "nswinrt.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": "./nswinrt.js",
+    "./native": "./index.js",
+    "./nswinrt.js": "./nswinrt.js"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "nswinrt.js",
+    "windows.*.node"
+  ],
+  "napi": {
+    "name": "windows",
+    "triples": {
+      "defaults": false,
+      "additional": [
+        "x86_64-pc-windows-msvc",
+        "aarch64-pc-windows-msvc"
+      ]
+    }
+  },
+  "os": [
+    "win32"
+  ],
+  "engines": {
+    "node": ">= 18"
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "artifacts": "napi artifacts",
+    "prepublishOnly": "napi prepublish -t npm --skip-gh-release",
+    "test": "node test/run-tests.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/triniwiz/windows-runtime.git",
+    "directory": "windows-napi"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  },
+  "optionalDependencies": {
+    "@nativescript/windows-napi-win32-x64-msvc": "0.1.0",
+    "@nativescript/windows-napi-win32-arm64-msvc": "0.1.0"
+  }
+}

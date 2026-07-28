@@ -186,7 +186,7 @@ fn try_get_async_status(
     Err("Async Status is not a numeric value".to_string())
 }
 
-fn normalize_js_path(path: &str) -> PathBuf {
+pub(crate) fn normalize_js_path(path: &str) -> PathBuf {
     if let Some(raw) = path.strip_prefix("file:///") {
         return PathBuf::from(raw.replace('/', "\\"));
     }
@@ -196,7 +196,7 @@ fn normalize_js_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn try_resolve_with_known_extensions(candidate: PathBuf) -> PathBuf {
+pub(crate) fn try_resolve_with_known_extensions(candidate: PathBuf) -> PathBuf {
     if candidate.exists() {
         return candidate;
     }
@@ -1712,6 +1712,17 @@ const HELPER_SOURCE: &str = r#"
                 return (ctor && (ctor.__winrtProxyName__ || ctor.__typeName__ || ctor.name)) || 'Object';
             }
 
+            // This IIFE runs before the NSWinRT.dotnet block below in script order, but by the
+            // time createManagedSubclass is actually CALLED (well after the whole bootstrap has
+            // finished evaluating) NSWinRT.dotnet.wrap already exists whenever
+            // __nsDotNetCreateJsSubclass does (both are registered together) — wraps a raw tagged
+            // handle value into a live DotNet instance proxy exactly like the dotnet block's own
+            // private `_wrap`, without needing access to that other IIFE's closure.
+            function _wrapDotNetHandle(value) {
+                var dotnet = globalThis.NSWinRT && globalThis.NSWinRT.dotnet;
+                return (dotnet && typeof dotnet.wrap === 'function') ? dotnet.wrap(value) : value;
+            }
+
             var typeDescriptorCache = Object.create(null);
 
             function describeWinRTType(typeName) {
@@ -2431,10 +2442,37 @@ const HELPER_SOURCE: &str = r#"
                         throw new Error('__nsDotNetCreateJsSubclass is not available in this runtime');
                     }
                     if (!overrides || typeof overrides !== 'object') overrides = {};
+
+                    var interfaceNames = Array.isArray(overrides.interfaces)
+                        ? overrides.interfaces.map(function (iface) { return ctorName(iface); })
+                        : [];
+
+                    // Literal CLR member names this JS object actually overrides. The bridge only
+                    // emits an IL override for base virtuals named here (everything else falls
+                    // through to the real base implementation) and implements exactly these
+                    // interface members from JS (others fall back to default/no-op). Plain
+                    // functions are method overrides; accessor descriptors become get_/set_-
+                    // prefixed property overrides — matching the literal CLR accessor names the
+                    // dynamic proxy already dispatches by. Read via getOwnPropertyDescriptor
+                    // throughout so collecting names never invokes a JS getter as a side effect.
+                    var memberNames = [];
+                    for (var mkey in overrides) {
+                        if (!Object.prototype.hasOwnProperty.call(overrides, mkey)) continue;
+                        if (mkey === 'interfaces' || mkey === 'init') continue;
+                        var mdesc = Object.getOwnPropertyDescriptor(overrides, mkey);
+                        if (!mdesc) continue;
+                        if (typeof mdesc.get === 'function' || typeof mdesc.set === 'function') {
+                            if (typeof mdesc.get === 'function') memberNames.push('get_' + mkey);
+                            if (typeof mdesc.set === 'function') memberNames.push('set_' + mkey);
+                        } else if (typeof mdesc.value === 'function') {
+                            memberNames.push(mkey);
+                        }
+                    }
+
                     var dispatcher = function () {
                         var a = Array.prototype.slice.call(arguments);
                         try {
-                            var target = _wrap(a[0]);
+                            var target = _wrapDotNetHandle(a[0]);
                             var method = a[1];
                             var margs = a[2] || [];
                             if (target && typeof method === 'string') {
@@ -2443,8 +2481,8 @@ const HELPER_SOURCE: &str = r#"
                             }
                         } catch (_) { }
                     };
-                    var handle = globalThis.__nsDotNetCreateJsSubclass(assembly || '', typeName || '', dispatcher);
-                    var obj = _wrap(handle);
+                    var handle = globalThis.__nsDotNetCreateJsSubclass(assembly || '', typeName || '', interfaceNames, memberNames, dispatcher);
+                    var obj = _wrapDotNetHandle(handle);
                     ensureProxyInstance(obj, overrides, function () { });
                     return obj;
                 },
@@ -3079,6 +3117,10 @@ const HELPER_SOURCE: &str = r#"
                     var assembly = _resolveAssembly(typeName || '');
                     return _makeDotNetInstance(handle, assembly, typeName || '');
                 },
+                // Exposed so other IIFEs in this bootstrap (e.g. the managed-subclass/proxy block,
+                // which runs in its own closure earlier in the script and has no direct access to
+                // this IIFE's private `_wrap`) can wrap a raw tagged handle value the same way.
+                wrap: _wrap,
                 // Lazily register a namespace prefix and optional assembly mapping.
                 // Example: NSWinRT.dotnet.registerNamespace('com', 'NativeScript');
                 registerNamespace: function(rootName, assemblyName) {
@@ -3862,17 +3904,31 @@ pub(crate) fn handle_dotnet_create_delegate(
     }
 }
 
+/// Reads a JS array of strings into a `Vec<String>`. Returns `None` on a non-array or on any
+/// element that fails to stringify (mirrors the pattern already used by `handle_win32_bind_fast`).
+fn read_js_string_array(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> Option<Vec<String>> {
+    let arr = v8::Local::<v8::Array>::try_from(value).ok()?;
+    let mut out = Vec::with_capacity(arr.length() as usize);
+    for i in 0..arr.length() {
+        let v = arr.get_index(scope, i)?;
+        out.push(value_to_string(scope, v)?);
+    }
+    Some(out)
+}
+
 /// Create a managed subclass instance backed by JS overrides.
-/// Args: args[0] = assembly (string or ''), args[1] = typeName (string), args[2] = function or object (callable to receive invocations)
+/// Args: args[0] = assembly (string or ''), args[1] = typeName (string),
+///       args[2] = interfaceNames (string[]), args[3] = memberNames (string[]),
+///       args[4] = function (callable to receive invocations)
 pub(crate) fn handle_dotnet_create_js_subclass(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
     mut retval: v8::ReturnValue,
 ) {
-    if args.length() < 3 {
+    if args.length() < 5 {
         throw_js_error(
             scope,
-            "__nsDotNetCreateJsSubclass(assembly, typeName, fn): expected 3 arguments",
+            "__nsDotNetCreateJsSubclass(assembly, typeName, interfaceNames, memberNames, fn): expected 5 arguments",
         );
         return;
     }
@@ -3889,12 +3945,28 @@ pub(crate) fn handle_dotnet_create_js_subclass(
         .map(|s| s.to_rust_string_lossy(scope))
         .unwrap_or_default();
 
+    let Some(interface_names) = read_js_string_array(scope, args.get(2)) else {
+        throw_js_error(
+            scope,
+            "__nsDotNetCreateJsSubclass: third argument must be an array of interface name strings",
+        );
+        return;
+    };
+
+    let Some(member_names) = read_js_string_array(scope, args.get(3)) else {
+        throw_js_error(
+            scope,
+            "__nsDotNetCreateJsSubclass: fourth argument must be an array of member name strings",
+        );
+        return;
+    };
+
     // Accept a function as the callback.
-    let cb_val = args.get(2);
+    let cb_val = args.get(4);
     let Ok(cb_fn) = v8::Local::<v8::Function>::try_from(cb_val) else {
         throw_js_error(
             scope,
-            "__nsDotNetCreateJsSubclass: third argument must be a function",
+            "__nsDotNetCreateJsSubclass: fifth argument must be a function",
         );
         return;
     };
@@ -3908,6 +3980,14 @@ pub(crate) fn handle_dotnet_create_js_subclass(
     req.push(0x0A);
     bin_write_str16(&mut req, assembly.as_bytes());
     bin_write_str16(&mut req, type_name.as_bytes());
+    req.extend_from_slice(&(interface_names.len() as i32).to_le_bytes());
+    for name in &interface_names {
+        bin_write_str16(&mut req, name.as_bytes());
+    }
+    req.extend_from_slice(&(member_names.len() as i32).to_le_bytes());
+    for name in &member_names {
+        bin_write_str16(&mut req, name.as_bytes());
+    }
     req.extend_from_slice(&cb_id.to_le_bytes());
 
     match crate::dotnet::call_dotnet_binary(&req) {
@@ -3919,7 +3999,7 @@ pub(crate) fn handle_dotnet_create_js_subclass(
     }
 }
 
-fn bin_write_str16(buf: &mut Vec<u8>, bytes: &[u8]) {
+pub(crate) fn bin_write_str16(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
     buf.extend_from_slice(bytes);
 }
@@ -4089,7 +4169,7 @@ fn bin_write_v8_arg(
     buf.push(0x00);
 }
 
-fn bin_write_str32(buf: &mut Vec<u8>, bytes: &[u8]) {
+pub(crate) fn bin_write_str32(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     buf.extend_from_slice(bytes);
 }

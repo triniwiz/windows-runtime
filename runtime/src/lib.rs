@@ -19,6 +19,8 @@ mod livesync;
 mod message_port;
 mod method_call;
 mod name_space;
+#[cfg(feature = "napi_engine")]
+pub mod napi_engine;
 mod ns_proxy;
 mod property_call;
 mod proxy_manifest_loader;
@@ -1577,7 +1579,7 @@ struct IfaceMethodCallData {
 
 /// Extract the comma-separated type arguments from a closed generic type name.
 /// E.g. `IFoo`2<Windows.X.Bar, Windows.X.Baz>` → `["Windows.X.Bar", "Windows.X.Baz"]`
-fn extract_generic_type_args(full_name: &str) -> Vec<String> {
+pub(crate) fn extract_generic_type_args(full_name: &str) -> Vec<String> {
     let Some(start) = full_name.find('<') else {
         return Vec::new();
     };

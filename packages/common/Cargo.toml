@@ -1,0 +1,8 @@
+[package]
+name = "ns-windows-common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared JS runtime support for the NativeScript Windows standalone-engine packages (prelude, URL polyfill) — used by the shipped napi addon/cdylib as well as the demo bin"
+
+[lib]
+crate-type = ["rlib"]

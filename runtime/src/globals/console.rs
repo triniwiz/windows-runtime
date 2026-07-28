@@ -421,7 +421,7 @@ fn console_handle() -> Option<HANDLE> {
     raw.map(|p| HANDLE(p as *mut _))
 }
 
-fn write_console(value: &str) {
+pub(crate) fn write_console(value: &str) {
     if let Some(handle) = console_handle() {
         let wide: Vec<u16> = value.encode_utf16().collect();
         let _ = unsafe { Console::WriteConsoleW(handle, &wide, None, None) };
@@ -689,8 +689,9 @@ pub(crate) fn handle_console_assert(
 }
 
 thread_local! {
-    /// Per-V8-thread timer store — maps label → start Instant.
-    static CONSOLE_TIMERS: RefCell<HashMap<String, Instant>> = RefCell::new(HashMap::new());
+    /// Per-JS-thread timer store — maps label → start Instant. Shared with the napi console
+    /// port so console.time started on one backend can be ended on the other.
+    pub(crate) static CONSOLE_TIMERS: RefCell<HashMap<String, Instant>> = RefCell::new(HashMap::new());
 }
 
 pub(crate) fn handle_console_time(
@@ -954,7 +955,8 @@ fn table_from_object(scope: &mut v8::PinScope<'_, '_>, obj: v8::Local<v8::Object
 }
 
 /// Render a table with box-drawing characters given column headers and row data.
-fn render_table(cols: &[String], rows: &[Vec<String>]) -> String {
+/// Engine-neutral; shared with the napi console port.
+pub(crate) fn render_table(cols: &[String], rows: &[Vec<String>]) -> String {
     // Compute column widths: max of header width and widest cell in that column
     let mut widths: Vec<usize> = cols.iter().map(|c| c.len()).collect();
     for row in rows {

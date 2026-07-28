@@ -1,6 +1,15 @@
+# Rust build artifacts (root + nested workspace/package crates)
 /target
+target/
 /**/*.rs.bk
 /Cargo.lock
+
+# Node
+node_modules/
+
+# Logs
+*.log
+
 .DS_Store
 .vs
 

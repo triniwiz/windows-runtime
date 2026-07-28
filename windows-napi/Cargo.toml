@@ -1,0 +1,20 @@
+[package]
+name = "windows-napi"
+version = "0.1.0"
+edition = "2021"
+description = "Node-API (napi) binding for the NativeScript Windows (WinRT) runtime"
+
+[lib]
+# `.node` addon output. Named `lib` so napi-rs' generated index.js loads it.
+crate-type = ["cdylib"]
+
+[dependencies]
+# Node-API 8 surface, no tokio/async runtime pulled in — this is a thin bridge.
+napi = { version = "2", default-features = false, features = ["napi8"] }
+napi-derive = "2"
+runtime = { path = "../runtime", features = ["napi_engine"] }
+metadata = { path = "../metadata" }
+windows-core = "0.62.2"
+
+[build-dependencies]
+napi-build = "2"

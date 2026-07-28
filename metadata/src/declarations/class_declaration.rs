@@ -166,6 +166,21 @@ impl ClassDeclaration {
             .flatten()
     }
 
+    /// Full name of the default interface, including generic instances (e.g. StringMap's
+    /// `Windows.Foundation.Collections.IMap`2<String, String>`) which `default_interface()`
+    /// cannot return (its downcast only admits plain `InterfaceDeclaration`s).
+    pub fn default_interface_full_name(&self) -> Option<&str> {
+        self.default_interface
+            .get_or_init(|| {
+                ClassDeclaration::make_default_interface(
+                    self.base.base().metadata(),
+                    self.base.base().token(),
+                )
+            })
+            .as_ref()
+            .map(|f| f.as_declaration().full_name())
+    }
+
     pub fn is_instantiable(&self) -> bool {
         !self.initializers().is_empty()
     }

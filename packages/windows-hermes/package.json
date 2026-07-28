@@ -1,0 +1,43 @@
+{
+  "name": "@nativescript/windows-hermes",
+  "version": "0.1.0",
+  "description": "NativeScript Windows runtime (Hermes engine) with a WinUI 3 app template",
+  "keywords": [
+    "NativeScript",
+    "Windows",
+    "WinRT",
+    "WinUI3",
+    "windows-app-sdk",
+    "runtime",
+    "hermes"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/NativeScript/windows-runtime",
+    "directory": "packages/windows-hermes"
+  },
+  "author": {
+    "name": "NativeScript Team",
+    "email": "oss@nativescript.org"
+  },
+  "license": "Apache-2.0",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "scripts": {
+    "build": "pwsh -File ../../template/build.ps1 -Engine hermes"
+  },
+  "files": [
+    "framework/**/*",
+    "!framework/**/bin/**",
+    "!framework/**/obj/**",
+    "README.md"
+  ],
+  "nativescript": {
+    "runtime": "windows",
+    "engine": "hermes"
+  }
+}

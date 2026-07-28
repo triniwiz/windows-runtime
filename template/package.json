@@ -17,5 +17,9 @@
     "framework/**/*",
     "!framework/**/bin/**",
     "!framework/**/obj/**"
-  ]
+  ],
+  "nativescript": {
+    "runtime": "windows",
+    "engine": "v8"
+  }
 }

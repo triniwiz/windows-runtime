@@ -1,0 +1,44 @@
+[package]
+name = "windows-v8"
+version = "0.1.0"
+edition = "2021"
+description = "NativeScript Windows runtime on V8 (napi-android v8 shim over the bundled rusty_v8). Publishes as @nativescript/windows-v8."
+
+# `cdylib` so `build.ps1 -Engine v8` can emit `nativescript.dll` (the WinUI 3 host DLL);
+# `rlib` so the standalone `nativescript-windows` bin can still link the crate.
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "nativescript-windows"
+path = "src/main.rs"
+
+[features]
+default = []
+# Compile the `nativescript.dll` C ABI (src/abi.rs) into the cdylib so the WinUI 3 host can load
+# V8 as a drop-in replacement for the classic runtime. Selected by `build.ps1 -Engine v8`.
+# All deps are already unconditional, so this only toggles the abi/host modules on.
+host_dll = []
+
+[dependencies]
+napi = { version = "2", default-features = false, features = ["napi8"] }
+# Brings rusty_v8 (V8 14.7, plain config) into the link — the shim's v8:: symbols resolve from it.
+runtime = { path = "../../runtime", features = ["napi_engine"] }
+# Direct rusty_v8 handle: initialize the V8 platform from Rust (its NewDefaultPlatform returns a
+# libc++ std::unique_ptr that can't be linked from the MSVC C++ shim).
+v8 = "147"
+# Shared JS prelude + URL polyfill — used by both the cdylib (abi.rs) and the demo bin (main.rs).
+ns-windows-common = { path = "../common" }
+# Crash reporter + self-test harness for the demo bin (main.rs) only.
+ns-windows-demo = { path = "../demo" }
+
+[build-dependencies]
+cc = "1"
+
+# Windows-port fix so napi_* resolve from THIS cdylib (nativescript.dll) when loaded by the WinUI 3
+# .NET host, not from the host .exe (which has no napi exports). See packages/vendor/napi-sys.
+[patch.crates-io]
+napi-sys = { path = "../vendor/napi-sys" }
+
+[profile.release]
+debug = true

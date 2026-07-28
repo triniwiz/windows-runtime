@@ -507,6 +507,60 @@ fn dotnet_environment_get_machine_name() {
     );
 }
 
+// Managed-subclass proxy system (NSWinRT.proxy.createManagedSubclass / Bridge.Proxy.cs's dynamic
+// dev-only fallback proxy). dotnet-bridge-tests exercises the C# IL-emission side directly via
+// Bridge.DispatchBin, bypassing the JS engine entirely — these run the full real path instead:
+// JS -> __nsDotNetCreateJsSubclass -> CreateJsSubclass (dynamic proxy emitted, IL overrides only
+// the requested members) -> instance call reflects on the real derived type -> virtual dispatch
+// hits the emitted override -> callback fires back into this exact JS closure.
+#[test]
+fn dotnet_managed_subclass_overridden_method_dispatches_to_js() {
+    if !dotnet_bridge_available() {
+        return;
+    }
+    let mut rt = Runtime::new(".");
+    assert_js(
+        &mut rt,
+        r#"
+        (function(){
+            var called = false;
+            var obj = NSWinRT.proxy.createManagedSubclass('', 'System.Object', {
+                ToString: function () { called = true; return 'js-tostring'; }
+            });
+            if (!obj || typeof obj !== 'object' || obj.__handle == null) return false;
+            var result = obj.ToString();
+            return called === true && result === 'js-tostring';
+        })()
+    "#,
+        "overridden ToString() on a managed subclass should dispatch to the JS override",
+    );
+}
+
+#[test]
+fn dotnet_managed_subclass_unoverridden_virtual_falls_back_to_base() {
+    if !dotnet_bridge_available() {
+        return;
+    }
+    let mut rt = Runtime::new(".");
+    assert_js(
+        &mut rt,
+        r#"
+        (function(){
+            var called = false;
+            // Override GetHashCode only; ToString is left untouched and must run the real
+            // System.Object implementation, never asking JS.
+            var obj = NSWinRT.proxy.createManagedSubclass('', 'System.Object', {
+                GetHashCode: function () { called = true; return 42; }
+            });
+            if (!obj || typeof obj !== 'object' || obj.__handle == null) return false;
+            var result = obj.ToString();
+            return called === false && typeof result === 'string' && result.indexOf('System.Object') !== -1;
+        })()
+    "#,
+        "un-overridden virtual on a managed subclass should run the real base implementation",
+    );
+}
+
 #[test]
 fn event_reads_null_before_assignment() {
     let mut rt = Runtime::new(".");

@@ -108,10 +108,29 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
 
+    <!-- Debug fallback: engine variants (quickjs/hermes/v8/jsc) ship no devtools build (no
+         inspector), so a Debug build must still pick up their plain runtime DLL instead of
+         silently omitting nativescript.dll from the output. -->
+    <Content Include="$(NSWindowsRoot)\libs\$(NSLibPlatform)\nativescript.dll"
+             Condition="'$(Configuration)' == 'Debug' and !Exists('$(NSWindowsRoot)\libs\devtools\$(NSLibPlatform)\nativescript.dll') and Exists('$(NSWindowsRoot)\libs\$(NSLibPlatform)\nativescript.dll')">
+      <Link>nativescript.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+
     <!-- Release: production runtime DLL (platform fallback via NSLibPlatform) -->
     <Content Include="$(NSWindowsRoot)\libs\$(NSLibPlatform)\nativescript.dll"
              Condition="'$(Configuration)' != 'Debug' and Exists('$(NSWindowsRoot)\libs\$(NSLibPlatform)\nativescript.dll')">
       <Link>nativescript.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+
+    <!-- Sidecar engine runtime DLLs some engine variants ship alongside nativescript.dll (e.g.
+         hermes.dll/hermes-icu.dll, JavaScriptCore.dll/icu*.dll) — same files regardless of
+         Debug/Release. nativescript.dll itself is excluded since it's handled above per config. -->
+    <Content Include="$(NSWindowsRoot)\libs\$(NSLibPlatform)\*.dll"
+             Exclude="$(NSWindowsRoot)\libs\$(NSLibPlatform)\nativescript.dll"
+             Condition="Exists('$(NSWindowsRoot)\libs\$(NSLibPlatform)')">
+      <Link>%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
 

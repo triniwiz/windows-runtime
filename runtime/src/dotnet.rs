@@ -112,6 +112,17 @@ pub(crate) fn set_app_root(app_root: &str) {
     let _ = DOTNET_APP_ROOT.get_or_init(|| app_root.to_string());
 }
 
+// Which callback fires when a managed delegate/task/UI-thread hop calls back into JS. The
+// rusty_v8 engine never registers one explicitly, so it falls back to the classic
+// `global_fns::invoke_dotnet_js_callback` (isolate found via `DELEGATE_ISOLATE_PTR`). A napi
+// engine registers `napi_engine::dotnet`'s own callback during bring-up, before any JS can reach
+// `ensure_dotnet_initialized` — see `napi_engine::dotnet::install_dotnet`.
+static JS_CALLBACK_DISPATCHER: OnceLock<FnJsCallback> = OnceLock::new();
+
+pub(crate) fn set_js_callback_dispatcher(cb: FnJsCallback) {
+    let _ = JS_CALLBACK_DISPATCHER.set(cb);
+}
+
 fn to_wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -360,7 +371,9 @@ fn ensure_dotnet_initialized() {
     // delegates can call back into V8. This is idempotent because init_js_callbacks
     // is a no-op when the host isn't available.
     if DOTNET_HOST.get().and_then(|r| r.as_ref().ok()).is_some() {
-        init_js_callbacks(crate::global_fns::invoke_dotnet_js_callback);
+        let dispatcher =
+            *JS_CALLBACK_DISPATCHER.get_or_init(|| crate::global_fns::invoke_dotnet_js_callback);
+        init_js_callbacks(dispatcher);
     }
 }
 

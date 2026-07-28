@@ -106,8 +106,17 @@ public static partial class Bridge
         {
             var assembly = r.ReadString16();
             var typeName = r.ReadString16();
+
+            var interfaceCount = r.ReadI32();
+            var interfaceNames = interfaceCount > 0 ? new string[interfaceCount] : [];
+            for (int i = 0; i < interfaceCount; i++) interfaceNames[i] = r.ReadString16();
+
+            var memberCount = r.ReadI32();
+            var memberNames = memberCount > 0 ? new string[memberCount] : [];
+            for (int i = 0; i < memberCount; i++) memberNames[i] = r.ReadString16();
+
             var callbackId = r.ReadI32();
-            return CreateJsSubclass(NullIfEmpty(assembly), typeName, callbackId);
+            return CreateJsSubclass(NullIfEmpty(assembly), typeName, callbackId, interfaceNames, memberNames);
         }
 
         if (op == 0x0B) // get CLR-only property by raw IInspectable ptr (CLR reflection fallback)
