@@ -1,6 +1,6 @@
 {
   "name": "@nativescript/windows-hermes",
-  "version": "0.1.0-alpha.0",
+  "version": "0.1.0-alpha.1",
   "description": "NativeScript Windows runtime (Hermes engine) with a WinUI 3 app template",
   "keywords": [
     "NativeScript",
