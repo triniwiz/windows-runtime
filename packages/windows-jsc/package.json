@@ -1,6 +1,6 @@
 {
   "name": "@nativescript/windows-jsc",
-  "version": "0.1.0",
+  "version": "0.1.0-alpha.0",
   "description": "NativeScript Windows runtime (JavaScriptCore engine) with a WinUI 3 app template",
   "keywords": [
     "NativeScript",
