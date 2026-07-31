@@ -82,6 +82,17 @@ pub const PRELUDE: &str = r#"
 
   g.NSWinRT = g.NSWinRT || {};
   g.NSWinRT.toPromise = toPromise;
+
+  // core calls the non-standard `.get()` on WeakRef.
+  if (typeof g.WeakRef !== 'undefined' && typeof g.WeakRef.prototype.get !== 'function') {
+    g.WeakRef.prototype.get = g.WeakRef.prototype.deref;
+    g.WeakRef.prototype.__hasWarnedAboutClear = false;
+    g.WeakRef.prototype.clear = function () {
+      if (g.WeakRef.prototype.__hasWarnedAboutClear) { return; }
+      g.WeakRef.prototype.__hasWarnedAboutClear = true;
+      console.warn('WeakRef.clear() is non-standard and has been deprecated. It does nothing and the call can be safely removed.');
+    };
+  }
 })(globalThis);
 
 // CommonJS shim: webpack `target: 'node'` bundles (what NativeScript apps are built as) expect

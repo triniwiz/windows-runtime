@@ -26,6 +26,29 @@ pub mod ffi {
     }
 }
 
+/// V8's fatal/OOM error handler (registered by `win_jsr.cpp`): logs to the trace log before the
+/// process goes down, since a packaged app has no visible stdout/stderr for V8's own CHECK-failure
+/// aborts (which bypass Rust's panic machinery entirely).
+#[no_mangle]
+pub extern "C" fn ns_v8_fatal_error(
+    location: *const std::os::raw::c_char,
+    message: *const std::os::raw::c_char,
+) {
+    let to_str = |p: *const std::os::raw::c_char| -> String {
+        if p.is_null() {
+            return "<none>".to_string();
+        }
+        unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    runtime::debug_output(&format!(
+        "[ERROR] [V8_FATAL] {} : {}\n",
+        to_str(location),
+        to_str(message)
+    ));
+}
+
 // The `nativescript.dll` C ABI (WinUI 3 host DLL), compiled only under the `host_dll` feature.
 #[cfg(feature = "host_dll")]
 pub mod abi;
@@ -92,11 +115,23 @@ pub mod host {
                 if pending {
                     let mut err: napi::sys::napi_value = std::ptr::null_mut();
                     napi::sys::napi_get_and_clear_last_exception(env.raw(), &mut err);
-                    let msg = JsUnknown::from_raw_unchecked(env.raw(), err)
-                        .coerce_to_string()
+                    // Prefer `.stack` over a bare toString() when available. Rebuild the JsUnknown
+                    // per attempt since each coercion consumes its receiver.
+                    let stack = JsUnknown::from_raw_unchecked(env.raw(), err)
+                        .coerce_to_object()
+                        .and_then(|o| o.get_named_property::<JsUnknown>("stack"))
+                        .and_then(|s| s.coerce_to_string())
                         .and_then(|s| s.into_utf8())
                         .and_then(|s| Ok(s.as_str()?.to_owned()))
-                        .unwrap_or_else(|_| "<unprintable exception>".into());
+                        .ok()
+                        .filter(|s| !s.is_empty());
+                    let msg = stack.unwrap_or_else(|| {
+                        JsUnknown::from_raw_unchecked(env.raw(), err)
+                            .coerce_to_string()
+                            .and_then(|s| s.into_utf8())
+                            .and_then(|s| Ok(s.as_str()?.to_owned()))
+                            .unwrap_or_else(|_| "<unprintable exception>".into())
+                    });
                     return Err(format!("JS exception: {msg}"));
                 }
                 return Err(format!("js_execute_script status {status}"));

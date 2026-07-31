@@ -217,8 +217,22 @@ class NativeInfo {
     static T* GetNativeInfo(JSContextRef ctx, JSObjectRef obj, const char * propertyKey) {
         JSValueRef exception {};
         JSValueRef native_info = JSObjectGetProperty(ctx, obj, JSString(propertyKey), &exception);
+        if (exception != nullptr) {
+            return nullptr;
+        }
 
-        NativeInfo* info = Get<NativeInfo>(JSValueToObject(ctx, native_info, &exception));
+        // [windows port] A never-wrapped object has no `propertyKey` own property (native_info is
+        // `undefined`); JSValueToObject on that throws + returns null, and feeding that null into
+        // JSObjectGetPrivate below would be an uncatchable access violation.
+        if (!JSValueIsObject(ctx, native_info)) {
+            return nullptr;
+        }
+        JSObjectRef native_info_obj = JSValueToObject(ctx, native_info, &exception);
+        if (exception != nullptr || native_info_obj == nullptr) {
+            return nullptr;
+        }
+
+        NativeInfo* info = Get<NativeInfo>(native_info_obj);
         if (info != nullptr && info->Type() == T::StaticType) {
             return reinterpret_cast<T*>(info);
         }

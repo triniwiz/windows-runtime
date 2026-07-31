@@ -91,11 +91,22 @@ pub mod host {
                 if pending {
                     let mut err: napi::sys::napi_value = std::ptr::null_mut();
                     napi::sys::napi_get_and_clear_last_exception(env.raw(), &mut err);
-                    let msg = JsUnknown::from_raw_unchecked(env.raw(), err)
-                        .coerce_to_string()
+                    // Prefer `.stack` over a bare toString() when available.
+                    let stack = JsUnknown::from_raw_unchecked(env.raw(), err)
+                        .coerce_to_object()
+                        .and_then(|o| o.get_named_property::<JsUnknown>("stack"))
+                        .and_then(|s| s.coerce_to_string())
                         .and_then(|s| s.into_utf8())
                         .and_then(|s| Ok(s.as_str()?.to_owned()))
-                        .unwrap_or_else(|_| "<unprintable exception>".into());
+                        .ok()
+                        .filter(|s| !s.is_empty());
+                    let msg = stack.unwrap_or_else(|| {
+                        JsUnknown::from_raw_unchecked(env.raw(), err)
+                            .coerce_to_string()
+                            .and_then(|s| s.into_utf8())
+                            .and_then(|s| Ok(s.as_str()?.to_owned()))
+                            .unwrap_or_else(|_| "<unprintable exception>".into())
+                    });
                     return Err(format!("JS exception: {msg}"));
                 }
                 return Err(format!("js_execute_script status {status}"));

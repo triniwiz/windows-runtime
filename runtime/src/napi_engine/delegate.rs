@@ -13,7 +13,7 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use napi::{sys, Env, JsFunction, NapiRaw};
+use napi::{sys, CallContext, Env, JsFunction, JsObject, JsUnknown, NapiRaw, NapiValue, ValueType};
 use windows::core::{IUnknown, Interface, GUID, HRESULT};
 
 use crate::value::NativeType;
@@ -292,6 +292,93 @@ unsafe fn delegate_param_to_napi(
         None
     }
 }
+
+/// Installs `__nsAsDelegate(typeName, fn)` + the `NSWinRT.asDelegate` JS surface. Resolves the
+/// delegate's GUID + parameter types from WinRT metadata via `crate::delegate_info_from_type_sig`
+/// and wraps `fn` with `make_napi_delegate`.
+pub fn install_as_delegate(env: &Env) -> napi::Result<()> {
+    let mut global = env.get_global()?;
+
+    let as_delegate_fn =
+        env.create_function_from_closure("__nsAsDelegate", |ctx: CallContext| {
+            native_as_delegate(&ctx)
+        })?;
+    global.set_named_property("__nsAsDelegate", as_delegate_fn)?;
+
+    let func_ctor: JsFunction = global.get_named_property("Function")?;
+    let body = env.create_string(AS_DELEGATE_HELPER_JS)?;
+    let installer_obj = func_ctor.new_instance(&[body])?;
+    let installer: JsFunction = unsafe { JsFunction::from_raw(env.raw(), installer_obj.raw()) }?;
+    installer.call_without_args(None)?;
+    Ok(())
+}
+
+fn native_as_delegate(ctx: &CallContext) -> napi::Result<JsUnknown> {
+    if ctx.length < 2 {
+        return Err(napi::Error::from_reason(
+            "__nsAsDelegate(typeName, fn): expected 2 arguments".to_string(),
+        ));
+    }
+    let type_name_val = ctx.get::<JsUnknown>(0)?;
+    if !matches!(type_name_val.get_type(), Ok(ValueType::String)) {
+        return Err(napi::Error::from_reason(
+            "__nsAsDelegate: first argument must be a string".to_string(),
+        ));
+    }
+    let type_name_str: napi::JsString = unsafe { type_name_val.cast() };
+    let type_name = type_name_str
+        .into_utf8()?
+        .as_str()
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?
+        .to_owned();
+
+    let func: JsFunction = ctx.get(1)?;
+
+    let Some((guid, param_types)) = crate::delegate_info_from_type_sig(&type_name) else {
+        return Err(napi::Error::from_reason(format!(
+            "__nsAsDelegate: unknown delegate type '{type_name}'"
+        )));
+    };
+
+    let Some(ptr) = make_napi_delegate(&ctx.env, &func, guid, param_types) else {
+        return Err(napi::Error::from_reason(
+            "__nsAsDelegate: failed to create native delegate".to_string(),
+        ));
+    };
+
+    let handle = crate::napi_engine::value::external_from_ptr(&ctx.env, ptr)
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+    let mut result = ctx.env.create_object()?;
+    result.set_named_property("handle", handle)?;
+    Ok(crate::napi_engine::value::as_unknown(&ctx.env, result))
+}
+
+/// JS half — supports both `asDelegate(fn)` and `asDelegate(typeName, fn)` call shapes.
+const AS_DELEGATE_HELPER_JS: &str = r#"
+'use strict';
+(function () {
+    globalThis.NSWinRT = globalThis.NSWinRT || {};
+    globalThis.NSWinRT.asDelegate = function (typeNameOrFn, fn) {
+        // Two-argument form: asDelegate(typeName, fn) -> COM-backed JsDelegate
+        if (typeof typeNameOrFn === 'string') {
+            if (typeof fn !== 'function')
+                throw new TypeError('NSWinRT.asDelegate: callback must be a function');
+            if (typeof globalThis.__nsAsDelegate === 'function')
+                return globalThis.__nsAsDelegate(typeNameOrFn, fn);
+            return fn;
+        }
+        // One-argument form: asDelegate(fn) or asDelegate({invoke(){}})
+        if (typeof typeNameOrFn === 'function') {
+            return typeNameOrFn;
+        }
+        if (typeNameOrFn && typeof typeNameOrFn.invoke === 'function') {
+            return typeNameOrFn.invoke.bind(typeNameOrFn);
+        }
+        throw new TypeError('NSWinRT.asDelegate: expected a function, { invoke() } object, or (typeName, fn) pair');
+    };
+})();
+'as-delegate-ok'
+"#;
 
 /// Stringify a napi value (used for exception capture); None on failure.
 unsafe fn napi_value_to_rust_string(env: sys::napi_env, value: sys::napi_value) -> Option<String> {

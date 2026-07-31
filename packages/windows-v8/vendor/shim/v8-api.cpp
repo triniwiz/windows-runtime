@@ -372,6 +372,10 @@ namespace v8impl {
             RETURN_STATUS_IF_FALSE(env, value->IsObject(), napi_invalid_arg);
             v8::Local<v8::Object> obj = value.As<v8::Object>();
 
+            // [windows port] Speculative callers may call napi_unwrap on a never-wrapped object
+            // (0 internal fields); without this check GetAlignedPointerFromInternalField hits an
+            // uncatchable V8 CHECK failure instead of returning an error.
+            RETURN_STATUS_IF_FALSE(env, obj->InternalFieldCount() > 0, napi_invalid_arg);
 
             // [BABYLON-NATIVE-ADDITION]: Increase perf by using internal field instead of private property
             Reference *reference =

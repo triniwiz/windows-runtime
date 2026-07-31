@@ -882,7 +882,7 @@ napi_status napi_get_reference_value(napi_env env, napi_ref ref, napi_value *res
     CHECK_ARG(result)
 
     if (!ref->referenceCount && JS_IsUndefined(ref->value)) {
-        CreateScopedResult(env, JS_UNDEFINED, result);
+        return CreateScopedResult(env, JS_UNDEFINED, result);
     }
 
     JSValue value;
@@ -890,6 +890,13 @@ napi_status napi_get_reference_value(napi_env env, napi_ref ref, napi_value *res
         value = JS_DupValue(env->context, ref->value);
     } else {
         value = JS_WeakRef_Deref(env->context, ref->value);
+        // [windows port] A collected weak ref must report absence (null), matching v8/jsc/hermes —
+        // otherwise the Windows runtime's COM instance cache reads a collected ref as a live hit.
+        // `ref->value` is only ever a real WeakRef here, so undefined means collected.
+        if (JS_IsUndefined(value)) {
+            *result = NULL;
+            return napi_clear_last_error(env);
+        }
     }
 
     return CreateScopedResult(env, value, result);
@@ -3522,7 +3529,9 @@ napi_status napi_unwrap(napi_env env, napi_value jsObject, void **result) {
 
     JSClassID classId;
     void *data = JS_GetAnyOpaque(jsValue, &classId);
-    if (data != NULL) {
+    // [windows port] JS_GetAnyOpaque doesn't validate the class — several built-ins alias this
+    // union slot. Only trust it for our own externalClassId; anything else falls through below.
+    if (data != NULL && classId == env->runtime->externalClassId) {
         ExternalInfo *externalInfo = (ExternalInfo *) data;
         *result = externalInfo->data;
         return napi_ok;

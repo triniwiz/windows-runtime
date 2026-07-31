@@ -16,6 +16,18 @@ struct napi_runtime__ {
     v8::Isolate* isolate;
 };
 
+// Forwards V8's fatal/OOM errors (CHECK failures otherwise crash silently via __debugbreak) to
+// the Rust trace log; defined in windows-v8's lib.rs.
+extern "C" void ns_v8_fatal_error(const char* location, const char* message);
+
+static void OnV8FatalError(const char* location, const char* message) {
+    ns_v8_fatal_error(location, message);
+}
+
+static void OnV8OOMError(const char* location, const v8::OOMDetails& details) {
+    ns_v8_fatal_error(location, details.detail ? details.detail : "out of memory");
+}
+
 extern "C" {
 
 // The V8 platform + V8::Initialize are done from Rust via the `v8` crate (rusty_v8), because
@@ -28,6 +40,8 @@ napi_status js_create_runtime(napi_runtime__** runtime) {
     v8::Isolate::CreateParams params;
     params.array_buffer_allocator = rt->allocator;
     rt->isolate = v8::Isolate::New(params);
+    rt->isolate->SetFatalErrorHandler(&OnV8FatalError);
+    rt->isolate->SetOOMErrorHandler(&OnV8OOMError);
     *runtime = rt;
     return napi_ok;
 }

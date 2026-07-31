@@ -14,6 +14,7 @@ pub mod globals;
 pub mod host_abi;
 pub mod interop;
 pub mod invoke;
+pub mod items_source;
 pub mod module_natives;
 pub mod ns_hostobject;
 pub mod ns_proxy;
