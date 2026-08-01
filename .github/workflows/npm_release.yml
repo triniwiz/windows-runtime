@@ -1,0 +1,232 @@
+name: npm release
+
+# Publishes the four engine variants — @nativescript/windows-{hermes,jsc,quickjs,v8} — to npm via
+# OIDC trusted publishing. npm matches a trusted publisher on repository + workflow FILENAME +
+# environment, so `npm_release.yml` and the `npm-publish` environment below are part of the
+# credential: renaming either breaks publishing for all four packages.
+#
+# NOTE: `paths` filters deliberately do NOT accompany the tag trigger — a tag push can have an
+# empty changed-file set, and paths+tags together silently skip the run.
+on:
+  push:
+    tags:
+      - "v*" # -> all four variants at the tag's version
+  workflow_dispatch:
+    inputs:
+      engine:
+        description: "Which variant to release"
+        type: choice
+        required: true
+        default: all
+        options: [all, hermes, jsc, quickjs, v8]
+      version:
+        description: "Release version to cut, e.g. 0.1.0-alpha.2 (dist-tag follows the prerelease id; a plain version publishes 'latest'). Leave empty for a rolling 'next' build."
+        required: false
+        default: ""
+      rebuild_framework:
+        description: "Rebuild the shared framework (tools + dotnet-bridge) from source instead of shipping the copies committed under template/framework."
+        type: boolean
+        required: false
+        default: false
+
+# Minimal default token permissions for every job; the publish job declares id-token:write locally.
+permissions:
+  contents: read
+
+# A variant is the same framework as @nativescript/windows — the WinUI 3 app template,
+# dotnet-bridge and tools — with the engine's runtime DLL staged as framework/libs/x64/
+# nativescript.dll. `template/build.ps1 -Engine <engine>` copies that shared scaffolding out of
+# template/framework and builds the engine cdylib into it, so a release is:
+#
+#   setup (resolve version + engine matrix) -> build (one Windows job per engine, npm pack)
+#   -> publish (npm, OIDC)
+#
+# Everything the shared framework needs is committed under template/framework, so the default build
+# only compiles the engine. `rebuild_framework` regenerates that scaffolding from source instead.
+jobs:
+  setup:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      npm_version: ${{ steps.out.outputs.NPM_VERSION }}
+      npm_tag: ${{ steps.out.outputs.NPM_TAG }}
+      build_matrix: ${{ steps.out.outputs.BUILD_MATRIX }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 22
+          # setup-node v6 enables dependency caching by default when it detects a package manager —
+          # a cache-poisoning vector, worst in the jobs that publish. Disabled on every setup-node
+          # step in this workflow (also keeps pre-v6 behavior).
+          package-manager-cache: false
+      - name: Compute version, dist-tag and engine matrix
+        id: out
+        env:
+          # env indirection keeps the dispatch inputs out of shell interpolation
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_ENGINE: ${{ inputs.engine || 'all' }}
+        run: node ./scripts/resolve-release.mjs --version "$INPUT_VERSION" --engine "$INPUT_ENGINE"
+
+  build:
+    name: Build ${{ matrix.engine }}
+    runs-on: windows-latest
+    needs: setup
+    strategy:
+      fail-fast: false
+      # { include: [{ engine: hermes }, ...] } — the engines selected in `setup`.
+      matrix: ${{ fromJSON(needs.setup.outputs.build_matrix) }}
+    env:
+      NPM_VERSION: ${{ needs.setup.outputs.npm_version }}
+      ENGINE: ${{ matrix.engine }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false # disable to prevent leaking credentials to build scripts
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # The engine packages are excluded from the root workspace (their C builds / prebuilt
+          # engine links must not run on a plain `cargo build`), so each has its own target dir.
+          workspaces: |
+            . -> target
+            packages/windows-${{ matrix.engine }} -> target
+          key: ${{ matrix.engine }}
+      # quickjs' napi shim uses clang/GCC C extensions that MSVC `cl` rejects; build.rs compiles it
+      # with clang-cl from this exact path and silently falls back to `cl` (which then fails deep in
+      # the C build) when it is absent. Fail early with the real reason instead.
+      - name: Ensure clang-cl (quickjs shim)
+        if: ${{ matrix.engine == 'quickjs' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $clangCl = 'C:\Program Files\LLVM\bin\clang-cl.exe'
+          if (-not (Test-Path $clangCl)) {
+            Write-Host "clang-cl not found at $clangCl — installing LLVM."
+            choco install llvm --no-progress -y
+          }
+          if (-not (Test-Path $clangCl)) {
+            throw "clang-cl is required to compile the quickjs napi shim and is not at $clangCl."
+          }
+          & $clangCl --version
+      - name: Setup .NET (framework rebuild)
+        if: ${{ inputs.rebuild_framework }}
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          # dotnet-typings-gen targets net10.0; ManifestMerger is netstandard2.0 and builds on it.
+          dotnet-version: "10.x"
+      - name: Rebuild shared framework
+        if: ${{ inputs.rebuild_framework }}
+        shell: pwsh
+        # -SkipRelease -SkipDevtools: the classic V8 nativescript.dll is not staged into a variant
+        # (the engine cdylib takes its place), so building it here would be thrown away.
+        # -SkipArm64: the variants are x64-only (`cpu: ["x64"]` in their package.json).
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./template/build.ps1 -SkipArm64 -SkipRelease -SkipDevtools
+      - name: Set package version
+        shell: pwsh
+        working-directory: packages/windows-${{ matrix.engine }}
+        run: npm version $env:NPM_VERSION --no-git-tag-version --allow-same-version
+      - name: Build ${{ matrix.engine }} framework
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # build.ps1 reports through Write-Host, so the log has to be teed off the information
+          # stream (`*>&1`) rather than stdout for the WARN check below to see anything.
+          $logPath = Join-Path $env:RUNNER_TEMP "build-$env:ENGINE.log"
+          ./template/build.ps1 -Engine $env:ENGINE *>&1 | Tee-Object -FilePath $logPath
+          # A missing engine runtime DLL (hermes.dll, JavaScriptCore.dll, …) beside the cdylib is
+          # only a warning there, but it ships a framework that fails to load at app start.
+          if (Select-String -Path $logPath -Pattern 'expected engine DLL not found' -Quiet) {
+            throw "An engine runtime DLL was not staged — see the WARN above."
+          }
+          $dll = "packages/windows-$env:ENGINE/framework/libs/x64/nativescript.dll"
+          if (-not (Test-Path $dll)) { throw "Runtime DLL missing: $dll" }
+      - name: Pack
+        shell: pwsh
+        working-directory: packages/windows-${{ matrix.engine }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # --pack-destination does not create the directory.
+          New-Item -ItemType Directory -Force -Path ../../dist | Out-Null
+          npm pack --pack-destination ../../dist
+      - name: Upload npm package artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: npm-package-${{ matrix.engine }}
+          path: dist/nativescript-windows-${{ matrix.engine }}-${{ needs.setup.outputs.npm_version }}.tgz
+          if-no-files-found: error
+
+  publish:
+    name: Publish ${{ matrix.engine }}
+    runs-on: ubuntu-latest
+    # Part of the npm trusted-publisher match — see the header note before renaming.
+    environment: npm-publish
+    needs:
+      - setup
+      - build
+    permissions:
+      contents: read
+      id-token: write # OIDC trusted publishing + provenance
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.build_matrix) }}
+    env:
+      NPM_VERSION: ${{ needs.setup.outputs.npm_version }}
+      NPM_TAG: ${{ needs.setup.outputs.npm_tag }}
+      ENGINE: ${{ matrix.engine }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+          registry-url: "https://registry.npmjs.org"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-package-${{ matrix.engine }}
+          path: dist
+      - name: Update npm (required for OIDC trusted publishing)
+        run: |
+          corepack enable npm
+          corepack install -g npm@11.5.1
+          test "$(npm --version)" = "11.5.1"
+          test "$(npx --version)" = "11.5.1"
+      - name: Publish package (OIDC trusted publishing)
+        if: ${{ vars.USE_NPM_TOKEN != 'true' }}
+        run: |
+          echo "Publishing @nativescript/windows-$ENGINE@$NPM_VERSION to NPM with tag $NPM_TAG via OIDC trusted publishing..."
+          unset NODE_AUTH_TOKEN
+          if [ -n "${NPM_CONFIG_USERCONFIG:-}" ]; then
+            rm -f "$NPM_CONFIG_USERCONFIG"
+          fi
+          npm publish "./dist/nativescript-windows-${ENGINE}-${NPM_VERSION}.tgz" --tag "$NPM_TAG" --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ""
+      - name: Publish package (granular token)
+        if: ${{ vars.USE_NPM_TOKEN == 'true' }}
+        run: |
+          echo "Publishing @nativescript/windows-$ENGINE@$NPM_VERSION to NPM with tag $NPM_TAG via granular token..."
+          npm publish "./dist/nativescript-windows-${ENGINE}-${NPM_VERSION}.tgz" --tag "$NPM_TAG" --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}

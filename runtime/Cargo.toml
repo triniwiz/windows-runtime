@@ -21,6 +21,10 @@ runtime-binding-gen = { path = "../runtime-binding-gen" }
 parking_lot = "0.12"
 libc = "0.2"
 runtime-devtools = { path = "../runtime-devtools", optional = true }
+# Node-API backend (napi_engine feature). Off by default so the rusty_v8 build is unaffected.
+napi = { version = "2", default-features = false, features = ["napi8"], optional = true }
+# Native crash reporter (napi_engine hosts): symbolize SEH faults via the host PDB.
+backtrace = "0.3"
 
 windows-core = "0.62.2"
 windows-collections = "0.3.2"
@@ -34,6 +38,7 @@ features = [
     "Win32_System_Com",
     "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
     "Win32_System_EventLog",
     "Win32_Security",
     "Win32_System_Ole",
@@ -56,6 +61,8 @@ features = [
 [features]
 default = []
 devtools = ["runtime-devtools"]
+# Engine-agnostic Node-API backend, ported from the rusty_v8 seam.
+napi_engine = ["dep:napi"]
 
 [dev-dependencies]
 criterion = "0.5"

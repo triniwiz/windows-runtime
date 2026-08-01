@@ -1030,7 +1030,7 @@ pub fn box_as_ireference(
 }
 
 /// Parse "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" into a GUID.
-fn parse_guid_str(s: &str) -> Option<windows::core::GUID> {
+pub(crate) fn parse_guid_str(s: &str) -> Option<windows::core::GUID> {
     let s = s.trim_matches(|c| c == '{' || c == '}');
     let parts: Vec<&str> = s.split('-').collect();
     if parts.len() != 5 {
@@ -1738,7 +1738,7 @@ pub fn write_v8_value_to_ptr(
     }
 }
 
-const OUT_PARAM_MARKER: &str = "__nswinrt_out_param__";
+pub(crate) const OUT_PARAM_MARKER: &str = "__nswinrt_out_param__";
 
 /// Detects an `NSWinRT.interop.out(...)` wrapper and returns its object plus
 /// the wrapped `value` that should initialize the native byref slot.

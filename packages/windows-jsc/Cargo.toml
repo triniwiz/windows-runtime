@@ -1,0 +1,45 @@
+[package]
+name = "windows-jsc"
+version = "0.1.0"
+edition = "2021"
+description = "NativeScript Windows runtime on JavaScriptCore (napi-android JSC shim over JSC's public C API). Publishes as @nativescript/windows-jsc."
+
+# `cdylib` so `build.ps1 -Engine jsc` can emit `nativescript.dll` (the WinUI 3 host DLL);
+# `rlib` so the standalone `nativescript-windows` bin can still link the crate.
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+# The runnable bin needs a real JavaScriptCore.lib in vendor/x64 — gated so the shim still
+# compile-verifies (cargo build --lib) without the engine binary present.
+[[bin]]
+name = "nativescript-windows"
+path = "src/main.rs"
+required-features = ["jsc_link"]
+
+[features]
+default = []
+# Link JavaScriptCore.{lib,dll} (must be dropped into vendor/x64) and build the runtime host.
+jsc_link = ["dep:napi", "dep:runtime", "dep:ns-windows-common", "dep:ns-windows-demo"]
+# Compile the `nativescript.dll` C ABI (src/abi.rs) into the cdylib so the WinUI 3 host can load
+# JSC as a drop-in replacement for the classic runtime. Selected by `build.ps1 -Engine jsc`;
+# implies `jsc_link` (a real JavaScriptCore.{lib,dll} must be present in vendor/x64).
+host_dll = ["jsc_link"]
+
+[dependencies]
+napi = { version = "2", default-features = false, features = ["napi8"], optional = true }
+runtime = { path = "../../runtime", features = ["napi_engine"], optional = true }
+# Shared JS prelude + URL polyfill — used by both the cdylib (abi.rs) and the demo bin (main.rs).
+ns-windows-common = { path = "../common", optional = true }
+# Crash reporter + self-test harness for the demo bin (main.rs) only.
+ns-windows-demo = { path = "../demo", optional = true }
+
+[build-dependencies]
+cc = "1"
+
+# Windows-port fix so napi_* resolve from THIS cdylib (nativescript.dll) when loaded by the WinUI 3
+# .NET host, not from the host .exe (which has no napi exports). See packages/vendor/napi-sys.
+[patch.crates-io]
+napi-sys = { path = "../vendor/napi-sys" }
+
+[profile.release]
+debug = true

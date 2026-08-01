@@ -33,6 +33,108 @@ use windows::core::{IInspectable, IUnknown, Interface, GUID, HRESULT, HSTRING};
 use windows::Win32::System::WinRT::IActivationFactory;
 use windows::Win32::System::WinRT::Metadata::CorTokenType;
 
+/// Precomputed marshaling decision for a `NativeType::Pointer` parameter. Every variant is a
+/// pure function of the parameter's *signature*, so it is resolved once when the method's
+/// static info is built instead of re-derived per call (signature string parsing, metadata
+/// lookups, kind downcasts, and IID/delegate-info resolution were all previously on the hot
+/// path of `call_napi`).
+#[derive(Clone)]
+pub(crate) enum PointerPlan {
+    /// Plain pointer parse: non-WinRT signature, unresolvable type, or a resolvable kind
+    /// that takes no special handling.
+    Plain,
+    /// `IReference<T>` parameter — box primitives via the typed Create* call (inner type name).
+    IReference(String),
+    /// `Windows.UI.Xaml.Interop.TypeName` struct — synthesize {Name, Kind} from a class ctor.
+    TypeName,
+    /// Other struct parameter — serialize field-by-field (declaration pre-resolved).
+    Struct(Arc<RwLock<dyn Declaration>>),
+    /// Delegate parameter — wrap a JS function with the precomputed (IID, invoke param types).
+    Delegate(GUID, Vec<NativeType>),
+    /// Interface/class parameter — QI the argument to this IID.
+    Interface(GUID),
+}
+
+impl PointerPlan {
+    /// Mirrors the (former) per-call decision tree of `call_napi`'s Pointer arm exactly —
+    /// parity, not policy change. Only meaningful for in-params parsed as `Pointer`.
+    ///
+    /// `type_args` substitutes Var!N placeholders when resolving delegate info (interface-routed
+    /// generic calls); `typename_special` opts into the `Windows.UI.Xaml.Interop.TypeName`
+    /// synthesis (MethodCall's arm has it, PropertyCall's never did).
+    pub(crate) fn for_parameter(
+        signature: &str,
+        parameter: &ParameterDeclaration,
+        type_args: &[String],
+        typename_special: bool,
+    ) -> Self {
+        if let Some(inner) = crate::helpers::ireference_inner_type(signature) {
+            return PointerPlan::IReference(inner.to_string());
+        }
+        if !signature.contains('.') {
+            return PointerPlan::Plain;
+        }
+        let lookup_name = crate::helpers::strip_generic_suffix(signature);
+        let Some(declaration) = MetadataReader::find_by_name(lookup_name) else {
+            return PointerPlan::Plain;
+        };
+        let kind = declaration.read().kind();
+        match kind {
+            DeclarationKind::Struct => {
+                if typename_special
+                    && declaration.read().full_name() == "Windows.UI.Xaml.Interop.TypeName"
+                {
+                    PointerPlan::TypeName
+                } else {
+                    PointerPlan::Struct(declaration)
+                }
+            }
+            DeclarationKind::Delegate
+            | DeclarationKind::GenericDelegate
+            | DeclarationKind::GenericDelegateInstance => {
+                let delegate_info = parameter.metadata().and_then(|meta| {
+                    let raw_iid = Signature::to_iid_string(meta, &parameter.type_());
+                    let iid_name = crate::property_call::substitute_type_vars(&raw_iid, type_args);
+                    crate::delegate_info_from_type_sig(&iid_name)
+                });
+                match delegate_info {
+                    Some((guid, param_types)) => PointerPlan::Delegate(guid, param_types),
+                    None => PointerPlan::Plain,
+                }
+            }
+            _ => {
+                let iid = {
+                    let lock = declaration.read();
+                    match lock.kind() {
+                        DeclarationKind::Interface => lock
+                            .as_any()
+                            .downcast_ref::<InterfaceDeclaration>()
+                            .map(|interface| interface.id()),
+                        DeclarationKind::GenericInterface => lock
+                            .as_any()
+                            .downcast_ref::<GenericInterfaceDeclaration>()
+                            .map(|interface| interface.id()),
+                        DeclarationKind::GenericInterfaceInstance => lock
+                            .as_any()
+                            .downcast_ref::<GenericInterfaceInstanceDeclaration>()
+                            .map(|interface| interface.id()),
+                        DeclarationKind::Class => lock
+                            .as_any()
+                            .downcast_ref::<ClassDeclaration>()
+                            .and_then(|class| class.default_interface())
+                            .map(|iface| iface.id()),
+                        _ => None,
+                    }
+                };
+                match iid {
+                    Some(iid) => PointerPlan::Interface(iid),
+                    None => PointerPlan::Plain,
+                }
+            }
+        }
+    }
+}
+
 struct MethodStaticInfo {
     cif: Rc<Cif>,
     iid: GUID,
@@ -53,6 +155,9 @@ struct MethodStaticInfo {
     number_of_parameters: usize,
     return_kind: ReturnKind,
     param_sigs: Vec<String>,
+    /// Per-parameter marshaling plan, aligned with `parse_parameter_types`. Only consulted
+    /// for in-params whose parse type is `Pointer`; every other slot is `Plain`.
+    param_plans: Vec<PointerPlan>,
 }
 
 impl MethodStaticInfo {
@@ -72,12 +177,16 @@ impl MethodStaticInfo {
             number_of_parameters: 0,
             return_kind: ReturnKind::Void,
             param_sigs: Vec::new(),
+            param_plans: Vec::new(),
         })
     }
 }
 
 thread_local! {
-    static METHOD_STATIC_INFO_CACHE: RefCell<ahash::AHashMap<u64, Rc<MethodStaticInfo>>>
+    // Keyed by (metadata scope, token | flags): metadata tokens are only unique within one
+    // .winmd scope, so the raw IMetaDataImport2 pointer disambiguates same-token methods from
+    // different winmds (e.g. a Windows.Data.Json method vs IMap::HasKey — observed collision).
+    static METHOD_STATIC_INFO_CACHE: RefCell<ahash::AHashMap<(usize, u64), Rc<MethodStaticInfo>>>
         = RefCell::new(ahash::AHashMap::new());
 }
 
@@ -160,7 +269,8 @@ impl MethodCall {
 
         // Fast path: if we've seen this method+sealed combination, reuse cached info.
         // Skips find_declaring_interface_for_method + Cif::new + param processing.
-        let cache_key = ((method.token().0 as u64) << 1) | (is_sealed as u64);
+        let scope_key = windows::core::Interface::as_raw(method_metadata) as usize;
+        let cache_key = (scope_key, ((method.token().0 as u64) << 1) | (is_sealed as u64));
         if let Some(si) = METHOD_STATIC_INFO_CACHE.with(|c| c.borrow().get(&cache_key).cloned()) {
             let vtable = interface.vtable();
             let mut interface_ptr: *mut c_void = std::ptr::null_mut();
@@ -458,6 +568,22 @@ impl MethodCall {
         let parameters = method.parameters().to_vec();
         let return_kind = crate::classify_return(&return_type, is_void);
 
+        // Resolve each Pointer in-param's marshaling plan once; out/ByRef params and
+        // non-pointer types never consult their slot.
+        let param_plans: Vec<PointerPlan> = parse_parameter_types
+            .iter()
+            .zip(parameters.iter())
+            .zip(param_sigs.iter())
+            .map(|((nt, parameter), sig)| {
+                let is_out = parameter.is_out() || sig.starts_with("ByRef ");
+                if !is_out && matches!(nt, NativeType::Pointer) {
+                    PointerPlan::for_parameter(sig, parameter, &[], true)
+                } else {
+                    PointerPlan::Plain
+                }
+            })
+            .collect();
+
         // Store static info in cache so future calls on the same method type skip the slow path.
         let static_info = Rc::new(MethodStaticInfo {
             cif,
@@ -474,6 +600,7 @@ impl MethodCall {
             number_of_parameters,
             return_kind,
             param_sigs,
+            param_plans,
         });
         METHOD_STATIC_INFO_CACHE
             .with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
@@ -501,7 +628,7 @@ impl MethodCall {
                 HRESULT(0x8000_4005u32 as i32),
                 std::ptr::null_mut(),
                 Vec::new(),
-            ); // E_FAIL
+            );
         }
 
         // Snapshot fields before the mutable borrow of argument_buf begins.
@@ -618,27 +745,21 @@ impl MethodCall {
                 NativeType::F32 => ffi_parse_f32_arg(value),
                 NativeType::F64 => ffi_parse_f64_arg(value),
                 NativeType::Pointer => {
-                    let parameter_signature: &str = &self.si.param_sigs[i];
-
-                    // IReference<T> parameters: box JS primitives with the correct Create* call
-                    // so XAML receives the right typed IPropertyValue (e.g. IReference<Double>).
-                    if let Some(inner) = crate::helpers::ireference_inner_type(&parameter_signature)
-                    {
-                        if let Some(nv) = crate::value::box_as_ireference(scope, value, inner) {
-                            Ok(nv)
-                        } else {
-                            ffi_parse_pointer_arg(scope, value)
+                    // Signature classification (IReference/struct/delegate/interface) resolved
+                    // once into the per-parameter plan at static-info build time (PointerPlan).
+                    match &self.si.param_plans[i] {
+                        PointerPlan::Plain => ffi_parse_pointer_arg(scope, value),
+                        // IReference<T> parameters: box JS primitives with the correct Create* call
+                        // so XAML receives the right typed IPropertyValue (e.g. IReference<Double>).
+                        PointerPlan::IReference(inner) => {
+                            if let Some(nv) = crate::value::box_as_ireference(scope, value, inner) {
+                                Ok(nv)
+                            } else {
+                                ffi_parse_pointer_arg(scope, value)
+                            }
                         }
-                    } else if parameter_signature.contains('.') {
-                        let lookup_name = crate::helpers::strip_generic_suffix(parameter_signature);
-
-                        if let Some(declaration) = MetadataReader::find_by_name(lookup_name) {
-                            // Struct parameters (TypeName, Point, Rect, …) are passed as a
-                            // pointer to their ABI-layout bytes.  Class constructors passed
-                            // where a TypeName is expected are synthesised automatically.
-                            if matches!(declaration.read().kind(), DeclarationKind::Struct) {
-                                let full_name = declaration.read().full_name().to_string();
-                                if full_name == "Windows.UI.Xaml.Interop.TypeName" {
+                        PointerPlan::TypeName => {
+                            {
                                     // If the JS argument is a class constructor (instance=None,
                                     // struct_instance=None) synthesise a TypeName{Name,Kind=Metadata}.
                                     let synthesized: Option<*mut c_void> = 'synth: {
@@ -670,7 +791,7 @@ impl MethodCall {
                                                     unsafe {
                                                         *(bytes.as_mut_ptr() as *mut usize) = raw;
                                                         *(bytes.as_mut_ptr().add(8) as *mut u32) =
-                                                            1u32; // TypeKind::Metadata
+                                                            1u32;
                                                     }
                                                     break 'synth Some(
                                                         Box::leak(bytes).as_ptr() as *mut c_void
@@ -687,7 +808,10 @@ impl MethodCall {
                                         // extracts struct_instance.buf.as_ptr() via try_get_external_handle.
                                         ffi_parse_pointer_arg(scope, value)
                                     }
-                                } else {
+                            }
+                        }
+                        PointerPlan::Struct(declaration) => {
+                                {
                                     // Other structs: accept ArrayBuffer, struct instances, or plain JS objects.
                                     if value.is_array_buffer() || value.is_array_buffer_view() {
                                         ffi_parse_struct_arg(scope, value)
@@ -728,17 +852,9 @@ impl MethodCall {
                                         ffi_parse_pointer_arg(scope, value)
                                     }
                                 }
-                            } else {
-                                let kind = declaration.read().kind();
-
-                                let is_delegate = matches!(
-                                    kind,
-                                    DeclarationKind::Delegate
-                                        | DeclarationKind::GenericDelegate
-                                        | DeclarationKind::GenericDelegateInstance
-                                );
-
-                                if is_delegate {
+                        }
+                        PointerPlan::Delegate(guid, delegate_param_types) => {
+                                {
                                     let handle_ptr = value.to_object(scope).and_then(|obj| {
                                         let key = v8::String::new(scope, "handle")?;
                                         let hv = obj.get(scope, key.into())?;
@@ -752,77 +868,35 @@ impl MethodCall {
                                     } else if let Ok(func) =
                                         v8::Local::<v8::Function>::try_from(value)
                                     {
-                                        let parameter = &self.si.parameters[i];
-                                        let delegate_info = parameter.metadata().and_then(|meta| {
-                                            let iid_name =
-                                                Signature::to_iid_string(meta, &parameter.type_());
-                                            crate::delegate_info_from_type_sig(&iid_name)
+                                        use std::sync::atomic::AtomicU32;
+                                        let data = Box::new(crate::JsDelegateData {
+                                            js_func: v8::Global::new(scope, func),
+                                            param_types: delegate_param_types.clone(),
                                         });
-                                        if let Some((guid, param_types)) = delegate_info {
-                                            use std::sync::atomic::AtomicU32;
-                                            let data = Box::new(crate::JsDelegateData {
-                                                js_func: v8::Global::new(scope, func),
-                                                param_types,
-                                            });
-                                            let delegate = Box::new(crate::JsDelegate {
-                                                vtable: &crate::JS_DELEGATE_VTBL as *const _,
-                                                ref_count: AtomicU32::new(1),
-                                                guid,
-                                                data: Box::into_raw(data),
-                                            });
-                                            Ok(NativeValue {
-                                                pointer: Box::into_raw(delegate) as *mut c_void,
-                                            })
-                                        } else {
-                                            ffi_parse_pointer_arg(scope, value)
-                                        }
-                                    } else {
-                                        ffi_parse_pointer_arg(scope, value)
-                                    }
-                                } else {
-                                    let iid = {
-                                        let lock = declaration.read();
-                                        match lock.kind() {
-                                            DeclarationKind::Interface => lock
-                                                .as_any()
-                                                .downcast_ref::<InterfaceDeclaration>()
-                                                .map(|interface| interface.id()),
-                                            DeclarationKind::GenericInterface => lock
-                                                .as_any()
-                                                .downcast_ref::<GenericInterfaceDeclaration>()
-                                                .map(|interface| interface.id()),
-                                            DeclarationKind::GenericInterfaceInstance => lock
-                                                .as_any()
-                                                .downcast_ref::<GenericInterfaceInstanceDeclaration>()
-                                                .map(|interface| interface.id()),
-                                            DeclarationKind::Class => lock
-                                                .as_any()
-                                                .downcast_ref::<ClassDeclaration>()
-                                                .and_then(|class| class.default_interface())
-                                                .map(|iface| iface.id()),
-                                            _ => None,
-                                        }
-                                    };
-
-                                    if let Some(iid) = iid {
-                                        match ffi_parse_query_interface_arg(scope, value, &iid) {
-                                            Ok((pointer, Some(interface_guard))) => {
-                                                queried_interfaces.push(interface_guard);
-                                                Ok(pointer)
-                                            }
-                                            Ok((pointer, None)) => Ok(pointer),
-                                            Err(_) => ffi_parse_pointer_arg(scope, value),
-                                        }
+                                        let delegate = Box::new(crate::JsDelegate {
+                                            vtable: &crate::JS_DELEGATE_VTBL as *const _,
+                                            ref_count: AtomicU32::new(1),
+                                            guid: *guid,
+                                            data: Box::into_raw(data),
+                                        });
+                                        Ok(NativeValue {
+                                            pointer: Box::into_raw(delegate) as *mut c_void,
+                                        })
                                     } else {
                                         ffi_parse_pointer_arg(scope, value)
                                     }
                                 }
-                            }
-                        } else {
-                            ffi_parse_pointer_arg(scope, value)
                         }
-                    } else {
-                        ffi_parse_pointer_arg(scope, value)
+                        PointerPlan::Interface(iid) => {
+                            match ffi_parse_query_interface_arg(scope, value, iid) {
+                                Ok((pointer, Some(interface_guard))) => {
+                                    queried_interfaces.push(interface_guard);
+                                    Ok(pointer)
+                                }
+                                Ok((pointer, None)) => Ok(pointer),
+                                Err(_) => ffi_parse_pointer_arg(scope, value),
+                            }
+                        }
                     }
                 }
                 NativeType::Buffer => {
@@ -938,7 +1012,7 @@ impl MethodCall {
                     HRESULT(0x8000_4005u32 as i32),
                     std::ptr::null_mut(),
                     Vec::new(),
-                ); // E_FAIL
+                );
             }
         };
 
@@ -1170,5 +1244,510 @@ impl MethodCall {
             }
         };
         HRESULT(ret)
+    }
+}
+
+/// Node-API entry point for invoking a WinRT method: runs the same marshaling pipeline,
+/// argument-buffer reuse, out-slot handling, and error contract as `MethodCall::call`, but
+/// takes JS values as napi handles instead of a `FunctionCallbackArguments`. Kept in this file
+/// so it can share the private fields with `MethodCall::call`.
+#[cfg(feature = "napi_engine")]
+impl MethodCall {
+    pub fn call_napi(
+        &mut self,
+        env: &napi::Env,
+        args: &[napi::JsUnknown],
+    ) -> (HRESULT, *mut c_void, Vec<napi::JsUnknown>) {
+        use crate::napi_engine::delegate::make_napi_delegate;
+        use crate::napi_engine::value as nv;
+        use napi::{JsFunction, JsObject, JsUnknown, NapiRaw, NapiValue, ValueType};
+
+        // Re-materialize the same napi handle as an owned JsUnknown (parsers take &JsUnknown;
+        // handles are cheap value-copies of (env, napi_value)).
+        #[inline]
+        fn dup_arg(env: &napi::Env, v: &JsUnknown) -> JsUnknown {
+            unsafe { JsUnknown::from_raw_unchecked(env.raw(), v.raw()) }
+        }
+        // v8's args.get(i) yields undefined past the end; mirror that.
+        #[inline]
+        fn arg_at(env: &napi::Env, args: &[JsUnknown], i: usize) -> Option<JsUnknown> {
+            match args.get(i) {
+                Some(v) => Some(dup_arg(env, v)),
+                None => env
+                    .get_undefined()
+                    .ok()
+                    .map(|u| unsafe { JsUnknown::from_raw_unchecked(env.raw(), u.raw()) }),
+            }
+        }
+        #[inline]
+        fn fail3() -> (HRESULT, *mut c_void, Vec<napi::JsUnknown>) {
+            (call_failure(), std::ptr::null_mut(), Vec::new())
+        }
+
+        if self.init_error.is_some() {
+            return (
+                HRESULT(0x8000_4005u32 as i32),
+                std::ptr::null_mut(),
+                Vec::new(),
+            );
+        }
+
+        let is_initializer = self.is_initializer;
+        let is_sealed = self.is_sealed;
+        let is_void = self.si.is_void;
+        let is_value_type = matches!(
+            self.si.return_kind,
+            ReturnKind::Struct(_) | ReturnKind::Guid
+        );
+        let is_scalar_return = matches!(
+            self.si.return_type.as_str(),
+            "UInt8"
+                | "Int8"
+                | "UInt16"
+                | "Int16"
+                | "UInt32"
+                | "Int32"
+                | "UInt64"
+                | "Int64"
+                | "USize"
+                | "ISize"
+                | "Single"
+                | "Double"
+                | "Boolean"
+                | "Char16"
+        );
+        let is_string_return = self.si.return_type.as_str() == "String";
+
+        self.argument_buf.clear();
+        self.argument_parse_types.clear();
+        let mut queried_interfaces: Vec<IUnknown> = Vec::new();
+        let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
+        // (argument_buf index, parse_native_type, param_index, out-wrapper object)
+        let mut out_slots: Vec<(usize, NativeType, usize, Option<napi::JsObject>)> = Vec::new();
+
+        self.argument_buf.push(NativeValue {
+            pointer: self.interface.as_raw() as *mut c_void,
+        });
+        self.argument_parse_types.push(None);
+
+        for (i, native_type) in self.si.parse_parameter_types.iter().enumerate() {
+            let parameter = &self.si.parameters[i];
+            let param_sig = &self.si.param_sigs[i];
+            let is_sig_byref = param_sig.starts_with("ByRef ");
+
+            if parameter.is_out() || is_sig_byref {
+                let slot_index = self.argument_buf.len();
+                let slot_size = match native_type {
+                    NativeType::Struct(_) => native_type.size(),
+                    NativeType::Pointer
+                    | NativeType::Buffer
+                    | NativeType::Function
+                    | NativeType::String => std::mem::size_of::<usize>(),
+                    _ => native_type.size(),
+                };
+                let mut buf: Vec<u8> = vec![0u8; slot_size];
+                let ptr = buf.as_mut_ptr() as *mut c_void;
+                struct_scratch.push(buf);
+                self.argument_buf.push(NativeValue { pointer: ptr });
+                self.argument_parse_types.push(None);
+
+                let raw_init_val = match arg_at(env, args, i) {
+                    Some(v) => v,
+                    None => return fail3(),
+                };
+                let (wrapper_obj, init_val) = match nv::try_unwrap_out_param(env, &raw_init_val) {
+                    Some((obj, value)) => (Some(obj), value),
+                    None => (None, raw_init_val),
+                };
+
+                if args.len() > i {
+                    let vt = init_val.get_type().unwrap_or(ValueType::Undefined);
+                    if vt != ValueType::Undefined && vt != ValueType::Null {
+                        match nv::write_js_value_to_ptr(env, &init_val, ptr, native_type) {
+                            Ok(_) => {}
+                            Err(_) => return fail3(),
+                        }
+                    }
+                }
+
+                out_slots.push((slot_index, native_type.clone(), i, wrapper_obj));
+                continue;
+            }
+
+            let value = match arg_at(env, args, i) {
+                Some(v) => v,
+                None => return fail3(),
+            };
+            let vt = value.get_type().unwrap_or(ValueType::Undefined);
+
+            let value = match *native_type {
+                NativeType::Void => return fail3(),
+                NativeType::Bool => nv::napi_parse_bool(&value),
+                NativeType::U8 => nv::napi_parse_u8(&value),
+                NativeType::I8 => nv::napi_parse_i8(&value),
+                NativeType::U16 => nv::napi_parse_u16(&value),
+                NativeType::I16 => nv::napi_parse_i16(&value),
+                NativeType::U32 => nv::napi_parse_u32(&value),
+                NativeType::I32 => nv::napi_parse_i32(&value),
+                NativeType::U64 => nv::napi_parse_u64(&value),
+                NativeType::I64 => nv::napi_parse_i64(&value),
+                NativeType::USize => nv::napi_parse_usize(&value),
+                NativeType::ISize => nv::napi_parse_isize(&value),
+                NativeType::F32 => nv::napi_parse_f32(&value),
+                NativeType::F64 => nv::napi_parse_f64(&value),
+                NativeType::Pointer => {
+                    // All signature classification (IReference/struct/delegate/interface) was
+                    // resolved once into the per-parameter plan when the static info was built.
+                    match &self.si.param_plans[i] {
+                        PointerPlan::Plain => nv::napi_parse_pointer(env, &value),
+                        PointerPlan::IReference(inner) => {
+                            // IReference<T>: box primitives with the correct typed Create* call.
+                            if let Some(nvv) = nv::box_as_ireference(env, &value, inner) {
+                                Ok(nvv)
+                            } else {
+                                nv::napi_parse_pointer(env, &value)
+                            }
+                        }
+                        PointerPlan::TypeName => {
+                            {
+                                    // Class constructor passed for a TypeName parameter →
+                                    // synthesize TypeName{Name, Kind=Metadata}. The wrapped
+                                    // DeclarationFFI arrives via env.unwrap (rusty_v8 used
+                                    // internal field 0).
+                                    let synthesized: Option<*mut c_void> = 'synth: {
+                                        if vt == ValueType::Object || vt == ValueType::Function {
+                                            let obj: JsObject = unsafe { value.cast() };
+                                            if let Ok(dec_ffi) =
+                                                env.unwrap::<crate::DeclarationFFI>(&obj)
+                                            {
+                                                if dec_ffi.struct_instance.is_none()
+                                                    && dec_ffi.instance.is_none()
+                                                {
+                                                    let class_name = dec_ffi
+                                                        .inner
+                                                        .read()
+                                                        .full_name()
+                                                        .to_string();
+                                                    let hstring =
+                                                        HSTRING::from(class_name.as_str());
+                                                    // SAFETY: HSTRING is repr(transparent) over
+                                                    // *mut u16; ownership moves into the leaked
+                                                    // bytes (Navigate reads Name during the call).
+                                                    let raw: usize =
+                                                        unsafe { std::mem::transmute(hstring) };
+                                                    let mut bytes: Box<[u8; 16]> =
+                                                        Box::new([0u8; 16]);
+                                                    unsafe {
+                                                        *(bytes.as_mut_ptr() as *mut usize) = raw;
+                                                        *(bytes.as_mut_ptr().add(8)
+                                                            as *mut u32) = 1u32;
+                                                    }
+                                                    break 'synth Some(
+                                                        Box::leak(bytes).as_ptr() as *mut c_void
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        None
+                                    };
+                                    if let Some(ptr) = synthesized {
+                                        Ok(NativeValue { pointer: ptr })
+                                    } else {
+                                        nv::napi_parse_pointer(env, &value)
+                                    }
+                            }
+                        }
+                        PointerPlan::Struct(declaration) => {
+                                {
+                                    // Other structs: ArrayBuffer bytes, wrapped struct
+                                    // instances, or plain JS objects serialized field-by-field.
+                                    let is_buffer_like =
+                                        nv::napi_parse_struct(env, &value).is_ok();
+                                    if is_buffer_like {
+                                        nv::napi_parse_struct(env, &value)
+                                    } else if vt == ValueType::Object {
+                                        let obj: JsObject = unsafe { value.cast() };
+                                        let has_wrap =
+                                            env.unwrap::<crate::DeclarationFFI>(&obj).is_ok();
+                                        if has_wrap {
+                                            nv::napi_parse_pointer(env, &value)
+                                        } else {
+                                            let mut sbuf: Vec<u8> = Vec::new();
+                                            {
+                                                let lock = declaration.read();
+                                                if let Some(sd) = lock
+                                                    .as_any()
+                                                    .downcast_ref::<StructDeclaration>()
+                                                {
+                                                    crate::property_call::append_struct_object_bytes_napi(env, &mut sbuf, &obj, sd);
+                                                }
+                                            }
+                                            if sbuf.is_empty() {
+                                                sbuf.push(0);
+                                            }
+                                            let ptr = sbuf.as_mut_ptr() as *mut c_void;
+                                            struct_scratch.push(sbuf);
+                                            Ok(NativeValue { pointer: ptr })
+                                        }
+                                    } else {
+                                        nv::napi_parse_pointer(env, &value)
+                                    }
+                                }
+                        }
+                        PointerPlan::Delegate(guid, delegate_param_types) => {
+                                {
+                                    // Pre-wrapped delegate ({handle: External}) → pass through.
+                                    let handle_ptr = if vt == ValueType::Object {
+                                        let obj: JsObject = unsafe { value.cast() };
+                                        obj.get_named_property::<JsUnknown>("handle")
+                                            .ok()
+                                            .and_then(|hv| nv::ptr_from_external(env, &hv))
+                                    } else {
+                                        None
+                                    };
+
+                                    if let Some(ptr) = handle_ptr {
+                                        Ok(NativeValue { pointer: ptr })
+                                    } else if vt == ValueType::Function {
+                                        let func: JsFunction = unsafe { value.cast() };
+                                        match make_napi_delegate(
+                                            env,
+                                            &func,
+                                            *guid,
+                                            delegate_param_types.clone(),
+                                        ) {
+                                            Some(ptr) => Ok(NativeValue { pointer: ptr }),
+                                            None => nv::napi_parse_pointer(env, &value),
+                                        }
+                                    } else {
+                                        nv::napi_parse_pointer(env, &value)
+                                    }
+                                }
+                        }
+                        PointerPlan::Interface(iid) => {
+                            match nv::napi_parse_query_interface(env, &value, iid) {
+                                Ok((pointer, Some(interface_guard))) => {
+                                    queried_interfaces.push(interface_guard);
+                                    Ok(pointer)
+                                }
+                                Ok((pointer, None)) => Ok(pointer),
+                                Err(_) => nv::napi_parse_pointer(env, &value),
+                            }
+                        }
+                    }
+                }
+                NativeType::Buffer => {
+                    let parsed = nv::napi_parse_buffer_with_length(env, &value);
+                    let (buffer_value, byte_length) = match parsed {
+                        Ok(value) => value,
+                        Err(_) => return fail3(),
+                    };
+                    self.argument_buf.push(NativeValue {
+                        u32_value: byte_length,
+                    });
+                    self.argument_parse_types.push(Some(native_type.clone()));
+                    self.argument_buf.push(buffer_value);
+                    self.argument_parse_types.push(Some(native_type.clone()));
+                    continue;
+                }
+                NativeType::Function => nv::napi_parse_function(env, &value),
+                NativeType::Struct(_) => nv::napi_parse_struct(env, &value),
+                NativeType::String => nv::napi_parse_string(&value),
+            };
+
+            let value = match value {
+                Ok(value) => value,
+                Err(_) => return fail3(),
+            };
+
+            self.argument_buf.push(value);
+            self.argument_parse_types.push(Some(native_type.clone()));
+        }
+
+        let mut result: *mut c_void = std::ptr::null_mut();
+        let composition_outer: *mut c_void = std::ptr::null_mut();
+        let mut composition_inner: *mut c_void = std::ptr::null_mut();
+
+        if is_initializer {
+            if !is_sealed {
+                // pOuter must be a literal null pointer (see the rusty_v8 original).
+                self.argument_buf.push(NativeValue {
+                    pointer: std::ptr::null_mut(),
+                });
+                self.argument_parse_types.push(None);
+                self.argument_buf.push(NativeValue {
+                    pointer: &mut composition_inner as *mut _ as *mut c_void,
+                });
+                self.argument_parse_types.push(None);
+            }
+            self.argument_buf.push(NativeValue {
+                pointer: &mut result as *mut _ as *mut c_void,
+            });
+            self.argument_parse_types.push(None);
+        } else if !is_void {
+            if is_value_type || is_scalar_return || is_string_return {
+                let buf_ptr = self.return_value_buf.as_mut_ptr() as *mut c_void;
+                self.argument_buf.push(NativeValue { pointer: buf_ptr });
+                self.argument_parse_types.push(None);
+            } else {
+                self.argument_buf.push(NativeValue {
+                    pointer: &mut result as *mut _ as *mut c_void,
+                });
+                self.argument_parse_types.push(None);
+            }
+        }
+
+        let prep = match crate::ffi::prepare_string_storage(
+            &self.argument_buf,
+            &self.si.parameter_types,
+            &self.argument_parse_types,
+        ) {
+            Ok(value) => value,
+            Err(_) => return fail3(),
+        };
+
+        let func_to_call = self.func;
+        let call_args =
+            crate::ffi::build_call_args(&prep, &self.argument_buf, &self.si.parameter_types);
+
+        let ret_i32_res = catch_unwind(AssertUnwindSafe(|| unsafe {
+            self.si
+                .cif
+                .call(CodePtr::from_ptr(func_to_call), &call_args)
+        }));
+
+        let ret = match ret_i32_res {
+            Ok(code) => code,
+            Err(_) => {
+                let method_display = if self.si.method_name == ".ctor" {
+                    "constructor"
+                } else if self.si.method_name == ".cctor" {
+                    "static constructor"
+                } else {
+                    self.si.method_name.as_str()
+                };
+                let msg = format!(
+                    "WinRT call panicked during invocation of '{}': returning E_FAIL",
+                    method_display
+                );
+                crate::store_last_js_error(msg);
+                return (
+                    HRESULT(0x8000_4005u32 as i32),
+                    std::ptr::null_mut(),
+                    Vec::new(),
+                );
+            }
+        };
+
+        let hr = HRESULT(ret);
+        const RPC_E_WRONG_THREAD: u32 = 0x8001010E;
+        if (hr.0 as u32) == RPC_E_WRONG_THREAD {
+            let method_display = if self.si.method_name == ".ctor" {
+                "constructor"
+            } else if self.si.method_name == ".cctor" {
+                "static constructor"
+            } else {
+                self.si.method_name.as_str()
+            };
+            let detail = crate::error::format_hresult_message(hr);
+            let msg = format!("{} when invoking '{}'", detail, method_display);
+            crate::store_last_js_error(msg.clone());
+            nv::throw_js_error(env, &msg);
+        }
+
+        if is_initializer && !is_sealed && result.is_null() {
+            if !composition_inner.is_null() {
+                result = composition_inner;
+            } else if !composition_outer.is_null() {
+                result = composition_outer;
+            }
+        }
+
+        if !is_initializer && !is_void && (is_value_type || is_scalar_return || is_string_return) {
+            result = self.return_value_buf.as_mut_ptr() as *mut c_void;
+        }
+
+        // Marshal out-parameters back into JS values using the recorded slots.
+        // TODO(ns_proxy port): WinRT-typed out params (structs / class instances) get typed
+        // wrappers once create_struct_object_from_raw / create_ns_ctor_instance_object are
+        // ported; until then they surface as externals via the fallback below.
+        let mut out_values: Vec<napi::JsUnknown> = Vec::new();
+        for (slot_index, parse_native_type, param_idx, wrapper_obj) in out_slots.into_iter() {
+            let storage_ptr = unsafe {
+                self.argument_buf
+                    .get(slot_index)
+                    .map(|v| v.pointer)
+                    .unwrap_or(std::ptr::null_mut())
+            };
+            if storage_ptr.is_null() {
+                let Ok(null_js) = env.get_null() else {
+                    return fail3();
+                };
+                let v = unsafe { JsUnknown::from_raw_unchecked(env.raw(), null_js.raw()) };
+                if let Some(mut wrapper) = wrapper_obj {
+                    let _ = nv::set_out_param_value(&mut wrapper, v);
+                } else {
+                    out_values.push(v);
+                }
+                continue;
+            }
+            let sig = &self.si.param_sigs[param_idx];
+            let v = unsafe {
+                match parse_native_type {
+                    NativeType::Pointer | NativeType::Buffer | NativeType::Function => {
+                        let inner =
+                            std::ptr::read_unaligned(storage_ptr as *const usize) as *mut c_void;
+                        if inner.is_null() {
+                            match env.get_null() {
+                                Ok(n) => JsUnknown::from_raw_unchecked(env.raw(), n.raw()),
+                                Err(_) => return fail3(),
+                            }
+                        } else if !sig.is_empty() && sig.contains('.') {
+                            // WinRT-typed out param: `inner` is the COM/struct pointer.
+                            // Classes resolve to typed proxies; structs stay externals.
+                            match crate::napi_engine::ns_proxy::try_wrap_inspectable_pointer(
+                                env, inner,
+                            ) {
+                                Some(p) => crate::napi_engine::value::as_unknown(env, p),
+                                None => match nv::read_return_value(
+                                    env,
+                                    inner,
+                                    &NativeType::Pointer,
+                                ) {
+                                    Ok(v) => v,
+                                    Err(_) => return fail3(),
+                                },
+                            }
+                        } else {
+                            // Non-WinRT pointer sig: identical read path to the rusty_v8
+                            // original (read_value_from_ptr on `inner`).
+                            match nv::read_value_from_ptr(
+                                env,
+                                inner as *const c_void,
+                                &NativeType::Pointer,
+                            ) {
+                                Ok(v) => v,
+                                Err(_) => return fail3(),
+                            }
+                        }
+                    }
+                    _ => match nv::read_value_from_ptr(
+                        env,
+                        storage_ptr as *const c_void,
+                        &parse_native_type,
+                    ) {
+                        Ok(v) => v,
+                        Err(_) => return fail3(),
+                    },
+                }
+            };
+            if let Some(mut wrapper) = wrapper_obj {
+                let _ = nv::set_out_param_value(&mut wrapper, v);
+            } else {
+                out_values.push(v);
+            }
+        }
+
+        (HRESULT(ret), result, out_values)
     }
 }

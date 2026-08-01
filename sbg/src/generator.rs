@@ -111,18 +111,102 @@ impl Generator {
         let filepath = project_dir.join(&filename);
 
         let base_type = proxy_base_type(ext_meta);
-        let base_clause = format!(" : {}", base_type);
+        let has_real_base = base_type != "object";
+
+        // Every base-class override JS asked for, resolved to its REAL signature from WinRT
+        // metadata (see signature_resolver) — a method that can't be resolved (unknown to
+        // metadata, or a JS-only helper with no C# counterpart) is skipped with a warning rather
+        // than emitted with a guessed signature that either won't compile as an `override` or,
+        // worse, silently compiles as an unrelated new method that never actually overrides
+        // anything.
+        let raw_base_name = ext_meta.base_class.as_deref().unwrap_or("");
+        let mut resolved_methods: Vec<MethodMetadata> = Vec::new();
+        if has_real_base {
+            for method in &ext_meta.methods {
+                match crate::signature_resolver::resolve_method(raw_base_name, &method.name) {
+                    Some(r) => resolved_methods.push(MethodMetadata {
+                        name: r.name,
+                        return_type: r.return_type,
+                        parameters: r.parameters,
+                        modifier: r.modifier_override.unwrap_or("public override").to_string(),
+                    }),
+                    None => eprintln!(
+                        "[sbg] warning: no known signature for {}.{} — skipping (extend the WinRT metadata lookup or check the method name)",
+                        raw_base_name, method.name
+                    ),
+                }
+            }
+        }
+
+        // Every interface JS asked to implement — the CLR requires ALL of an interface's
+        // members implemented, so (unlike base-class overrides) these are never JS-override-
+        // filtered: every resolved method/property gets a stub, forwarding to
+        // ProxyDispatcher exactly like a base override does. An interface that can't be
+        // resolved is skipped entirely (with a warning) — its members are unknown, so no
+        // compilable, contract-complete implementation can be emitted for it.
+        let mut interface_clause_names: Vec<String> = Vec::new();
+        let mut interface_methods: Vec<MethodMetadata> = Vec::new();
+        let mut interface_properties: Vec<PropertyMetadata> = Vec::new();
+        for iface_name in &ext_meta.interfaces {
+            match crate::signature_resolver::resolve_interface_members(iface_name) {
+                Some((methods, properties)) => {
+                    interface_clause_names.push(iface_name.clone());
+                    interface_methods.extend(methods.into_iter().map(|r| {
+                        // A member whose name collides with an inherited System.Object virtual
+                        // (e.g. Windows.Foundation.IStringable.ToString) must be an `override`,
+                        // not a bare `public` method — the latter only hides the base member
+                        // (CS0114) instead of properly overriding it/satisfying the interface via
+                        // the object virtual CsWinRT expects.
+                        let modifier = if is_object_virtual(&r.name) {
+                            "public override"
+                        } else {
+                            "public"
+                        };
+                        MethodMetadata {
+                            name: r.name,
+                            return_type: r.return_type,
+                            parameters: r.parameters,
+                            modifier: modifier.to_string(),
+                        }
+                    }));
+                    interface_properties.extend(properties.into_iter().map(|r| PropertyMetadata {
+                        name: r.name,
+                        prop_type: r.prop_type,
+                        is_readable: r.is_readable,
+                        is_writable: r.is_writable,
+                    }));
+                }
+                None => eprintln!(
+                    "[sbg] warning: could not resolve interface {} — skipping (not found in WinRT metadata)",
+                    iface_name
+                ),
+            }
+        }
+
+        // `: object` is never valid C# (every class already derives from object implicitly) —
+        // omit the base type entirely when there's no real base class, and only join with `, `
+        // when there's more than one entry.
+        let mut clause_parts: Vec<&str> = Vec::new();
+        if has_real_base {
+            clause_parts.push(base_type.as_str());
+        }
+        for name in &interface_clause_names {
+            clause_parts.push(name.as_str());
+        }
+        let base_clause = if clause_parts.is_empty() {
+            String::new()
+        } else {
+            format!(" : {}", clause_parts.join(", "))
+        };
+
         let type_name_literal = csharp_string_literal(js_type_name.as_str());
         let class_name_literal = csharp_string_literal(class_name.as_str());
-        let method_modifier = if base_type == "object" {
-            "public"
-        } else {
-            "public override"
-        };
-        let property_modifier = method_modifier;
+        let property_modifier = if has_real_base { "public override" } else { "public" };
 
         // Pre-size the buffer: header ~400 bytes + ~150 per method + ~120 per property
-        let capacity = 400 + ext_meta.methods.len() * 150 + ext_meta.properties.len() * 120;
+        let method_count = resolved_methods.len() + interface_methods.len();
+        let property_count = ext_meta.properties.len() + interface_properties.len();
+        let capacity = 400 + method_count * 150 + property_count * 120;
         let mut class_code = String::with_capacity(capacity);
         class_code.push_str(GENERATED_FILE_HEADER);
         class_code.push_str("using System;\nusing NativeScriptGeneratedProxies;\n\n");
@@ -140,9 +224,15 @@ impl Generator {
         for prop in &ext_meta.properties {
             class_code.push_str(&self.generate_property(prop, property_modifier));
         }
+        for prop in &interface_properties {
+            class_code.push_str(&self.generate_property(prop, "public"));
+        }
 
-        for method in &ext_meta.methods {
-            class_code.push_str(&self.generate_method(method, method_modifier));
+        for method in &resolved_methods {
+            class_code.push_str(&self.generate_method(method, "public override"));
+        }
+        for method in &interface_methods {
+            class_code.push_str(&self.generate_method(method, "public"));
         }
 
         class_code.push_str("    }\n}\n");
@@ -382,6 +472,10 @@ fn normalize_csharp_type(input: &str) -> String {
         "double" | "Double" => "double".to_string(),
         other => other.to_string(),
     }
+}
+
+fn is_object_virtual(method_name: &str) -> bool {
+    matches!(method_name, "ToString" | "Equals" | "GetHashCode" | "GetType")
 }
 
 fn csharp_string_literal(value: &str) -> String {

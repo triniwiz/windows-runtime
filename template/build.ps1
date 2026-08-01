@@ -1,22 +1,39 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Builds both nativescript.dll configurations and copies them into
-    template/framework/libs/ ready for npm publish.
+    Builds the NativeScript Windows framework for a chosen JS engine and stages it into
+    template/framework/ ready for npm publish.
 
 .DESCRIPTION
-    Produces four DLLs (x64 + arm64, release + devtools) from the workspace
-    Rust crate and places them at:
+    The framework is identical across engines — the same WinUI 3 app template, dotnet-bridge, and
+    tools — differing only in the runtime `nativescript.dll` staged into framework/libs/. `-Engine`
+    selects which runtime is built into that slot, so producing an engine variant is just a flag:
+
+        build.ps1                     # @nativescript/windows        (classic V8, default)
+        build.ps1 -Engine quickjs     # @nativescript/windows-quickjs
+        build.ps1 -Engine hermes      # @nativescript/windows-hermes
+        build.ps1 -Engine v8          # @nativescript/windows-v8
+        build.ps1 -Engine jsc         # @nativescript/windows-jsc
+
+    Classic (V8) builds the workspace `nativescript` cdylib for x64 + arm64, release + devtools:
 
         framework/libs/x64/nativescript.dll            # release, no devtools
         framework/libs/arm64/nativescript.dll
         framework/libs/devtools/x64/nativescript.dll   # release-with-devtools
         framework/libs/devtools/arm64/nativescript.dll
 
+    A napi engine (quickjs/hermes/v8/jsc) builds that engine package's cdylib (its `host_dll`
+    feature) and stages it — plus any engine runtime DLLs (hermes.dll, JavaScriptCore.dll, …) —
+    as framework/libs/x64/nativescript.dll. Engine variants are x64-only, no devtools (the
+    prebuilt/compiled engines are x64 and expose no inspector).
+
     Run from anywhere; the script locates the repo root via its own path.
 
+.PARAMETER Engine
+    Which JS engine to build into the runtime DLL: classic (default) | v8 | quickjs | hermes | jsc.
+
 .PARAMETER SkipArm64
-    Skip the arm64 cross-compilation steps (faster, x64-only output).
+    Skip the arm64 cross-compilation steps (faster, x64-only output). Implied for engine variants.
 
 .PARAMETER SkipRelease
     Skip the stripped release builds (devtools builds only).
@@ -25,6 +42,8 @@
     Skip the devtools builds (release builds only).
 #>
 param(
+    [ValidateSet('classic', 'v8', 'quickjs', 'hermes', 'jsc')]
+    [string]$Engine = 'classic',
     [switch]$SkipArm64,
     [switch]$SkipRelease,
     [switch]$SkipDevtools,
@@ -37,11 +56,40 @@ $ErrorActionPreference = "Stop"
 # Paths
 $ScriptDir  = $PSScriptRoot
 $RepoRoot   = (Resolve-Path (Join-Path $ScriptDir "..")).Path
-$FrameworkLibs = Join-Path $ScriptDir "framework\libs"
-$ToolsDir = Join-Path $ScriptDir "framework\tools"
-
 Write-Host "Repo root  : $RepoRoot"
-Write-Host "Output dir : $FrameworkLibs"
+
+# Engine variants: which package produces the runtime DLL, its cdylib name, extra runtime DLLs to
+# stage beside it, any extra cargo features, and the npm package name the framework publishes as.
+# `classic` is the default V8 workspace crate; the rest are the napi engine packages.
+$EngineMap = @{
+    classic = @{ Package = 'nativescript'; NpmName = '@nativescript/windows' }
+    v8       = @{ Dir = 'windows-v8';      Lib = 'windows_v8';      Dlls = @();                                                                Features = @('host_dll'); NpmName = '@nativescript/windows-v8' }
+    quickjs  = @{ Dir = 'windows-quickjs'; Lib = 'windows_quickjs'; Dlls = @();                                                                Features = @('host_dll'); NpmName = '@nativescript/windows-quickjs' }
+    hermes   = @{ Dir = 'windows-hermes';  Lib = 'windows_hermes';  Dlls = @('hermes.dll', 'hermes-icu.dll');                                  Features = @('host_dll'); NpmName = '@nativescript/windows-hermes' }
+    jsc      = @{ Dir = 'windows-jsc';      Lib = 'windows_jsc';     Dlls = @('JavaScriptCore.dll', 'icuin77.dll', 'icuuc77.dll', 'icudt77.dll'); Features = @('host_dll', 'jsc_link'); NpmName = '@nativescript/windows-jsc' }
+}
+$EngineInfo = $EngineMap[$Engine]
+if ($Engine -ne 'classic') {
+    # The prebuilt/compiled engines are x64 with no inspector; engine variants are x64 release only.
+    $SkipArm64 = $true
+    $SkipDevtools = $true
+}
+
+# The framework is staged into the template for classic, or into the engine package for a variant
+# (so each variant is a self-contained, publishable @nativescript/windows-<engine> with the same
+# framework layout). Shared scaffolding (dotnet-bridge, tools, app template) is copied from the
+# template at build time rather than duplicated in git — only the runtime DLL differs per engine.
+$TemplateFramework = Join-Path $ScriptDir "framework"
+if ($Engine -eq 'classic') {
+    $FrameworkRoot = $TemplateFramework
+} else {
+    $FrameworkRoot = Join-Path $RepoRoot "packages\$($EngineInfo.Dir)\framework"
+}
+$FrameworkLibs = Join-Path $FrameworkRoot "libs"
+$ToolsDir = Join-Path $FrameworkRoot "tools"
+
+Write-Host "Engine     : $Engine  ->  $($EngineInfo.NpmName)"
+Write-Host "Framework  : $FrameworkRoot"
 
 # Helper
 function Copy-Dll {
@@ -67,6 +115,60 @@ function Build-Crate {
     } finally {
         Pop-Location
     }
+}
+
+# Engine variant: stage the shared framework from the template, build the engine cdylib as
+# framework/libs/x64/nativescript.dll, and finish. The template must already have been built once
+# (classic) so its dotnet-bridge/tools/app-template scaffolding exists to copy.
+if ($Engine -ne 'classic') {
+    Write-Host "`n=== Engine framework: $Engine ===" -ForegroundColor Cyan
+
+    if (-not (Test-Path (Join-Path $TemplateFramework 'tools'))) {
+        throw "Template framework not built yet. Run './build.ps1' (classic) once before building an engine variant."
+    }
+
+    # Copy the shared scaffolding (everything except libs/, which is the per-engine runtime DLL).
+    Write-Host "Staging shared framework from $TemplateFramework -> $FrameworkRoot"
+    if (Test-Path $FrameworkRoot) { Remove-Item -Recurse -Force $FrameworkRoot }
+    $null = New-Item -ItemType Directory -Force -Path $FrameworkRoot
+    Get-ChildItem -Path $TemplateFramework -Force | Where-Object { $_.Name -ne 'libs' } | ForEach-Object {
+        Copy-Item -Recurse -Force $_.FullName (Join-Path $FrameworkRoot $_.Name)
+    }
+
+    # Build the engine cdylib (its `host_dll` feature) and stage it as the runtime DLL. `--lib`
+    # scopes this to the [lib] target only — the package's `nativescript-windows` bin (dev/bench
+    # only, never shipped; see packages/<engine>/README.md) would otherwise also build here since
+    # its `required-features` are satisfied by `host_dll`.
+    Write-Host "`n=== Engine runtime: $Engine (x64 release) ===" -ForegroundColor Cyan
+    $engineManifest = Join-Path $RepoRoot "packages\$($EngineInfo.Dir)\Cargo.toml"
+    $cargoArgs = @("build", "--release", "--lib", "--manifest-path", $engineManifest,
+                   "--features", ($EngineInfo.Features -join ","))
+    Write-Host "cargo $($cargoArgs -join ' ')"
+    Push-Location $RepoRoot
+    try {
+        & cargo @cargoArgs
+        if ($LASTEXITCODE -ne 0) { throw "engine cdylib build failed (exit $LASTEXITCODE)" }
+    } finally {
+        Pop-Location
+    }
+
+    # Excluded-from-workspace packages build into their own target/ dir.
+    $engineOut = Join-Path $RepoRoot "packages\$($EngineInfo.Dir)\target\release"
+    $srcDll = Join-Path $engineOut "$($EngineInfo.Lib).dll"
+    if (-not (Test-Path $srcDll)) { throw "engine cdylib not found: $srcDll" }
+    Copy-Dll -Src $srcDll -Dest (Join-Path $FrameworkLibs "x64\nativescript.dll")
+    foreach ($extra in $EngineInfo.Dlls) {
+        $extraSrc = Join-Path $engineOut $extra
+        if (Test-Path $extraSrc) {
+            Copy-Dll -Src $extraSrc -Dest (Join-Path $FrameworkLibs "x64\$extra")
+        } else {
+            Write-Host "  WARN: expected engine DLL not found: $extra" -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Done. $($EngineInfo.NpmName) framework staged at $FrameworkRoot" -ForegroundColor Green
+    return
 }
 
 # DotNet Bridge
@@ -125,7 +227,8 @@ if (-not $SkipArm64) {
     $Targets += @{ Arch = "arm64"; RustTarget = "aarch64-pc-windows-msvc" }
 }
 
-# Build
+# Build the runtime DLL (classic V8): the workspace `nativescript` cdylib, x64 + arm64,
+# release + devtools. (Engine variants build + stage their DLL earlier and return.)
 foreach ($t in $Targets) {
     $arch        = $t.Arch
     $rustTarget  = $t.RustTarget

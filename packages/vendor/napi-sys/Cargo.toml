@@ -1,0 +1,44 @@
+# Vendored copy of napi-sys 2.4.0 with ONE Windows-port change (see src/functions.rs `load_all`):
+# resolve the module that actually CONTAINS the napi provider (the .exe for a standalone host, or
+# the cdylib — nativescript.dll — when loaded by a foreign .NET host), instead of always the process
+# .exe. Applied via `[patch.crates-io]` in each engine package. Kept at 2.4.0 to satisfy napi-rs.
+[package]
+name = "napi-sys"
+version = "2.4.0"
+edition = "2021"
+rust-version = "1.65"
+authors = ["LongYinan <lynweklm@gmail.com>"]
+description = "NodeJS N-API raw binding"
+readme = "README.md"
+keywords = ["NodeJS", "FFI", "NAPI", "n-api"]
+license = "MIT"
+repository = "https://github.com/napi-rs/napi-rs"
+include = ["src/**/*", "Cargo.toml"]
+
+[package.metadata.workspaces]
+independent = true
+
+[dependencies.libloading]
+version = "0.8"
+optional = true
+
+[target."cfg(windows)".dependencies.libloading]
+version = "0.8"
+
+# For the Windows-port `load_all` fix: raw-dylib kernel32 imports via the SAME mechanism libloading
+# uses (windows-link), so they merge cleanly instead of colliding with libloading's own imports.
+[target."cfg(windows)".dependencies.windows-link]
+version = "0.2"
+
+[features]
+dyn-symbols = ["libloading"]
+experimental = []
+napi1 = []
+napi2 = ["napi1"]
+napi3 = ["napi2"]
+napi4 = ["napi3"]
+napi5 = ["napi4"]
+napi6 = ["napi5"]
+napi7 = ["napi6"]
+napi8 = ["napi7"]
+napi9 = ["napi8"]

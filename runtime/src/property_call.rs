@@ -1,5 +1,6 @@
 use crate::error::AnyError;
 use crate::helpers::{ffi_native_type_from_signature, strip_generic_suffix};
+use crate::method_call::PointerPlan;
 use crate::value::{
     append_struct_field_bytes, ffi_parse_bool_arg, ffi_parse_buffer_arg_with_length,
     ffi_parse_f32_arg, ffi_parse_f64_arg, ffi_parse_function_arg, ffi_parse_i16_arg,
@@ -35,12 +36,17 @@ use windows::Win32::System::WinRT::IActivationFactory;
 use windows::Win32::System::WinRT::Metadata::CorTokenType;
 
 #[inline]
-fn align_up(n: usize, a: usize) -> usize {
+pub(crate) fn align_up(n: usize, a: usize) -> usize {
     if a <= 1 {
         n
     } else {
         (n + a - 1) / a * a
     }
+}
+
+/// (size, alignment) for a field signature — engine-neutral; reused by the napi struct reader.
+pub(crate) fn sig_size_align_pub(sig: &str) -> (usize, usize) {
+    sig_size_align(sig)
 }
 
 /// (size, alignment) in bytes for a struct field signature. Recurses into nested structs; WinRT enums
@@ -151,7 +157,74 @@ pub(crate) fn append_struct_object_bytes(
     buf.extend(std::iter::repeat(0u8).take(tail));
 }
 
-fn substitute_type_vars(s: &str, type_args: &[String]) -> String {
+/// Serializes a WinRT struct's fields into `buf` off a napi object, using the same layout rules
+/// as `append_struct_object_bytes` (field alignment, nested structs, enum-as-Int32, trailing
+/// padding) so the two backends agree on the wire format.
+#[cfg(feature = "napi_engine")]
+pub(crate) fn append_struct_object_bytes_napi(
+    env: &napi::Env,
+    buf: &mut Vec<u8>,
+    obj: &napi::JsObject,
+    sd: &StructDeclaration,
+) {
+    use napi::{JsObject, JsUnknown, ValueType};
+
+    let start = buf.len();
+    let mut max_align = 1usize;
+    for f in sd.fields().iter() {
+        let m = match f.base().metadata() {
+            Some(m) => m,
+            None => continue,
+        };
+        let ts = Signature::to_string(m, &f.type_());
+        let fname = f.name().to_string();
+        let fv: Option<JsUnknown> = obj.get_named_property::<JsUnknown>(fname.as_str()).ok();
+
+        let (fsize, falign) = sig_size_align(&ts);
+        if falign > max_align {
+            max_align = falign;
+        }
+        let pad = align_up(buf.len(), falign) - buf.len();
+        buf.extend(std::iter::repeat(0u8).take(pad));
+
+        let is_struct = ts.contains('.')
+            && MetadataReader::find_by_name(strip_generic_suffix(&ts))
+                .map(|d| d.read().kind() == DeclarationKind::Struct)
+                .unwrap_or(false);
+        if is_struct {
+            let lookup = strip_generic_suffix(&ts);
+            let field_obj = fv.as_ref().and_then(|v| match v.get_type() {
+                Ok(ValueType::Object) => Some(unsafe { v.cast::<JsObject>() }),
+                _ => None,
+            });
+            if let (Some(decl), Some(fobj)) = (MetadataReader::find_by_name(lookup), field_obj) {
+                let lock = decl.read();
+                if let Some(nsd) = lock.as_any().downcast_ref::<StructDeclaration>() {
+                    append_struct_object_bytes_napi(env, buf, &fobj, nsd);
+                    continue;
+                }
+            }
+            buf.extend(std::iter::repeat(0u8).take(fsize));
+            continue;
+        }
+
+        // Enum fields are dotted but Int32-valued; primitives use their resolved native type.
+        let nt = if ts.contains('.') {
+            NativeType::I32
+        } else {
+            NativeType::try_from(ts.as_str()).unwrap_or(NativeType::I32)
+        };
+        match fv {
+            Some(v) => crate::napi_engine::value::append_struct_field_bytes(env, buf, &v, &nt),
+            None => buf.extend(std::iter::repeat(0u8).take(nt.size())),
+        }
+    }
+    let total = buf.len() - start;
+    let tail = align_up(total, max_align) - total;
+    buf.extend(std::iter::repeat(0u8).take(tail));
+}
+
+pub(crate) fn substitute_type_vars(s: &str, type_args: &[String]) -> String {
     if type_args.is_empty() {
         return s.to_string();
     }
@@ -185,10 +258,39 @@ struct PropertyStaticInfo {
     return_kind: ReturnKind,
     param_sigs: Vec<String>,
     type_args: Vec<String>,
+    /// Per-parameter marshaling plan, aligned with `parse_parameter_types` (see
+    /// `method_call::PointerPlan`). Only consulted for in-params parsed as `Pointer`.
+    param_plans: Vec<crate::method_call::PointerPlan>,
+}
+
+/// Resolve the Pointer-parameter marshaling plans for a property/interface call's static info.
+/// PropertyCall never applied the TypeName synthesis, so `typename_special` is false.
+fn pointer_plans_for(
+    parse_parameter_types: &[NativeType],
+    parameters: &[ParameterDeclaration],
+    param_sigs: &[String],
+    type_args: &[String],
+) -> Vec<crate::method_call::PointerPlan> {
+    use crate::method_call::PointerPlan;
+    parse_parameter_types
+        .iter()
+        .zip(parameters.iter())
+        .zip(param_sigs.iter())
+        .map(|((nt, parameter), sig)| {
+            let is_out = parameter.is_out() || sig.starts_with("ByRef ");
+            if !is_out && matches!(nt, NativeType::Pointer) {
+                PointerPlan::for_parameter(sig, parameter, type_args, false)
+            } else {
+                PointerPlan::Plain
+            }
+        })
+        .collect()
 }
 
 thread_local! {
-    static PROPERTY_STATIC_INFO_CACHE: RefCell<ahash::AHashMap<u64, Rc<PropertyStaticInfo>>>
+    // Keyed by (metadata scope, token | flags): tokens are only unique within one .winmd scope
+    // (see METHOD_STATIC_INFO_CACHE in method_call.rs for the observed cross-winmd collision).
+    static PROPERTY_STATIC_INFO_CACHE: RefCell<ahash::AHashMap<(usize, u64), Rc<PropertyStaticInfo>>>
         = RefCell::new(ahash::AHashMap::new());
     /// Cache for the interface-routed constructors (generic vectors, maps, …).
     /// Keyed by (method token | is_setter bit, declaring interface IID).
@@ -216,7 +318,6 @@ pub struct PropertyCall {
 
 #[inline]
 fn call_failure() -> HRESULT {
-    // E_FAIL
     HRESULT(0x8000_4005u32 as i32)
 }
 
@@ -290,7 +391,14 @@ impl PropertyCall {
         };
 
         // Fast path: reuse cached static info; only the QI is per-instance work.
-        let cache_key = ((method.token().0 as u64) << 1) | (is_initializer as u64);
+        let scope_key = method
+            .metadata()
+            .map(|m| windows::core::Interface::as_raw(m) as usize)
+            .unwrap_or(0);
+        let cache_key = (
+            scope_key,
+            ((method.token().0 as u64) << 1) | (is_initializer as u64),
+        );
         if let Some(si) = PROPERTY_STATIC_INFO_CACHE.with(|c| c.borrow().get(&cache_key).cloned()) {
             return Self::from_static_info(si, interface, is_setter, is_initializer);
         }
@@ -482,6 +590,8 @@ impl PropertyCall {
 
         let parameters = method.parameters().to_vec();
         let return_kind = crate::classify_return(&return_type, is_void);
+        let param_plans =
+            pointer_plans_for(&parse_parameter_types, &parameters, &param_sigs, &[]);
 
         let static_info = Rc::new(PropertyStaticInfo {
             cif,
@@ -499,6 +609,7 @@ impl PropertyCall {
             return_kind,
             param_sigs,
             type_args: Vec::new(),
+            param_plans,
         });
         PROPERTY_STATIC_INFO_CACHE
             .with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
@@ -656,13 +767,16 @@ impl PropertyCall {
         index = index.saturating_add(base_offset);
         let func = unsafe { *vtable_ptr.offset(index as isize) };
 
+        let parameters = method.parameters().to_vec();
+        let param_plans =
+            pointer_plans_for(&parse_parameter_types, &parameters, &param_sigs, &type_args);
         let static_info = Rc::new(PropertyStaticInfo {
             cif,
             iid: declaring_iid,
             index,
             parameter_types,
             parse_parameter_types,
-            parameters: method.parameters().to_vec(),
+            parameters,
             return_type,
             is_void,
             is_sealed,
@@ -672,6 +786,7 @@ impl PropertyCall {
             return_kind,
             param_sigs,
             type_args,
+            param_plans,
         });
         INTERFACE_STATIC_INFO_CACHE
             .with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
@@ -816,13 +931,16 @@ impl PropertyCall {
         index = index.saturating_add(base_offset);
         let func = unsafe { *vtable_ptr.offset(index as isize) };
 
+        let parameters = method.parameters().to_vec();
+        let param_plans =
+            pointer_plans_for(&parse_parameter_types, &parameters, &param_sigs, &type_args);
         let static_info = Rc::new(PropertyStaticInfo {
             cif,
             iid: declaring_iid,
             index,
             parameter_types,
             parse_parameter_types,
-            parameters: method.parameters().to_vec(),
+            parameters,
             return_type,
             is_void,
             is_sealed,
@@ -832,6 +950,7 @@ impl PropertyCall {
             return_kind,
             param_sigs,
             type_args,
+            param_plans,
         });
         INTERFACE_STATIC_INFO_CACHE
             .with(|c| c.borrow_mut().insert(cache_key, Rc::clone(&static_info)));
@@ -980,144 +1099,91 @@ impl PropertyCall {
                 NativeType::F32 => ffi_parse_f32_arg(value),
                 NativeType::F64 => ffi_parse_f64_arg(value),
                 NativeType::Pointer => {
-                    let parameter_signature: &str = &self.si.param_sigs[i];
-
-                    // IReference<T> parameters: box JS primitives with the correct Create* call
-                    // so XAML receives the right typed IPropertyValue (e.g. IReference<Double>).
-                    if let Some(inner) = crate::helpers::ireference_inner_type(&parameter_signature)
-                    {
-                        if let Some(nv) = crate::value::box_as_ireference(scope, value, inner) {
-                            Ok(nv)
-                        } else {
+                    // Signature classification precomputed into the per-parameter plan at
+                    // static-info build time (see method_call::PointerPlan).
+                    match &self.si.param_plans[i] {
+                        // TypeName synthesis was never applied on the PropertyCall path
+                        // (parity with the original decision tree).
+                        PointerPlan::Plain | PointerPlan::TypeName => {
                             ffi_parse_pointer_arg(scope, value)
                         }
-                    } else if parameter_signature.contains('.') {
-                        let lookup_name = crate::helpers::strip_generic_suffix(parameter_signature);
-
-                        if let Some(declaration) = MetadataReader::find_by_name(lookup_name) {
-                            if declaration.read().kind() == DeclarationKind::Struct {
-                                // ArrayBuffer / ArrayBufferView → raw bytes pointer
-                                if value.is_array_buffer() || value.is_array_buffer_view() {
-                                    ffi_parse_struct_arg(scope, value)
-                                } else if value.is_object() {
-                                    let obj = value.to_object(scope).unwrap();
-                                    let mut sbuf: Vec<u8> = Vec::new();
-                                    {
-                                        let lock = declaration.read();
-                                        if let Some(sd) =
-                                            lock.as_any().downcast_ref::<StructDeclaration>()
-                                        {
-                                            append_struct_object_bytes(&mut sbuf, scope, obj, sd);
-                                        }
-                                    }
-                                    if sbuf.is_empty() {
-                                        sbuf.push(0);
-                                    }
-                                    let ptr = sbuf.as_mut_ptr() as *mut c_void;
-                                    struct_scratch.push(sbuf);
-                                    Ok(NativeValue { pointer: ptr })
-                                } else {
-                                    ffi_parse_pointer_arg(scope, value)
-                                }
+                        // IReference<T> parameters: box JS primitives with the correct Create* call
+                        // so XAML receives the right typed IPropertyValue (e.g. IReference<Double>).
+                        PointerPlan::IReference(inner) => {
+                            if let Some(nv) = crate::value::box_as_ireference(scope, value, inner) {
+                                Ok(nv)
                             } else {
-                                let kind = declaration.read().kind();
-
-                                // Delegate types: auto-wrap a JS function as a JsDelegate COM object,
-                                // or extract the raw pointer from { handle: External } (NSWinRT.asDelegate result).
-                                let is_delegate = matches!(
-                                    kind,
-                                    DeclarationKind::Delegate
-                                        | DeclarationKind::GenericDelegate
-                                        | DeclarationKind::GenericDelegateInstance
-                                );
-
-                                if is_delegate {
-                                    let handle_ptr = value.to_object(scope).and_then(|obj| {
-                                        let key = v8::String::new(scope, "handle")?;
-                                        let hv = obj.get(scope, key.into())?;
-                                        v8::Local::<v8::External>::try_from(hv)
-                                            .ok()
-                                            .map(|e| e.value())
-                                    });
-
-                                    if let Some(ptr) = handle_ptr {
-                                        Ok(NativeValue { pointer: ptr })
-                                    } else if let Ok(func) =
-                                        v8::Local::<v8::Function>::try_from(value)
+                                ffi_parse_pointer_arg(scope, value)
+                            }
+                        }
+                        PointerPlan::Struct(declaration) => {
+                            // ArrayBuffer / ArrayBufferView → raw bytes pointer
+                            if value.is_array_buffer() || value.is_array_buffer_view() {
+                                ffi_parse_struct_arg(scope, value)
+                            } else if value.is_object() {
+                                let obj = value.to_object(scope).unwrap();
+                                let mut sbuf: Vec<u8> = Vec::new();
+                                {
+                                    let lock = declaration.read();
+                                    if let Some(sd) =
+                                        lock.as_any().downcast_ref::<StructDeclaration>()
                                     {
-                                        let parameter = &self.si.parameters[i];
-                                        let delegate_info = parameter.metadata().and_then(|meta| {
-                                            let raw_iid =
-                                                Signature::to_iid_string(meta, &parameter.type_());
-                                            let iid_name =
-                                                substitute_type_vars(&raw_iid, &self.si.type_args);
-                                            crate::delegate_info_from_type_sig(&iid_name)
-                                        });
-                                        if let Some((guid, param_types)) = delegate_info {
-                                            use std::sync::atomic::AtomicU32;
-                                            let data = Box::new(crate::JsDelegateData {
-                                                js_func: v8::Global::new(scope, func),
-                                                param_types,
-                                            });
-                                            let delegate = Box::new(crate::JsDelegate {
-                                                vtable: &crate::JS_DELEGATE_VTBL as *const _,
-                                                ref_count: AtomicU32::new(1),
-                                                guid,
-                                                data: Box::into_raw(data),
-                                            });
-                                            Ok(NativeValue {
-                                                pointer: Box::into_raw(delegate) as *mut c_void,
-                                            })
-                                        } else {
-                                            ffi_parse_pointer_arg(scope, value)
-                                        }
-                                    } else {
-                                        ffi_parse_pointer_arg(scope, value)
-                                    }
-                                } else {
-                                    let iid = {
-                                        let lock = declaration.read();
-                                        match lock.kind() {
-                                            DeclarationKind::Interface => lock
-                                                .as_any()
-                                                .downcast_ref::<InterfaceDeclaration>()
-                                                .map(|iface| iface.id()),
-                                            DeclarationKind::GenericInterface => lock
-                                                .as_any()
-                                                .downcast_ref::<GenericInterfaceDeclaration>()
-                                                .map(|iface| iface.id()),
-                                            DeclarationKind::GenericInterfaceInstance => lock
-                                                .as_any()
-                                                .downcast_ref::<GenericInterfaceInstanceDeclaration>()
-                                                .map(|iface| iface.id()),
-                                            DeclarationKind::Class => lock
-                                                .as_any()
-                                                .downcast_ref::<ClassDeclaration>()
-                                                .and_then(|class| class.default_interface())
-                                                .map(|iface| iface.id()),
-                                            _ => None,
-                                        }
-                                    };
-
-                                    if let Some(iid) = iid {
-                                        match ffi_parse_query_interface_arg(scope, value, &iid) {
-                                            Ok((pointer, Some(interface_guard))) => {
-                                                queried_interfaces.push(interface_guard);
-                                                Ok(pointer)
-                                            }
-                                            Ok((pointer, None)) => Ok(pointer),
-                                            Err(error) => Err(error),
-                                        }
-                                    } else {
-                                        ffi_parse_pointer_arg(scope, value)
+                                        append_struct_object_bytes(&mut sbuf, scope, obj, sd);
                                     }
                                 }
+                                if sbuf.is_empty() {
+                                    sbuf.push(0);
+                                }
+                                let ptr = sbuf.as_mut_ptr() as *mut c_void;
+                                struct_scratch.push(sbuf);
+                                Ok(NativeValue { pointer: ptr })
+                            } else {
+                                ffi_parse_pointer_arg(scope, value)
                             }
-                        } else {
-                            ffi_parse_pointer_arg(scope, value)
                         }
-                    } else {
-                        ffi_parse_pointer_arg(scope, value)
+                        // Delegate types: auto-wrap a JS function as a JsDelegate COM object,
+                        // or extract the raw pointer from { handle: External } (NSWinRT.asDelegate result).
+                        PointerPlan::Delegate(guid, delegate_param_types) => {
+                            let handle_ptr = value.to_object(scope).and_then(|obj| {
+                                let key = v8::String::new(scope, "handle")?;
+                                let hv = obj.get(scope, key.into())?;
+                                v8::Local::<v8::External>::try_from(hv)
+                                    .ok()
+                                    .map(|e| e.value())
+                            });
+
+                            if let Some(ptr) = handle_ptr {
+                                Ok(NativeValue { pointer: ptr })
+                            } else if let Ok(func) = v8::Local::<v8::Function>::try_from(value) {
+                                use std::sync::atomic::AtomicU32;
+                                let data = Box::new(crate::JsDelegateData {
+                                    js_func: v8::Global::new(scope, func),
+                                    param_types: delegate_param_types.clone(),
+                                });
+                                let delegate = Box::new(crate::JsDelegate {
+                                    vtable: &crate::JS_DELEGATE_VTBL as *const _,
+                                    ref_count: AtomicU32::new(1),
+                                    guid: *guid,
+                                    data: Box::into_raw(data),
+                                });
+                                Ok(NativeValue {
+                                    pointer: Box::into_raw(delegate) as *mut c_void,
+                                })
+                            } else {
+                                ffi_parse_pointer_arg(scope, value)
+                            }
+                        }
+                        PointerPlan::Interface(iid) => {
+                            // NB: a QI failure here propagates (parity with the original).
+                            match ffi_parse_query_interface_arg(scope, value, iid) {
+                                Ok((pointer, Some(interface_guard))) => {
+                                    queried_interfaces.push(interface_guard);
+                                    Ok(pointer)
+                                }
+                                Ok((pointer, None)) => Ok(pointer),
+                                Err(error) => Err(error),
+                            }
+                        }
                     }
                 }
                 NativeType::Buffer => {
@@ -1329,6 +1395,418 @@ impl PropertyCall {
                 } else {
                     out_values.push(v);
                 }
+            }
+        }
+
+        (HRESULT(ret), result, out_values)
+    }
+}
+
+/// Node-API entry point for invoking a WinRT property call: same pipeline and error contract as
+/// `PropertyCall::call_with_values`, but JS values arrive as napi handles instead of V8 values.
+/// Kept adjacent to that implementation since it shares the same private fields.
+#[cfg(feature = "napi_engine")]
+impl PropertyCall {
+    pub fn call_napi(
+        &mut self,
+        env: &napi::Env,
+        values: &[napi::JsUnknown],
+    ) -> (HRESULT, *mut c_void, Vec<napi::JsUnknown>) {
+        use crate::napi_engine::delegate::make_napi_delegate;
+        use crate::napi_engine::value as nv;
+        use napi::{JsFunction, JsObject, JsUnknown, NapiRaw, NapiValue, ValueType};
+
+        #[inline]
+        fn dup_arg(env: &napi::Env, v: &JsUnknown) -> JsUnknown {
+            unsafe { JsUnknown::from_raw_unchecked(env.raw(), v.raw()) }
+        }
+        #[inline]
+        fn fail3() -> (HRESULT, *mut c_void, Vec<napi::JsUnknown>) {
+            (call_failure(), std::ptr::null_mut(), Vec::new())
+        }
+
+        let is_void = self.si.is_void;
+        let is_value_type = matches!(
+            self.si.return_kind,
+            ReturnKind::Struct(_) | ReturnKind::Guid
+        );
+        let is_scalar_return = matches!(
+            self.si.return_type.as_str(),
+            "UInt8"
+                | "Int8"
+                | "UInt16"
+                | "Int16"
+                | "UInt32"
+                | "Int32"
+                | "UInt64"
+                | "Int64"
+                | "USize"
+                | "ISize"
+                | "Single"
+                | "Double"
+                | "Boolean"
+                | "Char16"
+        );
+        let is_string_return = self.si.return_type.as_str() == "String";
+
+        self.argument_buf.clear();
+        self.argument_parse_types.clear();
+        let mut queried_interfaces: Vec<IUnknown> = Vec::new();
+        let mut struct_scratch: Vec<Vec<u8>> = Vec::new();
+        let mut out_slots: Vec<(usize, NativeType, usize, Option<napi::JsObject>)> = Vec::new();
+
+        self.argument_buf.push(NativeValue {
+            pointer: self.interface.as_raw() as *mut c_void,
+        });
+        self.argument_parse_types.push(None);
+
+        for (i, native_type) in self.si.parse_parameter_types.iter().enumerate() {
+            let value = match values.get(i) {
+                Some(v) => dup_arg(env, v),
+                None => match env.get_undefined() {
+                    Ok(u) => unsafe { JsUnknown::from_raw_unchecked(env.raw(), u.raw()) },
+                    Err(_) => return fail3(),
+                },
+            };
+            let vt = value.get_type().unwrap_or(ValueType::Undefined);
+
+            let parameter = &self.si.parameters[i];
+            let param_sig = &self.si.param_sigs[i];
+            let is_sig_byref = param_sig.starts_with("ByRef ");
+            if parameter.is_out() || is_sig_byref {
+                let slot_index = self.argument_buf.len();
+                let slot_size = match native_type {
+                    NativeType::Struct(_) => native_type.size(),
+                    NativeType::Pointer
+                    | NativeType::Buffer
+                    | NativeType::Function
+                    | NativeType::String => std::mem::size_of::<usize>(),
+                    _ => native_type.size(),
+                };
+                let mut buf: Vec<u8> = vec![0u8; slot_size];
+                let ptr = buf.as_mut_ptr() as *mut c_void;
+                struct_scratch.push(buf);
+                self.argument_buf.push(NativeValue { pointer: ptr });
+                self.argument_parse_types.push(None);
+
+                let (wrapper_obj, init_val) = match nv::try_unwrap_out_param(env, &value) {
+                    Some((obj, inner)) => (Some(obj), inner),
+                    None => (None, value),
+                };
+
+                if values.get(i).is_some() {
+                    let ivt = init_val.get_type().unwrap_or(ValueType::Undefined);
+                    if ivt != ValueType::Undefined && ivt != ValueType::Null {
+                        match nv::write_js_value_to_ptr(env, &init_val, ptr, native_type) {
+                            Ok(_) => {}
+                            Err(_) => return fail3(),
+                        }
+                    }
+                }
+
+                out_slots.push((slot_index, native_type.clone(), i, wrapper_obj));
+                continue;
+            }
+
+            let value = match *native_type {
+                NativeType::Void => return fail3(),
+                NativeType::Bool => nv::napi_parse_bool(&value),
+                NativeType::U8 => nv::napi_parse_u8(&value),
+                NativeType::I8 => nv::napi_parse_i8(&value),
+                NativeType::U16 => nv::napi_parse_u16(&value),
+                NativeType::I16 => nv::napi_parse_i16(&value),
+                NativeType::U32 => nv::napi_parse_u32(&value),
+                NativeType::I32 => nv::napi_parse_i32(&value),
+                NativeType::U64 => nv::napi_parse_u64(&value),
+                NativeType::I64 => nv::napi_parse_i64(&value),
+                NativeType::USize => nv::napi_parse_usize(&value),
+                NativeType::ISize => nv::napi_parse_isize(&value),
+                NativeType::F32 => nv::napi_parse_f32(&value),
+                NativeType::F64 => nv::napi_parse_f64(&value),
+                NativeType::Pointer => {
+                    // Classification precomputed into the per-parameter plan at static-info
+                    // build time (see method_call::PointerPlan).
+                    match &self.si.param_plans[i] {
+                        // TypeName is never emitted for PropertyCall (no synthesis on this
+                        // path — parity with the v8 original).
+                        PointerPlan::Plain | PointerPlan::TypeName => {
+                            nv::napi_parse_pointer(env, &value)
+                        }
+                        PointerPlan::IReference(inner) => {
+                            if let Some(nvv) = nv::box_as_ireference(env, &value, inner) {
+                                Ok(nvv)
+                            } else {
+                                nv::napi_parse_pointer(env, &value)
+                            }
+                        }
+                        PointerPlan::Struct(declaration) => {
+                            // ArrayBuffer/view → raw bytes; other objects → serialize
+                            // field-by-field (v8 original used is_array_buffer checks).
+                            let is_buffer_like = nv::napi_parse_struct(env, &value).is_ok();
+                            if is_buffer_like {
+                                nv::napi_parse_struct(env, &value)
+                            } else if vt == ValueType::Object {
+                                let obj: JsObject = unsafe { value.cast() };
+                                let mut sbuf: Vec<u8> = Vec::new();
+                                {
+                                    let lock = declaration.read();
+                                    if let Some(sd) =
+                                        lock.as_any().downcast_ref::<StructDeclaration>()
+                                    {
+                                        append_struct_object_bytes_napi(env, &mut sbuf, &obj, sd);
+                                    }
+                                }
+                                if sbuf.is_empty() {
+                                    sbuf.push(0);
+                                }
+                                let ptr = sbuf.as_mut_ptr() as *mut c_void;
+                                struct_scratch.push(sbuf);
+                                Ok(NativeValue { pointer: ptr })
+                            } else {
+                                nv::napi_parse_pointer(env, &value)
+                            }
+                        }
+                        PointerPlan::Delegate(guid, delegate_param_types) => {
+                            let handle_ptr = if vt == ValueType::Object {
+                                let obj: JsObject = unsafe { value.cast() };
+                                obj.get_named_property::<JsUnknown>("handle")
+                                    .ok()
+                                    .and_then(|hv| nv::ptr_from_external(env, &hv))
+                            } else {
+                                None
+                            };
+
+                            if let Some(ptr) = handle_ptr {
+                                Ok(NativeValue { pointer: ptr })
+                            } else if vt == ValueType::Function {
+                                let func: JsFunction = unsafe { value.cast() };
+                                match make_napi_delegate(
+                                    env,
+                                    &func,
+                                    *guid,
+                                    delegate_param_types.clone(),
+                                ) {
+                                    Some(ptr) => Ok(NativeValue { pointer: ptr }),
+                                    None => nv::napi_parse_pointer(env, &value),
+                                }
+                            } else {
+                                nv::napi_parse_pointer(env, &value)
+                            }
+                        }
+                        PointerPlan::Interface(iid) => {
+                            // NB: unlike call_napi in method_call.rs, a QI failure
+                            // here propagates (matches the v8 original).
+                            match nv::napi_parse_query_interface(env, &value, iid) {
+                                Ok((pointer, Some(interface_guard))) => {
+                                    queried_interfaces.push(interface_guard);
+                                    Ok(pointer)
+                                }
+                                Ok((pointer, None)) => Ok(pointer),
+                                Err(error) => Err(error),
+                            }
+                        }
+                    }
+                }
+                NativeType::Buffer => {
+                    let parsed = nv::napi_parse_buffer_with_length(env, &value);
+                    let (buffer_value, byte_length) = match parsed {
+                        Ok(value) => value,
+                        Err(_) => return fail3(),
+                    };
+                    self.argument_buf.push(NativeValue {
+                        u32_value: byte_length,
+                    });
+                    self.argument_parse_types.push(Some(native_type.clone()));
+                    self.argument_buf.push(buffer_value);
+                    self.argument_parse_types.push(Some(native_type.clone()));
+                    continue;
+                }
+                NativeType::Function => nv::napi_parse_function(env, &value),
+                NativeType::Struct(_) => {
+                    // By-value struct: plain JS object → serialized bytes (scratch outlives
+                    // the call); ArrayBuffer/view or wrapped instances → struct parse.
+                    let mut handled: Option<NativeValue> = None;
+                    let is_buffer_like = nv::napi_parse_struct(env, &value).is_ok();
+                    if vt == ValueType::Object && !is_buffer_like {
+                        let sig: &str = &self.si.param_sigs[i];
+                        let lookup = crate::helpers::strip_generic_suffix(sig);
+                        if let Some(decl) = MetadataReader::find_by_name(lookup) {
+                            let is_struct = decl.read().kind() == DeclarationKind::Struct;
+                            if is_struct {
+                                let obj: JsObject = unsafe { value.cast() };
+                                let mut sbuf: Vec<u8> = Vec::new();
+                                {
+                                    let lock = decl.read();
+                                    if let Some(sd) =
+                                        lock.as_any().downcast_ref::<StructDeclaration>()
+                                    {
+                                        append_struct_object_bytes_napi(env, &mut sbuf, &obj, sd);
+                                    }
+                                }
+                                if sbuf.is_empty() {
+                                    sbuf.push(0);
+                                }
+                                let ptr = sbuf.as_mut_ptr() as *mut c_void;
+                                struct_scratch.push(sbuf);
+                                handled = Some(NativeValue { pointer: ptr });
+                            }
+                        }
+                    }
+                    match handled {
+                        Some(nvv) => Ok(nvv),
+                        None => nv::napi_parse_struct(env, &value),
+                    }
+                }
+                NativeType::String => nv::napi_parse_string(&value),
+            };
+
+            let value = match value {
+                Ok(value) => value,
+                Err(_) => return fail3(),
+            };
+
+            self.argument_buf.push(value);
+            self.argument_parse_types.push(Some(native_type.clone()));
+        }
+
+        let mut result: *mut c_void = std::ptr::null_mut();
+
+        if !self.is_initializer && !is_void {
+            if is_value_type || is_scalar_return || is_string_return {
+                let buf_ptr = self.return_value_buf.as_mut_ptr() as *mut c_void;
+                self.argument_buf.push(NativeValue { pointer: buf_ptr });
+                self.argument_parse_types.push(None);
+            } else {
+                self.argument_buf.push(NativeValue {
+                    pointer: &mut result as *mut _ as *mut c_void,
+                });
+                self.argument_parse_types.push(None);
+            }
+        }
+
+        let mut call_args: Vec<Arg> = Vec::with_capacity(self.argument_buf.len());
+        for (i, v) in self.argument_buf.iter().enumerate() {
+            let Some(abi_native) = self.si.parameter_types.get(i) else {
+                return fail3();
+            };
+            let effective_native = if matches!(abi_native, NativeType::Pointer) {
+                if let Some(Some(parse_pt)) = self.argument_parse_types.get(i) {
+                    if matches!(parse_pt, NativeType::String) {
+                        NativeType::String
+                    } else {
+                        abi_native.clone()
+                    }
+                } else {
+                    abi_native.clone()
+                }
+            } else {
+                abi_native.clone()
+            };
+            call_args.push(unsafe { v.as_arg(&effective_native) });
+        }
+
+        let ret = match catch_unwind(AssertUnwindSafe(|| unsafe {
+            self.si.cif.call(CodePtr::from_ptr(self.func), &call_args)
+        })) {
+            Ok(code) => code,
+            Err(_) => {
+                let msg =
+                    format!("WinRT property call panicked during invocation: returning E_FAIL");
+                crate::store_last_js_error(msg);
+                return fail3();
+            }
+        };
+
+        let hr = HRESULT(ret);
+        const RPC_E_WRONG_THREAD: u32 = 0x8001010E;
+        if (hr.0 as u32) == RPC_E_WRONG_THREAD {
+            let msg = crate::error::format_hresult_message(hr);
+            crate::store_last_js_error(msg.clone());
+            nv::throw_js_error(env, &msg);
+        }
+
+        if !self.is_initializer
+            && !is_void
+            && (is_value_type || is_scalar_return || is_string_return)
+        {
+            result = self.return_value_buf.as_mut_ptr() as *mut c_void;
+        }
+
+        // Marshal out-parameters back into JS values.
+        // TODO(ns_proxy port): dotted-sig out params get typed wrappers
+        // (create_struct_object_from_raw / create_ns_ctor_instance_object) once ported;
+        // external fallback until then. Plain sigs keep exact v8 read parity.
+        let mut out_values: Vec<napi::JsUnknown> = Vec::new();
+        for (slot_index, parse_native_type, param_idx, wrapper_obj) in out_slots.into_iter() {
+            let storage_ptr = unsafe {
+                self.argument_buf
+                    .get(slot_index)
+                    .map(|v| v.pointer)
+                    .unwrap_or(std::ptr::null_mut())
+            };
+            if storage_ptr.is_null() {
+                let Ok(null_js) = env.get_null() else {
+                    return fail3();
+                };
+                let v = unsafe { JsUnknown::from_raw_unchecked(env.raw(), null_js.raw()) };
+                if let Some(mut wrapper) = wrapper_obj {
+                    let _ = nv::set_out_param_value(&mut wrapper, v);
+                } else {
+                    out_values.push(v);
+                }
+                continue;
+            }
+            let sig = &self.si.param_sigs[param_idx];
+            let v = unsafe {
+                match parse_native_type {
+                    NativeType::Pointer | NativeType::Buffer | NativeType::Function => {
+                        let inner =
+                            std::ptr::read_unaligned(storage_ptr as *const usize) as *mut c_void;
+                        if inner.is_null() {
+                            match env.get_null() {
+                                Ok(n) => JsUnknown::from_raw_unchecked(env.raw(), n.raw()),
+                                Err(_) => return fail3(),
+                            }
+                        } else if !sig.is_empty() && sig.contains('.') {
+                            // Classes resolve to typed proxies; structs stay externals.
+                            match crate::napi_engine::ns_proxy::try_wrap_inspectable_pointer(
+                                env, inner,
+                            ) {
+                                Some(p) => crate::napi_engine::value::as_unknown(env, p),
+                                None => match nv::read_return_value(
+                                    env,
+                                    inner,
+                                    &NativeType::Pointer,
+                                ) {
+                                    Ok(v) => v,
+                                    Err(_) => return fail3(),
+                                },
+                            }
+                        } else {
+                            match nv::read_value_from_ptr(
+                                env,
+                                inner as *const c_void,
+                                &NativeType::Pointer,
+                            ) {
+                                Ok(v) => v,
+                                Err(_) => return fail3(),
+                            }
+                        }
+                    }
+                    _ => match nv::read_value_from_ptr(
+                        env,
+                        storage_ptr as *const c_void,
+                        &parse_native_type,
+                    ) {
+                        Ok(v) => v,
+                        Err(_) => return fail3(),
+                    },
+                }
+            };
+            if let Some(mut wrapper) = wrapper_obj {
+                let _ = nv::set_out_param_value(&mut wrapper, v);
+            } else {
+                out_values.push(v);
             }
         }
 

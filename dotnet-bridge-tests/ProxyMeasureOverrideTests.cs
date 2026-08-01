@@ -45,9 +45,13 @@ public sealed class ProxyMeasureOverrideTests : IDisposable
         var pkt = BuildPacket(w =>
         {
             w.WriteByte(0x0A); // create_js_subclass
-            // Binary protocol expects: assembly, typeName for opcode 0x0A
+            // Binary protocol expects: assembly, typeName, interfaceCount+names,
+            // memberCount+names, callbackId for opcode 0x0A.
             w.WriteString16("DotNetBridgeTests");
             w.WriteString16("DotNetBridgeTests.MeasureOverrideBase");
+            w.WriteI32(0); // interfaceCount
+            w.WriteI32(1); // memberCount
+            w.WriteString16("MeasureOverride");
             w.WriteI32(777); // callbackId
         });
 

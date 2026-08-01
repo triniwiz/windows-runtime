@@ -18,6 +18,7 @@ use std::process::Command;
 mod generator;
 mod manifest;
 mod metadata_reader;
+mod signature_resolver;
 
 use generator::Generator;
 use manifest::ProxyManifest;

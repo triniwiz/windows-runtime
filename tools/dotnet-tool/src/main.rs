@@ -73,44 +73,6 @@ fn is_winrt_type(s: &str) -> bool {
             .any(|seg| seg.starts_with(|c: char| c.is_uppercase()))
 }
 
-/// Returns `Some((modifier, return_type, params))` for known WinRT virtual methods,
-/// or `None` if the method has no corresponding C# virtual to override (JS-only helper).
-fn winrt_method_signature(
-    base_type: &str,
-    method: &str,
-) -> Option<(&'static str, &'static str, Vec<[String; 2]>)> {
-    let is_panel_or_fe = matches!(
-        base_type,
-        "Windows.UI.Xaml.Controls.Panel" | "Windows.UI.Xaml.FrameworkElement"
-    );
-    if is_panel_or_fe {
-        match method {
-            "MeasureOverride" => {
-                return Some((
-                    "protected override",
-                    "Windows.Foundation.Size",
-                    vec![[
-                        "availableSize".to_string(),
-                        "Windows.Foundation.Size".to_string(),
-                    ]],
-                ))
-            }
-            "ArrangeOverride" => {
-                return Some((
-                    "protected override",
-                    "Windows.Foundation.Size",
-                    vec![[
-                        "finalSize".to_string(),
-                        "Windows.Foundation.Size".to_string(),
-                    ]],
-                ))
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 fn build_sbg_entries(extensions: &[DetectedExtension]) -> Vec<SbgEntry> {
     let mut counter: u32 = 0;
     let mut seen: HashMap<String, bool> = HashMap::new();
@@ -135,18 +97,20 @@ fn build_sbg_entries(extensions: &[DetectedExtension]) -> Vec<SbgEntry> {
             }
         };
 
+        // Pass every detected override name through unfiltered — real signatures (return type,
+        // parameters, modifier) are resolved from WinRT metadata by `sbg` at generation time
+        // (see `sbg::signature_resolver`), which knows how to look up ANY base type's virtual,
+        // not just a hardcoded handful. These placeholder values are overwritten there; a method
+        // sbg can't resolve is skipped (with a warning) rather than emitted with a guessed and
+        // likely-wrong signature.
         let methods = ext
             .methods
             .iter()
-            .filter_map(|name| {
-                let (modifier, return_type, parameters) =
-                    winrt_method_signature(&ext.base_type, name)?;
-                Some(SbgMethod {
-                    name: name.clone(),
-                    return_type: return_type.to_string(),
-                    parameters,
-                    modifier: modifier.to_string(),
-                })
+            .map(|name| SbgMethod {
+                name: name.clone(),
+                return_type: "Void".to_string(),
+                parameters: Vec::new(),
+                modifier: "public override".to_string(),
             })
             .collect();
 

@@ -14,8 +14,12 @@ namespace NativeScriptBridge;
 
 public static partial class Bridge
 {
-    // Cache for dynamically generated proxy types (dev-only fallback).
-    private static readonly ConcurrentDictionary<Type, Type> s_dynamicProxyCache = new();
+    // Cache for dynamically generated proxy types (dev-only fallback). Keyed by base type PLUS
+    // the exact set of interfaces/members a given JS `overrides` object asked for, so different
+    // JS subclasses of the same base type (different override sets) get distinct emitted types.
+    private readonly record struct ProxyTypeKey(Type BaseType, string InterfaceKey, string MemberKey);
+    private static readonly ConcurrentDictionary<ProxyTypeKey, Type> s_dynamicProxyCache = new();
+    private static int s_dynamicProxyTypeCounter = 0;
     private static readonly AssemblyBuilder? s_dynamicAssembly = CreateDynamicAssembly();
     private static readonly ModuleBuilder? s_dynamicModule   = CreateDynamicModule(s_dynamicAssembly);
 
@@ -168,22 +172,35 @@ public static partial class Bridge
         return null;
     }
 
-    private static Type GetOrCreateDynamicProxyType(Type baseType)
+    private static Type GetOrCreateDynamicProxyType(Type baseType, string[] interfaceNames, string[] memberNames)
     {
-        return s_dynamicProxyCache.GetOrAdd(baseType, bt => CreateDynamicProxyType(bt));
+        var interfaceKey = string.Join(",", interfaceNames.OrderBy(n => n, StringComparer.Ordinal));
+        var memberKey = string.Join(",", memberNames.OrderBy(n => n, StringComparer.Ordinal));
+        var key = new ProxyTypeKey(baseType, interfaceKey, memberKey);
+        return s_dynamicProxyCache.GetOrAdd(key, _ => CreateDynamicProxyType(baseType, interfaceNames, memberNames));
     }
 
-    private static Type CreateDynamicProxyType(Type baseType)
+    private static Type CreateDynamicProxyType(Type baseType, string[] interfaceNames, string[] memberNames)
     {
-        
+
         if (s_dynamicModule == null)
             throw new InvalidOperationException("Dynamic proxy generation not available in this environment");
 
         if (baseType.IsSealed)
             throw new InvalidOperationException($"Cannot derive from sealed type {baseType.FullName}");
 
+        var interfaceTypes = interfaceNames
+            .Select(n => ResolveType(null, n) ?? throw new TypeLoadException($"Interface type not found: {n}"))
+            .ToArray();
+
+        // Members JS actually overrides. Only base virtuals in this set get an IL override
+        // emitted — anything else is left alone so the real base implementation stays live in
+        // the vtable (no "call base" IL needed, the base method was simply never touched).
+        var memberSet = new HashSet<string>(memberNames, StringComparer.Ordinal);
+
         var safeName = (baseType.FullName ?? Guid.NewGuid().ToString()).Replace('.', '_');
-        var typeName = $"NSWinRTDynamicProxies.{safeName}_JsProxy";
+        var uniqueSuffix = Interlocked.Increment(ref s_dynamicProxyTypeCounter);
+        var typeName = $"NSWinRTDynamicProxies.{safeName}_JsProxy_{uniqueSuffix}";
 
         var tb = s_dynamicModule.DefineType(typeName, TypeAttributes.Public | TypeAttributes.Class, baseType);
 
@@ -265,69 +282,137 @@ public static partial class Bridge
             }
         }
 
-        // Override all non-final virtual instance methods (skip ref/out and generic methods)
-        var methods = baseType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-            .Where(m => m.IsVirtual && !m.IsFinal && !m.IsGenericMethod && !m.IsConstructor)
+        // Shared by both loops below, keyed by "Name(Param1FullName,Param2FullName,...)" so a
+        // member that's both an overridden base virtual and a requested interface member (e.g.
+        // the base class already implements that interface) reuses one emitted body instead of
+        // tripping a "duplicate member" TypeBuilder error.
+        var definedSignatures = new Dictionary<string, MethodBuilder>(StringComparer.Ordinal);
+        static string SignatureKey(string name, Type[] paramTypes) =>
+            name + "(" + string.Join(",", paramTypes.Select(p => p.FullName)) + ")";
+
+        // Override only the base virtuals JS actually asked for (memberSet). Anything not in
+        // that set is simply never touched, so the base implementation stays live in the vtable —
+        // no "call base" IL needed. (Skip ref/out and generic methods — unsupported.)
+        var virtualMethods = baseType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            .Where(m => m.IsVirtual && !m.IsFinal && !m.IsGenericMethod && !m.IsConstructor && memberSet.Contains(m.Name))
             .ToArray();
 
-        foreach (var mi in methods)
+        foreach (var mi in virtualMethods)
         {
             var parameters = mi.GetParameters();
             if (parameters.Any(p => p.ParameterType.IsByRef)) continue;
 
             var paramTypes = parameters.Select(p => p.ParameterType).ToArray();
-            var mb = tb.DefineMethod(mi.Name,
-                MethodAttributes.Public | MethodAttributes.Virtual | MethodAttributes.HideBySig,
-                mi.CallingConvention, mi.ReturnType, paramTypes);
-
-            var ilg = mb.GetILGenerator();
-            var argsLocal = ilg.DeclareLocal(typeof(object[]));
-            ilg.Emit(OpCodes.Ldc_I4, paramTypes.Length);
-            ilg.Emit(OpCodes.Newarr, typeof(object));
-            ilg.Emit(OpCodes.Stloc, argsLocal);
-
-            for (int i = 0; i < paramTypes.Length; i++)
+            var sigKey = SignatureKey(mi.Name, paramTypes);
+            if (!definedSignatures.TryGetValue(sigKey, out var mb))
             {
-                ilg.Emit(OpCodes.Ldloc, argsLocal);
-                ilg.Emit(OpCodes.Ldc_I4, i);
-                ilg.Emit(OpCodes.Ldarg, i + 1);
-                if (paramTypes[i].IsValueType) ilg.Emit(OpCodes.Box, paramTypes[i]);
-                ilg.Emit(OpCodes.Stelem_Ref);
-            }
-
-            if (mi.ReturnType == typeof(void))
-            {
-                var invokeVoid = typeof(Bridge).GetNestedType("ProxyRuntime", BindingFlags.Public | BindingFlags.Static)!.GetMethod("InvokeVoid", BindingFlags.Public | BindingFlags.Static)!;
-                ilg.Emit(OpCodes.Ldarg_0);
-                ilg.Emit(OpCodes.Ldstr, mi.Name);
-                ilg.Emit(OpCodes.Ldloc, argsLocal);
-                ilg.Emit(OpCodes.Call, invokeVoid);
-                ilg.Emit(OpCodes.Ret);
-            }
-            else
-            {
-                var proxyRuntimeType = typeof(Bridge).GetNestedType("ProxyRuntime", BindingFlags.Public | BindingFlags.Static)!;
-                var gm = proxyRuntimeType.GetMethod("InvokeMethodTyped", BindingFlags.Public | BindingFlags.Static)!.MakeGenericMethod(mi.ReturnType);
-                ilg.Emit(OpCodes.Ldarg_0);
-                ilg.Emit(OpCodes.Ldstr, mi.Name);
-                ilg.Emit(OpCodes.Ldloc, argsLocal);
-                ilg.Emit(OpCodes.Call, gm);
-                ilg.Emit(OpCodes.Ret);
+                mb = EmitProxyMethodBody(tb, mi.Name,
+                    MethodAttributes.Public | MethodAttributes.Virtual | MethodAttributes.HideBySig,
+                    mi.CallingConvention, mi.ReturnType, paramTypes, mi.Name);
+                definedSignatures[sigKey] = mb;
             }
 
             tb.DefineMethodOverride(mb, mi);
         }
 
+        // Interfaces: every requested interface (plus any interfaces *those* extend, since
+        // AddInterfaceImplementation only registers the interface named, not its ancestors) must
+        // have every member implemented — the CLR requires it, unlike base-class virtuals where
+        // skipping is fine. Members JS doesn't override fall back to default/no-op via the same
+        // generic dispatcher (ProxyRuntime.InvokeMethodTyped/InvokeVoid already do this).
+        if (interfaceTypes.Length > 0)
+        {
+            var allInterfaceTypes = new List<Type>();
+            void CollectInterfaces(Type t)
+            {
+                if (allInterfaceTypes.Contains(t)) return;
+                allInterfaceTypes.Add(t);
+                foreach (var parent in t.GetInterfaces()) CollectInterfaces(parent);
+            }
+            foreach (var ifaceType in interfaceTypes) CollectInterfaces(ifaceType);
+
+            foreach (var ifaceType in allInterfaceTypes) tb.AddInterfaceImplementation(ifaceType);
+
+            foreach (var ifaceType in allInterfaceTypes)
+            {
+                foreach (var mi in ifaceType.GetMethods())
+                {
+                    var parameters = mi.GetParameters();
+                    if (parameters.Any(p => p.ParameterType.IsByRef)) continue;
+
+                    var paramTypes = parameters.Select(p => p.ParameterType).ToArray();
+                    var sigKey = SignatureKey(mi.Name, paramTypes);
+                    if (!definedSignatures.TryGetValue(sigKey, out var mb))
+                    {
+                        mb = EmitProxyMethodBody(tb, mi.Name,
+                            MethodAttributes.Public | MethodAttributes.Virtual | MethodAttributes.Final
+                                | MethodAttributes.HideBySig | MethodAttributes.NewSlot,
+                            mi.CallingConvention, mi.ReturnType, paramTypes, mi.Name);
+                        definedSignatures[sigKey] = mb;
+                    }
+
+                    tb.DefineMethodOverride(mb, mi);
+                }
+            }
+        }
+
         return tb.CreateTypeInfo()!.AsType();
     }
 
-    private static DispatchResult CreateJsSubclass(string? assemblyName, string typeName, int callbackId)
+    // Shared IL body for both base-virtual overrides and interface-member implementations: box
+    // args into an object[], forward to ProxyRuntime.InvokeVoid/InvokeMethodTyped<T> by name.
+    private static MethodBuilder EmitProxyMethodBody(
+        TypeBuilder tb, string emittedName, MethodAttributes attrs, CallingConventions callingConvention,
+        Type returnType, Type[] paramTypes, string dispatchName)
+    {
+        var mb = tb.DefineMethod(emittedName, attrs, callingConvention, returnType, paramTypes);
+        var ilg = mb.GetILGenerator();
+        var argsLocal = ilg.DeclareLocal(typeof(object[]));
+        ilg.Emit(OpCodes.Ldc_I4, paramTypes.Length);
+        ilg.Emit(OpCodes.Newarr, typeof(object));
+        ilg.Emit(OpCodes.Stloc, argsLocal);
+
+        for (int i = 0; i < paramTypes.Length; i++)
+        {
+            ilg.Emit(OpCodes.Ldloc, argsLocal);
+            ilg.Emit(OpCodes.Ldc_I4, i);
+            ilg.Emit(OpCodes.Ldarg, i + 1);
+            if (paramTypes[i].IsValueType) ilg.Emit(OpCodes.Box, paramTypes[i]);
+            ilg.Emit(OpCodes.Stelem_Ref);
+        }
+
+        if (returnType == typeof(void))
+        {
+            var invokeVoid = typeof(Bridge).GetNestedType("ProxyRuntime", BindingFlags.Public | BindingFlags.Static)!.GetMethod("InvokeVoid", BindingFlags.Public | BindingFlags.Static)!;
+            ilg.Emit(OpCodes.Ldarg_0);
+            ilg.Emit(OpCodes.Ldstr, dispatchName);
+            ilg.Emit(OpCodes.Ldloc, argsLocal);
+            ilg.Emit(OpCodes.Call, invokeVoid);
+            ilg.Emit(OpCodes.Ret);
+        }
+        else
+        {
+            var proxyRuntimeType = typeof(Bridge).GetNestedType("ProxyRuntime", BindingFlags.Public | BindingFlags.Static)!;
+            var gm = proxyRuntimeType.GetMethod("InvokeMethodTyped", BindingFlags.Public | BindingFlags.Static)!.MakeGenericMethod(returnType);
+            ilg.Emit(OpCodes.Ldarg_0);
+            ilg.Emit(OpCodes.Ldstr, dispatchName);
+            ilg.Emit(OpCodes.Ldloc, argsLocal);
+            ilg.Emit(OpCodes.Call, gm);
+            ilg.Emit(OpCodes.Ret);
+        }
+
+        return mb;
+    }
+
+    private static DispatchResult CreateJsSubclass(
+        string? assemblyName, string typeName, int callbackId, string[] interfaceNames, string[] memberNames)
     {
         EnsureProxyDispatcherCallbacksRegistered();
 
         s_pendingProxyCallbackId.Value = callbackId;
 
-        // Try to find a statically-generated proxy type first.
+        // Try to find a statically-generated proxy type first (Mechanism A: sbg-compiled into
+        // the app itself — already has any requested interfaces baked into real C# source).
         Type? t = FindGeneratedProxyType(typeName);
         if (t is null)
         {
@@ -342,14 +427,14 @@ public static partial class Bridge
                 resolveFrom = assemblyName;
             }
 
-            // Resolve the WinRT/base type and optionally emit a dynamic proxy (dev-only).
+            // Resolve the WinRT/base type and optionally emit a dynamic proxy (Mechanism B fallback).
             var baseType = ResolveType(null, resolveFrom)
                 ?? ResolveType(assemblyName, typeName)
                 ?? throw new TypeLoadException($"Type not found: {resolveFrom} (proxy: {typeName}, assembly: {assemblyName})");
-            
+
             if (baseType.IsClass && !baseType.IsSealed)
             {
-                try { t = GetOrCreateDynamicProxyType(baseType); }
+                try { t = GetOrCreateDynamicProxyType(baseType, interfaceNames, memberNames); }
                 catch (Exception) { t = baseType; }
             }
             else
@@ -371,6 +456,14 @@ public static partial class Bridge
         // the pending callback id when dynamic proxies don't call it.
         try { ProxyInitializeInstance(instance, typeName); } catch { }
 
+        // Force COM CCW vtable creation for any implemented WinRT interfaces now, rather than
+        // relying on it happening implicitly the first time the instance crosses the ABI boundary.
+        // Best-effort/reflection-only — no-ops cleanly when CsWinRT isn't loaded (e.g. xunit host).
+        if (interfaceNames.Length > 0)
+        {
+            TryActivateWinRTInterfaces(instance);
+        }
+
         // Box the instance into a handle to return to the runtime.
         var result = Box(instance);
 
@@ -390,6 +483,50 @@ public static partial class Bridge
 
         s_pendingProxyCallbackId.Value = null;
         return result;
+    }
+
+    // Locates CsWinRT's ComWrappersSupport via reflection (same style as the WinRT.IWinRTObject
+    // lookup in ObtainNativePtr — no compile-time reference needed, since DotNetBridge.csproj is a
+    // dependency-free net9.0 library and CsWinRT is only ever loaded into the process by the WinUI
+    // app itself) and asks it to build a real COM CCW for the instance's implemented WinRT
+    // interfaces now, via CsWinRT's JIT reflection-fallback vtable path (works for types it never
+    // saw at compile time — see plan doc for the CsWinRT version/AOT caveats). Best-effort: no-ops
+    // when CsWinRT isn't loaded, e.g. the xunit test host has no WinUI/CsWinRT at all.
+    private static void TryActivateWinRTInterfaces(object instance)
+    {
+        try
+        {
+            Type? supportType = null;
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try
+                {
+                    supportType = asm.GetType("WinRT.ComWrappersSupport");
+                    if (supportType != null) break;
+                }
+                catch { }
+            }
+            if (supportType == null) return;
+
+            foreach (var name in new[] { "CreateCCWForObject", "GetOrCreateComInterfaceForObject" })
+            {
+                foreach (var candidate in supportType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                                                      .Where(m => m.Name == name))
+                {
+                    try
+                    {
+                        var target = candidate.IsGenericMethodDefinition
+                            ? candidate.MakeGenericMethod(instance.GetType())
+                            : candidate;
+                        var ps = target.GetParameters();
+                        if (ps.Length == 1) { target.Invoke(null, [instance]); return; }
+                        if (ps.Length == 2 && ps[1].ParameterType == typeof(Guid)) { target.Invoke(null, [instance, Guid.Empty]); return; }
+                    }
+                    catch { /* try the next overload/name */ }
+                }
+            }
+        }
+        catch { /* best-effort only */ }
     }
 
     private static void ProxyInitializeInstance(object instance, string typeName)
