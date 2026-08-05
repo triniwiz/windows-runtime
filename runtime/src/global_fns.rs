@@ -197,23 +197,24 @@ pub(crate) fn normalize_js_path(path: &str) -> PathBuf {
 }
 
 pub(crate) fn try_resolve_with_known_extensions(candidate: PathBuf) -> PathBuf {
-    if candidate.exists() {
+    // Each `.exists()` probe also checks the sealed app.nsbundle's decrypted table (a no-op,
+    // cheap OnceLock read when no bundle is loaded) — a packed app has no real `app/` directory
+    // on disk, so `is_dir()`/`.exists()` alone would never resolve anything.
+    if candidate.exists() || crate::source_protect::contains(&candidate.to_string_lossy()) {
         return candidate;
     }
     if candidate.extension().is_none() {
         for ext in ["js", "mjs", "cjs"] {
             let with_ext = candidate.with_extension(ext);
-            if with_ext.exists() {
+            if with_ext.exists() || crate::source_protect::contains(&with_ext.to_string_lossy()) {
                 return with_ext;
             }
         }
     }
-    if candidate.is_dir() {
-        for index_file in ["index.js", "index.mjs", "index.cjs"] {
-            let with_index = candidate.join(index_file);
-            if with_index.exists() {
-                return with_index;
-            }
+    for index_file in ["index.js", "index.mjs", "index.cjs"] {
+        let with_index = candidate.join(index_file);
+        if with_index.exists() || crate::source_protect::contains(&with_index.to_string_lossy()) {
+            return with_index;
         }
     }
     candidate
@@ -788,6 +789,14 @@ pub(crate) fn handle_read_text_file(
         throw_js_error(scope, "__nsReadTextFile: path is empty");
         return;
     }
+    if let Some(content) = crate::source_protect::read_text(path.as_str()) {
+        if let Some(value) = v8::String::new(scope, content.as_str()) {
+            retval.set(value.into());
+        } else {
+            retval.set_null();
+        }
+        return;
+    }
     match fs::read_to_string(Path::new(path.as_str())) {
         Ok(content) => {
             if let Some(value) = v8::String::new(scope, content.as_str()) {
@@ -946,7 +955,11 @@ pub(crate) fn handle_resolve_module_path(
         let parent = parent_path
             .map(|v| normalize_js_path(v.as_str()))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        let base = if parent.is_file() {
+        // A packed (virtual, no-plaintext-on-disk) referrer never satisfies `.is_file()`, so also
+        // check the sealed bundle's table — otherwise a relative require() from a bundle-only file
+        // would wrongly treat the referrer itself as the base directory instead of its parent.
+        let base = if parent.is_file() || crate::source_protect::contains(&parent.to_string_lossy())
+        {
             parent.parent().map(Path::to_path_buf).unwrap_or(parent)
         } else {
             parent

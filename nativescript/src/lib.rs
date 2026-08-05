@@ -190,6 +190,20 @@ pub extern "C" fn runtime_set_local_folder(path: *const c_char) {
     let _ = LOCAL_FOLDER.set(s);
 }
 
+/// Supply a custom key (64 hex chars = 32 bytes) for opening a `key_mode == 1` app.nsbundle
+/// container packed with `nsbundle_pack --key-hex`. Must be called before `runtime_init` — same
+/// ordering requirement as `runtime_set_local_folder`. Returns 1 on success, 0 on malformed input
+/// (wrong length or non-hex characters). Apps sealed with the default pepper (`key_mode == 0`,
+/// i.e. `nsbundle_pack` invoked without `--key-hex`) never need to call this.
+#[no_mangle]
+pub extern "C" fn runtime_set_bundle_key(key_hex: *const c_char) -> c_int {
+    if key_hex.is_null() {
+        return 0;
+    }
+    let hex = unsafe { CStr::from_ptr(key_hex) }.to_string_lossy();
+    runtime::source_protect::set_custom_key_hex(hex.as_ref()) as c_int
+}
+
 #[no_mangle]
 pub extern "C" fn runtime_init(app_root: *const c_char) -> i64 {
     install_veh();
@@ -280,6 +294,32 @@ pub extern "C" fn runtime_get_last_js_error() -> *mut c_char {
 /// Free a string previously returned by `runtime_get_last_js_error`.
 #[no_mangle]
 pub extern "C" fn runtime_free_js_error(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        drop(unsafe { CString::from_raw(ptr) });
+    }
+}
+
+/// Read a JS source file out of the sealed app.nsbundle loaded for this process, if any. Returns
+/// NULL when no bundle was loaded, or the given path isn't in it — this doubles as an existence
+/// probe, so callers (`RuntimeHost.cs`'s `VExists`/`VReadAllText`) can use one call for both.
+/// Non-NULL results must be freed with `runtime_free_protected_string`.
+#[no_mangle]
+pub extern "C" fn runtime_read_protected_file(virtual_path: *const c_char) -> *mut c_char {
+    if virtual_path.is_null() {
+        return std::ptr::null_mut();
+    }
+    let path = unsafe { CStr::from_ptr(virtual_path) }.to_string_lossy();
+    match runtime::source_protect::read_text(path.as_ref()) {
+        Some(content) => CString::new(content)
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Free a string previously returned by `runtime_read_protected_file`.
+#[no_mangle]
+pub extern "C" fn runtime_free_protected_string(ptr: *mut c_char) {
     if !ptr.is_null() {
         drop(unsafe { CString::from_raw(ptr) });
     }

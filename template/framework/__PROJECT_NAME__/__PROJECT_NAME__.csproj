@@ -87,7 +87,12 @@
     <Content Include="Properties\Default.rd.xml" />
 
     <!-- App JS/resource files — copied to the output directory on every build -->
-    <Content Include="app\**\*">
+    <!-- Sealed source-protected bundle when present, takes
+         priority over the plaintext app\ tree; produced by the nsbundle_pack packer tool. -->
+    <Content Include="app.nsbundle" Condition="Exists('app.nsbundle')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="app\**\*" Condition="!Exists('app.nsbundle')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
 

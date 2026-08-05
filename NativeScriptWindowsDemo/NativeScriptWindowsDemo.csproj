@@ -104,7 +104,12 @@
     <Compile Include="$(NSGenDir)\NSWinRTProxies\**\*.cs" Visible="false" Condition="Exists('$(NSGenDir)\NSWinRTProxies')" />
     <Compile Remove="$(NSGenDir)\NSWinRTProxies\obj\**\*.cs" Condition="Exists('$(NSGenDir)\NSWinRTProxies\obj')" />
 
-    <Content Include="App\**\*">
+    <!-- Sealed source-protected bundle (see runtime/src/source_protect.rs), when present, takes
+         priority over the plaintext App\ tree; produced by the nsbundle_pack packer tool. -->
+    <Content Include="app.nsbundle" Condition="Exists('app.nsbundle')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="App\**\*" Condition="!Exists('app.nsbundle')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="$(NSGenDir)\sbg-manifest.json" Link="sbg-manifest.json" CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(NSGenDir)\sbg-manifest.json')" />

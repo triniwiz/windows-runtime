@@ -191,6 +191,17 @@ pub extern "C" fn runtime_set_local_folder(path: *const c_char) {
     runtime::set_log_dir(s);
 }
 
+/// Supply a custom key (64 hex chars = 32 bytes) for opening a `key_mode == 1` app.nsbundle
+/// container. Must be called before `runtime_init`. Returns 1 on success, 0 on malformed input.
+#[no_mangle]
+pub extern "C" fn runtime_set_bundle_key(key_hex: *const c_char) -> c_int {
+    if key_hex.is_null() {
+        return 0;
+    }
+    let hex = unsafe { CStr::from_ptr(key_hex) }.to_string_lossy();
+    runtime::source_protect::set_custom_key_hex(hex.as_ref()) as c_int
+}
+
 #[no_mangle]
 pub extern "C" fn runtime_install_ctrlc_handler(_exit_code: i32) {
     // No-op on the engine hosts: the WinUI 3 process owns Ctrl+C. Present for ABI parity.
@@ -214,6 +225,30 @@ pub extern "C" fn runtime_get_last_js_error() -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn runtime_free_js_error(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        drop(unsafe { CString::from_raw(ptr) });
+    }
+}
+
+/// Read a JS source file out of the sealed app.nsbundle loaded for this process, if any. NULL
+/// means no bundle loaded or the path isn't in it. Free non-NULL results with
+/// `runtime_free_protected_string`.
+#[no_mangle]
+pub extern "C" fn runtime_read_protected_file(virtual_path: *const c_char) -> *mut c_char {
+    if virtual_path.is_null() {
+        return std::ptr::null_mut();
+    }
+    let path = unsafe { CStr::from_ptr(virtual_path) }.to_string_lossy();
+    match runtime::source_protect::read_text(path.as_ref()) {
+        Some(content) => CString::new(content)
+            .map(|c| c.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn runtime_free_protected_string(ptr: *mut c_char) {
     if !ptr.is_null() {
         drop(unsafe { CString::from_raw(ptr) });
     }

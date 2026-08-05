@@ -289,6 +289,45 @@ if (Test-Path $x64Path) {
     Write-Host "  copied dotnet-tool-x64.exe -> dotnet-tool.exe"
 }
 
+# nsbundle_pack prebuilt binaries (source-protection packer — seals an app's webpack output
+# directory into an encrypted app.nsbundle. It's a [[bin]]
+# target inside the `runtime` crate rather than its own package, unlike dotnet-tool, but is
+# otherwise staged identically so nativescript-cli can resolve/invoke it the same way.
+Write-Host "`n=== Build nsbundle_pack prebuilt binaries ===" -ForegroundColor Cyan
+if (-not (Test-Path $ToolsDir)) { New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null }
+
+foreach ($t in $Targets) {
+    $arch = $t.Arch
+    $rustTarget = $t.RustTarget
+    Write-Host "Building nsbundle_pack for $arch ($rustTarget)..."
+    Push-Location $RepoRoot
+    try {
+        & cargo build -p runtime --bin nsbundle_pack --release --target $rustTarget
+        $buildExit = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    if ($buildExit -ne 0) {
+        Write-Host "cargo build for nsbundle_pack failed for target $rustTarget (exit $buildExit). Skipping copy for $arch." -ForegroundColor Yellow
+        continue
+    }
+    $candidate = Join-Path $RepoRoot "target\$rustTarget\release\nsbundle_pack.exe"
+    if (Test-Path $candidate) {
+        $dest = Join-Path $ToolsDir "nsbundle_pack-$arch.exe"
+        Copy-Item -Force $candidate $dest
+        Write-Host "  copied nsbundle_pack -> $(Resolve-Path $dest -Relative)"
+    } else {
+        Write-Host "Expected build output not found: $candidate" -ForegroundColor Yellow
+    }
+}
+
+# Provide a generic `nsbundle_pack.exe` fallback (copy x64 if available)
+$nsbundlePackX64Path = Join-Path $ToolsDir "nsbundle_pack-x64.exe"
+if (Test-Path $nsbundlePackX64Path) {
+    Copy-Item -Force $nsbundlePackX64Path (Join-Path $ToolsDir "nsbundle_pack.exe")
+    Write-Host "  copied nsbundle_pack-x64.exe -> nsbundle_pack.exe"
+}
+
 # sbg prebuilt binaries
 Write-Host "`n=== Build sbg prebuilt binaries ===" -ForegroundColor Cyan
 

@@ -30,6 +30,10 @@ use crate::napi_engine::{event_loop, globals, invoke, module_natives, ns_proxy};
 /// This is exactly what the standalone hosts do before running app code; the only thing left to
 /// the caller is running the engine's JS prelude/polyfills (which need the engine's own eval).
 pub fn initialize_runtime(env: &Env, app_root: &str) -> napi::Result<()> {
+    // Look for a sealed app.nsbundle next to app_root before anything else touches the
+    // filesystem for JS source — module_natives' __nsReadTextFile/__nsResolveModulePath below
+    // consult the decrypted in-memory table first and fall back to disk when none was found.
+    crate::source_protect::init_from_app_root(app_root);
     install_panic_logging_hook();
     install_native_crash_handler();
     invoke::ensure_winrt_initialized();

@@ -32,6 +32,20 @@ namespace NativeScriptWindowsDemo
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_set_local_folder))]
         private static extern void runtime_set_local_folder([MarshalAs(UnmanagedType.LPUTF8Str)] string localFolder);
 
+        // Escape hatch for apps packed with `nsbundle_pack --key-hex <hex>` (custom-key
+        // app.nsbundle containers). Must be called before runtime_init if used at all — apps
+        // packed with the default pepper (no --key-hex) never need to call this. Not wired to a
+        // default call site here; an app author supplies their own key material and calls this
+        // from Initialize() before runtime_init(...).
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_set_bundle_key))]
+        private static extern int runtime_set_bundle_key([MarshalAs(UnmanagedType.LPUTF8Str)] string keyHex);
+
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_read_protected_file))]
+        private static extern IntPtr runtime_read_protected_file([MarshalAs(UnmanagedType.LPUTF8Str)] string virtualPath);
+
+        [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_free_protected_string))]
+        private static extern void runtime_free_protected_string(IntPtr ptr);
+
         [DllImport(NativeScriptLibrary, EntryPoint = nameof(runtime_get_last_js_error))]
         private static extern IntPtr runtime_get_last_js_error();
 
@@ -191,6 +205,27 @@ namespace NativeScriptWindowsDemo
         }
 #endif
 
+        /// Reads a file that may live inside a sealed app.nsbundle instead of on disk: tries the
+        /// protected-VFS native call first (cheap no-op when no bundle is loaded), falls back to
+        /// the real filesystem. `path` is whatever candidate the caller already built for
+        /// `File.Exists`/`File.ReadAllText` — the native side strips it down to the bundle's
+        /// virtual (app/App-relative) path itself, so no extra bookkeeping is needed here.
+        private static string TryReadVirtual(string path)
+        {
+            IntPtr ptr = IntPtr.Zero;
+            try
+            {
+                ptr = runtime_read_protected_file(path);
+                return ptr == IntPtr.Zero ? null : Marshal.PtrToStringUTF8(ptr);
+            }
+            catch { return null; }
+            finally { if (ptr != IntPtr.Zero) runtime_free_protected_string(ptr); }
+        }
+
+        private static bool VExists(string path) => TryReadVirtual(path) != null || File.Exists(path);
+
+        private static string VReadAllText(string path) => TryReadVirtual(path) ?? File.ReadAllText(path);
+
         public void RunMainScript()
         {
             if (!_initialized)
@@ -208,7 +243,7 @@ namespace NativeScriptWindowsDemo
             foreach (var chunkName in new[] { "runtime.js", "vendor.js" })
             {
                 var chunkPath = Path.Combine(dir, chunkName);
-                if (File.Exists(chunkPath) &&
+                if (VExists(chunkPath) &&
                     !string.Equals(chunkPath, Path.GetFullPath(entryPath), StringComparison.OrdinalIgnoreCase))
                 {
                     chunks.Add(chunkPath);
@@ -218,7 +253,7 @@ namespace NativeScriptWindowsDemo
 
             foreach (var scriptPath in chunks)
             {
-                var script = File.ReadAllText(Path.GetFullPath(scriptPath));
+                var script = VReadAllText(Path.GetFullPath(scriptPath));
                 try
                 {
                     runtime_runscript(_runtime, script, Path.GetFileName(scriptPath));
@@ -260,7 +295,7 @@ namespace NativeScriptWindowsDemo
             foreach (var dir in appDirCandidates)
             {
                 var candidate = Path.Combine(dir, "package.json");
-                if (File.Exists(candidate))
+                if (VExists(candidate))
                 {
                     packageJsonPath = candidate;
                     resolvedBaseDir = dir;
@@ -269,7 +304,7 @@ namespace NativeScriptWindowsDemo
             }
 
             // Also accept package.json at the project root (parent of bin/).
-            if (packageJsonPath == null && File.Exists(Path.Combine(parentDir, "package.json")))
+            if (packageJsonPath == null && VExists(Path.Combine(parentDir, "package.json")))
             {
                 packageJsonPath = Path.Combine(parentDir, "package.json");
                 resolvedBaseDir = parentDir;
@@ -278,7 +313,7 @@ namespace NativeScriptWindowsDemo
             string Fallback() =>
                 appDirCandidates
                     .SelectMany(d => new[] { Path.Combine(d, "bundle.js"), Path.Combine(d, "bundle.mjs") })
-                    .FirstOrDefault(File.Exists);
+                    .FirstOrDefault(VExists);
 
             if (packageJsonPath == null)
                 return Fallback();
@@ -304,7 +339,7 @@ namespace NativeScriptWindowsDemo
 
         private static RuntimePackageConfig ParsePackageConfig(string packageJsonPath)
         {
-            using var doc = JsonDocument.Parse(File.ReadAllText(packageJsonPath));
+            using var doc = JsonDocument.Parse(VReadAllText(packageJsonPath));
             var config = new RuntimePackageConfig();
             if (doc.RootElement.TryGetProperty("main", out var main) && main.ValueKind == JsonValueKind.String)
                 config.Main = main.GetString();
@@ -321,11 +356,11 @@ namespace NativeScriptWindowsDemo
             foreach (var candidate in new[] { normalized, normalized + ".js", normalized + ".mjs" })
             {
                 var direct = Path.IsPathRooted(candidate) ? candidate : Path.Combine(baseDir, candidate);
-                if (File.Exists(direct)) return direct;
+                if (VExists(direct)) return direct;
                 var appLower = Path.Combine(baseDir, "app", candidate);
-                if (File.Exists(appLower)) return appLower;
+                if (VExists(appLower)) return appLower;
                 var appUpper = Path.Combine(baseDir, "App", candidate);
-                if (File.Exists(appUpper)) return appUpper;
+                if (VExists(appUpper)) return appUpper;
             }
             return null;
         }

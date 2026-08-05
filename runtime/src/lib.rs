@@ -24,6 +24,7 @@ pub mod napi_engine;
 mod ns_proxy;
 mod property_call;
 mod proxy_manifest_loader;
+pub mod source_protect;
 pub mod timers;
 mod type_description;
 pub mod ui_dispatcher;
@@ -1330,25 +1331,26 @@ fn normalize_js_path(path: &str) -> PathBuf {
 }
 
 fn try_resolve_with_known_extensions(candidate: PathBuf) -> PathBuf {
-    if candidate.exists() {
+    // Each `.exists()` probe also checks the sealed app.nsbundle's decrypted table (a no-op,
+    // cheap OnceLock read when no bundle is loaded) — a packed app has no real `app/` directory
+    // on disk, so `is_dir()`/`.exists()` alone would never resolve anything.
+    if candidate.exists() || crate::source_protect::contains(&candidate.to_string_lossy()) {
         return candidate;
     }
 
     if candidate.extension().is_none() {
         for ext in ["js", "mjs", "cjs"] {
             let with_ext = candidate.with_extension(ext);
-            if with_ext.exists() {
+            if with_ext.exists() || crate::source_protect::contains(&with_ext.to_string_lossy()) {
                 return with_ext;
             }
         }
     }
 
-    if candidate.is_dir() {
-        for index_file in ["index.js", "index.mjs", "index.cjs"] {
-            let with_index = candidate.join(index_file);
-            if with_index.exists() {
-                return with_index;
-            }
+    for index_file in ["index.js", "index.mjs", "index.cjs"] {
+        let with_index = candidate.join(index_file);
+        if with_index.exists() || crate::source_protect::contains(&with_index.to_string_lossy()) {
+            return with_index;
         }
     }
 
@@ -1363,7 +1365,11 @@ fn resolve_esm_path(specifier: &str, referrer_path: Option<&str>) -> String {
         let parent = referrer_path
             .map(normalize_js_path)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        let base = if parent.is_file() {
+        // A packed (virtual, no-plaintext-on-disk) referrer never satisfies `.is_file()`, so also
+        // check the sealed bundle's table — otherwise a relative import from a bundle-only module
+        // would wrongly treat the referrer itself as the base directory instead of its parent.
+        let base = if parent.is_file() || crate::source_protect::contains(&parent.to_string_lossy())
+        {
             parent.parent().map(Path::to_path_buf).unwrap_or(parent)
         } else {
             parent
@@ -1448,6 +1454,10 @@ fn compile_module_graph(scope: &mut v8::PinScope<'_, '_>, source: &str, path: &s
     for spec in child_specifiers {
         let child_path = resolve_esm_path(&spec, Some(path));
         if ESM_MODULE_REGISTRY.with(|r| r.borrow().contains_key(&child_path)) {
+            continue;
+        }
+        if let Some(content) = crate::source_protect::read_text(&child_path) {
+            compile_module_graph(scope, &content, &child_path);
             continue;
         }
         match fs::read_to_string(&child_path) {
@@ -7524,6 +7534,11 @@ pub(crate) fn handle_update_items_source(
 
 impl Runtime {
     pub fn new(app_root: &str) -> Self {
+        // Look for a sealed app.nsbundle next to app_root before anything else touches the
+        // filesystem for JS source — every read/resolve point below consults the decrypted
+        // in-memory table first and falls back to disk when none was found.
+        crate::source_protect::init_from_app_root(app_root);
+
         INIT.call_once(|| {
             // --expose-gc makes gc() available as a global JS function so callers
             // can trigger a full GC sweep (useful for debugging and test harnesses).
@@ -7616,15 +7631,20 @@ impl Runtime {
                 let referrer_path = value_to_string(scope, resource_name);
                 let resolved = resolve_esm_path(&spec, referrer_path.as_deref());
 
-                match std::fs::read_to_string(&resolved) {
-                    Ok(content) => compile_module_graph(scope, &content, &resolved),
-                    Err(e) => {
-                        if let Some(err_str) =
-                            v8::String::new(scope, &format!("ESM: cannot read {resolved}: {e}"))
-                        {
-                            resolver.reject(scope, err_str.into());
+                if let Some(content) = crate::source_protect::read_text(&resolved) {
+                    compile_module_graph(scope, &content, &resolved);
+                } else {
+                    match std::fs::read_to_string(&resolved) {
+                        Ok(content) => compile_module_graph(scope, &content, &resolved),
+                        Err(e) => {
+                            if let Some(err_str) = v8::String::new(
+                                scope,
+                                &format!("ESM: cannot read {resolved}: {e}"),
+                            ) {
+                                resolver.reject(scope, err_str.into());
+                            }
+                            return Some(resolver.get_promise(scope));
                         }
-                        return Some(resolver.get_promise(scope));
                     }
                 }
 

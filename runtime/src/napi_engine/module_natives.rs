@@ -55,6 +55,9 @@ pub fn install_module_natives(env: &Env, app_root: &str) -> napi::Result<()> {
             if path.is_empty() {
                 return Err(napi::Error::from_reason("__nsReadTextFile: path is empty"));
             }
+            if let Some(content) = crate::source_protect::read_text(&path) {
+                return Ok(env.create_string(&content)?);
+            }
             match std::fs::read_to_string(Path::new(&path)) {
                 Ok(content) => Ok(env.create_string(&content)?),
                 Err(err) => Err(napi::Error::from_reason(format!(
@@ -84,7 +87,12 @@ pub fn install_module_natives(env: &Env, app_root: &str) -> napi::Result<()> {
                 let parent = parent_path
                     .map(|v| crate::global_fns::normalize_js_path(&v))
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-                let base = if parent.is_file() {
+                // A packed (virtual, no-plaintext-on-disk) referrer never satisfies `.is_file()`,
+                // so also check the sealed bundle's table — otherwise a relative require() from a
+                // bundle-only file would wrongly treat the referrer as the base dir, not its parent.
+                let base = if parent.is_file()
+                    || crate::source_protect::contains(&parent.to_string_lossy())
+                {
                     parent.parent().map(Path::to_path_buf).unwrap_or(parent)
                 } else {
                     parent

@@ -25,6 +25,8 @@ runtime-devtools = { path = "../runtime-devtools", optional = true }
 napi = { version = "2", default-features = false, features = ["napi8"], optional = true }
 # Native crash reporter (napi_engine hosts): symbolize SEH faults via the host PDB.
 backtrace = "0.3"
+aes-gcm = "0.10"
+getrandom = "0.2"
 
 windows-core = "0.62.2"
 windows-collections = "0.3.2"
@@ -61,7 +63,6 @@ features = [
 [features]
 default = []
 devtools = ["runtime-devtools"]
-# Engine-agnostic Node-API backend, ported from the rusty_v8 seam.
 napi_engine = ["dep:napi"]
 
 [dev-dependencies]
@@ -74,3 +75,7 @@ harness = false
 [[bench]]
 name = "async_runtime"
 harness = false
+
+[[bin]]
+name = "nsbundle_pack"
+path = "src/bin/nsbundle_pack.rs"
